@@ -414,22 +414,52 @@ fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
         })
 }
 
-/// 生成 `salt$sha256(salt + password)`。盐取 16 字节十六进制。
+/// 生成 argon2id PHC 格式口令哈希（前缀 `$argon2id$`）。
+///
+/// 旧版 `salt$sha256(...)` 格式仍可被 [`verify_password`] 验证（兼容旧账套），
+/// 登录成功后会由持久化层透明升级为 argon2（见 findb::security::login）。
 pub fn hash_password(plain: &str) -> String {
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::{Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(plain.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| legacy_hash_password(plain))
+}
+
+/// 校验口令：兼容 argon2 PHC 与旧版 `salt$sha256` 两种存储格式
+pub fn verify_password(plain: &str, stored: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        use argon2::password_hash::PasswordHash;
+        use argon2::{Argon2, PasswordVerifier};
+        match PasswordHash::new(stored) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(plain.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        match stored.split_once('$') {
+            Some((salt, hash)) => {
+                let calc = sha256_hex(&format!("{salt}{plain}"));
+                constant_time_eq(calc.as_bytes(), hash.as_bytes())
+            }
+            None => false,
+        }
+    }
+}
+
+/// 该哈希是否为旧版 `salt$sha256` 格式（登录成功后应透明升级为 argon2）
+pub fn is_legacy_hash(stored: &str) -> bool {
+    !stored.starts_with("$argon2")
+}
+
+/// 旧版 `salt$sha256(password)`。仅保留作兼容（argon2 失败时的兜底与升级迁移测试用）。
+fn legacy_hash_password(plain: &str) -> String {
     let salt = random_hex(16);
     let hash = sha256_hex(&format!("{salt}{plain}"));
     format!("{salt}${hash}")
-}
-
-/// 校验口令
-pub fn verify_password(plain: &str, stored: &str) -> bool {
-    match stored.split_once('$') {
-        Some((salt, hash)) => {
-            let calc = sha256_hex(&format!("{salt}{plain}"));
-            constant_time_eq(calc.as_bytes(), hash.as_bytes())
-        }
-        None => false,
-    }
 }
 
 /// 定长比较，避免时序侧信道
@@ -510,6 +540,20 @@ mod tests {
         assert!(!verify_password("x", "garbage"));
         // 同样的明文两次哈希结果应不同（盐不同）
         assert_ne!(hash_password("same"), hash_password("same"));
+    }
+
+    #[test]
+    fn argon2_format_and_legacy_compat() {
+        // 新哈希使用 argon2id PHC 格式
+        let h = hash_password("Abc123!!");
+        assert!(h.starts_with("$argon2"), "新哈希应为 argon2 PHC：{h}");
+        assert!(!is_legacy_hash(&h));
+        assert!(verify_password("Abc123!!", &h));
+        // 旧版 salt$sha256 格式仍可验证，且被识别为 legacy
+        let old = legacy_hash_password("OldPwd!1");
+        assert!(is_legacy_hash(&old));
+        assert!(verify_password("OldPwd!1", &old));
+        assert!(!verify_password("Wrong!1", &old));
     }
 
     #[test]

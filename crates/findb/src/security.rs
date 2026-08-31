@@ -206,6 +206,13 @@ pub fn login(
             }
         }
     }
+    // 旧版 `salt$sha256` 哈希登录成功：透明升级为 argon2，不打断用户
+    if fincore::user::is_legacy_hash(&u.password_hash) {
+        let mut nu = u.clone();
+        nu.set_password(password);
+        crate::users::update(db, &nu)?;
+        db.log(username, "安全", "口令升级", "旧版口令哈希已升级为 argon2")?;
+    }
     // 成功：清失败计数、写登录时间
     log_attempt(db, username, true)?;
     crate::users::touch_login(db, username)?;

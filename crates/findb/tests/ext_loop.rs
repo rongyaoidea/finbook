@@ -87,7 +87,7 @@ fn t90_asset_dep_loop() {
         category: "电子设备".into(),
         spec: String::new(),
         dept: "财务部".into(),
-        asset_account: "1601".into(),
+        asset_account: "160101".into(),
         dep_account: "1602".into(),
         expense_account: "660201".into(),
         original_value: m("12000"),
@@ -166,7 +166,7 @@ fn t91_bank_reconcile_loop() {
         d(2026, 1, 5),
         "记",
         (1, "100201", m("1000"), true, bank_aux()),
-        (2, "6001", m("1000"), false, AuxRef::default()),
+        (2, "600101", m("1000"), false, AuxRef::default()),
     );
     post_two(
         &db,
@@ -228,7 +228,7 @@ fn t92_settle_and_aging_loop() {
         let (is_d1, is_d2) = (debit, !debit);
         let e1 = (
             1,
-            "1122",
+            "112201",
             m(amt),
             is_d1,
             AuxRef {
@@ -236,7 +236,7 @@ fn t92_settle_and_aging_loop() {
                 ..Default::default()
             },
         );
-        let e2 = (2, "6001", m(amt), is_d2, AuxRef::default());
+        let e2 = (2, "600101", m(amt), is_d2, AuxRef::default());
         let (_, es) = post_two(&db, date, "记", e1, e2);
         let _ = no;
         es[0]
@@ -296,7 +296,7 @@ fn t93_fx_transfer_checklist_loop() {
         name: "费用分摊测试".into(),
         sort: 1,
         active: true,
-        src_account: "6001".into(),
+        src_account: "600101".into(),
         src_aux: String::new(),
         src_kind: automation::SrcKind::Credit,
         src_dir: automation::EntryDir::Auto,
@@ -317,7 +317,7 @@ fn t93_fx_transfer_checklist_loop() {
         d(2026, 1, 15),
         "记",
         (1, "100201", m("5000"), true, bank_aux()),
-        (2, "6001", m("5000"), false, AuxRef::default()),
+        (2, "600101", m("5000"), false, AuxRef::default()),
     );
     let previews = automation::at_preview_all(&db, p).unwrap();
     let pv = previews.iter().find(|x| x.rule.id == rid).unwrap();
@@ -391,7 +391,7 @@ fn t94_inventory_payroll_claim_loop() {
         p.last_day(),
         CostMethod::MovingAverage,
         "6401",
-        "1405",
+        "140501",
         "测试员",
     )
     .unwrap()
@@ -588,7 +588,7 @@ fn t95_mgmt_template_summary_attach_loop() {
         d(2026, 1, 25),
         "记",
         (1, "100201", m("1"), true, bank_aux()),
-        (2, "6001", m("1"), false, AuxRef::default()),
+        (2, "600101", m("1"), false, AuxRef::default()),
     );
     let aid = attach::add(&db, vid, "invoice.png", &[1u8; 128], "测试员").unwrap();
     assert_eq!(attach::count(&db, vid).unwrap(), 1);

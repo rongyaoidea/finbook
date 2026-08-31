@@ -84,11 +84,15 @@ pub fn router(state: Arc<WebState>) -> Router {
 async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<SetupStatus>, AppError> {
     let db = state.pool.get()?;
     let admin_set = users::admin_exists(&db)?;
+    let opts = db.options();
+    // 未建账 = 尚未设定公司名称（启用期间默认值亦视为未建账）
+    let needs_setup = opts.company.trim().is_empty();
     // 注意：不返回管理员用户名——该接口无需登录即可访问，
     // 暴露账号名等于替攻击者完成了一半的用户名枚举。
     Ok(Json(SetupStatus {
         admin_set,
-        company: state.company.clone(),
+        needs_setup,
+        company: opts.company,
         version: state.version.clone(),
         book: state.book_path.display().to_string(),
     }))
@@ -352,6 +356,8 @@ async fn put_options(
     user.require(Perm::SysOption)?;
     let db = state.pool.get()?;
     db.set_options(&opts)?;
+    // 刷新公司名缓存（建账向导保存后，仪表盘立即显示新公司名）
+    state.refresh_company(&db);
     Ok(Json(json!({"ok": true})))
 }
 
@@ -375,7 +381,7 @@ async fn get_dashboard(
     let cur = current_period(&state, &user);
     let closed = periods::closed_upto(&db)?;
     Ok(Json(Dashboard {
-        company: state.company.clone(),
+        company: state.company_name(),
         start_period: period_to_str(start),
         current_period: period_to_str(cur),
         closed_upto: closed.map(period_to_str),
@@ -902,7 +908,7 @@ fn trial_balance_html(
          <td class='r'>—</td></tr></tfoot></table>\
          <script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>\
          </body></html>",
-        html_escape(&state.company),
+        html_escape(&state.company_name()),
         html_escape(&from),
         html_escape(&to),
         chrono::Local::now().format("%Y-%m-%d %H:%M"),

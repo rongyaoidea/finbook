@@ -38,13 +38,13 @@ fn m(s: &str) -> Money {
 fn opening_rows() -> Vec<(&'static str, Option<(&'static str, &'static str)>, &'static str)> {
     vec![
         ("100201", None, "700000.00"),
-        ("1122", Some(("customer", "C01")), "120000.00"),
-        ("1122", Some(("customer", "C02")), "80000.00"),
-        ("1405", Some(("item", "I01")), "300000.00"),
-        ("1601", None, "500000.00"),
+        ("112201", Some(("customer", "C01")), "120000.00"),
+        ("112201", Some(("customer", "C02")), "80000.00"),
+        ("140501", Some(("item", "I01")), "300000.00"),
+        ("160101", None, "500000.00"),
         // 贷方用负数表示
         ("4001", None, "-1500000.00"),
-        ("2202", Some(("supplier", "S01")), "-200000.00"),
+        ("220201", Some(("supplier", "S01")), "-200000.00"),
     ]
 }
 
@@ -84,7 +84,7 @@ fn t01_book_seeded() {
         "内置科目表应有一百多个科目，实际 {}",
         chart.all().len()
     );
-    for c in ["100201", "1122", "2202", "6001", "660201", "4103"] {
+    for c in ["100201", "112201", "220201", "600101", "660201", "4103"] {
         assert!(chart.get(c).is_some(), "缺少内置科目 {c}");
     }
 
@@ -115,9 +115,9 @@ fn t02_account_rules() {
     // 辅助核算只在末级科目上
     assert!(chart.get("1002").unwrap().aux.is_empty());
     assert!(chart.get("100201").unwrap().aux.contains(AuxKind::Bank));
-    assert!(chart.get("1122").unwrap().aux.contains(AuxKind::Customer));
-    assert!(chart.get("2202").unwrap().aux.contains(AuxKind::Supplier));
-    assert!(chart.get("1403").unwrap().has_qty);
+    assert!(chart.get("112201").unwrap().aux.contains(AuxKind::Customer));
+    assert!(chart.get("220201").unwrap().aux.contains(AuxKind::Supplier));
+    assert!(chart.get("140301").unwrap().has_qty);
 
     // 新增下级后，父科目自动变成非末级
     let before = chart.is_leaf("660201");
@@ -188,14 +188,14 @@ fn t03_opening_balance() {
     // 期初余额进入快照
     let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p1())).unwrap();
     assert_eq!(snap.for_account("100201", None).begin, m("700000.00"));
-    assert_eq!(snap.for_account("1405", None).begin, m("300000.00"));
-    assert_eq!(snap.for_account("1601", None).begin, m("500000.00"));
+    assert_eq!(snap.for_account("140501", None).begin, m("300000.00"));
+    assert_eq!(snap.for_account("160101", None).begin, m("500000.00"));
     assert_eq!(snap.for_account("4001", None).begin, m("-1500000.00"));
 
     // 应收账款按客户拆分，合计 200,000
     let mut cust = AuxRef::default();
     cust.customer = Some("C01".to_string());
-    assert_eq!(snap.for_account("1122", Some(&cust)).begin, m("120000.00"));
+    assert_eq!(snap.for_account("112201", Some(&cust)).begin, m("120000.00"));
 
     let tb = snap.trial_balance(&chart);
     assert!(tb.begin_balanced(), "期初试算应平衡");
@@ -232,7 +232,7 @@ fn voucher_specs() -> Vec<(NaiveDate, &'static str, Vec<E>)> {
                     qty: None,
                 },
                 E {
-                    code: "1122",
+                    code: "112201",
                     summary: "收到甲客户货款",
                     debit: "0",
                     credit: "120000.00",
@@ -247,7 +247,7 @@ fn voucher_specs() -> Vec<(NaiveDate, &'static str, Vec<E>)> {
             "采购原材料",
             vec![
                 E {
-                    code: "1403",
+                    code: "140301",
                     summary: "采购原材料",
                     debit: "100000.00",
                     credit: "0",
@@ -280,7 +280,7 @@ fn voucher_specs() -> Vec<(NaiveDate, &'static str, Vec<E>)> {
             "赊销产品给乙客户",
             vec![
                 E {
-                    code: "1122",
+                    code: "112201",
                     summary: "赊销产品",
                     debit: "226000.00",
                     credit: "0",
@@ -289,7 +289,7 @@ fn voucher_specs() -> Vec<(NaiveDate, &'static str, Vec<E>)> {
                     qty: None,
                 },
                 E {
-                    code: "6001",
+                    code: "600101",
                     summary: "主营业务收入",
                     debit: "0",
                     credit: "200000.00",
@@ -418,7 +418,7 @@ fn voucher_specs() -> Vec<(NaiveDate, &'static str, Vec<E>)> {
                     qty: None,
                 },
                 E {
-                    code: "1405",
+                    code: "140501",
                     summary: "结转销售成本",
                     debit: "0",
                     credit: "150000.00",
@@ -528,7 +528,7 @@ fn t05_reject_bad_vouchers() {
 
     // 缺辅助核算
     let mut v = Voucher::new(p1(), d(Y, 1, 10), "记", 3);
-    let mut e1 = Entry::new(1, "1122", "缺客户");
+    let mut e1 = Entry::new(1, "112201", "缺客户");
     e1.debit = m("100.00");
     let mut e2 = Entry::new(2, "4001", "缺客户");
     e2.credit = m("100.00");
@@ -539,7 +539,7 @@ fn t05_reject_bad_vouchers() {
 
     // 缺数量
     let mut v = Voucher::new(p1(), d(Y, 1, 10), "记", 4);
-    let mut e1 = Entry::new(1, "1403", "缺数量");
+    let mut e1 = Entry::new(1, "140301", "缺数量");
     e1.debit = m("100.00");
     e1.aux = aux_of("item", "I01");
     let mut e2 = Entry::new(2, "4001", "缺数量");
@@ -551,7 +551,7 @@ fn t05_reject_bad_vouchers() {
 
     // 数量 × 单价 ≠ 金额
     let mut v = Voucher::new(p1(), d(Y, 1, 10), "记", 5);
-    let mut e1 = Entry::new(1, "1403", "数量金额不符");
+    let mut e1 = Entry::new(1, "140301", "数量金额不符");
     e1.debit = m("100.00");
     e1.aux = aux_of("item", "I01");
     e1.qty = Some(m("10"));
@@ -748,14 +748,14 @@ fn t10_balance_table_and_trial() {
 
     // 关键科目期末余额
     assert_eq!(snap.for_account("100201", None).end(), m("607000.00"));
-    assert_eq!(snap.for_account("1122", None).end(), m("306000.00"));
-    assert_eq!(snap.for_account("1403", None).end(), m("100000.00"));
-    assert_eq!(snap.for_account("1405", None).end(), m("150000.00"));
+    assert_eq!(snap.for_account("112201", None).end(), m("306000.00"));
+    assert_eq!(snap.for_account("140301", None).end(), m("100000.00"));
+    assert_eq!(snap.for_account("140501", None).end(), m("150000.00"));
     assert_eq!(snap.for_account("1602", None).end(), m("-5000.00"));
     assert_eq!(snap.for_account("221101", None).end(), Money::ZERO);
 
     // 本年累计 = 本期发生额（1 月）
-    assert_eq!(snap.for_account("6001", None).ytd_credit, m("200000.00"));
+    assert_eq!(snap.for_account("600101", None).ytd_credit, m("200000.00"));
 
     // 余额表按级次过滤：一级科目行数应远少于全表
     let all = snap.account_table(&chart, &BalanceQuery::period(p1()));
@@ -778,7 +778,7 @@ fn t11_aux_breakdown() {
     let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p1())).unwrap();
 
     // 应收账款按客户
-    let rows = snap.aux_breakdown("1122");
+    let rows = snap.aux_breakdown("112201");
     assert_eq!(rows.len(), 2, "应收账款应有两个客户的辅助余额");
     let c1 = rows.iter().find(|r| r.aux.customer.as_deref() == Some("C01")).unwrap();
     let c2 = rows.iter().find(|r| r.aux.customer.as_deref() == Some("C02")).unwrap();
@@ -893,7 +893,7 @@ fn t15_carry_forward() {
     let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p1())).unwrap();
     let pl = snap.profit_loss_rows(&chart);
     assert!(!pl.is_empty());
-    assert_eq!(snap.for_account("6001", None).end(), m("-200000.00"));
+    assert_eq!(snap.for_account("600101", None).end(), m("-200000.00"));
     assert_eq!(snap.for_account("660201", None).end(), m("80000.00"));
 
     // 未结转时结账会被拦下（要求先结转）
@@ -1063,7 +1063,7 @@ fn t18_second_period_carries_forward() {
     let mut e1 = Entry::new(1, "100201", "收到乙客户货款");
     e1.debit = m("306000.00");
     e1.aux = aux_of("bank", "B01");
-    let mut e2 = Entry::new(2, "1122", "收到乙客户货款");
+    let mut e2 = Entry::new(2, "112201", "收到乙客户货款");
     e2.credit = m("306000.00");
     e2.aux = aux_of("customer", "C02");
     v.push_entry(e1);
@@ -1075,7 +1075,7 @@ fn t18_second_period_carries_forward() {
     let s2 = BalanceSnapshot::load(&db, &BalanceQuery::period(p2)).unwrap();
     assert_eq!(s2.for_account("100201", None).debit, m("306000.00"));
     assert_eq!(s2.for_account("100201", None).ytd_debit, m("426000.00"));
-    assert_eq!(s2.for_account("1122", None).end(), Money::ZERO);
+    assert_eq!(s2.for_account("112201", None).end(), Money::ZERO);
 
     // 1 月已结账，不影响
     assert!(periods::is_closed(&db, p1()).unwrap());

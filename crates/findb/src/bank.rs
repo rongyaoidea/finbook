@@ -643,7 +643,7 @@ mod tests {
                 customer: Some("C01".into()),
                 ..Default::default()
             },
-            ..Entry::new(2, "1122", "收货款")
+            ..Entry::new(2, "112201", "收货款")
         });
         let vid = crate::vouchers::save(&db, &mut v).unwrap();
         crate::vouchers::audit(&db, vid, "auditor").unwrap();

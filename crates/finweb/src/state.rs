@@ -23,7 +23,8 @@ pub struct WebState {
     pub sessions: SessionStore,
     pub policy: PasswordPolicy,
     pub book_path: PathBuf,
-    pub company: String,
+    /// 公司名缓存（RwLock：建账后可由 refresh_company 更新）
+    pub company: std::sync::RwLock<String>,
     pub version: String,
     /// 账套默认（启用）期间，ymm 形式，作为会话期间的初值
     pub default_period: i32,
@@ -43,10 +44,22 @@ impl WebState {
             sessions: SessionStore::new(),
             policy,
             book_path,
-            company,
+            company: std::sync::RwLock::new(company),
             version,
             default_period,
         })
+    }
+
+    /// 读取公司名
+    pub fn company_name(&self) -> String {
+        self.company.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// 从账套选项刷新公司名缓存（建账/改公司名后用）
+    pub fn refresh_company(&self, db: &Db) {
+        if let Ok(mut c) = self.company.write() {
+            *c = db.options().company;
+        }
     }
 }
 

@@ -1134,7 +1134,7 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         stock_insert(&db, &mv(p, d(2026, 1, 5), StockKind::Purchase, "10", "5")).unwrap();
         stock_insert(&db, &mv(p, d(2026, 1, 20), StockKind::Sale, "-4", "0")).unwrap();
-        let id = stock_cost_voucher(&db, p, d(2026, 1, 31), CostMethod::MovingAverage, "6401", "1405", "u")
+        let id = stock_cost_voucher(&db, p, d(2026, 1, 31), CostMethod::MovingAverage, "6401", "140501", "u")
             .unwrap()
             .unwrap();
         let v = crate::vouchers::get(&db, id).unwrap().unwrap();

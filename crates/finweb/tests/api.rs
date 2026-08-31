@@ -25,6 +25,7 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
         ..Default::default()
     };
     // create_no_admin：模拟「首次登录即管理员」初始化流程
+    // company 留空 = 未建账（触发 needs_setup 建账向导）
     findb::Db::create_no_admin(&book_path, &opts).expect("建账失败");
 
     let pool = DbPool::new(&book_path, 4);
@@ -32,7 +33,7 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
         pool,
         PasswordPolicy::default(),
         book_path.clone(),
-        "测试公司".to_string(),
+        "".to_string(),
         "test".to_string(),
         opts.start_period.ymm(),
     );
@@ -120,6 +121,59 @@ async fn setup_status_reports_no_admin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let s = body_string(resp).await;
     assert!(s.contains("\"admin_set\":false"), "新账套应无管理员：{s}");
+    assert!(s.contains("\"needs_setup\":true"), "未建账账套应标记 needs_setup：{s}");
+}
+
+#[tokio::test]
+async fn setup_wizard_completes_book() {
+    let (state, _bp, _dir) = test_state();
+    // 首登创建管理员
+    let (_, sid) = login(&state, "boss", "Admin!2026").await;
+    assert!(!sid.is_empty());
+
+    // 建账向导：读 options → 设置公司名与启用期间 → 保存
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let opts: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur = opts.as_object().unwrap().clone();
+    let mut merged = cur.clone();
+    merged.insert("company".into(), serde_json::json!("某某贸易有限公司"));
+    merged.insert("start_period".into(), serde_json::json!(202601));
+    merged.insert("base_currency".into(), serde_json::json!("CNY"));
+    // options 走 PUT
+    let resp = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/options")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &sid)
+                .body(Body::from(serde_json::Value::Object(merged).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建账保存应成功");
+
+    // 保存后 setup/status → needs_setup=false，公司名已写入
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/setup/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let s = body_string(resp).await;
+    assert!(s.contains("\"needs_setup\":false"), "建账后 needs_setup 应为 false：{s}");
+    assert!(s.contains("某某贸易有限公司"), "公司名应已写入：{s}");
+
+    // 仪表盘显示新公司名与默认期间
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let s = body_string(resp).await;
+    assert!(s.contains("某某贸易有限公司"), "仪表盘应显示新公司名：{s}");
 }
 
 #[tokio::test]

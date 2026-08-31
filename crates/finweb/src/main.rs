@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n  FinBook Web 已启动\n  访问地址 : http://{listen}\n  账套文件 : {}\n  公司名称 : {}\n   管理员账号: {}\n",
         path.display(),
-        state.company,
+        state.company_name(),
         if admin_set {
             format!("已设定（{}）", admin_user.unwrap_or_default())
         } else {

@@ -208,20 +208,6 @@ impl FinBookApp {
                     Err(e) => ctx.error(e.to_string()),
                 }
             }
-            ConfirmAction::ImportAccountsFull => {
-                let list = fincore::chart::default_accounts_full();
-                let n = list.len();
-                let r = findb::accounts::import_many(ctx.db(), &list);
-                match r {
-                    Ok(c) => {
-                        ctx.log("科目", "导入完整科目表", &format!("{c}/{n}"));
-                        ctx.info(format!("已导入 {c} 个科目（共 {n} 个）"));
-                        ctx.reload_chart();
-                        views.data_changed(crate::state::DataKind::Account);
-                    }
-                    Err(e) => ctx.error(e.to_string()),
-                }
-            }
             ConfirmAction::ImportCashFlowItems => {
                 let r = findb::reports::reset_cash_flow_items(ctx.db());
                 if let Some(n) = ctx.handle(r) {

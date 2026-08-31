@@ -789,12 +789,12 @@ mod tests {
             currency: Some("USD".into()),
             rate: Some(Money::parse("7").unwrap().inner()),
             amount_for: Some(Money::parse("1000").unwrap()),
-            ..Entry::new(1, "1122", "出口销售")
+            ..Entry::new(1, "112201", "出口销售")
         });
         v.push_entry(Entry {
             debit: Money::ZERO,
             credit: Money::parse("7000").unwrap(),
-            ..Entry::new(2, "6001", "出口销售")
+            ..Entry::new(2, "600101", "出口销售")
         });
         let id = crate::vouchers::save(&db, &mut v).unwrap();
         crate::vouchers::audit(&db, id, "a").unwrap();

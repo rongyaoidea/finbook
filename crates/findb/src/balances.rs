@@ -884,7 +884,7 @@ mod tests {
             vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
         );
         // 2 月：借 1001 500 / 贷 6001 500
-        post_voucher(&db, p2, 6, vec![("1001", "借", "500"), ("6001", "贷", "500")]);
+        post_voucher(&db, p2, 6, vec![("1001", "借", "500"), ("600101", "贷", "500")]);
 
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p2)).unwrap();
         let cash = snap.for_account("1001", None);
@@ -935,7 +935,7 @@ mod tests {
         let vid: i64 = db.conn().last_insert_rowid();
         for (line, code, side, amt) in [
             (1i32, "1001", "借", "100"),
-            (2i32, "6001", "贷", "90"),
+            (2i32, "600101", "贷", "90"),
         ] {
             let (dr, cr) = if side == "借" { (amt, "0") } else { ("0", amt) };
             db.conn()
@@ -959,7 +959,7 @@ mod tests {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
         post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("100201", "贷", "1000")]);
-        post_voucher(&db, p, 10, vec![("1001", "借", "500"), ("6001", "贷", "500")]);
+        post_voucher(&db, p, 10, vec![("1001", "借", "500"), ("600101", "贷", "500")]);
         post_voucher(&db, p, 20, vec![("660101", "借", "200"), ("1001", "贷", "200")]);
 
         let chart = crate::accounts::chart(&db).unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
             },
         )
         .unwrap();
-        post_voucher(&db, p, 5, vec![("1001", "借", "200"), ("6001", "贷", "200")]);
+        post_voucher(&db, p, 5, vec![("1001", "借", "200"), ("600101", "贷", "200")]);
 
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
         let cash = snap.for_account("1001", None);
@@ -1074,11 +1074,11 @@ mod tests {
     fn balance_source_impl() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("600101", "贷", "1000")]);
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
         let src: &dyn BalanceSource = &snap;
         assert_eq!(src.balance_of("1001", None).end(), Money::parse("1000").unwrap());
-        assert_eq!(src.balance_of("6001", None).end(), Money::parse("-1000").unwrap());
+        assert_eq!(src.balance_of("600101", None).end(), Money::parse("-1000").unwrap());
         assert_eq!(src.balance_of("9999", None).end(), Money::ZERO);
     }
 
@@ -1091,7 +1091,7 @@ mod tests {
             debit: Money::parse("1000").unwrap(),
             qty: Some(Money::parse("10").unwrap()),
             price: Some(Money::parse("100").unwrap()),
-            ..Entry::new(1, "1405", "购入")
+            ..Entry::new(1, "140501", "购入")
         };
         fill_required(&db, &mut e1);
         let mut e2 = Entry {
@@ -1106,7 +1106,7 @@ mod tests {
         vouchers::post(&db, id, "王五").unwrap();
 
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
-        let r = snap.for_account("1405", None);
+        let r = snap.for_account("140501", None);
         assert_eq!(r.qty.unwrap().end(), Money::parse("10").unwrap());
     }
 
@@ -1114,7 +1114,7 @@ mod tests {
     fn account_table_shape() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("600101", "贷", "1000")]);
         let chart = crate::accounts::chart(&db).unwrap();
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
         let table = snap.account_table(&chart, &BalanceQuery {
@@ -1123,21 +1123,21 @@ mod tests {
         });
         // 1001 与 6001 应有数据，1002 无数据被过滤
         assert!(table.iter().any(|r| r.account_code == "1001"));
-        assert!(table.iter().any(|r| r.account_code == "6001"));
-        assert!(!table.iter().any(|r| r.account_code == "1405"));
+        assert!(table.iter().any(|r| r.account_code == "600101"));
+        assert!(!table.iter().any(|r| r.account_code == "140501"));
     }
 
     #[test]
     fn profit_loss_rows_only_pl() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("600101", "贷", "1000")]);
         post_voucher(&db, p, 6, vec![("660101", "借", "300"), ("1001", "贷", "300")]);
         let chart = crate::accounts::chart(&db).unwrap();
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
         let pl = snap.profit_loss_rows(&chart);
         let codes: Vec<&str> = pl.iter().map(|r| r.account_code.as_str()).collect();
-        assert!(codes.contains(&"6001"));
+        assert!(codes.contains(&"600101"));
         assert!(codes.contains(&"660101"));
         assert!(!codes.contains(&"1001"));
         let _ = AcctCategory::Asset;
@@ -1150,7 +1150,7 @@ mod tests {
 
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("600101", "贷", "1000")]);
         post_voucher(&db, p, 6, vec![("100201", "借", "500"), ("1001", "贷", "500")]);
 
         let chart = crate::accounts::chart(&db).unwrap();
@@ -1160,7 +1160,7 @@ mod tests {
         let rows = BalanceSnapshot::load(&db, &q0).unwrap().account_table(&chart, &q0);
         let codes: Vec<&str> = rows.iter().map(|r| r.account_code.as_str()).collect();
         assert!(codes.contains(&"1001"));
-        assert!(codes.contains(&"6001"));
+        assert!(codes.contains(&"600101"));
 
         // 范围只允许 1001~1002：不含 6001
         let scope = DataScope {
@@ -1172,7 +1172,7 @@ mod tests {
         let rows = BalanceSnapshot::load(&db, &q1).unwrap().account_table(&chart, &q1);
         let codes: Vec<&str> = rows.iter().map(|r| r.account_code.as_str()).collect();
         assert!(codes.contains(&"1001"), "1001 应在范围内：{codes:?}");
-        assert!(!codes.contains(&"6001"), "6001 不应在范围内：{codes:?}");
+        assert!(!codes.contains(&"600101"), "600101 不应在范围内：{codes:?}");
 
         // 与手动下界取交集：手动 1001→ 与范围 1001→ 一致
         let q2 = BalanceQuery::period(p)
@@ -1180,6 +1180,6 @@ mod tests {
             .with_data_scope(&scope);
         let rows = BalanceSnapshot::load(&db, &q2).unwrap().account_table(&chart, &q2);
         assert!(rows.iter().any(|r| r.account_code == "1001"));
-        assert!(!rows.iter().any(|r| r.account_code == "6001"));
+        assert!(!rows.iter().any(|r| r.account_code == "600101"));
     }
 }

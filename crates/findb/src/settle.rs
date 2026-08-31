@@ -541,7 +541,7 @@ mod tests {
                 customer: Some(cust.into()),
                 ..Default::default()
             },
-            ..Entry::new(1, "1122", "往来")
+            ..Entry::new(1, "112201", "往来")
         };
         let e2 = Entry {
             debit: if dir_debit { Money::ZERO } else { a },
@@ -572,7 +572,7 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         let d1 = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
-        let (_, e_ar) = ar_voucher(&db, p, d1, 1, "C01", "1000", true, "6001");
+        let (_, e_ar) = ar_voucher(&db, p, d1, 1, "C01", "1000", true, "600101");
         let (_, e_cash) = ar_voucher(&db, p, d2, 2, "C01", "600", false, "100201");
 
         settle(&db, e_ar, e_cash, Money::parse("600").unwrap(), "u1").unwrap();
@@ -598,7 +598,7 @@ mod tests {
         let db = tmpdb("cross");
         let p = Period::new(2026, 1).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
-        let (_, e1) = ar_voucher(&db, p, d, 1, "C01", "100", true, "6001");
+        let (_, e1) = ar_voucher(&db, p, d, 1, "C01", "100", true, "600101");
         let (_, e2) = ar_voucher(&db, p, d, 2, "C02", "100", false, "100201");
         // 往来单位不同
         assert!(settle(&db, e1, e2, Money::parse("100").unwrap(), "u").is_err());
@@ -610,8 +610,8 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         // 两笔应收各 500，一笔收款 800
-        ar_voucher(&db, p, d, 1, "C01", "500", true, "6001");
-        ar_voucher(&db, p, d, 2, "C01", "500", true, "6001");
+        ar_voucher(&db, p, d, 1, "C01", "500", true, "600101");
+        ar_voucher(&db, p, d, 2, "C01", "500", true, "600101");
         ar_voucher(&db, p, d, 3, "C01", "800", false, "100201");
 
         let res = auto_settle(&db, "1122", p, Money::parse("0.01").unwrap(), "u").unwrap();
@@ -627,8 +627,8 @@ mod tests {
         let p = Period::new(2026, 3).unwrap();
         let d1 = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2025, 6, 1).unwrap();
-        ar_voucher(&db, p, d1, 1, "C01", "1000", true, "6001");
-        ar_voucher(&db, p, d2, 2, "C01", "2000", true, "6001");
+        ar_voucher(&db, p, d1, 1, "C01", "1000", true, "600101");
+        ar_voucher(&db, p, d2, 2, "C01", "2000", true, "600101");
 
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
         let b = fincore::engine::aging::buckets_by_days();

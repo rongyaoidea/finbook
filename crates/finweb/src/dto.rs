@@ -47,6 +47,8 @@ impl PublicUser {
 pub struct SetupStatus {
     /// 管理员账号是否已设定（不暴露用户名，避免登录页被枚举）
     pub admin_set: bool,
+    /// 账套是否已初始化建账（公司名/启用期间是否已设定）
+    pub needs_setup: bool,
     pub company: String,
     pub version: String,
     pub book: String,

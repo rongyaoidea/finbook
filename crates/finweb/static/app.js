@@ -107,6 +107,65 @@ async function afterLogin() {
   } catch (e) {}
   state.view = "dashboard";
   render();
+  // 未建账（尚未设置公司名）→ 弹出建账向导
+  try {
+    const st = await api("/setup/status");
+    if (st && st.needs_setup) showSetupWizard();
+  } catch (e) {}
+}
+
+// ===========================================================================
+// 建账向导（首次登录 / 未设置公司名时出现）
+// ===========================================================================
+async function showSetupWizard() {
+  if (!session.user) return;
+  let opts = {};
+  try { opts = await api("/options"); } catch (e) {}
+  const now = new Date();
+  const mask = modal(`
+    <h3>创建账套</h3>
+    <p class="muted" style="margin:0 0 14px;line-height:1.6">
+      为当前账套设置公司信息与启用期间。完成后即可开始填制凭证。
+      此步骤可由管理员随时在「账套参数」中修改。
+    </p>
+    <div class="field">
+      <label>公司名称</label>
+      <input id="set-company" placeholder="例如：某某贸易有限公司" value="${esc(opts.company || "")}" />
+    </div>
+    <div class="field">
+      <label>启用期间（YYYY-MM）</label>
+      <input id="set-start" placeholder="2026-01" value="${opts.start_period || now.getFullYear() + "-01"}" />
+    </div>
+    <div class="field">
+      <label>本位币</label>
+      <input id="set-currency" value="${opts.base_currency || "CNY"}" />
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="setup-later">稍后再说</button>
+      <button class="btn primary" id="setup-save">创建账套</button>
+    </div>
+  `);
+  $("#setup-save").addEventListener("click", async () => {
+    const company = $("#set-company").value.trim();
+    if (!company) { toast("请输入公司名称", "err"); return; }
+    const startText = $("#set-start").value.trim();
+    const ym = startText.replace(/[^0-9]/g, "");
+    let start_period = 0;
+    if (ym.length === 6) start_period = parseInt(ym, 10);
+    else if (/^\d{4}$/.test(ym)) start_period = parseInt(ym, 10) * 100 + 1;
+    if (start_period <= 0) { toast("启用期间格式应为 YYYY-MM", "err"); return; }
+    try {
+      const cur = await api("/options");
+      const merged = Object.assign({}, cur, { company, start_period, base_currency: $("#set-currency").value.trim() || "CNY" });
+      await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(merged) });
+      closeModal();
+      toast("账套创建成功", "ok");
+      state.view = "dashboard";
+      render();
+    } catch (err) { toast(err.message, "err"); }
+  });
+  const later = $("#setup-later");
+  if (later) later.addEventListener("click", () => closeModal());
 }
 
 // ===========================================================================

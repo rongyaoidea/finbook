@@ -623,7 +623,7 @@ mod tests {
             &db,
             p,
             1,
-            &[("100201", "100000", "0", Some("D01")), ("6001", "0", "100000", Some("D01"))],
+            &[("100201", "100000", "0", Some("D01")), ("600101", "0", "100000", Some("D01"))],
         );
         post(
             &db,
@@ -654,7 +654,7 @@ mod tests {
     fn custom_report_eval() {
         let db = tmpdb("custom");
         let p = Period::new(2026, 1).unwrap();
-        post(&db, p, 1, &[("100201", "50000", "0", None), ("6001", "0", "50000", None)]);
+        post(&db, p, 1, &[("100201", "50000", "0", None), ("600101", "0", "50000", None)]);
         let mut r = CustomReport::new("custom.r1", "资金情况", vec!["本月".into(), "占比".into()]);
         r.lines.push(CustomLine {
             name: "银行存款".into(),

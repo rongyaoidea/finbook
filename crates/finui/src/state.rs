@@ -62,6 +62,8 @@ pub enum NavItem {
     Backup,
     /// 操作日志
     Logs,
+    /// 帮助
+    Help,
     /// 关于
     About,
 }
@@ -95,6 +97,7 @@ impl NavItem {
             NavItem::Options => "账套参数".to_string(),
             NavItem::Backup => "备份恢复".to_string(),
             NavItem::Logs => "操作日志".to_string(),
+            NavItem::Help => "帮助".to_string(),
             NavItem::About => "关于".to_string(),
         }
     }
@@ -117,8 +120,7 @@ impl NavItem {
             NavItem::Inventory | NavItem::Payroll | NavItem::Claims => "业务",
             NavItem::Budget | NavItem::DimProfit => "管理会计",
             NavItem::Users | NavItem::Security | NavItem::Options | NavItem::Backup
-            | NavItem::Logs => "系统",
-            NavItem::About => "系统",
+            | NavItem::Logs | NavItem::Help | NavItem::About => "系统",
         }
     }
 
@@ -180,6 +182,7 @@ impl NavItem {
             NavItem::Options,
             NavItem::Backup,
             NavItem::Logs,
+            NavItem::Help,
             NavItem::About,
         ]
     }

@@ -33,9 +33,9 @@ impl VoucherStatus {
             VoucherStatus::Void => "已作废",
         }
     }
-    /// 是否参与账簿汇总（只有已记账的凭证进入账）
+    /// 是否参与账簿汇总（草稿/已审核/已记账均参与，已作废不参与）
     pub fn counts(self) -> bool {
-        self == VoucherStatus::Posted
+        self != VoucherStatus::Void
     }
     pub fn can_edit(self) -> bool {
         self == VoucherStatus::Draft

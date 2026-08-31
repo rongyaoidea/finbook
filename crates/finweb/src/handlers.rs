@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use axum::routing::{get, post, put};
 use chrono::{Datelike, NaiveDate};
-use fincore::{AuxRef, Entry, Period, Role, User, Voucher};
+use fincore::{AuxRef, Entry, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
 use findb::accounts;
 use findb::balances::{self, BalanceSnapshot, BalanceQuery, LedgerQuery};
@@ -532,6 +532,36 @@ async fn get_voucher(
     Ok(Json(VoucherDetail::from_voucher(v)))
 }
 
+/// 解析银行科目：支持尾号简写。
+/// - 输入已是完整科目编码（如 `100201`）：原样返回
+/// - 输入是纯数字尾号（如 `01`）：在 `1002*` 科目中查找编码以该尾号结尾的唯一科目，
+///   解析为完整编码；无唯一匹配则返回 None（交给后续科目校验报错）
+fn normalize_bank_account(chart: &fincore::Chart, account_code: &str) -> Option<String> {
+    let trimmed = account_code.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 完整编码：科目表里能查到就直接用
+    if chart.get(trimmed).is_some() {
+        return Some(trimmed.to_string());
+    }
+    // 纯数字尾号：在银行科目里按尾号匹配
+    if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut hits: Vec<&str> = Vec::new();
+    for a in chart.all() {
+        if a.code.starts_with("1002") && a.code.ends_with(trimmed) && a.code.len() > 4 {
+            hits.push(&a.code);
+        }
+    }
+    if hits.len() == 1 {
+        Some(hits[0].to_string())
+    } else {
+        None
+    }
+}
+
 async fn save_voucher(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -557,8 +587,8 @@ async fn save_voucher(
     let mut v = if req.id > 0 {
         let mut existing = vouchers::get(&db, req.id)?
             .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
-        if !existing.status.can_edit() {
-            return Err(AppError::forbidden("该凭证已审核/记账，不能修改"));
+        if existing.status.counts() {
+            return Err(AppError::forbidden("该凭证已参与账簿汇总，不能修改"));
         }
         // 日期不能漂移到凭证期间之外（期间本身不可改，改的是日期）
         if (date.year(), date.month()) != (existing.period.year(), existing.period.month()) {
@@ -593,15 +623,28 @@ async fn save_voucher(
         v
     };
     v.prepared_by = user.username().to_string();
+    // 加载科目表：银行尾号简写需要按科目表解析为完整编码
+    let chart = accounts::chart(&db)?;
     for e in &req.entries {
-        let mut en = Entry::new(e.line, e.account_code.clone(), e.summary.clone());
+        let account_code = normalize_bank_account(&chart, &e.account_code)
+            .unwrap_or_else(|| e.account_code.clone());
+        let mut en = Entry::new(e.line, account_code.clone(), e.summary.clone());
         en.debit = parse_money(&e.debit);
         en.credit = parse_money(&e.credit);
         en.aux = AuxRef::default();
+        // 如果是银行科目，将尾号存入辅助核算银行字段
+        if en.account_code.starts_with("1002") {
+            en.aux.bank = Some(account_code);
+        }
         v.entries.push(en);
     }
     if !v.balanced() {
         return Err(AppError::bad_request("借贷不平衡，请检查分录金额"));
+    }
+    // 保存即生效（直接进入余额表/账簿汇总），无草稿/审核流程
+    v.status = VoucherStatus::Posted;
+    if v.posted_by.is_none() {
+        v.posted_by = Some(user.username().to_string());
     }
     let id = vouchers::save(&db, &mut v)?;
     db.log(
@@ -615,13 +658,19 @@ async fn save_voucher(
 
 async fn voucher_post(
     State(state): State<Arc<WebState>>,
-    user: CurrentUser,
+    _user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherPost)?;
+    // 凭证已在保存时直接设为已记账（Posted）状态，本接口仅确认状态
     let db = state.pool.get()?;
-    vouchers::post(&db, id, user.username())?;
-    Ok(Json(json!({"ok": true})))
+    // 检查是否已参与汇总
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !v.status.counts() {
+        return Err(AppError::bad_request("该凭证不参与账簿汇总"));
+    }
+    // 已是已记账状态，直接返回成功
+    Ok(Json(json!({"ok": true, "already_posted": true})))
 }
 
 async fn voucher_audit(
@@ -629,6 +678,13 @@ async fn voucher_audit(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // 凭证已在保存时设为 Audited 状态，无需再次审核
+    let db = state.pool.get()?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if v.status == VoucherStatus::Audited {
+        return Ok(Json(json!({"ok": true, "already_audited": true})));
+    }
     user.require(Perm::VoucherAudit)?;
     let db = state.pool.get()?;
     vouchers::audit(&db, id, user.username())?;
@@ -637,13 +693,19 @@ async fn voucher_audit(
 
 async fn voucher_unaudit(
     State(state): State<Arc<WebState>>,
-    user: CurrentUser,
+    _user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherUnaudit)?;
+    // 取消记账（如果已记账）
     let db = state.pool.get()?;
-    vouchers::unaudit(&db, id)?;
-    Ok(Json(json!({"ok": true})))
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if v.status == VoucherStatus::Posted {
+        vouchers::unaudit(&db, id)?;
+        Ok(Json(json!({"ok": true, "unposted": true})))
+    } else {
+        Ok(Json(json!({"ok": false, "message": "仅可取消已记账凭证的记账"})))
+    }
 }
 
 async fn voucher_delete(

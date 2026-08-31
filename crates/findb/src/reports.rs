@@ -174,7 +174,7 @@ pub fn cash_flow_amounts(db: &Db, from: fincore::Period, to: fincore::Period) ->
     let sql = format!(
         "SELECT e.cf_item, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
            AND e.account_code IN ({placeholders})"
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![

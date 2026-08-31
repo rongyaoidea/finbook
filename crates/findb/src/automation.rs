@@ -118,7 +118,7 @@ pub fn fx_calc(db: &Db, period: Period) -> DbResult<Vec<FxAdjLine>> {
     let mut st = db.conn().prepare(
         "SELECT e.account_code, e.aux_key, e.currency, e.debit, e.credit, e.rate, e.amount_for
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
-         WHERE v.period <= ?1 AND v.status='posted'
+         WHERE v.period <= ?1 AND v.status != 'void'
            AND e.currency IS NOT NULL AND e.currency <> ''
            AND (e.debit <> '0' OR e.credit <> '0')
          ORDER BY e.account_code, e.aux_key, e.currency",

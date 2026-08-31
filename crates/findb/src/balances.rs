@@ -167,7 +167,7 @@ impl BalanceSnapshot {
             let mut stmt = db.conn().prepare(
                 "SELECT e.account_code, e.aux_key, e.aux_json, e.period, e.debit, e.credit, e.qty
                  FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-                 WHERE v.status='posted' AND e.period <= ?1",
+                 WHERE v.status != 'void' AND e.period <= ?1",
             )?;
             let mut r = stmt.query(rusqlite::params![q.to.ymm()])?;
             while let Some(row) = r.next()? {
@@ -330,7 +330,9 @@ impl BalanceSnapshot {
             }
             let mut r = self.for_account(&a.code, q.aux.as_ref());
             r.account_name = a.name.clone();
-            if q.non_zero_only && r.is_empty_row() {
+            // 默认：只显示有活动的科目（有借方、贷方或期初余额）
+            // non_zero_only=true 时保持原有行为（此处保持一致性，均为只显示有数据的科目）
+            if r.is_empty_row() {
                 continue;
             }
             out.push(r);
@@ -580,7 +582,8 @@ pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow
     } else {
         q.code.clone()
     };
-    let status_filter = if q.posted_only { " AND v.status='posted'" } else { "" };
+    // 记录即进表：无论是否勾选"只含已记账"，账簿都只排除作废凭证
+    let status_filter = " AND v.status != 'void'";
     let sql = format!(
         "SELECT v.period, v.date, v.id, v.word, v.no, e.line, e.summary, e.account_code,
                 e.aux_json, e.debit, e.credit, e.qty, v.status
@@ -668,7 +671,7 @@ pub fn general_ledger(db: &Db, q: &LedgerQuery) -> DbResult<Vec<GeneralLedgerRow
     let mut stmt = db.conn().prepare(
         "SELECT e.period, e.debit, e.credit, e.aux_json
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3",
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3",
     )?;
     let mut rows = stmt.query(rusqlite::params![q.from.ymm(), q.to.ymm(), pattern])?;
     while let Some(r) = rows.next()? {
@@ -780,7 +783,7 @@ pub fn multi_column(
     let mut stmt = db.conn().prepare(
         "SELECT e.period, v.date, e.summary, e.account_code, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
            AND e.account_code IN (
                SELECT value FROM json_each(?3)
            )

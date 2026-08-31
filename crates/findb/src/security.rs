@@ -206,18 +206,29 @@ pub fn login(
             }
         }
     }
+    // 口令已验证 + 设备校验通过 = 本次登录成功：清失败计数、写登录时间
+    // （须在强制改密 / 过期提示等提前返回之前，保证成功登录总能清零失败计数）
+    log_attempt(db, username, true)?;
+    crate::users::touch_login(db, username)?;
+    // 成功前检查是否强制改密（在口令升级前检查，避免升级过程清除标志）
+    if u.must_change_pwd {
+        // 若为遗留哈希需先升级，再返回强制改密结果
+        let mut nu = u.clone();
+        if fincore::user::is_legacy_hash(&u.password_hash) {
+            nu.set_password(password);
+            crate::users::update(db, &nu)?;
+            db.log(username, "安全", "口令升级", "旧版口令哈希已升级为 argon2，并强制改密")?;
+        } else {
+            db.log(username, "安全", "强制改密", "口令已升级为argon2格式")?;
+        }
+        return Ok(LoginResult::MustChangePassword(nu));
+    }
     // 旧版 `salt$sha256` 哈希登录成功：透明升级为 argon2，不打断用户
     if fincore::user::is_legacy_hash(&u.password_hash) {
         let mut nu = u.clone();
         nu.set_password(password);
         crate::users::update(db, &nu)?;
         db.log(username, "安全", "口令升级", "旧版口令哈希已升级为 argon2")?;
-    }
-    // 成功：清失败计数、写登录时间
-    log_attempt(db, username, true)?;
-    crate::users::touch_login(db, username)?;
-    if u.must_change_pwd {
-        return Ok(LoginResult::MustChangePassword(u));
     }
     if policy.is_expired(&u.pwd_changed_at, chrono::Local::now().date_naive()) {
         return Ok(LoginResult::MustChangePassword(u));

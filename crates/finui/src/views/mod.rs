@@ -15,6 +15,7 @@ pub mod custom_report;
 pub mod dashboard;
 pub mod dim_profit;
 pub mod export;
+pub mod help;
 pub mod inventory;
 pub mod ledger;
 pub mod login;
@@ -60,6 +61,7 @@ pub struct Views {
     pub inventory: inventory::InventoryView,
     pub payroll: payroll::PayrollView,
     pub claims: claims::ClaimsView,
+    pub help: help::HelpView,
     pub about: about::AboutView,
     /// 上一次渲染的导航项，用于首次进入时初始化过滤条件
     last: Option<NavItem>,
@@ -90,6 +92,7 @@ impl Views {
         self.security.invalidate();
         self.options.invalidate();
         self.logs.invalidate();
+        self.help.invalidate();
     }
 
     /// 某模块数据变动后，让相关界面刷新
@@ -178,6 +181,7 @@ impl Views {
                 NavItem::Options => self.options.invalidate(),
                 NavItem::Backup => {}
                 NavItem::Logs => self.logs.invalidate(),
+                NavItem::Help => self.help.enter(ctx),
                 NavItem::About => {}
             }
             self.last = Some(nav);
@@ -222,6 +226,7 @@ impl Views {
             NavItem::Options => self.options.show(ctx, ui),
             NavItem::Backup => self.backup.show(ctx, ui),
             NavItem::Logs => self.logs.show(ctx, ui),
+            NavItem::Help => self.help.show(ctx, ui),
             NavItem::About => self.about.show(ctx, ui),
         }
     }

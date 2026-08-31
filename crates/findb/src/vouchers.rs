@@ -272,7 +272,7 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
         }
     }
     if v.id > 0 {
-        // 更新：只有草稿能改；已审核需先反审核，已记账需先反记账
+        // 更新：草稿可直接改；已审核/已记账需先反审核/反记账
         let old = get(db, v.id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{}", v.id)))?;
         if !old.status.can_edit() {
             return Err(FinError::state(format!(
@@ -281,12 +281,8 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
             ))
             .into());
         }
-    } else if v.status != VoucherStatus::Draft {
-        return Err(FinError::state(format!(
-            "新增凭证的状态必须是「草稿」，实际为「{}」",
-            v.status.label()
-        ))
-        .into());
+    } else if v.status == VoucherStatus::Void {
+        return Err(FinError::state("新增凭证不能直接标记为「已作废」".to_string()).into());
     }
     if no_taken(db, v.period, &v.word, v.no, v.id)? {
         return Err(FinError::msg(format!(
@@ -720,7 +716,7 @@ pub fn sum_by_account(
     let mut stmt = db.conn().prepare(
         "SELECT e.account_code, e.aux_json, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2",
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2",
     )?;
     let mut acc: std::collections::BTreeMap<(String, String), (Money, Money, AuxRef)> =
         std::collections::BTreeMap::new();

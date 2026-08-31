@@ -764,10 +764,12 @@ fn t10_balance_table_and_trial() {
     assert!(l1.len() < all.len());
     assert!(l1.iter().all(|r| r.account_code.len() == 4));
 
-    // 非零过滤
+    // 非零过滤：默认余额表已只显示有数据的科目（不显示没用到的科目），
+    // 因此 non_zero 结果应是全表的子集
     let nz = snap
         .account_table(&chart, &BalanceQuery::period(p1()).with_non_zero(true));
-    assert!(nz.len() < all.len());
+    assert!(nz.len() <= all.len());
+    assert!(!all.is_empty());
 }
 
 #[test]

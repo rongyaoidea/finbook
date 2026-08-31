@@ -292,7 +292,7 @@ pub fn open_entries(
                 e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
          WHERE (e.account_code = ?1 OR e.account_code LIKE ?1||'%')
-           AND v.period <= ?2 AND v.status='posted'
+           AND v.period <= ?2 AND v.status != 'void'
            AND (e.debit <> '0' OR e.credit <> '0')
          ORDER BY v.date, v.no, e.line",
     )?;

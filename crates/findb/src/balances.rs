@@ -1,0 +1,1120 @@
+//! 余额与账簿的实时聚合
+//!
+//! 设计要点：**不物化余额表**。
+//! 余额 = 期初 + 已记账凭证发生额，每次查询实时算。单机 SQLite 下十万级分录仍是毫秒级，
+//! 换来的是"改一张凭证、账簿立刻正确"，不需要维护缓存一致性——这在财务软件里值这个价。
+//!
+//! 所有金额累加都在 Rust 侧用 `Decimal` 完成，绕开 SQLite 无十进制类型的短板。
+
+use std::collections::BTreeMap;
+
+use chrono::NaiveDate;
+use fincore::report::{AmountKind, BalanceSource};
+use fincore::{
+    AuxRef, BalanceRow, Chart, GeneralLedgerRow, JournalRow, LedgerRow, Money, Period, QtyRow,
+    TrialBalance,
+};
+
+use crate::{accounts, read_money, read_money_opt, Db, DbResult};
+
+/// 聚合键：(科目编码, 辅助核算键)
+type Key = (String, String);
+
+/// 余额查询条件
+#[derive(Clone, Debug)]
+pub struct BalanceQuery {
+    /// 起始期间（期初余额取该期间月初）
+    pub from: Period,
+    /// 结束期间（本期发生额 = from..=to 的合计）
+    pub to: Period,
+    /// 科目范围
+    pub code_from: Option<String>,
+    pub code_to: Option<String>,
+    /// 只看某个辅助核算维度
+    pub aux: Option<AuxRef>,
+    /// 只保留末级科目
+    pub only_leaf: bool,
+    /// 只保留有余额或有发生额的行
+    pub non_zero_only: bool,
+    /// 只显示到第几级科目（None 表示全部级次）
+    pub max_level: Option<u8>,
+}
+
+impl BalanceQuery {
+    pub fn period(p: Period) -> Self {
+        Self {
+            from: p,
+            to: p,
+            code_from: None,
+            code_to: None,
+            aux: None,
+            only_leaf: false,
+            non_zero_only: false,
+            max_level: None,
+        }
+    }
+    pub fn range(from: Period, to: Period) -> Self {
+        Self {
+            from,
+            to,
+            ..BalanceQuery::period(from)
+        }
+    }
+    pub fn with_leaf_only(mut self, on: bool) -> Self {
+        self.only_leaf = on;
+        self
+    }
+    pub fn with_non_zero(mut self, on: bool) -> Self {
+        self.non_zero_only = on;
+        self
+    }
+    pub fn with_max_level(mut self, lv: Option<u8>) -> Self {
+        self.max_level = lv;
+        self
+    }
+    pub fn with_code_range(mut self, from: Option<String>, to: Option<String>) -> Self {
+        self.code_from = from;
+        self.code_to = to;
+        self
+    }
+}
+
+/// 某一时点的余额快照。加载一次，多处复用。
+#[derive(Clone, Debug, Default)]
+pub struct BalanceSnapshot {
+    pub from: Period,
+    pub to: Period,
+    /// (科目, 辅助核算) → 余额行
+    rows: BTreeMap<Key, BalanceRow>,
+    /// (科目, 辅助核算) → 数量行
+    qtys: BTreeMap<Key, QtyRow>,
+    /// 加载快照时的科目表。报表需要按科目类别取数（如"未结转损益净额"），
+    /// 缓存下来避免调用方到处传 chart。
+    chart: Option<Chart>,
+}
+
+impl BalanceSnapshot {
+    /// 加载快照
+    pub fn load(db: &Db, q: &BalanceQuery) -> DbResult<Self> {
+        let start = db.options().start_period;
+        let mut rows: BTreeMap<Key, BalanceRow> = BTreeMap::new();
+        let mut qtys: BTreeMap<Key, QtyRow> = BTreeMap::new();
+
+        // 1) 期初：启用期之前的累计
+        {
+            let mut stmt = db.conn().prepare(
+                "SELECT account_code, aux_key, aux_json, year_begin, debit_accum, credit_accum, qty_begin
+                 FROM begin_balance",
+            )?;
+            let mut r = stmt.query([])?;
+            while let Some(row) = r.next()? {
+                let code: String = row.get(0)?;
+                let aux_key: String = row.get(1)?;
+                let aux_json: String = row.get(2)?;
+                let aux: AuxRef = serde_json::from_str(&aux_json).unwrap_or_default();
+                let yb = read_money(row, 3)?;
+                let ad = read_money(row, 4)?;
+                let ac = read_money(row, 5)?;
+                let qb = read_money_opt(row, 6)?.unwrap_or(Money::ZERO);
+                let key = (code.clone(), aux_key);
+                let e = rows.entry(key.clone()).or_insert_with(|| BalanceRow {
+                    account_code: code,
+                    account_name: String::new(),
+                    aux,
+                    ..Default::default()
+                });
+                // 期初 = 年初 + 累计借 - 累计贷
+                e.begin = yb + ad - ac;
+                e.ytd_debit = ad;
+                e.ytd_credit = ac;
+                if !qb.is_zero() {
+                    qtys.insert(key, QtyRow { begin: qb, ..Default::default() });
+                }
+            }
+        }
+
+        // 2) 已记账凭证：一次扫描，同时算出期初、本期发生额、本年累计
+        {
+            let ytd_from = if q.to.year() == start.year() {
+                start.ymm()
+            } else {
+                q.to.year() * 100 + 1
+            };
+            let mut stmt = db.conn().prepare(
+                "SELECT e.account_code, e.aux_key, e.aux_json, e.period, e.debit, e.credit, e.qty
+                 FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+                 WHERE v.status='posted' AND e.period <= ?1",
+            )?;
+            let mut r = stmt.query(rusqlite::params![q.to.ymm()])?;
+            while let Some(row) = r.next()? {
+                let code: String = row.get(0)?;
+                let aux_key: String = row.get(1)?;
+                let aux_json: String = row.get(2)?;
+                let period = Period::from_ymm(row.get(3)?);
+                let d = read_money(row, 4)?;
+                let c = read_money(row, 5)?;
+                let qty = read_money_opt(row, 6)?.unwrap_or(Money::ZERO);
+                let aux: AuxRef = serde_json::from_str(&aux_json).unwrap_or_default();
+                let key = (code.clone(), aux_key);
+
+                let e = rows.entry(key.clone()).or_insert_with(|| BalanceRow {
+                    account_code: code,
+                    account_name: String::new(),
+                    aux,
+                    ..Default::default()
+                });
+
+                if period < q.from {
+                    // 期初：累加净额与数量
+                    e.begin += d - c;
+                } else if period <= q.to {
+                    e.debit += d;
+                    e.credit += c;
+                }
+                // 本年累计（仅当期所属年度）
+                if period.ymm() >= ytd_from && period <= q.to {
+                    e.ytd_debit += d;
+                    e.ytd_credit += c;
+                }
+
+                if !qty.is_zero() {
+                    let qr = qtys.entry(key).or_default();
+                    if period < q.from {
+                        qr.begin += qty;
+                    } else if period <= q.to {
+                        if qty.is_positive() {
+                            qr.in_qty += qty;
+                        } else {
+                            qr.out_qty += qty.negated();
+                        }
+                    }
+                }
+            }
+        }
+
+        let chart = accounts::chart(db).ok();
+        Ok(Self {
+            from: q.from,
+            to: q.to,
+            rows,
+            qtys,
+            chart,
+        })
+    }
+
+    /// 未结转的损益净额：所有末级损益类科目余额之和（正=净亏损，负=净盈利）
+    ///
+    /// 资产负债表用它把尚未结转的本期盈亏并入"未分配利润"。
+    pub fn profit_loss_net(&self, kind: AmountKind) -> Money {
+        let chart = match &self.chart {
+            Some(c) => c,
+            None => return Money::ZERO,
+        };
+        let mut sum = Money::ZERO;
+        for a in chart.all() {
+            if !a.category.is_profit_loss() || !chart.is_leaf(&a.code) {
+                continue;
+            }
+            let r = self.for_account(&a.code, None);
+            sum += match kind {
+                AmountKind::Begin => r.begin,
+                AmountKind::End => r.end(),
+                AmountKind::PeriodDebit => r.debit,
+                AmountKind::PeriodCredit => r.credit,
+                AmountKind::YearDebit => r.ytd_debit,
+                AmountKind::YearCredit => r.ytd_credit,
+                AmountKind::EndQty => Money::ZERO,
+            };
+        }
+        sum
+    }
+
+    /// 未经筛选的全部行
+    pub fn raw_rows(&self) -> Vec<BalanceRow> {
+        self.rows.values().cloned().collect()
+    }
+
+    /// 应用查询条件（科目范围、级次、末级、非零）
+    pub fn filtered(&self, chart: &Chart, q: &BalanceQuery) -> Vec<BalanceRow> {
+        let mut out = Vec::new();
+        for (code, aux_key) in self.rows.keys() {
+            if let Some(ref f) = q.code_from {
+                if code < f {
+                    continue;
+                }
+            }
+            if let Some(ref t) = q.code_to {
+                if code > t {
+                    continue;
+                }
+            }
+            if let Some(ref want) = q.aux {
+                let want_key = want.key();
+                if !aux_key_contains(aux_key, &want_key) {
+                    continue;
+                }
+            }
+            if q.only_leaf && !chart.is_leaf(code) {
+                continue;
+            }
+            if let Some(lv) = q.max_level {
+                if chart.level(code) > lv {
+                    continue;
+                }
+            }
+            let mut r = self.rows.get(&(code.clone(), aux_key.clone())).cloned().unwrap();
+            r.account_name = chart.get(code).map(|a| a.name.clone()).unwrap_or_default();
+            if let Some(qr) = self.qtys.get(&(code.clone(), aux_key.clone())) {
+                if !qr.is_zero() {
+                    r.qty = Some(*qr);
+                }
+            }
+            if q.non_zero_only && r.is_empty_row() {
+                continue;
+            }
+            out.push(r);
+        }
+        out.sort_by(|a, b| {
+            a.account_code
+                .cmp(&b.account_code)
+                .then_with(|| a.aux.key().cmp(&b.aux.key()))
+        });
+        out
+    }
+
+    /// 科目余额表：每个科目一行，金额含所有下级
+    pub fn account_table(&self, chart: &Chart, q: &BalanceQuery) -> Vec<BalanceRow> {
+        let mut out = Vec::new();
+        for a in chart.all() {
+            if let Some(ref f) = q.code_from {
+                if &a.code < f {
+                    continue;
+                }
+            }
+            if let Some(ref t) = q.code_to {
+                if &a.code > t {
+                    continue;
+                }
+            }
+            if q.only_leaf && !chart.is_leaf(&a.code) {
+                continue;
+            }
+            if let Some(lv) = q.max_level {
+                if chart.level(&a.code) > lv {
+                    continue;
+                }
+            }
+            let mut r = self.for_account(&a.code, q.aux.as_ref());
+            r.account_name = a.name.clone();
+            if q.non_zero_only && r.is_empty_row() {
+                continue;
+            }
+            out.push(r);
+        }
+        out
+    }
+
+    /// 汇总某科目（含所有下级、含所有辅助核算维度）的余额
+    pub fn for_account(&self, code: &str, aux: Option<&AuxRef>) -> BalanceRow {
+        let mut r = BalanceRow {
+            account_code: code.to_string(),
+            ..Default::default()
+        };
+        let mut qr = QtyRow::default();
+        let want_key = aux.map(|a| a.key());
+        for ((c, ak), row) in &self.rows {
+            if !c.starts_with(code) {
+                continue;
+            }
+            if let Some(ref wk) = want_key {
+                if !aux_key_contains(ak, wk) {
+                    continue;
+                }
+            }
+            r.begin += row.begin;
+            r.debit += row.debit;
+            r.credit += row.credit;
+            r.ytd_debit += row.ytd_debit;
+            r.ytd_credit += row.ytd_credit;
+            if let Some(q) = self.qtys.get(&(c.clone(), ak.clone())) {
+                qr.begin += q.begin;
+                qr.in_qty += q.in_qty;
+                qr.out_qty += q.out_qty;
+            }
+        }
+        if !qr.is_zero() {
+            r.qty = Some(qr);
+        }
+        r
+    }
+
+    /// 取某科目的辅助核算明细余额（每个辅助维度一行）
+    pub fn aux_breakdown(&self, code: &str) -> Vec<BalanceRow> {
+        let mut out: Vec<BalanceRow> = self
+            .rows
+            .iter()
+            .filter(|((c, _), _)| c == code)
+            .map(|((_, _), r)| r.clone())
+            .collect();
+        out.sort_by_key(|r| r.aux.key());
+        out
+    }
+
+    /// 损益类科目的余额行（结转损益取数用）
+    pub fn profit_loss_rows(&self, chart: &Chart) -> Vec<BalanceRow> {
+        let mut out = Vec::new();
+        for a in chart.all() {
+            if !a.category.is_profit_loss() || !chart.is_leaf(&a.code) {
+                continue;
+            }
+            let r = self.for_account(&a.code, None);
+            if r.is_empty_row() {
+                continue;
+            }
+            let mut r = r;
+            r.account_name = a.name.clone();
+            out.push(r);
+        }
+        out
+    }
+
+    /// 试算平衡
+    pub fn trial_balance(&self, chart: &Chart) -> TrialBalance {
+        let mut t = TrialBalance::default();
+        for a in chart.all() {
+            if !chart.is_leaf(&a.code) {
+                continue;
+            }
+            let r = self.for_account(&a.code, None);
+            if r.begin.is_positive() {
+                t.begin_debit += r.begin;
+            } else {
+                t.begin_credit += r.begin.negated();
+            }
+            t.period_debit += r.debit;
+            t.period_credit += r.credit;
+            let end = r.end();
+            if end.is_positive() {
+                t.end_debit += end;
+            } else {
+                t.end_credit += end.negated();
+            }
+        }
+        t
+    }
+
+    /// 期间标签
+    pub fn label(&self) -> String {
+        if self.from == self.to {
+            self.from.label()
+        } else {
+            format!("{} 至 {}", self.from.label(), self.to.label())
+        }
+    }
+}
+
+impl BalanceSource for BalanceSnapshot {
+    fn balance_of(&self, code: &str, aux: Option<&AuxRef>) -> BalanceRow {
+        let mut r = self.for_account(code, aux);
+        if r.account_name.is_empty() {
+            r.account_name = code.to_string();
+        }
+        r
+    }
+
+    fn profit_loss_net(&self, kind: AmountKind) -> Money {
+        BalanceSnapshot::profit_loss_net(self, kind)
+    }
+}
+
+/// 辅助核算键的包含判断：`\u{1f}` 分隔的 `kind=value` 串
+fn aux_key_contains(key: &str, want: &str) -> bool {
+    if want.is_empty() {
+        return true;
+    }
+    let parts: Vec<&str> = want.split('\u{1f}').collect();
+    let have: Vec<&str> = key.split('\u{1f}').collect();
+    parts.iter().all(|p| have.contains(p))
+}
+
+// ---------------------------------------------------------------------------
+// 期初余额
+// ---------------------------------------------------------------------------
+
+/// 期初余额行（含辅助核算）
+#[derive(Clone, Debug)]
+pub struct BeginRow {
+    pub id: i64,
+    pub account_code: String,
+    pub aux: AuxRef,
+    pub year_begin: Money,
+    pub debit_accum: Money,
+    pub credit_accum: Money,
+    pub qty_begin: Option<Money>,
+}
+
+pub fn list_begin(db: &Db) -> DbResult<Vec<BeginRow>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, account_code, aux_json, year_begin, debit_accum, credit_accum, qty_begin
+         FROM begin_balance ORDER BY account_code, aux_key",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let aux_json: String = r.get(2)?;
+            Ok(BeginRow {
+                id: r.get(0)?,
+                account_code: r.get(1)?,
+                aux: serde_json::from_str(&aux_json).unwrap_or_default(),
+                year_begin: read_money(r, 3)?,
+                debit_accum: read_money(r, 4)?,
+                credit_accum: read_money(r, 5)?,
+                qty_begin: read_money_opt(r, 6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 写入 / 更新一条期初余额（按 科目+辅助核算 唯一）
+pub fn upsert_begin(db: &Db, r: &BeginRow) -> DbResult<()> {
+    db.conn().execute(
+        "INSERT INTO begin_balance(account_code,aux_key,aux_json,year_begin,debit_accum,credit_accum,qty_begin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(account_code,aux_key) DO UPDATE SET
+            year_begin=excluded.year_begin, debit_accum=excluded.debit_accum,
+            credit_accum=excluded.credit_accum, qty_begin=excluded.qty_begin",
+        rusqlite::params![
+            r.account_code,
+            r.aux.key(),
+            serde_json::to_string(&r.aux)?,
+            crate::money_param(r.year_begin),
+            crate::money_param(r.debit_accum),
+            crate::money_param(r.credit_accum),
+            r.qty_begin.map(crate::money_param),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_begin(db: &Db, id: i64) -> DbResult<()> {
+    db.conn()
+        .execute("DELETE FROM begin_balance WHERE id=?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// 期初试算：借方合计 / 贷方合计
+pub fn begin_trial(db: &Db) -> DbResult<(Money, Money)> {
+    let mut d = Money::ZERO;
+    let mut c = Money::ZERO;
+    for r in list_begin(db)? {
+        let net = r.year_begin + r.debit_accum - r.credit_accum;
+        if net.is_positive() {
+            d += net;
+        } else {
+            c += net.negated();
+        }
+    }
+    Ok((d, c))
+}
+
+// ---------------------------------------------------------------------------
+// 明细账 / 总账 / 日记账
+// ---------------------------------------------------------------------------
+
+/// 明细账查询参数
+#[derive(Clone, Debug)]
+pub struct LedgerQuery {
+    pub code: String,
+    /// 是否包含下级科目
+    pub include_children: bool,
+    pub aux: Option<AuxRef>,
+    pub from: Period,
+    pub to: Period,
+    /// 只显示已记账凭证
+    pub posted_only: bool,
+}
+
+/// 明细账：逐笔滚动余额
+pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow>> {
+    let snap = BalanceSnapshot::load(
+        db,
+        &BalanceQuery {
+            from: q.from,
+            to: q.to,
+            ..BalanceQuery::period(q.from)
+        },
+    )?;
+    let mut running = snap.for_account(&q.code, q.aux.as_ref()).begin;
+    let mut qty_running = snap
+        .for_account(&q.code, q.aux.as_ref())
+        .qty
+        .map(|q| q.begin)
+        .unwrap_or(Money::ZERO);
+
+    let pattern = if q.include_children {
+        format!("{}%", q.code)
+    } else {
+        q.code.clone()
+    };
+    let status_filter = if q.posted_only { " AND v.status='posted'" } else { "" };
+    let sql = format!(
+        "SELECT v.period, v.date, v.id, v.word, v.no, e.line, e.summary, e.account_code,
+                e.aux_json, e.debit, e.credit, e.qty, v.status
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3 {status_filter}
+         ORDER BY v.date, v.word, v.no, e.line"
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params![q.from.ymm(), q.to.ymm(), pattern])?;
+
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let aux_json: String = r.get(8)?;
+        let aux: AuxRef = serde_json::from_str(&aux_json).unwrap_or_default();
+        if let Some(ref want) = q.aux {
+            let want_key = want.key();
+            if !aux_key_contains(&aux.key(), &want_key) {
+                continue;
+            }
+        }
+        let debit = read_money(r, 9)?;
+        let credit = read_money(r, 10)?;
+        let qty = read_money_opt(r, 11)?;
+
+        running += debit - credit;
+        if let Some(qv) = qty {
+            qty_running += qv;
+        }
+
+        let (dir, balance) = if running.is_negative() {
+            (fincore::Direction::Credit, running.negated())
+        } else {
+            (fincore::Direction::Debit, running)
+        };
+        let date_s: String = r.get(1)?;
+        let word: String = r.get(3)?;
+        let no: i32 = r.get(4)?;
+        let code: String = r.get(7)?;
+
+        out.push(LedgerRow {
+            period: Period::from_ymm(r.get(0)?),
+            date: NaiveDate::parse_from_str(&date_s, "%Y-%m-%d")
+                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).expect("基准日期")),
+            voucher_id: r.get(2)?,
+            voucher_no: format!("{word}-{no:04}"),
+            word,
+            no,
+            line: r.get(5)?,
+            summary: r.get(6)?,
+            account_code: code,
+            aux,
+            debit,
+            credit,
+            dir,
+            balance,
+            signed_balance: running,
+            qty_in: qty.filter(|v| v.is_positive()),
+            qty_out: qty.and_then(|v| if v.is_negative() { Some(v.negated()) } else { None }),
+            qty_balance: if qty.is_some() { Some(qty_running) } else { None },
+        });
+    }
+    let _ = chart;
+    Ok(out)
+}
+
+/// 总账：按期间汇总
+pub fn general_ledger(db: &Db, q: &LedgerQuery) -> DbResult<Vec<GeneralLedgerRow>> {
+    let snap = BalanceSnapshot::load(
+        db,
+        &BalanceQuery {
+            from: q.from,
+            to: q.to,
+            ..BalanceQuery::period(q.from)
+        },
+    )?;
+    let mut running = snap.for_account(&q.code, q.aux.as_ref()).begin;
+
+    let pattern = if q.include_children {
+        format!("{}%", q.code)
+    } else {
+        q.code.clone()
+    };
+    // 按期间聚合，金额在 Rust 侧累加
+    let mut acc: BTreeMap<i32, (Money, Money)> = BTreeMap::new();
+    let mut stmt = db.conn().prepare(
+        "SELECT e.period, e.debit, e.credit, e.aux_json
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![q.from.ymm(), q.to.ymm(), pattern])?;
+    while let Some(r) = rows.next()? {
+        let aux_json: String = r.get(3)?;
+        let aux: AuxRef = serde_json::from_str(&aux_json).unwrap_or_default();
+        if let Some(ref want) = q.aux {
+            if !aux_key_contains(&aux.key(), &want.key()) {
+                continue;
+            }
+        }
+        let p: i32 = r.get(0)?;
+        let e = acc.entry(p).or_insert((Money::ZERO, Money::ZERO));
+        e.0 += read_money(r, 1)?;
+        e.1 += read_money(r, 2)?;
+    }
+
+    let mut out = Vec::new();
+    for (p, (d, c)) in acc {
+        running += d - c;
+        let (dir, balance) = if running.is_negative() {
+            (fincore::Direction::Credit, running.negated())
+        } else {
+            (fincore::Direction::Debit, running)
+        };
+        out.push(GeneralLedgerRow {
+            period: Period::from_ymm(p),
+            summary: format!("本期发生额（{}）", Period::from_ymm(p).label()),
+            debit: d,
+            credit: c,
+            dir,
+            balance,
+            signed_balance: running,
+        });
+    }
+    Ok(out)
+}
+
+/// 现金 / 银行日记账
+pub fn journal(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<JournalRow>> {
+    let rows = ledger(db, chart, q)?;
+
+    // 一次性取出相关凭证的对方科目
+    let ids: Vec<i64> = {
+        let mut v: Vec<i64> = rows.iter().map(|r| r.voucher_id).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let mut opposite: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    if !ids.is_empty() {
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT voucher_id, account_code, debit, credit FROM voucher_entry
+             WHERE voucher_id IN ({placeholders})"
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
+        let mut rr = stmt.query(params.as_slice())?;
+        while let Some(r) = rr.next()? {
+            let vid: i64 = r.get(0)?;
+            let code: String = r.get(1)?;
+            let d = read_money(r, 2)?;
+            let c = read_money(r, 3)?;
+            // 只保留与本行借贷方向相反的分录，即真正的"对方科目"
+            let is_debit = d.is_positive();
+            if (is_debit && c.is_zero()) || (!is_debit && d.is_zero()) {
+                if !code.starts_with(&q.code) {
+                    let name = chart
+                        .get(&code)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| code.clone());
+                    opposite.entry(vid).or_default().push(name);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for r in rows {
+        let opp = opposite
+            .get(&r.voucher_id)
+            .cloned()
+            .unwrap_or_default()
+            .join("、");
+        out.push(JournalRow {
+            date: r.date,
+            voucher_no: r.voucher_no,
+            summary: r.summary,
+            opposite_accounts: opp,
+            debit: r.debit,
+            credit: r.credit,
+            dir: r.dir,
+            balance: r.balance,
+            settle_type: None,
+            settle_no: None,
+        });
+    }
+    Ok(out)
+}
+
+/// 多栏账：按指定栏目科目拆借/贷方
+pub fn multi_column(
+    db: &Db,
+    main_code: &str,
+    columns: &[String],
+    from: Period,
+    to: Period,
+) -> DbResult<Vec<(Period, String, String, Money)>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT e.period, v.date, e.summary, e.account_code, e.debit, e.credit
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
+           AND e.account_code IN (
+               SELECT value FROM json_each(?3)
+           )
+         ORDER BY v.date, v.id, e.line",
+    )?;
+    let codes = serde_json::to_string(&columns)?;
+    let mut rows = stmt.query(rusqlite::params![from.ymm(), to.ymm(), codes])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let code: String = r.get(3)?;
+        // 主科目单独成列，其余栏科目按栏目归集
+        if code.starts_with(main_code) {
+            continue;
+        }
+        out.push((
+            Period::from_ymm(r.get(0)?),
+            r.get(2)?,
+            code,
+            read_money(r, 4)? + read_money(r, 5)?,
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::mem;
+    use crate::vouchers;
+    use fincore::{AcctCategory, AuxKind, AuxMask, Entry, Voucher};
+
+
+    /// 按科目表要求补齐辅助核算与数量，让测试用的凭证符合落库校验。
+    ///
+    /// 现在 `vouchers::save` 会做完整校验（借贷平衡、末级科目、辅助必录、数量必录），
+    /// 测试里手写的简写分录必须先补齐这些字段才能存进去。
+    fn fill_required(db: &Db, e: &mut Entry) {
+        let chart = crate::accounts::chart(db).unwrap();
+        let Some(a) = chart.get(&e.account_code).map(|a| a.clone()) else {
+            return;
+        };
+        for k in a.aux.list() {
+            if e.aux.get(k).is_some() {
+                continue;
+            }
+            let v = match k {
+                AuxKind::Bank => "B01",
+                AuxKind::Customer => "C01",
+                AuxKind::Supplier => "S01",
+                AuxKind::Item => "I01",
+                AuxKind::Dept => "D01",
+                AuxKind::Employee => "E01",
+                AuxKind::Project => "P01",
+                AuxKind::CashFlow => continue,
+            };
+            e.aux.set(k, Some(v.to_string()));
+        }
+        if a.has_qty && e.qty.is_none() {
+            let amt = if e.debit.is_positive() { e.debit } else { e.credit };
+            e.qty = Some(Money::ONE);
+            e.price = Some(amt);
+        }
+    }
+
+    fn post_voucher(db: &Db, period: Period, day: u32, entries: Vec<(&str, &str, &str)>) -> i64 {
+        let d = NaiveDate::from_ymd_opt(period.year(), period.month(), day).unwrap();
+        let mut v = Voucher::new(period, d, "记", vouchers::next_no(db, period, "记").unwrap());
+        v.prepared_by = "张三".to_string();
+        let mut i = 0;
+        for (code, side, amt) in entries {
+            i += 1;
+            let m = Money::parse(amt).unwrap();
+            let mut e = Entry::new(i, code, "测试");
+            if side == "借" {
+                e.debit = m;
+            } else {
+                e.credit = m;
+            }
+            fill_required(db, &mut e);
+            v.push_entry(e);
+        }
+        let id = vouchers::save(db, &mut v).unwrap();
+        vouchers::audit(db, id, "李四").unwrap();
+        vouchers::post(db, id, "王五").unwrap();
+        id
+    }
+
+    #[test]
+    fn snapshot_accumulates() {
+        let db = mem();
+        let p1 = Period::new(2026, 1).unwrap();
+        let p2 = Period::new(2026, 2).unwrap();
+        // 1 月：借 1001 1000 / 贷 100201 1000
+        post_voucher(
+            &db,
+            p1,
+            5,
+            vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
+        );
+        // 2 月：借 1001 500 / 贷 6001 500
+        post_voucher(&db, p2, 6, vec![("1001", "借", "500"), ("6001", "贷", "500")]);
+
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p2)).unwrap();
+        let cash = snap.for_account("1001", None);
+        assert_eq!(cash.begin, Money::parse("1000").unwrap(), "2 月期初应是 1 月期末");
+        assert_eq!(cash.debit, Money::parse("500").unwrap());
+        assert_eq!(cash.end(), Money::parse("1500").unwrap());
+        assert_eq!(cash.ytd_debit, Money::parse("1500").unwrap());
+
+        // 银行存款：1 月贷 1000，期末为贷方 1000
+        let bank = snap.for_account("100201", None);
+        assert_eq!(bank.end(), Money::parse("-1000").unwrap());
+    }
+
+    #[test]
+    fn trial_balance_balances() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(
+            &db,
+            p,
+            5,
+            vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
+        );
+        post_voucher(&db, p, 6, vec![("660101", "借", "300"), ("1001", "贷", "300")]);
+
+        let chart = crate::accounts::chart(&db).unwrap();
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let t = snap.trial_balance(&chart);
+        assert!(t.is_balanced(), "{:?}", t.problems());
+        assert_eq!(t.period_debit, Money::parse("1300").unwrap());
+        assert_eq!(t.period_credit, Money::parse("1300").unwrap());
+    }
+
+    #[test]
+    fn trial_balance_detects_imbalance() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        // save 会拒绝借贷不平衡的凭证，这里直接写库模拟"历史脏数据"，
+        // 用来验证试算平衡确实能把它揪出来。
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO voucher(period,date,word,no,status,prepared_by,source)
+                 VALUES(?1,?2,'记',1,'posted','张三','manual')",
+                rusqlite::params![p.ymm(), d.format("%Y-%m-%d").to_string()],
+            )
+            .unwrap();
+        let vid: i64 = db.conn().last_insert_rowid();
+        for (line, code, side, amt) in [
+            (1i32, "1001", "借", "100"),
+            (2i32, "6001", "贷", "90"),
+        ] {
+            let (dr, cr) = if side == "借" { (amt, "0") } else { ("0", amt) };
+            db.conn()
+                .execute(
+                    "INSERT INTO voucher_entry(voucher_id,period,line,summary,account_code,
+                            aux_key,aux_json,debit,credit)
+                     VALUES(?1,?2,?3,'不平',?4,'','{}',?5,?6)",
+                    rusqlite::params![vid, p.ymm(), line, code, dr, cr],
+                )
+                .unwrap();
+        }
+
+        let chart = crate::accounts::chart(&db).unwrap();
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let t = snap.trial_balance(&chart);
+        assert!(!t.is_balanced());
+    }
+
+    #[test]
+    fn ledger_rolls_balance() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("100201", "贷", "1000")]);
+        post_voucher(&db, p, 10, vec![("1001", "借", "500"), ("6001", "贷", "500")]);
+        post_voucher(&db, p, 20, vec![("660101", "借", "200"), ("1001", "贷", "200")]);
+
+        let chart = crate::accounts::chart(&db).unwrap();
+        let rows = ledger(
+            &db,
+            &chart,
+            &LedgerQuery {
+                code: "1001".into(),
+                include_children: false,
+                aux: None,
+                from: p,
+                to: p,
+                posted_only: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].balance, Money::parse("1000").unwrap());
+        assert_eq!(rows[1].balance, Money::parse("1500").unwrap());
+        assert_eq!(rows[2].balance, Money::parse("1300").unwrap());
+        assert_eq!(rows[2].dir, fincore::Direction::Debit);
+    }
+
+    #[test]
+    fn ledger_with_children() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("100201", "借", "800"), ("1001", "贷", "800")]);
+        post_voucher(&db, p, 6, vec![("100202", "借", "200"), ("1001", "贷", "200")]);
+
+        let chart = crate::accounts::chart(&db).unwrap();
+        // 父科目 1002 应汇总两个下级
+        let rows = ledger(
+            &db,
+            &chart,
+            &LedgerQuery {
+                code: "1002".into(),
+                include_children: true,
+                aux: None,
+                from: p,
+                to: p,
+                posted_only: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].balance, Money::parse("1000").unwrap());
+    }
+
+    #[test]
+    fn aux_filtered_balance() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = Voucher::new(p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "记", 1);
+        v.push_entry(Entry {
+            debit: Money::parse("600").unwrap(),
+            aux: AuxRef { dept: Some("D01".into()), ..Default::default() },
+            ..Entry::new(1, "660201", "办公费")
+        });
+        v.push_entry(Entry {
+            debit: Money::parse("400").unwrap(),
+            aux: AuxRef { dept: Some("D02".into()), ..Default::default() },
+            ..Entry::new(2, "660201", "办公费")
+        });
+        v.push_entry(Entry {
+            credit: Money::parse("1000").unwrap(),
+            ..Entry::new(3, "1001", "办公费")
+        });
+        let id = vouchers::save(&db, &mut v).unwrap();
+        vouchers::audit(&db, id, "李四").unwrap();
+        vouchers::post(&db, id, "王五").unwrap();
+
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let all = snap.for_account("660201", None);
+        assert_eq!(all.debit, Money::parse("1000").unwrap());
+        let d01 = snap.for_account(
+            "660201",
+            Some(&AuxRef { dept: Some("D01".into()), ..Default::default() }),
+        );
+        assert_eq!(d01.debit, Money::parse("600").unwrap());
+        assert_eq!(snap.aux_breakdown("660201").len(), 2);
+    }
+
+    #[test]
+    fn begin_balance_used() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        upsert_begin(
+            &db,
+            &BeginRow {
+                id: 0,
+                account_code: "1001".into(),
+                aux: AuxRef::default(),
+                year_begin: Money::parse("5000").unwrap(),
+                debit_accum: Money::ZERO,
+                credit_accum: Money::parse("1000").unwrap(),
+                qty_begin: None,
+            },
+        )
+        .unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "200"), ("6001", "贷", "200")]);
+
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let cash = snap.for_account("1001", None);
+        // 5000 - 1000 + 200 = 4200
+        assert_eq!(cash.end(), Money::parse("4200").unwrap());
+        assert_eq!(cash.begin, Money::parse("4000").unwrap());
+        assert_eq!(begin_trial(&db).unwrap(), (Money::parse("4000").unwrap(), Money::ZERO));
+    }
+
+    #[test]
+    fn balance_source_impl() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let src: &dyn BalanceSource = &snap;
+        assert_eq!(src.balance_of("1001", None).end(), Money::parse("1000").unwrap());
+        assert_eq!(src.balance_of("6001", None).end(), Money::parse("-1000").unwrap());
+        assert_eq!(src.balance_of("9999", None).end(), Money::ZERO);
+    }
+
+    #[test]
+    fn qty_tracked() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = Voucher::new(p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "记", 1);
+        let mut e1 = Entry {
+            debit: Money::parse("1000").unwrap(),
+            qty: Some(Money::parse("10").unwrap()),
+            price: Some(Money::parse("100").unwrap()),
+            ..Entry::new(1, "1405", "购入")
+        };
+        fill_required(&db, &mut e1);
+        let mut e2 = Entry {
+            credit: Money::parse("1000").unwrap(),
+            ..Entry::new(2, "1001", "购入")
+        };
+        fill_required(&db, &mut e2);
+        v.push_entry(e1);
+        v.push_entry(e2);
+        let id = vouchers::save(&db, &mut v).unwrap();
+        vouchers::audit(&db, id, "李四").unwrap();
+        vouchers::post(&db, id, "王五").unwrap();
+
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let r = snap.for_account("1405", None);
+        assert_eq!(r.qty.unwrap().end(), Money::parse("10").unwrap());
+    }
+
+    #[test]
+    fn account_table_shape() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        let chart = crate::accounts::chart(&db).unwrap();
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let table = snap.account_table(&chart, &BalanceQuery {
+            non_zero_only: true,
+            ..BalanceQuery::period(p)
+        });
+        // 1001 与 6001 应有数据，1002 无数据被过滤
+        assert!(table.iter().any(|r| r.account_code == "1001"));
+        assert!(table.iter().any(|r| r.account_code == "6001"));
+        assert!(!table.iter().any(|r| r.account_code == "1405"));
+    }
+
+    #[test]
+    fn profit_loss_rows_only_pl() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 6, vec![("660101", "借", "300"), ("1001", "贷", "300")]);
+        let chart = crate::accounts::chart(&db).unwrap();
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
+        let pl = snap.profit_loss_rows(&chart);
+        let codes: Vec<&str> = pl.iter().map(|r| r.account_code.as_str()).collect();
+        assert!(codes.contains(&"6001"));
+        assert!(codes.contains(&"660101"));
+        assert!(!codes.contains(&"1001"));
+        let _ = AcctCategory::Asset;
+        let _ = AuxMask::NONE.with(AuxKind::Dept);
+    }
+}

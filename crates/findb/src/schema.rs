@@ -1,0 +1,521 @@
+//! 账套表结构
+//!
+//! 设计取舍：
+//! - **金额一律存 TEXT**。SQLite 的 REAL 是 IEEE754 双精度，存钱会出精度事故；
+//!   TEXT 存十进制字符串，配合 `Decimal` 解析，分毫不差。
+//! - 凭证分录冗余了 `period` 字段，账簿汇总查询只需扫 `voucher_entry` 一张表，
+//!   百万级数据量下也能在毫秒级出报表。
+//! - 辅助核算维度数量不固定，用 `aux_key`（稳定排序串）+ `aux_json`（完整值）两个字段：
+//!   前者用于 GROUP BY，后者用于还原展示。
+
+use rusqlite::Connection;
+
+use crate::DbError;
+
+/// 当前 schema 版本
+///
+/// v1：核心闭环（科目 / 凭证 / 账簿 / 报表 / 期末）
+/// v2：业务闭环与月度自动化（出纳对账 / 往来核销 / 固定资产 / 存货 / 工资 / 报销 /
+///     预算 / 自动转账 / 期末调汇 / 附件 / 账户安全）
+/// v3：自动转账补"对方科目"，支持计提类（来源科目只取数不转出）
+/// v4：自定义报表独立建表（行 × 列 × 公式网格）
+/// v5：账号设备绑定（user.device_id / device_name）
+pub const SCHEMA_VERSION: i64 = 5;
+
+/// 建表语句
+const DDL: &str = r#"
+-- 账套元数据与参数
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- 会计科目
+CREATE TABLE IF NOT EXISTS account (
+    code        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    dir         TEXT NOT NULL,
+    aux_mask    INTEGER NOT NULL DEFAULT 0,
+    unit        TEXT,
+    currency    TEXT,
+    has_qty     INTEGER NOT NULL DEFAULT 0,
+    is_cash     INTEGER NOT NULL DEFAULT 0,
+    is_bank     INTEGER NOT NULL DEFAULT 0,
+    cf_item     TEXT,
+    bs_item     TEXT,
+    pl_item     TEXT,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_account_prefix ON account(code);
+
+-- 辅助核算档案（客户/供应商/部门/职员/项目/存货/银行账户）
+CREATE TABLE IF NOT EXISTS aux_entity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    code        TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    parent_code TEXT,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    props_json  TEXT NOT NULL DEFAULT '{}',
+    memo        TEXT NOT NULL DEFAULT '',
+    UNIQUE(kind, code)
+);
+CREATE INDEX IF NOT EXISTS idx_aux_kind ON aux_entity(kind);
+
+-- 期间状态（期末结账标记）
+CREATE TABLE IF NOT EXISTS period_state (
+    period    INTEGER PRIMARY KEY,
+    closed    INTEGER NOT NULL DEFAULT 0,
+    closed_at TEXT,
+    closed_by TEXT
+);
+
+-- 期初余额
+CREATE TABLE IF NOT EXISTS begin_balance (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_code TEXT NOT NULL,
+    aux_key      TEXT NOT NULL DEFAULT '',
+    aux_json     TEXT NOT NULL DEFAULT '{}',
+    year_begin   TEXT NOT NULL DEFAULT '0',
+    debit_accum  TEXT NOT NULL DEFAULT '0',
+    credit_accum TEXT NOT NULL DEFAULT '0',
+    qty_begin    TEXT,
+    UNIQUE(account_code, aux_key)
+);
+
+-- 记账凭证
+CREATE TABLE IF NOT EXISTS voucher (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    word        TEXT NOT NULL DEFAULT '记',
+    no          INTEGER NOT NULL,
+    attachments INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'draft',
+    prepared_by TEXT NOT NULL DEFAULT '',
+    audited_by  TEXT,
+    posted_by   TEXT,
+    cashier     TEXT,
+    source      TEXT NOT NULL DEFAULT 'manual',
+    memo        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE(period, word, no)
+);
+CREATE INDEX IF NOT EXISTS idx_voucher_period ON voucher(period);
+CREATE INDEX IF NOT EXISTS idx_voucher_date   ON voucher(date);
+CREATE INDEX IF NOT EXISTS idx_voucher_status ON voucher(status);
+
+-- 凭证分录
+CREATE TABLE IF NOT EXISTS voucher_entry (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_id   INTEGER NOT NULL REFERENCES voucher(id) ON DELETE CASCADE,
+    period       INTEGER NOT NULL,
+    line         INTEGER NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    account_code TEXT NOT NULL,
+    aux_key      TEXT NOT NULL DEFAULT '',
+    aux_json     TEXT NOT NULL DEFAULT '{}',
+    debit        TEXT NOT NULL DEFAULT '0',
+    credit       TEXT NOT NULL DEFAULT '0',
+    qty          TEXT,
+    price        TEXT,
+    currency     TEXT,
+    rate         TEXT,
+    amount_for   TEXT,
+    settle_type  TEXT,
+    settle_no    TEXT,
+    biz_date     TEXT,
+    cf_item      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entry_voucher ON voucher_entry(voucher_id);
+CREATE INDEX IF NOT EXISTS idx_entry_account ON voucher_entry(account_code);
+CREATE INDEX IF NOT EXISTS idx_entry_period  ON voucher_entry(period);
+CREATE INDEX IF NOT EXISTS idx_entry_cf      ON voucher_entry(cf_item);
+
+-- 用户
+CREATE TABLE IF NOT EXISTS user (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL DEFAULT '',
+    role          TEXT NOT NULL DEFAULT 'accountant',
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    extra_perms   TEXT NOT NULL DEFAULT '[]',
+    memo          TEXT NOT NULL DEFAULT ''
+);
+
+-- 操作日志
+CREATE TABLE IF NOT EXISTS audit_log (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     TEXT NOT NULL,
+    user   TEXT NOT NULL DEFAULT '',
+    module TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_log_ts ON audit_log(ts);
+
+-- 现金流量项目
+CREATE TABLE IF NOT EXISTS cash_flow_item (
+    code     TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    grp      TEXT NOT NULL,
+    dir      TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0
+);
+
+-- 自定义报表模板
+CREATE TABLE IF NOT EXISTS report_def (
+    key         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    columns_json TEXT NOT NULL,
+    lines_json  TEXT NOT NULL
+);
+
+-- 常用摘要
+CREATE TABLE IF NOT EXISTS summary (
+    text       TEXT PRIMARY KEY,
+    use_count  INTEGER NOT NULL DEFAULT 0
+);
+
+-- 结算方式
+CREATE TABLE IF NOT EXISTS settle_type (
+    name TEXT PRIMARY KEY,
+    sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- 常用凭证模板
+CREATE TABLE IF NOT EXISTS voucher_template (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name     TEXT NOT NULL,
+    memo     TEXT NOT NULL DEFAULT '',
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    -- v2 扩展：周期性自动生成（null/'' 表示仅作为手工调用的模板）
+    freq        TEXT NOT NULL DEFAULT '',          -- monthly / quarterly / yearly
+    start_period INTEGER NOT NULL DEFAULT 0,
+    end_period   INTEGER NOT NULL DEFAULT 0,
+    last_period  INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 0
+);
+
+-- ===========================================================================
+-- v2：业务闭环与月度自动化
+-- ===========================================================================
+
+-- 凭证附件（扫描件 / 电子发票 / 合同）
+CREATE TABLE IF NOT EXISTS attachment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_id  INTEGER NOT NULL REFERENCES voucher(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT '',   -- 扩展名或 MIME 简写
+    size        INTEGER NOT NULL DEFAULT 0,
+    sha256      TEXT NOT NULL DEFAULT '',
+    -- 小文件直接内联存 SQLite，大文件落同目录 .attachments/ 只存相对路径
+    inline      INTEGER NOT NULL DEFAULT 1,
+    data        BLOB,
+    path        TEXT,
+    added_by    TEXT NOT NULL DEFAULT '',
+    added_at    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_attach_voucher ON attachment(voucher_id);
+
+-- 银行对账单（出纳模块）
+CREATE TABLE IF NOT EXISTS bank_statement (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    account_code TEXT NOT NULL,      -- 对应的银行存款科目
+    biz_date    TEXT NOT NULL,
+    summary     TEXT NOT NULL DEFAULT '',
+    settle_no   TEXT NOT NULL DEFAULT '',
+    debit       TEXT NOT NULL DEFAULT '0',   -- 银行口径：进账
+    credit      TEXT NOT NULL DEFAULT '0',   -- 银行口径：支出
+    balance     TEXT NOT NULL DEFAULT '0',   -- 对账单上的余额
+    entry_id    INTEGER,                     -- 勾对上的凭证分录 id
+    matched_at  TEXT,
+    matched_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stmt_period ON bank_statement(period, account_code);
+CREATE INDEX IF NOT EXISTS idx_stmt_entry  ON bank_statement(entry_id);
+
+-- 往来核销记录
+CREATE TABLE IF NOT EXISTS settle_record (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    period       INTEGER NOT NULL,
+    account_code TEXT NOT NULL,
+    aux_key      TEXT NOT NULL DEFAULT '',
+    from_entry   INTEGER NOT NULL,   -- 被核销的分录（原单据）
+    to_entry     INTEGER NOT NULL,   -- 核销方分录（收款/付款）
+    amount       TEXT NOT NULL,      -- 本次核销金额（正数）
+    settled_by   TEXT NOT NULL DEFAULT '',
+    settled_at   TEXT NOT NULL DEFAULT '',
+    UNIQUE(from_entry, to_entry)
+);
+CREATE INDEX IF NOT EXISTS idx_settle_entry ON settle_record(from_entry, to_entry);
+
+-- 固定资产卡片
+CREATE TABLE IF NOT EXISTS fixed_asset (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    code          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    category      TEXT NOT NULL DEFAULT '',
+    spec          TEXT NOT NULL DEFAULT '',
+    dept          TEXT NOT NULL DEFAULT '',      -- 使用部门（辅助档案 code）
+    asset_account TEXT NOT NULL DEFAULT '1601',  -- 资产科目
+    dep_account   TEXT NOT NULL DEFAULT '1602',  -- 累计折旧科目
+    expense_account TEXT NOT NULL DEFAULT '6602',-- 折旧费用科目
+    original_value TEXT NOT NULL DEFAULT '0',    -- 原值
+    residual_rate  TEXT NOT NULL DEFAULT '0.05', -- 残值率
+    life_months    INTEGER NOT NULL DEFAULT 60,  -- 预计使用月数
+    method         TEXT NOT NULL DEFAULT 'straight', -- straight / ddb / sum_of_years
+    start_period   INTEGER NOT NULL,             -- 开始计提期间
+    disposed_period INTEGER,                     -- 清理期间
+    dispose_amount TEXT,
+    status         TEXT NOT NULL DEFAULT 'in_use', -- in_use / idle / disposed
+    voucher_id     INTEGER,                      -- 入账凭证
+    memo           TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_asset_status ON fixed_asset(status);
+
+-- 折旧明细（每月一条）
+CREATE TABLE IF NOT EXISTS asset_depreciation (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id   INTEGER NOT NULL REFERENCES fixed_asset(id) ON DELETE CASCADE,
+    period     INTEGER NOT NULL,
+    amount     TEXT NOT NULL,          -- 本期折旧额
+    accum      TEXT NOT NULL,          -- 期末累计折旧
+    net_value  TEXT NOT NULL,          -- 期末净值
+    voucher_id INTEGER,                -- 生成的折旧凭证
+    UNIQUE(asset_id, period)
+);
+CREATE INDEX IF NOT EXISTS idx_dep_period ON asset_depreciation(period);
+
+-- 汇率表（期末调汇）
+CREATE TABLE IF NOT EXISTS fx_rate (
+    period      INTEGER NOT NULL,
+    currency    TEXT NOT NULL,
+    rate        TEXT NOT NULL,   -- 1 外币 = ? 本位币
+    PRIMARY KEY (period, currency)
+);
+
+-- 自动转账规则（期末一键批量生成凭证）
+CREATE TABLE IF NOT EXISTS auto_transfer (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    sort        INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    -- 转入方（贷方来源）：取数定义
+    src_account TEXT NOT NULL DEFAULT '',
+    src_aux     TEXT NOT NULL DEFAULT '',
+    src_kind    TEXT NOT NULL DEFAULT 'end',  -- begin / debit / credit / end
+    src_dir     TEXT NOT NULL DEFAULT 'auto', -- 取该方向的余额：debit / credit / auto
+    ratio       TEXT NOT NULL DEFAULT '1',    -- 比例或固定金额
+    ratio_mode  TEXT NOT NULL DEFAULT 'ratio',-- ratio 按比例 / amount 固定金额
+    -- 转出方
+    dst_account TEXT NOT NULL,
+    dst_aux     TEXT NOT NULL DEFAULT '',
+    dst_dir     TEXT NOT NULL DEFAULT 'debit',
+    -- 对方科目：留空则用 src_account（结转类，把来源科目结平）；
+    -- 填了则用对方科目（计提类，来源科目只取数不转出）
+    offset_account TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+
+-- 存货出入库流水
+CREATE TABLE IF NOT EXISTS stock_move (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    biz_date    TEXT NOT NULL,
+    kind        TEXT NOT NULL,      -- purchase / sale / other_in / other_out / transfer
+    item        TEXT NOT NULL,      -- 存货档案 code
+    warehouse   TEXT NOT NULL DEFAULT '',
+    qty         TEXT NOT NULL,      -- 正数入库，负数出库
+    price       TEXT NOT NULL DEFAULT '0',
+    amount      TEXT NOT NULL DEFAULT '0',
+    voucher_id  INTEGER,
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_stock_period ON stock_move(period, item);
+CREATE INDEX IF NOT EXISTS idx_stock_item ON stock_move(item, biz_date);
+
+-- 工资表
+CREATE TABLE IF NOT EXISTS payroll (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    employee    TEXT NOT NULL,          -- 职员档案 code
+    dept        TEXT NOT NULL DEFAULT '',
+    gross       TEXT NOT NULL DEFAULT '0',  -- 应发合计
+    social      TEXT NOT NULL DEFAULT '0',  -- 社保个人部分
+    housing     TEXT NOT NULL DEFAULT '0',  -- 公积金个人部分
+    deduction   TEXT NOT NULL DEFAULT '0',  -- 其他扣款
+    additional  TEXT NOT NULL DEFAULT '0',  -- 专项附加扣除
+    tax_base    TEXT NOT NULL DEFAULT '0',  -- 计税基数
+    tax         TEXT NOT NULL DEFAULT '0',  -- 个人所得税
+    net         TEXT NOT NULL DEFAULT '0',  -- 实发
+    -- 企业承担部分
+    social_co   TEXT NOT NULL DEFAULT '0',
+    housing_co  TEXT NOT NULL DEFAULT '0',
+    voucher_id  INTEGER,
+    memo        TEXT NOT NULL DEFAULT '',
+    UNIQUE(period, employee)
+);
+CREATE INDEX IF NOT EXISTS idx_payroll_period ON payroll(period);
+
+-- 费用报销单
+CREATE TABLE IF NOT EXISTS expense_claim (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    no          TEXT NOT NULL,
+    biz_date    TEXT NOT NULL,
+    applicant   TEXT NOT NULL,      -- 申请人（职员 code）
+    dept        TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    amount      TEXT NOT NULL DEFAULT '0',
+    status      TEXT NOT NULL DEFAULT 'draft',  -- draft/submitted/approved/rejected/paid
+    items_json  TEXT NOT NULL DEFAULT '[]',     -- 明细：[{expense_account,amount,memo}]
+    approver    TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
+    payer       TEXT NOT NULL DEFAULT '',
+    paid_at     TEXT,
+    voucher_id  INTEGER,
+    created_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE(period, no)
+);
+CREATE INDEX IF NOT EXISTS idx_claim_period ON expense_claim(period, status);
+
+-- 预算
+CREATE TABLE IF NOT EXISTS budget (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    account_code TEXT NOT NULL,
+    dept        TEXT NOT NULL DEFAULT '',
+    amount      TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT '',
+    UNIQUE(period, account_code, dept)
+);
+CREATE INDEX IF NOT EXISTS idx_budget_period ON budget(period);
+
+-- 用户自定义报表（UFO 风格：单元格 = 公式）
+CREATE TABLE IF NOT EXISTS custom_report (
+    key         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    columns_json TEXT NOT NULL DEFAULT '[]',
+    lines_json  TEXT NOT NULL DEFAULT '[]',
+    updated_at  TEXT NOT NULL DEFAULT ''
+);
+
+-- 登录失败记录（账户锁定）
+CREATE TABLE IF NOT EXISTS login_attempt (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    ts       TEXT NOT NULL,
+    ok       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_attempt_user ON login_attempt(username, ts);
+"#;
+
+/// v1 → v2 需要新增到既有表上的列
+///
+/// 老账套升级时 `CREATE TABLE IF NOT EXISTS` 不会补列，所以要显式 ALTER。
+/// 每条都先探测列是否存在，重复执行安全。
+const MIGRATE_V2: &[(&str, &str, &str)] = &[
+    ("user", "pwd_changed_at", "TEXT NOT NULL DEFAULT ''"),
+    ("user", "must_change_pwd", "INTEGER NOT NULL DEFAULT 0"),
+    ("user", "locked_until", "TEXT"),
+    ("user", "last_login_at", "TEXT NOT NULL DEFAULT ''"),
+    ("user", "data_scope_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("voucher_template", "freq", "TEXT NOT NULL DEFAULT ''"),
+    ("voucher_template", "start_period", "INTEGER NOT NULL DEFAULT 0"),
+    ("voucher_template", "end_period", "INTEGER NOT NULL DEFAULT 0"),
+    ("voucher_template", "last_period", "INTEGER NOT NULL DEFAULT 0"),
+    ("voucher_template", "active", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// v2 → v3：自动转账补对方科目
+const MIGRATE_V3: &[(&str, &str, &str)] = &[
+    ("auto_transfer", "offset_account", "TEXT NOT NULL DEFAULT ''"),
+    ("payroll", "additional", "TEXT NOT NULL DEFAULT '0'"),
+];
+
+/// v4 → v5：账号设备绑定
+const MIGRATE_V5: &[(&str, &str, &str)] = &[
+    ("user", "device_id", "TEXT NOT NULL DEFAULT ''"),
+    ("user", "device_name", "TEXT NOT NULL DEFAULT ''"),
+];
+
+/// 初始化 schema（幂等）
+pub fn init(conn: &Connection) -> Result<(), DbError> {
+    // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
+    // busy_timeout 让并发写入时等待而不是立刻报 database is locked。
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA synchronous = NORMAL;",
+    )?;
+    conn.execute_batch(DDL)?;
+    let v: i64 = version(conn);
+    if v < 2 {
+        migrate_v2(conn)?;
+    }
+    if v < 3 {
+        migrate_v3(conn)?;
+    }
+    if v < SCHEMA_VERSION {
+        migrate_generic(conn, MIGRATE_V5)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
+            rusqlite::params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// v1 → v2：给既有表补列
+fn migrate_v2(conn: &Connection) -> Result<(), DbError> {
+    migrate_generic(conn, MIGRATE_V2)
+}
+
+/// v2 → v3
+fn migrate_v3(conn: &Connection) -> Result<(), DbError> {
+    migrate_generic(conn, MIGRATE_V3)
+}
+
+/// 按清单补列（幂等）
+fn migrate_generic(conn: &Connection, list: &[(&str, &str, &str)]) -> Result<(), DbError> {
+    for (table, col, decl) in list {
+        if column_exists(conn, table, col)? {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// 判断某表是否已存在某列
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, DbError> {
+    let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+    for name in rows {
+        if name?.eq_ignore_ascii_case(col) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 读取 schema 版本
+pub fn version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}

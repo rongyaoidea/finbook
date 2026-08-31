@@ -1,0 +1,252 @@
+//! 科目仓储
+
+use fincore::{Account, AcctCategory, AuxMask, Chart, CodeScheme, Direction, FinError};
+use rusqlite::OptionalExtension;
+
+use crate::{Db, DbError, DbResult};
+
+fn map_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
+    let cat: String = r.get(2)?;
+    let dir: String = r.get(3)?;
+    Ok(Account {
+        code: r.get(0)?,
+        name: r.get(1)?,
+        category: serde_json::from_str::<AcctCategory>(&format!("\"{cat}\""))
+            .unwrap_or(AcctCategory::Asset),
+        dir: serde_json::from_str::<Direction>(&format!("\"{dir}\"")).unwrap_or(Direction::Debit),
+        aux: AuxMask(r.get(4)?),
+        unit: r.get(5)?,
+        currency: r.get(6)?,
+        has_qty: r.get::<_, i64>(7)? != 0,
+        is_cash: r.get::<_, i64>(8)? != 0,
+        is_bank: r.get::<_, i64>(9)? != 0,
+        cash_flow_item: r.get(10)?,
+        bs_item: r.get(11)?,
+        pl_item: r.get(12)?,
+        disabled: r.get::<_, i64>(13)? != 0,
+        memo: r.get(14)?,
+    })
+}
+
+/// 全部科目（按编码排序）
+pub fn list(db: &Db) -> DbResult<Vec<Account>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
+                cf_item,bs_item,pl_item,disabled,memo
+         FROM account ORDER BY code",
+    )?;
+    let rows = stmt
+        .query_map([], map_account)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn get(db: &Db, code: &str) -> DbResult<Option<Account>> {
+    db.conn()
+        .query_row(
+            "SELECT code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
+                    cf_item,bs_item,pl_item,disabled,memo
+             FROM account WHERE code=?1",
+            rusqlite::params![code],
+            map_account,
+        )
+        .optional()
+        .map_err(DbError::from)
+}
+
+/// 构建科目表（含树形关系）
+pub fn chart(db: &Db) -> DbResult<Chart> {
+    let scheme = CodeScheme(db.options().code_scheme.clone());
+    Ok(Chart::with_accounts(scheme, list(db)?))
+}
+
+pub fn insert(db: &Db, a: &Account) -> DbResult<()> {
+    db.conn().execute(
+        "INSERT INTO account(code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
+                             cf_item,bs_item,pl_item,disabled,memo)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+        rusqlite::params![
+            a.code,
+            a.name,
+            serde_json::to_value(a.category)?.as_str().unwrap_or("asset"),
+            serde_json::to_value(a.dir)?.as_str().unwrap_or("debit"),
+            a.aux.0 as i64,
+            a.unit,
+            a.currency,
+            a.has_qty as i64,
+            a.is_cash as i64,
+            a.is_bank as i64,
+            a.cash_flow_item,
+            a.bs_item,
+            a.pl_item,
+            a.disabled as i64,
+            a.memo,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update(db: &Db, a: &Account) -> DbResult<()> {
+    let n = db.conn().execute(
+        "UPDATE account SET name=?2,category=?3,dir=?4,aux_mask=?5,unit=?6,currency=?7,has_qty=?8,
+                is_cash=?9,is_bank=?10,cf_item=?11,bs_item=?12,pl_item=?13,disabled=?14,memo=?15
+         WHERE code=?1",
+        rusqlite::params![
+            a.code,
+            a.name,
+            serde_json::to_value(a.category)?.as_str().unwrap_or("asset"),
+            serde_json::to_value(a.dir)?.as_str().unwrap_or("debit"),
+            a.aux.0 as i64,
+            a.unit,
+            a.currency,
+            a.has_qty as i64,
+            a.is_cash as i64,
+            a.is_bank as i64,
+            a.cash_flow_item,
+            a.bs_item,
+            a.pl_item,
+            a.disabled as i64,
+            a.memo,
+        ],
+    )?;
+    if n == 0 {
+        return Err(FinError::not_found(format!("科目 {}", a.code)).into());
+    }
+    Ok(())
+}
+
+/// 删除科目。调用前业务层需自行校验（无下级、无余额、无凭证）。
+pub fn delete(db: &Db, code: &str) -> DbResult<()> {
+    db.conn()
+        .execute("DELETE FROM account WHERE code=?1", rusqlite::params![code])?;
+    Ok(())
+}
+
+/// 科目被引用情况：（分录行数, 期初行数）
+pub fn usage(db: &Db, code: &str) -> DbResult<(i64, i64)> {
+    let e: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM voucher_entry WHERE account_code=?1",
+        rusqlite::params![code],
+        |r| r.get(0),
+    )?;
+    let b: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM begin_balance WHERE account_code=?1",
+        rusqlite::params![code],
+        |r| r.get(0),
+    )?;
+    Ok((e, b))
+}
+
+/// 科目及其所有下级被引用情况
+pub fn usage_with_children(db: &Db, code: &str) -> DbResult<(i64, i64)> {
+    let like = format!("{code}%");
+    let e: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM voucher_entry WHERE account_code LIKE ?1",
+        rusqlite::params![like],
+        |r| r.get(0),
+    )?;
+    let b: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM begin_balance WHERE account_code LIKE ?1",
+        rusqlite::params![like],
+        |r| r.get(0),
+    )?;
+    Ok((e, b))
+}
+
+/// 批量导入（覆盖同名编码）
+pub fn import_many(db: &Db, accounts: &[Account]) -> DbResult<usize> {
+    let tx = db.conn().unchecked_transaction()?;
+    let mut n = 0;
+    for a in accounts {
+        tx.execute(
+            "INSERT OR REPLACE INTO account(code,name,category,dir,aux_mask,unit,currency,has_qty,
+                    is_cash,is_bank,cf_item,bs_item,pl_item,disabled,memo)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            rusqlite::params![
+                a.code,
+                a.name,
+                serde_json::to_value(a.category).unwrap_or_default().as_str().unwrap_or("asset"),
+                serde_json::to_value(a.dir).unwrap_or_default().as_str().unwrap_or("debit"),
+                a.aux.0 as i64,
+                a.unit,
+                a.currency,
+                a.has_qty as i64,
+                a.is_cash as i64,
+                a.is_bank as i64,
+                a.cash_flow_item,
+                a.bs_item,
+                a.pl_item,
+                a.disabled as i64,
+                a.memo,
+            ],
+        )?;
+        n += 1;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// 关键字搜索（编码或名称）
+pub fn search(db: &Db, kw: &str, limit: i64) -> DbResult<Vec<Account>> {
+    let like = format!("%{kw}%");
+    let mut stmt = db.conn().prepare(
+        "SELECT code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
+                cf_item,bs_item,pl_item,disabled,memo
+         FROM account WHERE code LIKE ?1 OR name LIKE ?1 ORDER BY code LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![like, limit], map_account)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::mem;
+
+    #[test]
+    fn roundtrip() {
+        let db = mem();
+        let mut a = Account::new("1009", "其他货币资金-测试", AcctCategory::Asset);
+        a.memo = "备注".to_string();
+        insert(&db, &a).unwrap();
+
+        let got = get(&db, "1009").unwrap().unwrap();
+        assert_eq!(got.name, a.name);
+        assert_eq!(got.category, AcctCategory::Asset);
+        assert_eq!(got.dir, Direction::Debit);
+        assert_eq!(got.memo, "备注");
+
+        a.name = "改过名字".to_string();
+        update(&db, &a).unwrap();
+        assert_eq!(get(&db, "1009").unwrap().unwrap().name, "改过名字");
+
+        delete(&db, "1009").unwrap();
+        assert!(get(&db, "1009").unwrap().is_none());
+    }
+
+    #[test]
+    fn chart_builds() {
+        let db = mem();
+        let c = chart(&db).unwrap();
+        assert!(c.contains("1001"));
+        assert!(c.is_leaf("1001"));
+        assert!(!c.is_leaf("1002"));
+        assert_eq!(c.full_name("100201"), "银行存款 / 工行基本户");
+    }
+
+    #[test]
+    fn usage_counts() {
+        let db = mem();
+        assert_eq!(usage(&db, "1001").unwrap(), (0, 0));
+        assert_eq!(usage_with_children(&db, "1002").unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn search_works() {
+        let db = mem();
+        assert!(!search(&db, "现金", 20).unwrap().is_empty());
+        assert!(search(&db, "不存在的科目xyz", 20).unwrap().is_empty());
+    }
+}

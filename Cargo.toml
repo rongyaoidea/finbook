@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/fincore", "crates/findb", "crates/finui", "crates/finbook", "crates/finweb"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["FinBook"]
+
+[workspace.dependencies]
+fincore = { path = "crates/fincore" }
+findb = { path = "crates/findb" }
+finui = { path = "crates/finui" }
+
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde-str", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Web 服务端
+axum = { version = "0.7" }
+axum-extra = { version = "0.9", features = ["cookie"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

@@ -1,0 +1,534 @@
+//! 用户、角色与权限
+//!
+//! 财务软件讲究不相容职务分离：制单、审核、记账、结账应是不同的人。
+//! 这里用角色 → 权限集合的模型，密码用加盐 SHA-256 存储（单机场景足够，不上明文）。
+
+use serde::{Deserialize, Serialize};
+
+/// 操作权限
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Perm {
+    /// 新增凭证
+    VoucherNew,
+    /// 修改凭证
+    VoucherEdit,
+    /// 删除凭证
+    VoucherDelete,
+    /// 审核凭证
+    VoucherAudit,
+    /// 反审核
+    VoucherUnaudit,
+    /// 记账
+    VoucherPost,
+    /// 反记账
+    VoucherUnpost,
+    /// 出纳签字
+    CashierSign,
+    /// 维护科目
+    AccountEdit,
+    /// 维护辅助档案
+    AuxEdit,
+    /// 期初建账
+    Opening,
+    /// 期末结转
+    CarryForward,
+    /// 期末结账 / 反结账
+    PeriodClose,
+            /// 查看账簿报表
+            Report,
+            /// 导出数据（Excel / CSV 文件落地，仅管理员与财务主管）
+            Export,
+    /// 用户与权限管理
+    UserManage,
+    /// 账套参数
+    SysOption,
+    /// 备份恢复
+    Backup,
+    /// 查看操作日志
+    AuditLog,
+}
+
+impl Perm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Perm::VoucherNew => "填制凭证",
+            Perm::VoucherEdit => "修改凭证",
+            Perm::VoucherDelete => "删除凭证",
+            Perm::VoucherAudit => "审核凭证",
+            Perm::VoucherUnaudit => "反审核凭证",
+            Perm::VoucherPost => "记账",
+            Perm::VoucherUnpost => "反记账",
+            Perm::CashierSign => "出纳签字",
+            Perm::AccountEdit => "科目维护",
+            Perm::AuxEdit => "档案维护",
+            Perm::Opening => "期初建账",
+            Perm::CarryForward => "期末结转",
+            Perm::PeriodClose => "期末结账",
+            Perm::Report => "账簿报表",
+            Perm::Export => "导出数据",
+            Perm::UserManage => "用户权限",
+            Perm::SysOption => "账套参数",
+            Perm::Backup => "备份恢复",
+            Perm::AuditLog => "操作日志",
+        }
+    }
+    pub fn all() -> &'static [Perm] {
+        &[
+            Perm::VoucherNew,
+            Perm::VoucherEdit,
+            Perm::VoucherDelete,
+            Perm::VoucherAudit,
+            Perm::VoucherUnaudit,
+            Perm::VoucherPost,
+            Perm::VoucherUnpost,
+            Perm::CashierSign,
+            Perm::AccountEdit,
+            Perm::AuxEdit,
+            Perm::Opening,
+            Perm::CarryForward,
+            Perm::PeriodClose,
+            Perm::Report,
+            Perm::Export,
+            Perm::UserManage,
+            Perm::SysOption,
+            Perm::Backup,
+            Perm::AuditLog,
+        ]
+    }
+}
+
+/// 角色
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// 系统管理员：全部权限
+    Admin,
+    /// 财务主管：除用户管理外的全部账务权限
+    Supervisor,
+    /// 会计：制单、记账、报表，但不能审核自己制的单
+    #[default]
+    Accountant,
+    /// 出纳：现金银行相关、出纳签字
+    Cashier,
+    /// 审核人：只能审核
+    Auditor,
+    /// 只读：查看报表
+    Viewer,
+}
+
+impl Role {
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Admin => "系统管理员",
+            Role::Supervisor => "财务主管",
+            Role::Accountant => "会计",
+            Role::Cashier => "出纳",
+            Role::Auditor => "审核人",
+            Role::Viewer => "只读",
+        }
+    }
+    pub fn all() -> &'static [Role] {
+        &[
+            Role::Admin,
+            Role::Supervisor,
+            Role::Accountant,
+            Role::Cashier,
+            Role::Auditor,
+            Role::Viewer,
+        ]
+    }
+    pub fn perms(self) -> &'static [Perm] {
+        use Perm::*;
+        // 导出数据（Export）只给管理员与财务主管：普通账户只能打印预览，
+        // 防止把整表数据带出（文件落地），纸面打印留痕可控。
+        match self {
+            Role::Admin => Perm::all(),
+            Role::Supervisor => &[
+                VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
+                VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
+                CarryForward, PeriodClose, Report, Export, Backup, AuditLog,
+            ],
+            Role::Accountant => &[
+                VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
+                Opening, CarryForward, Report,
+            ],
+            Role::Cashier => &[VoucherNew, VoucherEdit, CashierSign, Report],
+            Role::Auditor => &[VoucherAudit, VoucherUnaudit, Report],
+            Role::Viewer => &[Report],
+        }
+    }
+}
+
+/// 数据权限范围
+///
+/// 角色决定了"能做什么操作"，数据范围决定"能看到哪些数据"。
+/// 两者分开，是因为同一个会计在不同公司可能要限制到不同部门。
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DataScope {
+    /// 允许查看的部门编码；为空表示不限制
+    pub depts: Vec<String>,
+    /// 科目范围（含端点），为空表示不限
+    pub account_from: String,
+    pub account_to: String,
+    /// 只能查看自己填制的凭证
+    pub own_voucher_only: bool,
+    /// 只能查看自己经手的业务单据（报销 / 工资）
+    pub own_doc_only: bool,
+}
+
+impl DataScope {
+    /// 无任何限制
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+    pub fn is_unrestricted(&self) -> bool {
+        self.depts.is_empty()
+            && self.account_from.is_empty()
+            && self.account_to.is_empty()
+            && !self.own_voucher_only
+            && !self.own_doc_only
+    }
+    /// 部门是否在可见范围内
+    pub fn allows_dept(&self, dept: &str) -> bool {
+        if self.depts.is_empty() || dept.is_empty() {
+            return true;
+        }
+        self.depts.iter().any(|d| d == dept)
+    }
+    /// 科目是否在可见范围内（按编码前缀比较，父级自动含下级）
+    pub fn allows_account(&self, code: &str) -> bool {
+        let lo = self.account_from.trim();
+        let hi = self.account_to.trim();
+        if lo.is_empty() && hi.is_empty() {
+            return true;
+        }
+        if !lo.is_empty() && code < lo {
+            return false;
+        }
+        if !hi.is_empty() {
+            // 上界按"该编码及其所有下级"理解：1002 应包含 100201
+            return code <= hi || code.starts_with(hi);
+        }
+        true
+    }
+}
+
+/// 口令策略
+///
+/// 默认给一套"够用但不折腾"的规则：8 位 + 字母 + 数字。
+/// 财务软件加太复杂的策略，结果往往是有人把密码写在显示器边上。
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct PasswordPolicy {
+    pub min_len: usize,
+    pub need_letter: bool,
+    pub need_digit: bool,
+    pub need_symbol: bool,
+    /// 口令有效期（天），0 表示永不过期
+    pub max_age_days: i64,
+    /// 连续失败多少次锁定
+    pub max_fail: i64,
+    /// 锁定时长（分钟）
+    pub lock_minutes: i64,
+    /// 空闲多久自动登出（分钟），0 表示不自动登出
+    pub idle_minutes: i64,
+}
+
+impl Default for PasswordPolicy {
+    fn default() -> Self {
+        Self {
+            min_len: 8,
+            need_letter: true,
+            need_digit: true,
+            need_symbol: false,
+            max_age_days: 90,
+            max_fail: 5,
+            lock_minutes: 15,
+            idle_minutes: 30,
+        }
+    }
+}
+
+impl PasswordPolicy {
+    /// 校验口令，返回第一个不满足的规则
+    pub fn check(&self, pwd: &str) -> Result<(), String> {
+        if pwd.len() < self.min_len {
+            return Err(format!("口令长度不能少于 {} 位", self.min_len));
+        }
+        if self.need_letter && !pwd.chars().any(|c| c.is_ascii_alphabetic()) {
+            return Err("口令必须包含字母".to_string());
+        }
+        if self.need_digit && !pwd.chars().any(|c| c.is_ascii_digit()) {
+            return Err("口令必须包含数字".to_string());
+        }
+        if self.need_symbol && !pwd.chars().any(|c| !c.is_alphanumeric()) {
+            return Err("口令必须包含特殊字符".to_string());
+        }
+        Ok(())
+    }
+    /// 口令强度 0~4，用于界面上的进度条
+    pub fn strength(&self, pwd: &str) -> u8 {
+        let mut s = 0u8;
+        if pwd.len() >= self.min_len {
+            s += 1;
+        }
+        if pwd.len() >= 12 {
+            s += 1;
+        }
+        if pwd.chars().any(|c| c.is_ascii_alphabetic()) && pwd.chars().any(|c| c.is_ascii_digit()) {
+            s += 1;
+        }
+        if pwd.chars().any(|c| !c.is_alphanumeric()) {
+            s += 1;
+        }
+        s.min(4)
+    }
+    /// 距上次改口令是否已超过有效期
+    pub fn is_expired(&self, changed_at: &str, now: chrono::NaiveDate) -> bool {
+        if self.max_age_days <= 0 || changed_at.is_empty() {
+            return false;
+        }
+        let d = changed_at.get(..10).unwrap_or("");
+        match chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") {
+            Ok(c) => (now - c).num_days() > self.max_age_days,
+            Err(_) => false,
+        }
+    }
+}
+
+/// 用户
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    /// 加盐后的口令摘要，格式 `salt$hash`
+    pub password_hash: String,
+    pub role: Role,
+    pub disabled: bool,
+    /// 额外权限（在角色基础上追加或例外）
+    pub extra_perms: Vec<Perm>,
+    pub memo: String,
+    /// 上次修改口令时间
+    pub pwd_changed_at: String,
+    /// 下次登录必须改口令（管理员重置后常用）
+    pub must_change_pwd: bool,
+    /// 锁定截止时刻（`%Y-%m-%d %H:%M:%S`），None 表示未锁定
+    pub locked_until: Option<String>,
+    /// 上次登录时间
+    pub last_login_at: String,
+    /// 绑定的设备指纹（空 = 未绑定，首次登录自动绑定当前设备）
+    pub device_id: String,
+    /// 绑定设备的展示名（方便管理员辨认是哪台机器）
+    pub device_name: String,
+    /// 数据权限范围
+    pub data_scope: DataScope,
+}
+
+impl User {
+    pub fn new(username: &str, display_name: &str, role: Role) -> Self {
+        Self {
+            id: 0,
+            username: username.to_string(),
+            display_name: display_name.to_string(),
+            password_hash: String::new(),
+            role,
+            disabled: false,
+            extra_perms: Vec::new(),
+            memo: String::new(),
+            pwd_changed_at: String::new(),
+            must_change_pwd: false,
+            locked_until: None,
+            last_login_at: String::new(),
+            device_id: String::new(),
+            device_name: String::new(),
+            data_scope: DataScope::default(),
+        }
+    }
+
+    /// 是否系统管理员（设备绑定、导出限制对管理员不生效）
+    pub fn is_admin(&self) -> bool {
+        self.role == Role::Admin
+    }
+
+    pub fn can(&self, p: Perm) -> bool {
+        if self.disabled {
+            return false;
+        }
+        self.role.perms().contains(&p) || self.extra_perms.contains(&p)
+    }
+
+    pub fn set_password(&mut self, plain: &str) {
+        self.password_hash = hash_password(plain);
+        self.pwd_changed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        self.must_change_pwd = false;
+    }
+    pub fn verify_password(&self, plain: &str) -> bool {
+        verify_password(plain, &self.password_hash)
+    }
+    /// 禁用或处于锁定期都算"进不来"
+    pub fn is_locked_out(&self) -> bool {
+        if self.disabled {
+            return true;
+        }
+        match &self.locked_until {
+            Some(s) if s.is_empty() => false,
+            Some(s) => parse_ts(s)
+                .map(|t| t > chrono::Local::now().naive_local())
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+    /// 剩余锁定分钟数（未锁定返回 0）
+    pub fn lock_remaining_min(&self) -> i64 {
+        match &self.locked_until {
+            Some(s) if !s.is_empty() => match parse_ts(s) {
+                Some(t) => {
+                    let left = (t - chrono::Local::now().naive_local()).num_minutes();
+                    left.max(0)
+                }
+                None => 0,
+            },
+            _ => 0,
+        }
+    }
+    /// 是否还能查看某科目的数据
+    pub fn can_see_account(&self, code: &str) -> bool {
+        self.data_scope.allows_account(code)
+    }
+    pub fn can_see_dept(&self, dept: &str) -> bool {
+        self.data_scope.allows_dept(dept)
+    }
+}
+
+/// 解析 `%Y-%m-%d %H:%M:%S` 时间戳
+fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(s.get(..10).unwrap_or(""), "%Y-%m-%d")
+                .ok()
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+        })
+}
+
+/// 生成 `salt$sha256(salt + password)`。盐取 16 字节十六进制。
+pub fn hash_password(plain: &str) -> String {
+    let salt = random_hex(16);
+    let hash = sha256_hex(&format!("{salt}{plain}"));
+    format!("{salt}${hash}")
+}
+
+/// 校验口令
+pub fn verify_password(plain: &str, stored: &str) -> bool {
+    match stored.split_once('$') {
+        Some((salt, hash)) => {
+            let calc = sha256_hex(&format!("{salt}{plain}"));
+            constant_time_eq(calc.as_bytes(), hash.as_bytes())
+        }
+        None => false,
+    }
+}
+
+/// 定长比较，避免时序侧信道
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut r = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        r |= x ^ y;
+    }
+    r == 0
+}
+
+/// 简易随机十六进制（单机软件，不用于密码学强度场景）
+fn random_hex(n: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut x = seed;
+    for _ in 0..n {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let b = ((x >> 33) & 0xf) as u8;
+        out.push(char::from_digit(b as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// SHA-256，十六进制输出
+fn sha256_hex(input: &str) -> String {
+    // 依赖 sha2 crate
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 操作日志
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct AuditLog {
+    pub id: i64,
+    pub ts: String,
+    pub user: String,
+    pub action: String,
+    pub detail: String,
+    /// 影响的模块
+    pub module: String,
+}
+
+impl AuditLog {
+    pub fn new(user: &str, module: &str, action: &str, detail: &str) -> Self {
+        Self {
+            id: 0,
+            ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            user: user.to_string(),
+            action: action.to_string(),
+            detail: detail.to_string(),
+            module: module.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_roundtrip() {
+        let h = hash_password("Abc123!!");
+        assert!(verify_password("Abc123!!", &h));
+        assert!(!verify_password("abc123!!", &h));
+        assert!(!verify_password("x", "garbage"));
+        // 同样的明文两次哈希结果应不同（盐不同）
+        assert_ne!(hash_password("same"), hash_password("same"));
+    }
+
+    #[test]
+    fn role_perms() {
+        let mut u = User::new("zs", "张三", Role::Accountant);
+        assert!(u.can(Perm::VoucherNew));
+        assert!(!u.can(Perm::VoucherAudit));
+        assert!(!u.can(Perm::PeriodClose));
+        u.extra_perms.push(Perm::PeriodClose);
+        assert!(u.can(Perm::PeriodClose));
+        u.disabled = true;
+        assert!(!u.can(Perm::VoucherNew));
+    }
+
+    #[test]
+    fn admin_has_all() {
+        let u = User::new("root", "管理员", Role::Admin);
+        for p in Perm::all() {
+            assert!(u.can(*p), "管理员缺少权限 {}", p.label());
+        }
+    }
+}

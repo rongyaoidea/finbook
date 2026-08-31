@@ -1,0 +1,29 @@
+//! 创建一个空的 FinBook 账套
+//!
+//! 用法: cargo run --example create --release -- <path>
+
+use findb::Db;
+use fincore::{BookOptions, Period};
+use std::env;
+use std::path::PathBuf;
+
+fn main() {
+    let path = PathBuf::from(env::args().nth(1).expect("usage: create <path>"));
+    let _ = std::fs::remove_file(&path);
+    let opts = BookOptions {
+        code_scheme: vec![4, 2, 2, 2],
+        start_period: Period::parse("2025-01").unwrap(),
+        base_currency: "CNY".into(),
+        company: "示例科技有限公司".into(),
+        tax_no: "91110000123456789X".into(),
+        enable_qty: false,
+        enable_foreign: false,
+        require_cashier: false,
+        require_audit: true,
+        voucher_words: fincore::chart::default_voucher_words(),
+    };
+    let db = Db::create(&path, &opts).expect("create");
+    let _ = db.log("admin", "系统", "建账", "由 CLI 创建");
+    drop(db);
+    println!("已创建 {}", path.display());
+}

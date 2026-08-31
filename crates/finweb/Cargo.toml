@@ -1,0 +1,25 @@
+[package]
+name = "finweb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["FinBook"]
+
+[[bin]]
+name = "finweb"
+path = "src/main.rs"
+
+[dependencies]
+fincore = { workspace = true }
+findb = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

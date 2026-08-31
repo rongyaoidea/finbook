@@ -1,0 +1,38 @@
+# FinBook Web 端 systemd 服务示例
+#
+# 安装:
+#   1. 把编译产物 finweb 与 static/ 放到 /opt/finbook/
+#   2. 创建运行用户与数据目录:
+#        sudo useradd --system --home /opt/finbook --shell /usr/sbin/nologin finbook
+#        sudo mkdir -p /opt/finbook/data
+#        sudo chown -R finbook:finbook /opt/finbook
+#   3. 复制本文件到 /etc/systemd/system/finweb.service
+#   4. sudo systemctl daemon-reload && sudo systemctl enable --now finweb
+#
+# 反向代理（HTTPS）建议用 nginx/caddy 挂在本服务前面，
+# 本服务只监听 127.0.0.1，避免裸 HTTP 暴露到公网。
+[Unit]
+Description=FinBook 财务管理系统（Web 端）
+Documentation=https://github.com/rongyaoidea/finbook
+After=network.target
+
+[Service]
+Type=simple
+User=finbook
+Group=finbook
+WorkingDirectory=/opt/finbook
+Environment=FINBOOK_DB=/opt/finbook/data/finbook.fbk
+Environment=FINBOOK_LISTEN=127.0.0.1:8080
+Environment=FINWEB_STATIC_DIR=/opt/finbook/static
+ExecStart=/usr/bin/env finweb
+Restart=on-failure
+RestartSec=5
+# 加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/finbook/data
+
+[Install]
+WantedBy=multi-user.target

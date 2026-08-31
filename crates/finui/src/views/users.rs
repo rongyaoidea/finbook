@@ -215,6 +215,10 @@ impl UsersView {
                     self.pwd.clone()
                 };
                 u.set_password(&pwd);
+                // 普通账户默认只能看自己填制的凭证；管理员可看全部
+                if !u.is_admin() {
+                    u.data_scope.own_voucher_only = true;
+                }
                 match findb::users::insert(ctx.db(), &u) {
                     Ok(_) => {
                         ctx.log("用户", "新增用户", &u.username);

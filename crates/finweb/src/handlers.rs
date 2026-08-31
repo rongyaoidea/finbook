@@ -228,6 +228,11 @@ async fn create_user(
     u.set_password(&req.password);
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     u.must_change_pwd = true;
+    // 普通账户默认只能看自己填制的凭证（防越权翻看他人/全盘数据）；
+    // 管理员不受此限制，可看到所有账套数据
+    if !u.is_admin() {
+        u.data_scope.own_voucher_only = true;
+    }
     let id = users::insert(&db, &u)?;
     db.log(user.username(), "安全", "新建用户", &format!("创建账号「{username}」（{}）", req.role.label()))?;
     Ok(Json(json!({"id": id})))

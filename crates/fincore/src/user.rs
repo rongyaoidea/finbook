@@ -140,14 +140,15 @@ impl Role {
     }
     pub fn perms(self) -> &'static [Perm] {
         use Perm::*;
-        // 导出数据（Export）只给管理员与财务主管：普通账户只能打印预览，
-        // 防止把整表数据带出（文件落地），纸面打印留痕可控。
+        // 备份（Backup）与导出（Export）是数据外带通道：
+        // - Backup 仅限系统管理员：普通账户拿不到账套文件副本，防止数据转移
+        // - Export 仅限管理员与财务主管：普通账户只能打印预览（纸面留痕可控）
         match self {
             Role::Admin => Perm::all(),
             Role::Supervisor => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
                 VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
-                CarryForward, PeriodClose, Report, Export, Backup, AuditLog,
+                CarryForward, PeriodClose, Report, Export, AuditLog,
             ],
             Role::Accountant => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
@@ -591,5 +592,36 @@ mod tests {
         for p in Perm::all() {
             assert!(u.can(*p), "管理员缺少权限 {}", p.label());
         }
+    }
+
+    #[test]
+    fn backup_admin_only() {
+        // 备份是数据外带通道，仅系统管理员可用；财务主管也不拥有
+        let admin = User::new("admin", "管理员", Role::Admin);
+        assert!(admin.can(Perm::Backup));
+
+        let sup = User::new("sup", "财务主管", Role::Supervisor);
+        assert!(!sup.can(Perm::Backup), "财务主管不应有备份权限");
+
+        let acc = User::new("acc", "会计", Role::Accountant);
+        assert!(!acc.can(Perm::Backup), "会计不应有备份权限");
+
+        let viewer = User::new("v", "只读", Role::Viewer);
+        assert!(!viewer.can(Perm::Backup));
+    }
+
+    #[test]
+    fn normal_user_default_own_voucher_only() {
+        // 普通账户默认只能看自己填制的凭证；管理员不受限
+        let mut acc = User::new("acc1", "会计一", Role::Accountant);
+        // 模拟 finweb/finui 建号时的默认范围设置
+        if !acc.is_admin() {
+            acc.data_scope.own_voucher_only = true;
+        }
+        assert!(acc.data_scope.own_voucher_only);
+
+        let admin = User::new("admin", "管理员", Role::Admin);
+        assert!(!admin.data_scope.own_voucher_only);
+        assert!(admin.data_scope.is_unrestricted());
     }
 }

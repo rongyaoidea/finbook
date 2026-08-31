@@ -35,6 +35,16 @@ impl BackupView {
             );
         });
 
+        // 备份/恢复是数据外带通道，仅系统管理员可用。
+        // 普通账户（含财务主管）看不到任何备份按钮，无法获取账套文件副本。
+        if !ctx.user().can(fincore::Perm::Backup) {
+            ui.colored_label(
+                palette::WARN,
+                "备份与恢复仅限系统管理员。普通账户无法获取账套文件副本，如需备份请联系管理员。",
+            );
+            return;
+        }
+
         widgets::card(ui, "备份", |ui| {
             ui.label("把当前账套完整另存为一份新文件（内含全部科目、凭证、期初与用户）。");
             ui.horizontal(|ui| {

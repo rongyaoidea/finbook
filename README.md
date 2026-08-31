@@ -353,6 +353,25 @@ finbook/
 
 ---
 
+## 10.1 Windows 保留设备名适配（aux 模块重命名）
+
+本仓库在推送到 GitHub 前做过一次**模块重命名**，原因与影响说明如下：
+
+- **原因**：原源码中有两个文件名为 `aux.rs`（`crates/fincore/src/aux.rs` 与 `crates/finui/src/views/aux.rs`）。
+  `aux` 是 Windows 的保留设备名（类似 `con`/`prn`/`nul`），git 在 Windows 上默认开启 `core.protectNTFS`，
+  会拒绝索引这类路径，导致 `git add` 直接失败、无法提交/推送。
+- **处理**：
+  - `crates/fincore/src/aux.rs` → **`crates/fincore/src/auxiliary.rs`**，模块声明 `pub mod auxiliary`；
+  - `crates/finui/src/views/aux.rs` → **`crates/finui/src/views/aux_view.rs`**，模块声明 `pub mod aux_view`；
+  - 同步更新了 4 处引用：`crates/fincore/src/lib.rs`、`crates/findb/src/mgmt.rs`（测试）、
+    `crates/finui/src/views/mod.rs`、`crates/finui/src/views/aux_view.rs`。
+- **验证**：重命名后 `cargo check --workspace` 编译通过（无新增警告）。
+- **克隆注意事项**：在 Windows 上克隆 / 编译本项目时，请以 `auxiliary.rs` / `aux_view.rs` 为准，
+  不要再把文件改回 `aux.rs`，否则会再次触发同一问题。对外 API 不变（`fincore::auxiliary::AuxEntity`、
+  `fincore::auxiliary::validate_aux` 等），`findb::auxs` 模块名本就合法、未受影响。
+
+---
+
 ## 11. 重新交叉编译 Windows 包
 
 ```bash

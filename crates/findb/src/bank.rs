@@ -469,7 +469,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         return NaiveDate::from_ymd_opt(y, m, d);
     }
     // 2026年1月5日
-    let t = s.replace('年', "-").replace('月', "-").replace('日', "");
+    let t = s.replace(['年', '月'], "-").replace('日', "");
     NaiveDate::parse_from_str(&t, "%Y-%m-%d").ok()
 }
 
@@ -511,7 +511,7 @@ pub fn import_csv(
         if i == 0 && parse_date(&f[0]).is_none() {
             continue;
         }
-        let date = match parse_date(f.get(0).unwrap_or(&String::new())) {
+        let date = match parse_date(f.first().unwrap_or(&String::new())) {
             Some(d) => d,
             None => {
                 warns.push(format!("第 {} 行：日期无法识别，已跳过", i + 1));

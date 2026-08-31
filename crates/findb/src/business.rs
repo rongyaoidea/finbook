@@ -272,8 +272,7 @@ pub fn stock_cost_voucher(
         debit: total,
         ..Entry::new(1, cost_account, "结转销售成本")
     });
-    let mut i = 2;
-    for s in sum.iter().filter(|s| !s.out_amount.is_zero()) {
+    for (idx, s) in sum.iter().filter(|s| !s.out_amount.is_zero()).enumerate() {
         v.push_entry(Entry {
             credit: s.out_amount,
             aux: AuxRef {
@@ -281,9 +280,8 @@ pub fn stock_cost_voucher(
                 ..Default::default()
             },
             qty: Some(s.out_qty),
-            ..Entry::new(i, asset_account, "结转销售成本")
+            ..Entry::new(idx as i32 + 2, asset_account, "结转销售成本")
         });
-        i += 1;
     }
     v.renumber();
     let id = crate::vouchers::save(db, &mut v)?;

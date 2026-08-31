@@ -306,7 +306,7 @@ impl Db {
             "SELECT id,ts,user,module,action,detail FROM audit_log ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![limit], |r| Ok(map_log(r)?))?
+            .query_map(rusqlite::params![limit], map_log)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -319,7 +319,7 @@ impl Db {
              ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![kw, limit], |r| Ok(map_log(r)?))?
+            .query_map(rusqlite::params![kw, limit], map_log)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }

@@ -145,7 +145,7 @@ pub fn schedule(input: &DepInput) -> Result<Vec<DepRow>, FinError> {
         };
         // 最后一期：把累计拉平到应提总额，吃掉所有尾差
         let amount = if i == n { total - accum } else { amount };
-        accum = accum + amount;
+        accum += amount;
         rows.push(DepRow {
             seq: i,
             amount,
@@ -157,7 +157,7 @@ pub fn schedule(input: &DepInput) -> Result<Vec<DepRow>, FinError> {
     if let Some(last) = rows.last_mut() {
         if last.accum != total {
             let diff = total - last.accum;
-            last.amount = last.amount + diff;
+            last.amount += diff;
             last.accum = total;
             last.net = input.original - total;
         }
@@ -202,7 +202,7 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
             let remain_years = years as i64 - y as i64 + 1;
             let year_amount = (total * Money::from_i64(remain_years) / Money::from_i64(sum)).round2();
             // 该年内的月数（最后一年可能不满 12 个月）
-            let months_in_year = ((n - (y - 1) * 12).min(12)).max(1);
+            let months_in_year = (n - (y - 1) * 12).clamp(1, 12);
             (year_amount / Money::from_i64(months_in_year as i64)).round2()
         }
     }

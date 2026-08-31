@@ -166,7 +166,7 @@ pub fn analyze(
         .into_values()
         .filter(|l| !l.total.is_zero() || !l.credit_total.is_zero())
         .collect();
-    out.sort_by(|a, b| b.total.cmp(&a.total));
+    out.sort_by_key(|l| std::cmp::Reverse(l.total));
     Ok(out)
 }
 

@@ -149,6 +149,6 @@ mod tests {
             bump(&db, t).unwrap();
         }
         assert_eq!(search(&db, "报销").unwrap().len(), 2);
-        assert_eq!(search(&db, "").unwrap().len() >= 3, true);
+        assert!(search(&db, "").unwrap().len() >= 3);
     }
 }

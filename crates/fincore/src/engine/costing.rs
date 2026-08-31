@@ -122,20 +122,20 @@ impl StockState {
         if self.qty.is_negative() {
             let fill = (-self.qty).min(qty);
             let back = (fill * self.last_price).round2();
-            self.qty = self.qty + fill;
-            self.amount = self.amount + back;
+            self.qty += fill;
+            self.amount += back;
             let rest = qty - fill;
             if rest > Money::ZERO {
-                self.qty = self.qty + rest;
-                self.amount = self.amount + (rest * price).round2();
+                self.qty += rest;
+                self.amount += (rest * price).round2();
                 self.last_price = price;
                 self.push_lot(rest, price);
             }
             return Ok(());
         }
 
-        self.qty = self.qty + qty;
-        self.amount = self.amount + amount;
+        self.qty += qty;
+        self.amount += amount;
         self.last_price = price;
         self.push_lot(qty, price);
         Ok(())
@@ -145,7 +145,7 @@ impl StockState {
         // 同价批次合并，避免批次列表无限膨胀
         if let Some(last) = self.lots.last_mut() {
             if last.unit_cost == cost {
-                last.qty = last.qty + qty;
+                last.qty += qty;
                 return;
             }
         }
@@ -162,8 +162,8 @@ impl StockState {
             // 指定单价（个别计价 / 手工调整），直接按它出库
             let cost = (want * p).round2();
             self.consume_lots(want);
-            self.qty = self.qty - want;
-            self.amount = self.amount - cost;
+            self.qty -= want;
+            self.amount -= cost;
             self.normalize_if_empty();
             return Ok(cost);
         }
@@ -183,7 +183,7 @@ impl StockState {
 
         self.consume_lots(want);
         self.qty = (self.qty - want).round_dp(QTY_DP);
-        self.amount = self.amount - cost;
+        self.amount -= cost;
         self.normalize_if_empty();
         Ok(cost)
     }
@@ -196,12 +196,12 @@ impl StockState {
                 break;
             }
             let take = remain.min(lot.qty);
-            cost = cost + (take * lot.unit_cost).round2();
-            remain = remain - take;
+            cost += (take * lot.unit_cost).round2();
+            remain -= take;
         }
         // 批次不够（负库存）：剩余部分按 last_price 计价
         if remain > Money::ZERO {
-            cost = cost + (remain * self.last_price).round2();
+            cost += (remain * self.last_price).round2();
         }
         cost.round2()
     }
@@ -211,8 +211,8 @@ impl StockState {
         let mut idx = 0;
         while idx < self.lots.len() && remain > Money::ZERO {
             let take = remain.min(self.lots[idx].qty);
-            self.lots[idx].qty = self.lots[idx].qty - take;
-            remain = remain - take;
+            self.lots[idx].qty -= take;
+            remain -= take;
             if self.lots[idx].qty.abs() < Money::new(rust_decimal::Decimal::new(1, QTY_DP)) {
                 self.lots.remove(idx);
             } else {

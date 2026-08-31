@@ -200,11 +200,11 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Tok::Plus => {
                     self.bump();
-                    v = v + self.term()?;
+                    v += self.term()?;
                 }
                 Tok::Minus => {
                     self.bump();
-                    v = v - self.term()?;
+                    v -= self.term()?;
                 }
                 _ => break,
             }

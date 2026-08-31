@@ -554,7 +554,7 @@ mod tests {
         let p7 = Period::new(2026, 7).unwrap();
         assert_eq!(a.elapsed_months(p1), 1);
         assert_eq!(a.elapsed_months(p7), 7);
-        assert!(a.should_depreciate(p7) == false); // 超过 6 个月不再提
+        assert!(!a.should_depreciate(p7)); // 超过 6 个月不再提
         assert!(a.should_depreciate(Period::new(2026, 6).unwrap()));
 
         a.status = AssetStatus::Idle;

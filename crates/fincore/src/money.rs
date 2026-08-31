@@ -268,7 +268,7 @@ impl Money {
         out.push('元');
 
         if jiao == 0 && fen == 0 {
-            out.push_str("整");
+            out.push('整');
         } else {
             if jiao > 0 {
                 out.push_str(DIGITS[jiao as usize]);
@@ -281,7 +281,7 @@ impl Money {
                 out.push('分');
             } else {
                 // 角位有值、分位为零：票据规则要求以"整"结尾
-                out.push_str("整");
+                out.push('整');
             }
         }
         if neg {
@@ -306,7 +306,7 @@ fn insert_thousands(int_part: &str) -> String {
     let mut out = String::with_capacity(int_part.len() + int_part.len() / 3 + 1);
     let n = int_part.len();
     for (i, ch) in int_part.chars().enumerate() {
-        if i > 0 && (n - i) % 3 == 0 {
+        if i > 0 && (n - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

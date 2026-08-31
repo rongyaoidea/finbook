@@ -538,15 +538,11 @@ impl Chart {
     pub fn full_name(&self, code: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut cur = code.to_string();
-        loop {
-            if let Some(a) = self.accounts.get(&cur) {
-                parts.push(a.name.clone());
-                match self.parent_code(&cur) {
-                    Some(p) => cur = p,
-                    None => break,
-                }
-            } else {
-                break;
+        while let Some(a) = self.accounts.get(&cur) {
+            parts.push(a.name.clone());
+            match self.parent_code(&cur) {
+                Some(p) => cur = p,
+                None => break,
             }
         }
         parts.reverse();

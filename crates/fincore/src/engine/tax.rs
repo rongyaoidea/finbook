@@ -138,10 +138,10 @@ pub fn year_schedule(
     let mut out = Vec::with_capacity(monthly.len());
 
     for (i, (inc, sp, ad, ot)) in monthly.iter().enumerate() {
-        income = income + *inc;
-        special = special + *sp;
-        additional = additional + *ad;
-        other = other + *ot;
+        income += *inc;
+        special += *sp;
+        additional += *ad;
+        other += *ot;
         let c = Cumulative {
             income,
             special,
@@ -151,7 +151,7 @@ pub fn year_schedule(
             months: (i + 1) as i32,
         };
         let t = current_tax(&c).unwrap_or(Money::ZERO);
-        withheld = withheld + t;
+        withheld += t;
         out.push(t);
     }
     out

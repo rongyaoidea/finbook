@@ -297,7 +297,7 @@ pub fn dim_profit(
     for d in out.iter_mut() {
         d.profit = d.revenue - d.cost - d.expense - d.tax;
     }
-    out.sort_by(|a, b| b.profit.cmp(&a.profit));
+    out.sort_by_key(|l| std::cmp::Reverse(l.profit));
     let _ = chart;
     Ok(out)
 }

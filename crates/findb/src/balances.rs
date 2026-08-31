@@ -711,15 +711,14 @@ pub fn journal(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<JournalR
             let c = read_money(r, 3)?;
             // 只保留与本行借贷方向相反的分录，即真正的"对方科目"
             let is_debit = d.is_positive();
-            if (is_debit && c.is_zero()) || (!is_debit && d.is_zero()) {
-                if !code.starts_with(&q.code) {
+            if ((is_debit && c.is_zero()) || (!is_debit && d.is_zero()))
+                && !code.starts_with(&q.code) {
                     let name = chart
                         .get(&code)
                         .map(|a| a.name.clone())
                         .unwrap_or_else(|| code.clone());
                     opposite.entry(vid).or_default().push(name);
                 }
-            }
         }
     }
 
@@ -796,7 +795,7 @@ mod tests {
     /// 测试里手写的简写分录必须先补齐这些字段才能存进去。
     fn fill_required(db: &Db, e: &mut Entry) {
         let chart = crate::accounts::chart(db).unwrap();
-        let Some(a) = chart.get(&e.account_code).map(|a| a.clone()) else {
+        let Some(a) = chart.get(&e.account_code).cloned() else {
             return;
         };
         for k in a.aux.list() {

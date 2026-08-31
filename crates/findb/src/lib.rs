@@ -261,6 +261,29 @@ impl Db {
         Ok(())
     }
 
+    /// 自动备份：写入 `dir` 下以 `auto_` 开头、带时间戳的文件，
+    /// 并只保留最近 `keep` 份（轮转删除最旧的），返回实际生成的文件路径。
+    ///
+    /// 命名 `auto_YYYYMMDD_HHMMSSmmm.fbk`（毫秒级防止同一秒冲突），
+    /// 供 [`prune_auto_backups`] 识别。
+    pub fn backup_auto<P: AsRef<Path>>(&self, dir: P, keep: usize) -> DbResult<PathBuf> {
+        let dir = dir.as_ref().to_path_buf();
+        let base = format!(
+            "auto_{}",
+            chrono::Local::now().format("%Y%m%d_%H%M%S%3f")
+        );
+        // 毫秒级时间戳极少冲突；万一冲突（时钟回拨等）则追加序号
+        let mut path = dir.join(format!("{base}.{BOOK_EXT}"));
+        let mut n = 1;
+        while path.exists() {
+            path = dir.join(format!("{base}_{n}.{BOOK_EXT}"));
+            n += 1;
+        }
+        self.backup(&path)?;
+        prune_auto_backups(&dir, keep)?;
+        Ok(path)
+    }
+
     /// 整理数据库文件（回收删除产生的空闲页）
     pub fn vacuum(&self) -> DbResult<()> {
         self.conn.execute_batch("VACUUM")?;
@@ -376,6 +399,40 @@ pub fn options_json<T: serde::de::DeserializeOwned>(db: &Db, key: &str) -> Optio
     db.meta_json::<T>(key)
 }
 
+/// 自动备份轮转：删除目录下 `auto_*.fbk` 中按修改时间排序最旧的，
+/// 只保留最近 `keep` 份。`keep == 0` 表示不清理任何文件。
+///
+/// 只匹配 `auto_` 前缀的自动备份，绝不误删用户手工命名的备份。
+pub fn prune_auto_backups(dir: &Path, keep: usize) -> DbResult<()> {
+    if keep == 0 {
+        return Ok(());
+    }
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| FinError::io(e.to_string()))? {
+        let entry = entry.map_err(|e| FinError::io(e.to_string()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("auto_") || !name.ends_with(&format!(".{BOOK_EXT}")) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mt) = meta.modified() {
+                files.push((mt, path));
+            }
+        }
+    }
+    if files.len() <= keep {
+        return Ok(());
+    }
+    files.sort_by_key(|f| f.0); // 最旧的在前
+    let excess = files.len() - keep;
+    for (_, p) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(p); // 删除失败不致命，只留下孤儿文件
+    }
+    Ok(())
+}
+
 /// 写入一段 JSON 配置到账套
 pub fn set_options_json<T: serde::Serialize>(db: &Db, key: &str, v: &T) -> DbResult<()> {
     db.meta_set_json(key, v)
@@ -444,5 +501,42 @@ mod tests {
         let db = mem();
         let r = db.integrity_check().unwrap();
         assert_eq!(r, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn backup_auto_with_retention() {
+        let db = mem();
+        let dir = std::env::temp_dir().join(format!(
+            "finbook_test_backup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 故意放一个手工命名的备份，验证轮转不会误删它
+        let manual = dir.join("user_backup.fbk");
+        std::fs::write(&manual, b"manual").unwrap();
+
+        // 生成 5 份自动备份，保留 3 份
+        for _ in 0..5 {
+            db.backup_auto(&dir, 3).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // 保证时间戳/修改时间不同
+        }
+        let autos: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("auto_"))
+            .collect();
+        assert_eq!(autos.len(), 3, "自动备份应只保留最近 3 份：{autos:?}");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().any(|e| {
+                e.ok()
+                    .map(|x| x.file_name().to_string_lossy() == "user_backup.fbk")
+                    .unwrap_or(false)
+            }),
+            "手工备份不应被轮转删除"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

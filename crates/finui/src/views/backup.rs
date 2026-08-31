@@ -12,6 +12,8 @@ use crate::widgets;
 pub struct BackupView {
     pub check: Option<Vec<String>>,
     pub msg: String,
+    /// 自动备份保留份数（QSpinBox 风格输入）
+    pub keep: u32,
 }
 
 impl Default for BackupView {
@@ -19,6 +21,7 @@ impl Default for BackupView {
         Self {
             check: None,
             msg: String::new(),
+            keep: 10,
         }
     }
 }
@@ -41,6 +44,18 @@ impl BackupView {
                 if ui.button("备份到同目录").clicked() && ctx.can(fincore::Perm::Backup) {
                     self.quick_backup(ctx);
                 }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("自动备份（保留 N 份）").clicked() && ctx.can(fincore::Perm::Backup) {
+                    self.auto_backup(ctx);
+                }
+                ui.label("保留份数");
+                let r = ui.add(egui::DragValue::new(&mut self.keep).range(1..=99));
+                if r.changed() {
+                    // 就地生效，无需额外确认
+                }
+                ui.label(RichText::new("自动备份写入账套同目录 auto_*.fbk，超出份数自动删除最旧").weak());
             });
         });
 
@@ -142,6 +157,29 @@ impl BackupView {
         let name = self.default_name(ctx);
         let p = cur.with_file_name(format!("{name}.{BOOK_EXT}"));
         self.run_backup(ctx, p);
+    }
+
+    /// 自动备份到账套同目录，带保留份数轮转
+    fn auto_backup(&mut self, ctx: &mut AppCtx<'_>) {
+        let Some(cur) = ctx.st.book_path.clone() else {
+            ctx.error("当前账套没有文件路径，请使用「备份到…」");
+            return;
+        };
+        let dir = cur
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let keep = self.keep.max(1) as usize;
+        let r = ctx.db().backup_auto(&dir, keep);
+        match r {
+            Ok(p) => {
+                let msg = format!("已自动备份到 {}（保留最近 {keep} 份）", p.display());
+                ctx.log("账套", "自动备份", &p.display().to_string());
+                ctx.info(&msg);
+                self.msg = msg;
+            }
+            Err(e) => ctx.error(e.to_string()),
+        }
     }
 
     fn run_backup(&mut self, ctx: &mut AppCtx<'_>, p: PathBuf) {

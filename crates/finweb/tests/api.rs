@@ -1,0 +1,240 @@
+//! finweb 关键 API 集成测试
+//!
+//! 用临时目录建真实账套 + tokio + tower oneshot 直接打路由，
+//! 覆盖：初始化状态、首次登录即管理员、会话鉴权、权限拒绝、健康检查。
+//! 这是「首登即管理员 + 一人一机 + 导出管控」三大部署级特性的回归防线。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use fincore::user::PasswordPolicy;
+use fincore::BookOptions;
+use tower::ServiceExt;
+
+use finweb::handlers;
+use finweb::state::{DbPool, WebState};
+
+/// 建一个临时账套 + 完整 WebState，返回 (state, book_path, dir_guard)
+fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("创建临时目录失败");
+    let book_path = dir.path().join("test.fbk");
+    let opts = BookOptions {
+        start_period: fincore::Period::new(2026, 1).unwrap(),
+        ..Default::default()
+    };
+    // create_no_admin：模拟「首次登录即管理员」初始化流程
+    findb::Db::create_no_admin(&book_path, &opts).expect("建账失败");
+
+    let pool = DbPool::new(&book_path, 4);
+    let state = WebState::new(
+        pool,
+        PasswordPolicy::default(),
+        book_path.clone(),
+        "测试公司".to_string(),
+        "test".to_string(),
+        opts.start_period.ymm(),
+    );
+    (state, book_path, dir)
+}
+
+/// 把 JSON 包成 POST 请求
+fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// 从登录响应的 set-cookie 里取出 `finbook_sid=xxx` 段
+fn sid_from(resp: &axum::http::Response<Body>) -> String {
+    let cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("登录应返回 set-cookie")
+        .to_str()
+        .unwrap();
+    cookie.split(';').next().unwrap().to_string()
+}
+
+async fn login(state: &Arc<WebState>, username: &str, password: &str) -> (StatusCode, String) {
+    let resp = handlers::router(state.clone())
+        .oneshot(post_json(
+            "/api/login",
+            serde_json::json!({
+                "username": username,
+                "password": password,
+                "device_id": "dev-test-0001",
+                "device_name": "测试机",
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let sid = if status.is_success() {
+        sid_from(&resp)
+    } else {
+        String::new()
+    };
+    (status, sid)
+}
+
+/// 带 sid 的请求
+fn authed_get(uri: &str, sid: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::COOKIE, sid)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// 带 sid 的 POST JSON 请求
+fn authed_post(uri: &str, sid: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, sid)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn body_string(resp: axum::http::Response<Body>) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("读取响应体失败");
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+#[tokio::test]
+async fn setup_status_reports_no_admin() {
+    let (state, _bp, _dir) = test_state();
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/setup/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = body_string(resp).await;
+    assert!(s.contains("\"admin_set\":false"), "新账套应无管理员：{s}");
+}
+
+#[tokio::test]
+async fn health_endpoint() {
+    let (state, _bp, _dir) = test_state();
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await, "ok");
+}
+
+#[tokio::test]
+async fn first_login_becomes_admin() {
+    let (state, _bp, _dir) = test_state();
+    let (status, sid) = login(&state, "boss", "Admin!2026").await;
+    assert_eq!(status, StatusCode::OK, "首次登录应成功创建管理员");
+    assert!(!sid.is_empty());
+
+    // 用会话访问 /api/me，应看到 admin 角色
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/me", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = body_string(resp).await;
+    assert!(s.contains("\"is_admin\":true"), "首个账号应为管理员：{s}");
+}
+
+#[tokio::test]
+async fn unauthenticated_me_is_401() {
+    let (state, _bp, _dir) = test_state();
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wrong_password_rejected() {
+    let (state, _bp, _dir) = test_state();
+    // 先建出管理员：首次登录用 boss
+    let (_, _) = login(&state, "boss", "Admin!2026").await;
+    // 错误口令
+    let (status, _) = login(&state, "boss", "WrongPass123!").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn non_admin_cannot_manage_users() {
+    let (state, _bp, _dir) = test_state();
+    // 管理员开通一个普通会计
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &admin_sid,
+            serde_json::json!({
+                "username": "acc1",
+                "display_name": "会计一",
+                "password": "Acc@123456",
+                "role": "accountant",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员建号应成功");
+
+    // 普通账号登录后访问用户管理 → 403
+    let (status, sid2) = login(&state, "acc1", "Acc@123456").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/users", &sid2))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不应能管用户");
+}
+
+#[tokio::test]
+async fn device_binding_blocks_second_device() {
+    let (state, _bp, _dir) = test_state();
+    // 管理员建一个普通账号
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let _ = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &admin_sid,
+            serde_json::json!({
+                "username": "emp1",
+                "display_name": "员工一",
+                "password": "Emp@123456",
+                "role": "viewer",
+            }),
+        ))
+        .await;
+    drop(admin_sid);
+
+    // 第一次登录：自动绑定 dev-A
+    let (status, _) = login(&state, "emp1", "Emp@123456").await;
+    assert_eq!(status, StatusCode::OK, "首次登录应绑定并成功");
+
+    // 换设备 dev-B 登录：应被拒
+    let resp = handlers::router(state.clone())
+        .oneshot(post_json(
+            "/api/login",
+            serde_json::json!({
+                "username": "emp1",
+                "password": "Emp@123456",
+                "device_id": "dev-B-0002",
+                "device_name": "另一台电脑",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "换设备应被拒绝");
+}

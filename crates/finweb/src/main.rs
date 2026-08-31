@@ -2,10 +2,8 @@
 //!
 //! 在 Linux 服务器上运行，多个用户通过浏览器访问同一套账（服务端 SQLite，WAL 模式）。
 //! 首次访问且账套为空时，「首次登录即管理员」：第一个成功登录的账号会成为系统管理员。
-
-mod dto;
-mod handlers;
-mod state;
+//!
+//! 业务代码在 lib 目标（finweb::handlers / finweb::state），本文件只做启动装配。
 
 use std::path::PathBuf;
 
@@ -16,7 +14,8 @@ use fincore::user::PasswordPolicy;
 use fincore::BookOptions;
 use findb::{users, Db};
 
-use state::WebState;
+use finweb::handlers;
+use finweb::state::{DbPool, WebState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_user = users::first_admin_username(&db)?;
     drop(db); // 释放这一连接，连接池会按需重新打开
 
-    let pool = state::DbPool::new(&path, 16);
+    let pool = DbPool::new(&path, 16);
     let state = WebState::new(
         pool,
         PasswordPolicy::default(),

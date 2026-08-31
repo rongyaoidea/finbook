@@ -23,3 +23,8 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# 集成测试用：tower util（oneshot 发请求）+ tempfile（临时账套目录）
+tower = { workspace = true, features = ["util"] }
+tempfile = "3"

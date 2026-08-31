@@ -79,6 +79,30 @@ impl BalanceQuery {
     }
 }
 
+impl BalanceQuery {
+    /// 套用用户的数据范围（科目范围）：与查询已有的科目范围取交集。
+    ///
+    /// 下界取较大者、上界取较小者（科目编码前缀可比，相同前 4 位时逐级更严）。
+    pub fn with_data_scope(mut self, scope: &fincore::user::DataScope) -> Self {
+        let lo = scope.account_from.trim();
+        let hi = scope.account_to.trim();
+        if lo.is_empty() && hi.is_empty() {
+            return self;
+        }
+        let lo = (!lo.is_empty()).then(|| lo.to_string());
+        let hi = (!hi.is_empty()).then(|| hi.to_string());
+        self.code_from = match (self.code_from.take(), lo) {
+            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        self.code_to = match (self.code_to.take(), hi) {
+            (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        self
+    }
+}
+
 /// 某一时点的余额快照。加载一次，多处复用。
 #[derive(Clone, Debug, Default)]
 pub struct BalanceSnapshot {
@@ -1115,5 +1139,44 @@ mod tests {
         assert!(!codes.contains(&"1001"));
         let _ = AcctCategory::Asset;
         let _ = AuxMask::NONE.with(AuxKind::Dept);
+    }
+
+    #[test]
+    fn data_scope_merges_account_range() {
+        use fincore::user::DataScope;
+
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        post_voucher(&db, p, 5, vec![("1001", "借", "1000"), ("6001", "贷", "1000")]);
+        post_voucher(&db, p, 6, vec![("100201", "借", "500"), ("1001", "贷", "500")]);
+
+        let chart = crate::accounts::chart(&db).unwrap();
+
+        // 无范围：能看到全部
+        let q0 = BalanceQuery::period(p).with_data_scope(&DataScope::default());
+        let rows = BalanceSnapshot::load(&db, &q0).unwrap().account_table(&chart, &q0);
+        let codes: Vec<&str> = rows.iter().map(|r| r.account_code.as_str()).collect();
+        assert!(codes.contains(&"1001"));
+        assert!(codes.contains(&"6001"));
+
+        // 范围只允许 1001~1002：不含 6001
+        let scope = DataScope {
+            account_from: "1001".into(),
+            account_to: "1002".into(),
+            ..Default::default()
+        };
+        let q1 = BalanceQuery::period(p).with_data_scope(&scope);
+        let rows = BalanceSnapshot::load(&db, &q1).unwrap().account_table(&chart, &q1);
+        let codes: Vec<&str> = rows.iter().map(|r| r.account_code.as_str()).collect();
+        assert!(codes.contains(&"1001"), "1001 应在范围内：{codes:?}");
+        assert!(!codes.contains(&"6001"), "6001 不应在范围内：{codes:?}");
+
+        // 与手动下界取交集：手动 1001→ 与范围 1001→ 一致
+        let q2 = BalanceQuery::period(p)
+            .with_code_range(Some("1001".into()), None)
+            .with_data_scope(&scope);
+        let rows = BalanceSnapshot::load(&db, &q2).unwrap().account_table(&chart, &q2);
+        assert!(rows.iter().any(|r| r.account_code == "1001"));
+        assert!(!rows.iter().any(|r| r.account_code == "6001"));
     }
 }

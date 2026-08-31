@@ -113,7 +113,15 @@ impl VoucherList {
         self.dirty = false;
         self.sel.clear();
         self.paging.reset();
-        self.rows = findb::vouchers::list(ctx.db(), &self.query()).unwrap_or_default();
+        let mut q = self.query().with_data_scope(ctx.user());
+        // 科目范围（数据范围）：凭证可能横跨多科目，查询层只挡了制单人，
+        // 这里对结果逐张过滤
+        let u = ctx.user().clone();
+        let mut rows = findb::vouchers::list(ctx.db(), &q).unwrap_or_default();
+        if !u.data_scope.is_unrestricted() {
+            rows.retain(|v| u.can_see_voucher(v));
+        }
+        self.rows = rows;
     }
 
     pub fn show(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) -> Action {

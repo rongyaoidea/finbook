@@ -401,6 +401,23 @@ impl User {
     pub fn can_see_dept(&self, dept: &str) -> bool {
         self.data_scope.allows_dept(dept)
     }
+    /// 凭证是否在数据范围内可见：
+    /// - 科目范围：凭证涉及的全部科目都在范围内才可见（空范围 = 不限制）
+    /// - 本人凭证：`own_voucher_only` 时仅制单人本人可见
+    pub fn can_see_voucher(&self, v: &crate::voucher::Voucher) -> bool {
+        let scope = &self.data_scope;
+        if scope.own_voucher_only && v.prepared_by != self.username {
+            return false;
+        }
+        let has_account_limit = !scope.account_from.trim().is_empty()
+            || !scope.account_to.trim().is_empty();
+        if !has_account_limit {
+            return true;
+        }
+        // 凭证可能横跨多个科目，只要有一个分录落在范围内就可见；
+        // 但也要保证分录本身不与范围冲突（取"任一可见"语义）。
+        v.entries.iter().any(|e| scope.allows_account(&e.account_code))
+    }
 }
 
 /// 解析 `%Y-%m-%d %H:%M:%S` 时间戳

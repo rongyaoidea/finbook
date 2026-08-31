@@ -85,6 +85,8 @@ impl BalanceTableView {
                 if ct.is_empty() { None } else { Some(ct) },
             );
         }
+        // 数据范围（科目范围）：与用户手动选择取交集
+        q = q.with_data_scope(&ctx.user().data_scope);
 
         match BalanceSnapshot::load(ctx.db(), &q) {
             Ok(s) => {

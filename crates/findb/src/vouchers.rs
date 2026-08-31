@@ -4,6 +4,7 @@
 //! 单机场景下性能完全够用，还能避免残留孤儿行。
 
 use chrono::NaiveDate;
+use fincore::user::User;
 use fincore::{
     AuxRef, Entry, FinError, Issues, Money, Period, Voucher, VoucherSource, VoucherStatus,
 };
@@ -28,6 +29,8 @@ pub struct VoucherQuery {
     pub account_code: Option<String>,
     /// 只返回涉及该辅助核算的凭证
     pub aux: Option<AuxRef>,
+    /// 只返回该制单人填制的凭证（数据范围：仅看本人凭证）
+    pub prepared_by: Option<String>,
     pub source: Option<VoucherSource>,
     pub limit: Option<i64>,
     /// 排序：true 为按日期+凭证号升序（默认），false 为降序
@@ -50,6 +53,20 @@ impl VoucherQuery {
     pub fn with_keyword(mut self, kw: &str) -> Self {
         let kw = kw.trim().to_string();
         self.keyword = if kw.is_empty() { None } else { Some(kw) };
+        self
+    }
+
+    /// 套用用户的数据范围（DataScope）：
+    /// - `own_voucher_only`：只看本人填制的凭证。
+    /// - 科目范围：凭证可能涉及多个科目，查询层不便预过滤，
+    ///   由界面层对结果逐张调用 `User::can_see_voucher` 过滤
+    ///   （账簿/余额表等按科目聚合的模块则在查询条件里取交集）。
+    pub fn with_data_scope(mut self, u: &User) -> Self {
+        let scope = &u.data_scope;
+        if scope.own_voucher_only {
+            // 凭证的 prepared_by 存的是显示名（填制时写 display_name）
+            self.prepared_by = Some(u.display_name.clone());
+        }
         self
     }
 }
@@ -187,6 +204,10 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
         params.push(Box::new(
             serde_json::to_value(src)?.as_str().unwrap_or("manual").to_string(),
         ));
+    }
+    if let Some(ref who) = q.prepared_by {
+        sql.push_str(" AND v.prepared_by = ?");
+        params.push(Box::new(who.clone()));
     }
     if let Some(ref code) = q.account_code {
         sql.push_str(
@@ -884,5 +905,34 @@ mod tests {
         let mut v = sample(p, 5, 1);
         save(&db, &mut v).unwrap();
         assert_eq!(status_summary(&db, p).unwrap(), (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn data_scope_own_voucher_only() {
+        use fincore::user::DataScope;
+
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v1 = sample(p, 5, 1);
+        v1.prepared_by = "张三".to_string();
+        save(&db, &mut v1).unwrap();
+        let mut v2 = sample(p, 6, 2);
+        v2.prepared_by = "李四".to_string();
+        save(&db, &mut v2).unwrap();
+
+        // 张三：只看到自己填制的 1 张
+        let mut zhang = fincore::User::new("zhangsan", "张三", fincore::Role::Accountant);
+        zhang.data_scope = DataScope {
+            own_voucher_only: true,
+            ..Default::default()
+        };
+        let rows = list(&db, &VoucherQuery::period(p).with_data_scope(&zhang)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prepared_by, "张三");
+
+        // 管理员/无限制用户：2 张都可见
+        let admin = fincore::User::new("admin", "管理员", fincore::Role::Admin);
+        let rows = list(&db, &VoucherQuery::period(p).with_data_scope(&admin)).unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

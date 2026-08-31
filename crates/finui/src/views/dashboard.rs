@@ -87,7 +87,13 @@ impl Dashboard {
         let mut q = findb::vouchers::VoucherQuery::period(p);
         q.asc = false;
         q.limit = Some(10);
-        self.recent = findb::vouchers::list(db, &q).unwrap_or_default();
+        q = q.with_data_scope(ctx.user());
+        let u = ctx.user().clone();
+        let mut recent = findb::vouchers::list(db, &q).unwrap_or_default();
+        if !u.data_scope.is_unrestricted() {
+            recent.retain(|v| u.can_see_voucher(v));
+        }
+        self.recent = recent;
 
         // 待办
         let mut todos = Vec::new();

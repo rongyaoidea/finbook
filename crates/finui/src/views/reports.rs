@@ -102,7 +102,9 @@ impl ReportsView {
                         return;
                     }
                 };
-                let snap = match BalanceSnapshot::load(ctx.db(), &BalanceQuery::range(from, to)) {
+                let mut bq = BalanceQuery::range(from, to);
+                bq = bq.with_data_scope(&ctx.user().data_scope);
+                let snap = match BalanceSnapshot::load(ctx.db(), &bq) {
                     Ok(s) => s,
                     Err(e) => {
                         self.err = Some(e.to_string());

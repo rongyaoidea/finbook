@@ -28,6 +28,8 @@ pub struct LedgerView {
     pub general: Vec<GeneralLedgerRow>,
     pub journal: Vec<JournalRow>,
     pub begin: Money,
+    /// 数据范围拦截：所选科目不在可见范围内
+    pub scope_blocked: bool,
     pub dirty: bool,
     key: String,
 }
@@ -47,6 +49,7 @@ impl Default for LedgerView {
             general: Vec::new(),
             journal: Vec::new(),
             begin: Money::ZERO,
+            scope_blocked: false,
             dirty: true,
             key: String::new(),
         }
@@ -86,8 +89,19 @@ impl LedgerView {
 
         let from = Period::parse(&self.from).unwrap_or_else(|_| ctx.period());
         let to = Period::parse(&self.to).unwrap_or_else(|_| ctx.period());
+        let code = self.code.trim().to_string();
+        // 数据范围（科目范围）：所选科目不在可见范围时，清空账簿并提示
+        if !ctx.user().can_see_account(&code) {
+            self.detail.clear();
+            self.general.clear();
+            self.journal.clear();
+            self.begin = Money::ZERO;
+            self.scope_blocked = true;
+            return;
+        }
+        self.scope_blocked = false;
         let q = LedgerQuery {
-            code: self.code.trim().to_string(),
+            code: code.clone(),
             include_children: self.include_children,
             aux: None,
             from,
@@ -129,6 +143,12 @@ impl LedgerView {
         widgets::page_header(ui, "账簿查询", |ui| {
             ui.label(RichText::new(format!("{} {}", self.code, acct_name)).weak());
         });
+        if self.scope_blocked {
+            ui.colored_label(
+                crate::theme::palette::CREDIT,
+                format!("当前数据范围限制了科目「{}」的查看权限", self.code),
+            );
+        }
 
         widgets::toolbar(ui, |ui| {
             ui.selectable_value(&mut self.tab, Tab::Detail, "明细账");

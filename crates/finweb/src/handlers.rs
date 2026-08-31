@@ -587,8 +587,8 @@ async fn save_voucher(
     let mut v = if req.id > 0 {
         let mut existing = vouchers::get(&db, req.id)?
             .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
-        if existing.status.counts() {
-            return Err(AppError::forbidden("该凭证已参与账簿汇总，不能修改"));
+        if !existing.status.can_edit() {
+            return Err(AppError::forbidden("该凭证当前状态不能修改（已作废）"));
         }
         // 日期不能漂移到凭证期间之外（期间本身不可改，改的是日期）
         if (date.year(), date.month()) != (existing.period.year(), existing.period.month()) {

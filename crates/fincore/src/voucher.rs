@@ -37,8 +37,9 @@ impl VoucherStatus {
     pub fn counts(self) -> bool {
         self != VoucherStatus::Void
     }
+    /// 是否可编辑：草稿与已记账都可改（记录即生效，允许回改修正后重新保存）
     pub fn can_edit(self) -> bool {
-        self == VoucherStatus::Draft
+        matches!(self, VoucherStatus::Draft | VoucherStatus::Posted)
     }
     pub fn can_delete(self) -> bool {
         self == VoucherStatus::Draft

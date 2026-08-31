@@ -107,6 +107,19 @@ impl AccountView {
                     ConfirmAction::ImportAccounts,
                 );
             }
+            if ui.button("导入完整科目表").clicked() && ctx.can(Perm::AccountEdit) {
+                let list = fincore::chart::default_accounts_full();
+                let n = list.len();
+                ctx.confirm(
+                    "导入完整科目表",
+                    &format!(
+                        "将导入 {n} 个细分科目（对标金蝶/用友完整科目体系，含 1002 下银行账户细分、\n\
+                         1403 原材料细分、6601/6602/6603 期间费用明细等），已存在的编码会被覆盖。\n\
+                         不会影响已有凭证与期初余额，确定继续吗？"
+                    ),
+                    ConfirmAction::ImportAccountsFull,
+                );
+            }
             ui.separator();
             if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
                 self.export(ctx, mode);

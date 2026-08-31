@@ -379,7 +379,7 @@ impl VoucherEdit {
 
     fn save(&mut self, ctx: &mut AppCtx<'_>, keep: bool) {
         if !self.status.can_edit() {
-            ctx.error("已记账或已作废的凭证不能修改");
+            ctx.error("已作废的凭证不能修改");
             return;
         }
         let mut v = match self.to_voucher() {
@@ -413,6 +413,12 @@ impl VoucherEdit {
         if let Ok(true) = findb::vouchers::no_taken(ctx.db(), v.period, &v.word, v.no, v.id) {
             ctx.error(format!("{}-{:04} 已存在，请更换凭证号", v.word, v.no));
             return;
+        }
+
+        // 保存即生效：直接进入已记账（Posted）状态，无草稿/审核流程
+        v.status = VoucherStatus::Posted;
+        if v.posted_by.is_none() {
+            v.posted_by = Some(ctx.user().display_name.clone());
         }
 
         match findb::vouchers::save(ctx.db(), &mut v) {

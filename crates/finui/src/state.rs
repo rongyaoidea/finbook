@@ -244,6 +244,8 @@ pub enum ConfirmAction {
     AutoFillBegin,
     /// 导入内置科目表
     ImportAccounts,
+    /// 导入完整科目表（对标金蝶/用友，细分层级）
+    ImportAccountsFull,
     /// 导入内置现金流量项目
     ImportCashFlowItems,
     /// 删除固定资产卡片

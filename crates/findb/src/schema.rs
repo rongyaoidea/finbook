@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -632,6 +632,50 @@ CREATE TABLE IF NOT EXISTS price_history (
     UNIQUE(item_code, supplier_code, date)
 );
 CREATE INDEX IF NOT EXISTS idx_ph ON price_history(item_code, supplier_code);
+
+-- ===========================================================================
+-- v12：销售深化（报价单 / 发货 / 收款）
+-- ===========================================================================
+
+-- 销售报价单
+CREATE TABLE IF NOT EXISTS quotation (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL UNIQUE,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    customer_code TEXT NOT NULL DEFAULT '',
+    customer_name TEXT NOT NULL DEFAULT '',
+    item_code   TEXT NOT NULL,
+    item_name   TEXT NOT NULL DEFAULT '',
+    qty         TEXT NOT NULL DEFAULT '0',
+    unit_price  TEXT NOT NULL DEFAULT '0',
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft / approved / converted / cancelled
+    prepared_by TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_quo_period ON quotation(period);
+
+-- 销售发货记录
+CREATE TABLE IF NOT EXISTS so_shipment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_id       INTEGER NOT NULL,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    qty         TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_so_ship ON so_shipment(so_id);
+
+-- 销售收款记录
+CREATE TABLE IF NOT EXISTS so_payment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_id       INTEGER NOT NULL,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    amount      TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_so_pay ON so_payment(so_id);
 
 -- ===========================================================================
 -- v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案

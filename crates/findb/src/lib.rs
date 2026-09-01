@@ -25,6 +25,7 @@ pub mod periods;
 pub mod procurement;
 pub mod security;
 pub mod reports;
+pub mod sales;
 pub mod schema;
 pub mod summaries;
 pub mod settle;

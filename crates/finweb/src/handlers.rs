@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use axum::routing::{get, post, put};
 use chrono::{Datelike, NaiveDate};
+use serde::Deserialize;
 use fincore::{AuxRef, Entry, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
 use findb::accounts;
@@ -62,6 +63,14 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id/audit", post(voucher_audit))
         .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
+        // 发票管理
+        .route("/api/invoices", get(list_invoices).post(create_invoice))
+        .route("/api/invoices/summary", get(invoice_summary))
+        .route(
+            "/api/invoices/:id",
+            put(update_invoice).delete(delete_invoice),
+        )
+        .route("/api/invoices/:id/status", post(invoice_set_status))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
         .route("/api/reports/trial-balance", get(get_trial_balance))
@@ -724,6 +733,152 @@ async fn voucher_delete(
     vouchers::delete(&db, id)?;
     db.log(user.username(), "凭证", "删除", &format!("凭证 #{id}"))?;
     Ok(Json(json!({"ok": true})))
+}
+
+// ---------------------------------------------------------------------------
+// 发票管理
+// ---------------------------------------------------------------------------
+
+/// 发票 → 响应 JSON（金额已格式化）
+fn invoice_json(inv: &findb::invoices::Invoice) -> serde_json::Value {
+    json!({
+        "id": inv.id,
+        "kind": inv.kind,
+        "code": inv.code,
+        "number": inv.number,
+        "date": inv.date,
+        "buyer": inv.buyer,
+        "seller": inv.seller,
+        "amount_tax": inv.amount_tax.fmt_money(),
+        "amount": inv.amount.fmt_money(),
+        "tax": inv.tax.fmt_money(),
+        "tax_rate": inv.tax_rate,
+        "status": inv.status,
+        "status_label": inv.status_label(),
+        "memo": inv.memo,
+        "attach_id": inv.attach_id,
+        "created_by": inv.created_by,
+    })
+}
+
+fn invoice_from_req(r: &InvoiceReq) -> findb::invoices::Invoice {
+    findb::invoices::Invoice {
+        id: r.id,
+        kind: if r.kind.is_empty() { "in".to_string() } else { r.kind.clone() },
+        code: r.code.clone(),
+        number: r.number.clone(),
+        date: r.date.clone(),
+        buyer: r.buyer.clone(),
+        seller: r.seller.clone(),
+        amount_tax: parse_money(&r.amount_tax),
+        amount: parse_money(&r.amount),
+        tax: parse_money(&r.tax),
+        tax_rate: r.tax_rate.clone(),
+        status: if r.status.is_empty() { "pending".to_string() } else { r.status.clone() },
+        memo: r.memo.clone(),
+        attach_id: 0,
+        created_by: String::new(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    }
+}
+
+async fn list_invoices(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<InvoiceListQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.pool.get()?;
+    let rows = findb::invoices::list(
+        &db,
+        &findb::invoices::InvoiceQuery {
+            kind: if q.kind.is_empty() { None } else { Some(q.kind) },
+            status: if q.status.is_empty() { None } else { Some(q.status) },
+            keyword: if q.keyword.is_empty() { None } else { Some(q.keyword) },
+            limit: None,
+        },
+    )?;
+    let items: Vec<serde_json::Value> = rows.iter().map(invoice_json).collect();
+    Ok(Json(json!({ "rows": items, "total": items.len() })))
+}
+
+async fn invoice_summary(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.pool.get()?;
+    let sum = findb::invoices::summary(&db)?;
+    let by_kind: serde_json::Map<String, serde_json::Value> = sum
+        .into_iter()
+        .map(|(k, tax_total, tax_amt, n)| {
+            (
+                k.clone(),
+                json!({ "amount_tax": tax_total.fmt_money(), "tax": tax_amt.fmt_money(), "count": n }),
+            )
+        })
+        .collect();
+    Ok(Json(json!({ "by_kind": by_kind })))
+}
+
+async fn create_invoice(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<InvoiceReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.pool.get()?;
+    let inv = invoice_from_req(&req);
+    let id = findb::invoices::insert(&db, &inv, user.username())?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn update_invoice(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<InvoiceReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherEdit)?;
+    let db = state.pool.get()?;
+    let mut inv = invoice_from_req(&req);
+    inv.id = id;
+    findb::invoices::update(&db, &inv)?;
+    db.log(user.username(), "发票", "更新", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_invoice(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherDelete)?;
+    let db = state.pool.get()?;
+    findb::invoices::delete(&db, id)?;
+    db.log(user.username(), "发票", "删除", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn invoice_set_status(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<InvoiceStatusReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherEdit)?;
+    let db = state.pool.get()?;
+    let inv = findb::invoices::set_status(&db, id, &req.status, user.username())?;
+    Ok(Json(invoice_json(&inv)))
+}
+
+/// 发票列表查询参数
+#[derive(Deserialize, Default)]
+pub struct InvoiceListQuery {
+    pub kind: String,
+    pub status: String,
+    pub keyword: String,
 }
 
 // ---------------------------------------------------------------------------

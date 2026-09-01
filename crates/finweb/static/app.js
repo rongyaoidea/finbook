@@ -178,6 +178,7 @@ function render() {
   const nav = [
     { id: "dashboard", label: "仪表盘", perm: null },
     { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
+    { id: "invoices", label: "发票管理", perm: "report" },
     { id: "ledger", label: "明细账", perm: "report" },
     { id: "reports", label: "报表中心", perm: "report" },
     { id: "security", label: "安全中心", perm: "user_manage" },
@@ -221,6 +222,7 @@ function renderMain() {
   switch (state.view) {
     case "dashboard": return viewDashboard(main);
     case "vouchers": return viewVouchers(main);
+    case "invoices": return viewInvoices(main);
     case "ledger": return viewLedger(main);
     case "reports": return viewReports(main);
     case "security": return viewSecurity(main);
@@ -414,6 +416,182 @@ async function openVoucherEditor(id) {
   $("#v-close", mask).onclick = closeModal;
 }
 function today() { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
+
+// ===========================================================================
+// 发票管理
+// ===========================================================================
+let invoiceCache = null;
+
+async function loadInvoices(filter) {
+  const q = new URLSearchParams();
+  if (filter && filter.kind) q.set("kind", filter.kind);
+  if (filter && filter.status) q.set("status", filter.status);
+  if (filter && filter.keyword) q.set("keyword", filter.keyword);
+  const s = q.toString();
+  const data = await api(`/invoices${s ? "?" + s : ""}`);
+  // 汇总卡片：单独拉取（始终全量）
+  let summary = {};
+  try { summary = await api("/invoices/summary"); } catch (e) {}
+  data.summary = (summary && summary.by_kind) || {};
+  invoiceCache = data;
+  return data;
+}
+
+async function viewInvoices(main) {
+  main.innerHTML = `<h2>发票管理</h2><div class="muted">加载中…</div>`;
+  let d;
+  try { d = await loadInvoices(); } catch (e) { main.innerHTML = `<h2>发票管理</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  renderInvoices(main, d);
+}
+
+function renderInvoices(main, d) {
+  const rows = (d && d.rows) || [];
+  const sum = (d && d.summary) || {};
+  const statusBadge = (s) => {
+    if (s === "verified") return `<span class="tag ok">已认证</span>`;
+    if (s === "rejected") return `<span class="tag err">已作废</span>`;
+    return `<span class="tag warn">待认证</span>`;
+  };
+  const kindLabel = (k) => (k === "out" ? "销项" : "进项");
+  main.innerHTML = `
+    <h2>发票管理</h2>
+    <div class="cards" style="margin-bottom:14px">
+      <div class="card"><div class="k">发票总数</div><div class="v">${rows.length}</div></div>
+      <div class="card"><div class="k">进项价税合计</div><div class="v" style="font-size:18px">${esc((sum.in && sum.in.amount_tax) || "0.00")}</div></div>
+      <div class="card"><div class="k">销项价税合计</div><div class="v" style="font-size:18px">${esc((sum.out && sum.out.amount_tax) || "0.00")}</div></div>
+    </div>
+    <div class="toolbar">
+      <input id="inv-kw" placeholder="号码 / 代码 / 购销方" style="width:180px" />
+      <select id="inv-kind">
+        <option value="">全部类型</option>
+        <option value="in">进项</option>
+        <option value="out">销项</option>
+      </select>
+      <select id="inv-status">
+        <option value="">全部状态</option>
+        <option value="pending">待认证</option>
+        <option value="verified">已认证</option>
+        <option value="rejected">已作废</option>
+      </select>
+      <button class="btn" id="inv-query">查询</button>
+      <div class="spacer"></div>
+      ${can("voucher_new") ? `<button class="btn primary" id="inv-new">新增发票</button>` : ""}
+    </div>
+    <div class="panel" style="padding:0;overflow:hidden">
+      <table class="grid">
+        <thead><tr>
+          <th>类型</th><th>发票号码</th><th>开票日期</th><th>购买方</th><th>销售方</th>
+          <th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((r) => `
+            <tr>
+              <td>${kindLabel(r.kind)}</td>
+              <td>${esc(r.number)}</td>
+              <td>${esc(r.date)}</td>
+              <td>${esc(r.buyer)}</td>
+              <td>${esc(r.seller)}</td>
+              <td class="num">${esc(r.amount)}</td>
+              <td class="num">${esc(r.tax)}</td>
+              <td class="num">${esc(r.amount_tax)}</td>
+              <td>${statusBadge(r.status)}</td>
+              <td class="row-actions">
+                ${can("voucher_edit") ? `<button class="btn sm ghost" data-act="edit" data-id="${r.id}">编辑</button>` : ""}
+                ${r.status === "pending" && can("voucher_edit") ? `<button class="btn sm ghost" data-act="verify" data-id="${r.id}">认证</button>` : ""}
+                ${r.status !== "rejected" && can("voucher_edit") ? `<button class="btn sm ghost" data-act="reject" data-id="${r.id}">作废</button>` : ""}
+                ${can("voucher_delete") ? `<button class="btn sm ghost" data-act="del" data-id="${r.id}">删除</button>` : ""}
+              </td>
+            </tr>`).join("") : `<tr><td colspan="10" class="muted" style="text-align:center;padding:18px">暂无发票</td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
+  $("#inv-query").addEventListener("click", async () => {
+    const d2 = await loadInvoices({ kind: $("#inv-kind").value, status: $("#inv-status").value, keyword: $("#inv-kw").value });
+    renderInvoices(main, d2);
+  });
+  if ($("#inv-new")) $("#inv-new").addEventListener("click", () => openInvoiceEditor(main, null));
+  $all("[data-act]", main).forEach((b) => b.addEventListener("click", async () => {
+    const id = parseInt(b.dataset.id, 10);
+    const act = b.dataset.act;
+    try {
+      if (act === "edit") {
+        const list = (await loadInvoices()).rows || [];
+        const inv = list.find((x) => x.id === id);
+        if (inv) openInvoiceEditor(main, inv);
+      } else if (act === "verify") {
+        const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "verified" }) });
+        if (up) { toast("已认证", "ok"); renderInvoices(main, await loadInvoices()); }
+      } else if (act === "reject") {
+        if (!confirm("确定作废该发票？")) return;
+        const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rejected" }) });
+        if (up) { toast("已作废", "ok"); renderInvoices(main, await loadInvoices()); }
+      } else if (act === "del") {
+        if (!confirm("确定删除该发票？")) return;
+        await api(`/invoices/${id}`, { method: "DELETE" });
+        toast("已删除", "ok");
+        renderInvoices(main, await loadInvoices());
+      }
+    } catch (e) { toast(e.message, "err"); }
+  }));
+}
+
+function openInvoiceEditor(main, inv) {
+  const isEdit = !!inv;
+  const mask = modal(`
+    <h3>${isEdit ? "编辑发票" : "新增发票"}</h3>
+    <div class="field"><label>类型</label>
+      <select id="inv-kind2">
+        <option value="in" ${!isEdit || inv.kind === "in" ? "selected" : ""}>进项</option>
+        <option value="out" ${isEdit && inv.kind === "out" ? "selected" : ""}>销项</option>
+      </select>
+    </div>
+    <div class="field"><label>发票代码</label><input id="inv-code" value="${esc(inv ? inv.code : "")}" /></div>
+    <div class="field"><label>发票号码 *</label><input id="inv-number" value="${esc(inv ? inv.number : "")}" /></div>
+    <div class="field"><label>开票日期</label><input id="inv-date" value="${esc(inv ? inv.date : today())}" /></div>
+    <div class="field"><label>购买方</label><input id="inv-buyer" value="${esc(inv ? inv.buyer : "")}" /></div>
+    <div class="field"><label>销售方</label><input id="inv-seller" value="${esc(inv ? inv.seller : "")}" /></div>
+    <div class="field"><label>价税合计</label><input id="inv-amt" value="${esc(inv ? inv.amount_tax : "0")}" /></div>
+    <div class="field"><label>不含税金额</label><input id="inv-amount" value="${esc(inv ? inv.amount : "0")}" /></div>
+    <div class="field"><label>税额</label><input id="inv-tax" value="${esc(inv ? inv.tax : "0")}" /></div>
+    <div class="field"><label>税率（如 0.13）</label><input id="inv-rate" value="${esc(inv ? inv.tax_rate : "0")}" /></div>
+    <div class="field"><label>备注</label><input id="inv-memo" value="${esc(inv ? inv.memo : "")}" /></div>
+    <div class="foot">
+      <button class="btn ghost" id="inv-close">取消</button>
+      <button class="btn primary" id="inv-save">保存</button>
+    </div>
+  `, true);
+  $("#inv-close").addEventListener("click", closeModal);
+  $("#inv-save").addEventListener("click", async () => {
+    const number = $("#inv-number").value.trim();
+    if (!number) { toast("发票号码必填", "err"); return; }
+    const body = {
+      id: isEdit ? inv.id : 0,
+      kind: $("#inv-kind2").value,
+      code: $("#inv-code").value.trim(),
+      number,
+      date: $("#inv-date").value.trim(),
+      buyer: $("#inv-buyer").value.trim(),
+      seller: $("#inv-seller").value.trim(),
+      amount_tax: $("#inv-amt").value.trim() || "0",
+      amount: $("#inv-amount").value.trim() || "0",
+      tax: $("#inv-tax").value.trim() || "0",
+      tax_rate: $("#inv-rate").value.trim() || "0",
+      status: isEdit ? inv.status : "pending",
+      memo: $("#inv-memo").value.trim(),
+    };
+    try {
+      if (isEdit) {
+        await api(`/invoices/${inv.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        toast("已保存", "ok");
+      } else {
+        await api("/invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        toast("已新增", "ok");
+      }
+      closeModal();
+      renderInvoices(main, await loadInvoices());
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
 
 // ===========================================================================
 // 明细账

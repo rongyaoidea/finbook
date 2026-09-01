@@ -415,6 +415,29 @@ CREATE TABLE IF NOT EXISTS login_attempt (
     ok       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_attempt_user ON login_attempt(username, ts);
+
+-- 发票管理（进项/销项发票台账）
+CREATE TABLE IF NOT EXISTS invoice (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL DEFAULT 'in',      -- in=进项 / out=销项
+    code        TEXT NOT NULL DEFAULT '',        -- 发票代码
+    number      TEXT NOT NULL,                   -- 发票号码
+    date        TEXT NOT NULL,                   -- 开票日期
+    buyer       TEXT NOT NULL DEFAULT '',        -- 购买方名称
+    seller      TEXT NOT NULL DEFAULT '',        -- 销售方名称
+    amount_tax  TEXT NOT NULL DEFAULT '0',       -- 价税合计
+    amount      TEXT NOT NULL DEFAULT '0',       -- 不含税金额
+    tax         TEXT NOT NULL DEFAULT '0',       -- 税额
+    tax_rate    TEXT NOT NULL DEFAULT '0',       -- 税率
+    status      TEXT NOT NULL DEFAULT 'pending', -- pending=待认证 / verified=已认证 / rejected=已作废
+    memo        TEXT NOT NULL DEFAULT '',
+    attach_id   INTEGER NOT NULL DEFAULT 0,      -- 关联凭证附件（可选）
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_invoice_kind ON invoice(kind, date);
+CREATE INDEX IF NOT EXISTS idx_invoice_number ON invoice(number);
 "#;
 
 /// v1 → v2 需要新增到既有表上的列

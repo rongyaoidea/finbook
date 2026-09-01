@@ -145,6 +145,34 @@ pub struct SaveVoucherReq {
     pub entries: Vec<VoucherEntryDto>,
 }
 
+/// 发票新增/更新请求
+#[derive(Deserialize, Default)]
+pub struct InvoiceReq {
+    pub id: i64,
+    /// in / out
+    pub kind: String,
+    pub code: String,
+    pub number: String,
+    pub date: String,
+    pub buyer: String,
+    pub seller: String,
+    /// 价税合计（十进制字符串）
+    pub amount_tax: String,
+    /// 不含税金额
+    pub amount: String,
+    /// 税额
+    pub tax: String,
+    pub tax_rate: String,
+    pub status: String,
+    pub memo: String,
+}
+
+/// 发票状态流转请求
+#[derive(Deserialize)]
+pub struct InvoiceStatusReq {
+    pub status: String,
+}
+
 /// 凭证列表项（轻量，不含分录明细）
 #[derive(Serialize)]
 pub struct VoucherListItem {

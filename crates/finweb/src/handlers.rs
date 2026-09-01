@@ -1565,6 +1565,7 @@ async fn post_routing(
         .map(|d| advanced::RoutingOp {
             id: 0,
             item_code: item.clone(),
+            version: String::new(),
             seq: d.seq,
             op_code: d.op_code,
             op_name: d.op_name,

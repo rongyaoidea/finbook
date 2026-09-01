@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -589,15 +589,16 @@ CREATE INDEX IF NOT EXISTS idx_bom_log ON bom_change_log(parent_code);
 CREATE TABLE IF NOT EXISTS routing (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     item_code   TEXT NOT NULL,              -- 产成品存货 code
+    version     TEXT NOT NULL DEFAULT '',   -- v10: 工艺版本
     seq         INTEGER NOT NULL DEFAULT 0, -- 工序顺序
     op_code     TEXT NOT NULL DEFAULT '',   -- 工序编码
     op_name     TEXT NOT NULL DEFAULT '',   -- 工序名称
     work_center TEXT NOT NULL DEFAULT '',   -- 工作中心
     std_hours   TEXT NOT NULL DEFAULT '0',  -- 标准工时（小时）
     rate        TEXT NOT NULL DEFAULT '0',  -- 小时费率（人工/制造费用）
-    UNIQUE(item_code, seq)
+    UNIQUE(item_code, version, seq)
 );
-CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code);
+CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code, version);
 
 -- 生产订单工序进度（报工记录）
 CREATE TABLE IF NOT EXISTS prod_op (
@@ -606,6 +607,7 @@ CREATE TABLE IF NOT EXISTS prod_op (
     routing_id  INTEGER NOT NULL DEFAULT 0,
     op_name     TEXT NOT NULL DEFAULT '',
     work_center TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',   -- v10: 派工工人
     qty_done    TEXT NOT NULL DEFAULT '0',  -- 累计完工数量
     hours       TEXT NOT NULL DEFAULT '0',  -- 累计实际工时
     status      TEXT NOT NULL DEFAULT 'pending', -- pending / in_progress / done
@@ -902,6 +904,37 @@ fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// v9 → v10：routing 表 UNIQUE 从 (item_code,seq) 扩展为 (item_code,version,seq)，
+/// 需重建；prod_op 补 worker 列。
+fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
+    if column_exists(conn, "routing", "version")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE routing_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_code   TEXT NOT NULL,
+            version     TEXT NOT NULL DEFAULT '',
+            seq         INTEGER NOT NULL DEFAULT 0,
+            op_code     TEXT NOT NULL DEFAULT '',
+            op_name     TEXT NOT NULL DEFAULT '',
+            work_center TEXT NOT NULL DEFAULT '',
+            std_hours   TEXT NOT NULL DEFAULT '0',
+            rate        TEXT NOT NULL DEFAULT '0',
+            UNIQUE(item_code, version, seq)
+         );
+         INSERT INTO routing_new(id,item_code,version,seq,op_code,op_name,work_center,std_hours,rate)
+             SELECT id,item_code,'',seq,op_code,op_name,work_center,std_hours,rate FROM routing;
+         DROP TABLE routing;
+         ALTER TABLE routing_new RENAME TO routing;
+         CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code, version);",
+    )?;
+    if !column_exists(conn, "prod_op", "worker")? {
+        conn.execute("ALTER TABLE prod_op ADD COLUMN worker TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    Ok(())
+}
+
 /// 初始化 schema（幂等）
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
@@ -926,6 +959,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
         migrate_v7(conn)?;
         migrate_generic(conn, MIGRATE_V8)?;
         migrate_v9(conn)?;
+        migrate_v10(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

@@ -28,6 +28,7 @@ fn read_m(s: &str) -> Money {
 pub struct RoutingOp {
     pub id: i64,
     pub item_code: String,
+    pub version: String,
     pub seq: i32,
     pub op_code: String,
     pub op_name: String,
@@ -40,40 +41,63 @@ fn map_routing(r: &rusqlite::Row) -> rusqlite::Result<RoutingOp> {
     Ok(RoutingOp {
         id: r.get(0)?,
         item_code: r.get(1)?,
-        seq: r.get(2)?,
-        op_code: r.get(3)?,
-        op_name: r.get(4)?,
-        work_center: r.get(5)?,
-        std_hours: read_m(&r.get::<_, String>(6)?),
-        rate: read_m(&r.get::<_, String>(7)?),
+        version: r.get(2)?,
+        seq: r.get(3)?,
+        op_code: r.get(4)?,
+        op_name: r.get(5)?,
+        work_center: r.get(6)?,
+        std_hours: read_m(&r.get::<_, String>(7)?),
+        rate: read_m(&r.get::<_, String>(8)?),
     })
 }
 
-const RT_COLS: &str = "id,item_code,seq,op_code,op_name,work_center,std_hours,rate";
+const RT_COLS: &str = "id,item_code,version,seq,op_code,op_name,work_center,std_hours,rate";
 
 pub fn routing_list(db: &Db, item_code: &str) -> DbResult<Vec<RoutingOp>> {
+    routing_list_version(db, item_code, "")
+}
+
+/// 按版本列工艺路线（version 为空 = 默认版本）
+pub fn routing_list_version(db: &Db, item_code: &str, version: &str) -> DbResult<Vec<RoutingOp>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {RT_COLS} FROM routing WHERE item_code=?1 AND version=?2 ORDER BY seq"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![item_code, version], map_routing)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 某产品的全部工艺版本
+pub fn routing_versions(db: &Db, item_code: &str) -> DbResult<Vec<String>> {
     let mut st = db
         .conn()
-        .prepare(&format!("SELECT {RT_COLS} FROM routing WHERE item_code=?1 ORDER BY seq"))?;
+        .prepare("SELECT DISTINCT version FROM routing WHERE item_code=?1 ORDER BY version")?;
     let rows = st
-        .query_map(rusqlite::params![item_code], map_routing)?
+        .query_map(rusqlite::params![item_code], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
 /// 整单保存某产品的工艺路线（先删后插，事务保证原子性）
 pub fn routing_save(db: &Db, item_code: &str, ops: &[RoutingOp]) -> DbResult<()> {
+    routing_save_version(db, item_code, "", ops)
+}
+
+/// 带版本保存工艺路线
+pub fn routing_save_version(db: &Db, item_code: &str, version: &str, ops: &[RoutingOp]) -> DbResult<()> {
     let tx = db.conn().unchecked_transaction()?;
     tx.execute(
-        "DELETE FROM routing WHERE item_code=?1",
-        rusqlite::params![item_code],
+        "DELETE FROM routing WHERE item_code=?1 AND version=?2",
+        rusqlite::params![item_code, version],
     )?;
     for op in ops {
         tx.execute(
-            "INSERT INTO routing(item_code,seq,op_code,op_name,work_center,std_hours,rate)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO routing(item_code,version,seq,op_code,op_name,work_center,std_hours,rate)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![
                 item_code,
+                version,
                 op.seq,
                 op.op_code,
                 op.op_name,
@@ -88,11 +112,81 @@ pub fn routing_save(db: &Db, item_code: &str, ops: &[RoutingOp]) -> DbResult<()>
 }
 
 pub fn routing_delete(db: &Db, item_code: &str) -> DbResult<()> {
+    routing_delete_version(db, item_code, "")
+}
+
+/// 删除指定版本的工艺路线
+pub fn routing_delete_version(db: &Db, item_code: &str, version: &str) -> DbResult<()> {
     db.conn().execute(
-        "DELETE FROM routing WHERE item_code=?1",
-        rusqlite::params![item_code],
+        "DELETE FROM routing WHERE item_code=?1 AND version=?2",
+        rusqlite::params![item_code, version],
     )?;
     Ok(())
+}
+
+/// 工艺统计：某产品的工序数、标准工时合计、标准成本合计
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RoutingStats {
+    pub item_code: String,
+    pub op_count: usize,
+    pub total_hours: Money,
+    pub total_cost: Money,
+}
+
+/// 工艺统计（默认版本）
+pub fn routing_stats(db: &Db, item_code: &str) -> DbResult<RoutingStats> {
+    let ops = routing_list(db, item_code)?;
+    let total_hours: Money = ops.iter().map(|o| o.std_hours).sum();
+    let total_cost: Money = ops.iter().map(|o| o.std_hours * o.rate.inner()).sum();
+    Ok(RoutingStats {
+        item_code: item_code.to_string(),
+        op_count: ops.len(),
+        total_hours,
+        total_cost,
+    })
+}
+
+/// 工艺导入：JSON 数组 [{seq,op_code,op_name,work_center,std_hours,rate},...]
+pub fn routing_import_json(db: &Db, item_code: &str, version: &str, json: &str) -> DbResult<usize> {
+    #[derive(serde::Deserialize)]
+    struct RawOp {
+        #[serde(default)]
+        seq: i32,
+        #[serde(default)]
+        op_code: String,
+        #[serde(default)]
+        op_name: String,
+        #[serde(default)]
+        work_center: String,
+        #[serde(default)]
+        std_hours: String,
+        #[serde(default)]
+        rate: String,
+    }
+    let raw: Vec<RawOp> = serde_json::from_str(json)
+        .map_err(|e| FinError::msg(format!("工艺 JSON 解析失败：{e}")))?;
+    let ops: Vec<RoutingOp> = raw
+        .into_iter()
+        .map(|r| RoutingOp {
+            id: 0,
+            item_code: item_code.to_string(),
+            version: version.to_string(),
+            seq: r.seq,
+            op_code: r.op_code,
+            op_name: r.op_name,
+            work_center: r.work_center,
+            std_hours: Money::parse_or_zero(&r.std_hours),
+            rate: Money::parse_or_zero(&r.rate),
+        })
+        .collect();
+    routing_save_version(db, item_code, version, &ops)?;
+    Ok(ops.len())
+}
+
+/// 工艺导出：整条路线序列化为 JSON
+pub fn routing_export_json(db: &Db, item_code: &str, version: &str) -> DbResult<String> {
+    let ops = routing_list_version(db, item_code, version)?;
+    serde_json::to_string(&ops).map_err(|e| FinError::msg(format!("序列化失败：{e}")).into())
 }
 
 // ===========================================================================
@@ -106,6 +200,7 @@ pub struct ProdOp {
     pub routing_id: i64,
     pub op_name: String,
     pub work_center: String,
+    pub worker: String,
     pub qty_done: Money,
     pub hours: Money,
     pub status: String, // pending / in_progress / done
@@ -119,14 +214,15 @@ fn map_prod_op(r: &rusqlite::Row) -> rusqlite::Result<ProdOp> {
         routing_id: r.get(2)?,
         op_name: r.get(3)?,
         work_center: r.get(4)?,
-        qty_done: read_m(&r.get::<_, String>(5)?),
-        hours: read_m(&r.get::<_, String>(6)?),
-        status: r.get(7)?,
-        memo: r.get(8)?,
+        worker: r.get(5)?,
+        qty_done: read_m(&r.get::<_, String>(6)?),
+        hours: read_m(&r.get::<_, String>(7)?),
+        status: r.get(8)?,
+        memo: r.get(9)?,
     })
 }
 
-const PO_COLS: &str = "id,po_id,routing_id,op_name,work_center,qty_done,hours,status,memo";
+const PO_COLS: &str = "id,po_id,routing_id,op_name,work_center,worker,qty_done,hours,status,memo";
 
 /// 生产订单开工时按工艺路线生成工序清单
 pub fn prod_op_init_from_routing(db: &Db, po_id: i64, item_code: &str) -> DbResult<usize> {
@@ -146,8 +242,8 @@ pub fn prod_op_init_from_routing(db: &Db, po_id: i64, item_code: &str) -> DbResu
     let tx = db.conn().unchecked_transaction()?;
     for op in &ops {
         tx.execute(
-            "INSERT INTO prod_op(po_id,routing_id,op_name,work_center,qty_done,hours,status,memo)
-             VALUES(?1,?2,?3,?4,'0','0','pending','')",
+            "INSERT INTO prod_op(po_id,routing_id,op_name,work_center,worker,qty_done,hours,status,memo)
+             VALUES(?1,?2,?3,?4,'','0','0','pending','')",
             rusqlite::params![po_id, op.id, op.op_name, op.work_center],
         )?;
     }
@@ -206,6 +302,48 @@ pub fn prod_op_finish(db: &Db, op_id: i64) -> DbResult<()> {
         rusqlite::params![op_id],
     )?;
     Ok(())
+}
+
+/// 工序派工：把工人分配到某道工序
+pub fn prod_op_dispatch(db: &Db, op_id: i64, worker: &str) -> DbResult<()> {
+    if worker.trim().is_empty() {
+        return Err(FinError::msg("派工工人不能为空").into());
+    }
+    db.conn().execute(
+        "UPDATE prod_op SET worker=?2 WHERE id=?1",
+        rusqlite::params![op_id, worker],
+    )?;
+    Ok(())
+}
+
+/// 生产进度：完工工序数 / 总工序数
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProdProgress {
+    pub po_id: i64,
+    pub total_ops: usize,
+    pub done_ops: usize,
+    pub in_progress_ops: usize,
+    /// 进度百分比（0~100）
+    pub percent: Money,
+}
+
+pub fn prod_progress(db: &Db, po_id: i64) -> DbResult<ProdProgress> {
+    let ops = prod_op_list(db, po_id)?;
+    let total = ops.len();
+    let done = ops.iter().filter(|o| o.status == "done").count();
+    let in_prog = ops.iter().filter(|o| o.status == "in_progress").count();
+    let percent = if total == 0 {
+        Money::ZERO
+    } else {
+        (Money::from_i64(done as i64) * Money::from_i64(100) / Money::from_i64(total as i64)).round2()
+    };
+    Ok(ProdProgress {
+        po_id,
+        total_ops: total,
+        done_ops: done,
+        in_progress_ops: in_prog,
+        percent,
+    })
 }
 
 /// 按工时 × 费率归集工序成本到生产订单（写入 prod_cost 的 labor/overhead）
@@ -1371,6 +1509,7 @@ mod tests {
                 RoutingOp {
                     id: 0,
                     item_code: "FG01".into(),
+                    version: String::new(),
                     seq: 1,
                     op_code: "OP1".into(),
                     op_name: "下料".into(),
@@ -1381,6 +1520,7 @@ mod tests {
                 RoutingOp {
                     id: 0,
                     item_code: "FG01".into(),
+                    version: String::new(),
                     seq: 2,
                     op_code: "OP2".into(),
                     op_name: "装配".into(),
@@ -1394,6 +1534,80 @@ mod tests {
         let ops = routing_list(&db, "FG01").unwrap();
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[1].op_name, "装配");
+    }
+
+    #[test]
+    fn routing_version_and_stats() {
+        let db = tmpdb("rtver");
+        routing_save_version(
+            &db,
+            "FG01",
+            "v1",
+            &[RoutingOp {
+                id: 0, item_code: "FG01".into(), version: "v1".into(), seq: 1,
+                op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
+                std_hours: m("2"), rate: m("50"),
+            }],
+        )
+        .unwrap();
+        routing_save_version(
+            &db,
+            "FG01",
+            "v2",
+            &[RoutingOp {
+                id: 0, item_code: "FG01".into(), version: "v2".into(), seq: 1,
+                op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
+                std_hours: m("4"), rate: m("50"),
+            }],
+        )
+        .unwrap();
+        assert_eq!(routing_versions(&db, "FG01").unwrap().len(), 2);
+        assert_eq!(routing_list_version(&db, "FG01", "v1").unwrap()[0].std_hours, m("2"));
+        // 统计（默认版本）
+        let st = routing_stats(&db, "FG01").unwrap();
+        assert_eq!(st.op_count, 0); // 默认版本为空
+        // 导入导出
+        let json = routing_export_json(&db, "FG01", "v1").unwrap();
+        assert!(json.contains("OP1"));
+        let n = routing_import_json(&db, "FG01", "v3", &json).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(routing_list_version(&db, "FG01", "v3").unwrap()[0].op_code, "OP1");
+    }
+
+    #[test]
+    fn dispatch_and_progress() {
+        let db = tmpdb("dispatch");
+        // 建生产订单 + 工艺路线 + 生成工序
+        let p = Period::new(2026, 1).unwrap();
+        let mut order = crate::scm::ProductionOrder {
+            id: 0, no: "SC2026010001".into(), period: p,
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            item_code: "FG01".into(), item_name: "成品".into(),
+            planned_qty: m("10"), completed_qty: m("0"),
+            status: crate::scm::ProdStatus::Released,
+            work_center: "WC1".into(), prepared_by: "u".into(), memo: String::new(),
+        };
+        order.no = crate::scm::prod_next_no(&db, p).unwrap();
+        let po_id = crate::scm::prod_save(&db, &mut order).unwrap();
+        routing_save(&db, "FG01", &[
+            RoutingOp { id: 0, item_code: "FG01".into(), version: String::new(), seq: 1,
+                op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
+                std_hours: m("2"), rate: m("50") },
+            RoutingOp { id: 0, item_code: "FG01".into(), version: String::new(), seq: 2,
+                op_code: "OP2".into(), op_name: "装配".into(), work_center: "WC2".into(),
+                std_hours: m("3"), rate: m("60") },
+        ]).unwrap();
+        prod_op_init_from_routing(&db, po_id, "FG01").unwrap();
+        let ops = prod_op_list(&db, po_id).unwrap();
+        assert_eq!(ops.len(), 2);
+        // 派工
+        prod_op_dispatch(&db, ops[0].id, "张三").unwrap();
+        assert_eq!(prod_op_list(&db, po_id).unwrap()[0].worker, "张三");
+        // 完工一道 → 进度 50%
+        prod_op_finish(&db, ops[0].id).unwrap();
+        let prog = prod_progress(&db, po_id).unwrap();
+        assert_eq!(prog.done_ops, 1);
+        assert_eq!(prog.percent, m("50"));
     }
 
     #[test]

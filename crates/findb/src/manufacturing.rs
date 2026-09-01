@@ -167,6 +167,51 @@ fn get_item_cost(db: &Db, item_code: &str, period_ymm: i32) -> DbResult<Money> {
 }
 
 // ===========================================================================
+// 退料管理
+// ===========================================================================
+
+/// 生产退料：把某物料的一部分退回库存（冲减领料）。
+/// 生成一条「其他入库」流水，数量为正、金额按最近采购价。
+pub fn prod_return_materials(
+    db: &Db,
+    po_id: i64,
+    return_date: NaiveDate,
+    period: Period,
+    item_code: &str,
+    qty: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    use crate::business::{stock_insert, StockMove, StockKind};
+
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::msg("生产订单不存在"))?;
+    if order.status != ProdStatus::InProgress && order.status != ProdStatus::Released {
+        return Err(FinError::msg("只有已下达/进行中的订单能退料").into());
+    }
+    if qty.is_negative() || qty.is_zero() {
+        return Err(FinError::msg("退料数量必须为正数").into());
+    }
+    let unit_cost = get_item_cost(db, item_code, period.ymm())?;
+    let amount = (qty * unit_cost).round2();
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: return_date,
+            kind: StockKind::OtherIn,
+            item: item_code.to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty,
+            price: unit_cost,
+            amount,
+            voucher_id: None,
+            memo: format!("生产退料 PO#{} {}", order.no, memo),
+        },
+    )
+}
+
+// ===========================================================================
 // 完工入库
 // ===========================================================================
 

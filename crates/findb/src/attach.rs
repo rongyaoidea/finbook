@@ -16,6 +16,17 @@ use crate::{Db, DbResult};
 /// 内联存储的大小上限（字节）。超过就写磁盘。
 pub const INLINE_LIMIT: usize = 256 * 1024;
 
+/// 单文件最大大小限制（10MB），防止资源耗尽攻击
+pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+
+/// 允许的文件扩展名白名单
+pub const ALLOWED_EXTENSIONS: &[&str] = &[
+    "pdf", "jpg", "jpeg", "png", "gif", "bmp", "tiff",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "txt", "csv", "zip", "rar", "7z",
+    "xml", "json", "html", "htm",
+];
+
 /// 附件目录名（位于账套文件同级）
 pub const DIR_NAME: &str = ".attachments";
 
@@ -141,7 +152,11 @@ pub fn read(db: &Db, id: i64) -> DbResult<Vec<u8>> {
             .path
             .clone()
             .ok_or_else(|| FinError::msg("附件记录缺少文件路径"))?;
-        let p = dir_of(db).join(rel);
+        // 路径安全检查：防止路径穿越攻击
+        if rel.contains("..") || rel.contains('/') || rel.contains('\\') {
+            return Err(FinError::msg("无效的附件路径").into());
+        }
+        let p = dir_of(db).join(&rel);
         let bytes = std::fs::read(&p)
             .map_err(|e| FinError::io(format!("读取附件失败（{}）：{e}", p.display())))?;
         Ok(bytes)
@@ -156,10 +171,24 @@ pub fn dir_of(db: &Db) -> PathBuf {
 
 /// 新增附件。返回 id。
 pub fn add(db: &Db, voucher_id: i64, name: &str, data: &[u8], who: &str) -> DbResult<i64> {
+    // 大小校验：防止超大文件导致内存/磁盘耗尽
+    if data.len() > MAX_FILE_SIZE {
+        return Err(FinError::msg(format!(
+            "附件「{name}」超过大小限制（最大 {}MB）",
+            MAX_FILE_SIZE / 1024 / 1024
+        )).into());
+    }
+    // 扩展名校验：白名单防止执行恶意文件上传
     let kind = Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+    if !kind.is_empty() && !ALLOWED_EXTENSIONS.contains(&kind.as_str()) {
+        return Err(FinError::msg(format!(
+            "不允许的附件类型「.{kind}」，仅支持：{}",
+            ALLOWED_EXTENSIONS.join(", ")
+        )).into());
+    }
     let sha = sha256(data);
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let inline = data.len() <= INLINE_LIMIT;
@@ -206,6 +235,10 @@ pub fn delete(db: &Db, id: i64) -> DbResult<()> {
     if let Some(a) = a {
         if !a.inline {
             if let Some(rel) = a.path {
+                // 路径安全检查
+                if rel.contains("..") || rel.contains('/') || rel.contains('\\') {
+                    return Err(FinError::msg("无效的附件路径").into());
+                }
                 let p = dir_of(db).join(rel);
                 // 删不掉也不算致命错误，只是留下孤儿文件
                 let _ = std::fs::remove_file(p);

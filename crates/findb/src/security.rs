@@ -10,6 +10,10 @@ use fincore::FinError;
 
 use crate::{Db, DbResult};
 
+/// 登录失败计数窗口（分钟）：独立于锁定时长，默认 10 分钟
+/// 防止 lock_minutes×60 的误用导致窗口变成 15 小时
+pub const LOCK_WINDOW_MIN: i64 = 10;
+
 /// 一条登录尝试
 #[derive(Clone, Debug)]
 pub struct Attempt {
@@ -177,7 +181,8 @@ pub fn login(
     if !u.verify_password(password) {
         log_attempt(db, username, false)?;
         // 注意：本次失败已经写进 login_attempt 了，recent_fails 会把它算进去，别再加 1
-        let fails = recent_fails(db, username, policy.lock_minutes.max(1) * 60)?;
+        // 使用独立的失败窗口常量，不与锁定时长耦合
+        let fails = recent_fails(db, username, LOCK_WINDOW_MIN)?;
         if fails >= policy.max_fail.max(1) {
             lock_user(db, username, policy.lock_minutes)?;
             return Ok(LoginResult::Locked {

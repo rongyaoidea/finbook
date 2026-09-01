@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -516,10 +516,11 @@ CREATE TABLE IF NOT EXISTS bom (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_code TEXT NOT NULL,
     child_code  TEXT NOT NULL,
+    version     TEXT NOT NULL DEFAULT '',  -- v9: BOM 版本
     qty         TEXT NOT NULL DEFAULT '1',
     loss_rate   TEXT NOT NULL DEFAULT '0',
     seq         INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(parent_code, child_code)
+    UNIQUE(parent_code, child_code, version)
 );
 CREATE INDEX IF NOT EXISTS idx_bom_parent ON bom(parent_code);
 
@@ -552,6 +553,33 @@ CREATE TABLE IF NOT EXISTS prod_cost (
     created_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_pc_po ON prod_cost(po_id);
+
+-- ===========================================================================
+-- v9：BOM 增强（替代料 / 变更历史）
+-- ===========================================================================
+
+-- BOM 替代料（某子件可被替代料替换）
+CREATE TABLE IF NOT EXISTS bom_substitute (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_code  TEXT NOT NULL,
+    child_code   TEXT NOT NULL,
+    substitute   TEXT NOT NULL,        -- 替代料代码
+    ratio        TEXT NOT NULL DEFAULT '1', -- 替代比例（1 份原物料 = ratio 份替代料）
+    priority     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(parent_code, child_code, substitute)
+);
+CREATE INDEX IF NOT EXISTS idx_bom_sub ON bom_substitute(parent_code, child_code);
+
+-- BOM 变更历史（审计追溯）
+CREATE TABLE IF NOT EXISTS bom_change_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_code TEXT NOT NULL,
+    action      TEXT NOT NULL,         -- save / delete / add_sub / del_sub
+    detail      TEXT NOT NULL DEFAULT '',
+    changed_by  TEXT NOT NULL DEFAULT '',
+    changed_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bom_log ON bom_change_log(parent_code);
 
 -- ===========================================================================
 -- v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
@@ -848,6 +876,32 @@ const MIGRATE_V8: &[(&str, &str, &str)] = &[
     ("stock_move", "batch_no", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
+/// SQLite ALTER 改不了约束，需重建表。bom_substitute / bom_change_log 为 DDL 新表。
+fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
+    if column_exists(conn, "bom", "version")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE bom_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_code TEXT NOT NULL,
+            child_code  TEXT NOT NULL,
+            version     TEXT NOT NULL DEFAULT '',
+            qty         TEXT NOT NULL DEFAULT '1',
+            loss_rate   TEXT NOT NULL DEFAULT '0',
+            seq         INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(parent_code, child_code, version)
+         );
+         INSERT INTO bom_new(id,parent_code,child_code,version,qty,loss_rate,seq)
+             SELECT id,parent_code,child_code,'',qty,loss_rate,seq FROM bom;
+         DROP TABLE bom;
+         ALTER TABLE bom_new RENAME TO bom;
+         CREATE INDEX IF NOT EXISTS idx_bom_parent ON bom(parent_code);",
+    )?;
+    Ok(())
+}
+
 /// 初始化 schema（幂等）
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
@@ -871,6 +925,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
         migrate_generic(conn, MIGRATE_V6)?;
         migrate_v7(conn)?;
         migrate_generic(conn, MIGRATE_V8)?;
+        migrate_v9(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

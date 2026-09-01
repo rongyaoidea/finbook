@@ -435,11 +435,16 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
 
 // BOM操作
 pub fn bom_list(db: &Db, parent_code: &str) -> DbResult<Vec<BomItem>> {
+    bom_list_version(db, parent_code, "")
+}
+
+/// 按版本列 BOM（version 为空 = 默认版本）
+pub fn bom_list_version(db: &Db, parent_code: &str, version: &str) -> DbResult<Vec<BomItem>> {
     let mut stmt = db.conn().prepare(
         "SELECT id, parent_code, child_code, qty, loss_rate, seq
-         FROM bom WHERE parent_code=? ORDER BY seq"
+         FROM bom WHERE parent_code=?1 AND version=?2 ORDER BY seq"
     )?;
-    let rows = stmt.query_map([parent_code], |r| Ok(BomItem {
+    let rows = stmt.query_map(rusqlite::params![parent_code, version], |r| Ok(BomItem {
         id: r.get(0)?,
         parent_code: r.get(1)?,
         child_code: r.get(2)?,
@@ -453,22 +458,202 @@ pub fn bom_list(db: &Db, parent_code: &str) -> DbResult<Vec<BomItem>> {
 }
 
 pub fn bom_save(db: &Db, parent_code: &str, children: &[(String, Money, Money)]) -> DbResult<()> {
+    bom_save_version(db, parent_code, "", children, "")
+}
+
+/// 带版本保存 BOM，并记录变更历史
+pub fn bom_save_version(db: &Db, parent_code: &str, version: &str, children: &[(String, Money, Money)], who: &str) -> DbResult<()> {
     let tx = db.conn().unchecked_transaction()?;
-    tx.execute("DELETE FROM bom WHERE parent_code=?", [parent_code])?;
+    tx.execute("DELETE FROM bom WHERE parent_code=?1 AND version=?2", rusqlite::params![parent_code, version])?;
     for (i, (child_code, qty, loss_rate)) in children.iter().enumerate() {
         tx.execute(
-            "INSERT INTO bom(parent_code, child_code, qty, loss_rate, seq) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![parent_code, child_code, qty.to_string(), loss_rate.to_string(), i as i32]
+            "INSERT INTO bom(parent_code, child_code, version, qty, loss_rate, seq) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![parent_code, child_code, version, qty.to_string(), loss_rate.to_string(), i as i32]
         )?;
+    }
+    bom_log_tx(&tx, parent_code, "save", &format!("版本 {}，{} 个子件", version, children.len()), who)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn bom_delete(db: &Db, parent_code: &str, version: &str, who: &str) -> DbResult<()> {
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute("DELETE FROM bom WHERE parent_code=?1 AND version=?2", rusqlite::params![parent_code, version])?;
+    bom_log_tx(&tx, parent_code, "delete", &format!("版本 {}", version), who)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn bom_log_tx(tx: &rusqlite::Transaction, parent_code: &str, action: &str, detail: &str, who: &str) -> DbResult<()> {
+    tx.execute(
+        "INSERT INTO bom_change_log(parent_code, action, detail, changed_by, changed_at)
+         VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            parent_code,
+            action,
+            detail,
+            who,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+/// BOM 变更历史
+pub fn bom_change_log(db: &Db, parent_code: &str) -> DbResult<Vec<(String, String, String, String)>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT action, detail, changed_by, changed_at FROM bom_change_log
+         WHERE parent_code=?1 ORDER BY id DESC"
+    )?;
+    let rows = stmt.query_map([parent_code], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows { out.push(r?); }
+    Ok(out)
+}
+
+// ===========================================================================
+// 替代料
+// ===========================================================================
+
+#[derive(Clone, Debug)]
+pub struct Substitute {
+    pub id: i64,
+    pub parent_code: String,
+    pub child_code: String,
+    pub substitute: String,
+    pub ratio: Money,
+    pub priority: i32,
+}
+
+pub fn bom_substitutes(db: &Db, parent_code: &str, child_code: &str) -> DbResult<Vec<Substitute>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, parent_code, child_code, substitute, ratio, priority
+         FROM bom_substitute WHERE parent_code=?1 AND child_code=?2 ORDER BY priority"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![parent_code, child_code], |r| Ok(Substitute {
+        id: r.get(0)?,
+        parent_code: r.get(1)?,
+        child_code: r.get(2)?,
+        substitute: r.get(3)?,
+        ratio: Money::parse_or_zero(&r.get::<_, String>(4)?),
+        priority: r.get(5)?,
+    }))?;
+    let mut out = Vec::new();
+    for r in rows { out.push(r?); }
+    Ok(out)
+}
+
+pub fn bom_substitute_save(db: &Db, s: &Substitute, who: &str) -> DbResult<i64> {
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO bom_substitute(parent_code, child_code, substitute, ratio, priority)
+         VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(parent_code, child_code, substitute) DO UPDATE SET
+             ratio=excluded.ratio, priority=excluded.priority",
+        rusqlite::params![s.parent_code, s.child_code, s.substitute, s.ratio.to_string(), s.priority],
+    )?;
+    let id: i64 = tx.query_row(
+        "SELECT id FROM bom_substitute WHERE parent_code=?1 AND child_code=?2 AND substitute=?3",
+        rusqlite::params![s.parent_code, s.child_code, s.substitute],
+        |r| r.get(0),
+    )?;
+    bom_log_tx(&tx, &s.parent_code, "add_sub", &format!("{}/{} → {}", s.child_code, s.substitute, s.ratio.fmt_qty()), who)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn bom_substitute_delete(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let parent: Option<String> = db.conn().query_row(
+        "SELECT parent_code FROM bom_substitute WHERE id=?1", [id], |r| r.get(0)).optional()?;
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute("DELETE FROM bom_substitute WHERE id=?1", [id])?;
+    if let Some(p) = parent {
+        bom_log_tx(&tx, &p, "del_sub", &format!("替代料 id={id}"), who)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+// ===========================================================================
+// 多层 BOM 展开 & 成本汇总
+// ===========================================================================
+
+/// 展开节点
+#[derive(Clone, Debug)]
+pub struct BomNode {
+    pub code: String,
+    pub level: i32,
+    /// 累计用量（1 单位顶层成品所需的该物料数量，含损耗）
+    pub qty: Money,
+}
+
+/// 多层 BOM 展开：给定顶层成品与目标产量，逐层展开成 (物料, 层级, 累计用量)。
+/// 有 BOM 的物料继续向下展开，无 BOM 的视为采购件。
+pub fn bom_explode(db: &Db, top_code: &str, top_qty: Money) -> DbResult<Vec<BomNode>> {
+    let mut out: std::collections::BTreeMap<String, BomNode> = std::collections::BTreeMap::new();
+    let mut queue: std::collections::VecDeque<(String, Money, i32)> =
+        std::collections::VecDeque::from([(top_code.to_string(), top_qty, 0)]);
+    let mut guard = 0usize;
+    while let Some((code, qty, level)) = queue.pop_front() {
+        guard += 1;
+        if guard > 10_000 {
+            return Err(fincore::FinError::msg("BOM 展开超过 10000 节点，疑似循环引用").into());
+        }
+        let e = out.entry(code.clone()).or_insert(BomNode { code: code.clone(), level, qty: Money::ZERO });
+        e.qty += qty;
+        let children = bom_list(db, &code)?;
+        if children.is_empty() {
+            continue;
+        }
+        for ch in children {
+            let eff = ch.qty * (Money::ONE + ch.loss_rate);
+            let need = (qty * eff).round_dp(fincore::money::QTY_DP);
+            queue.push_back((ch.child_code, need, level + 1));
+        }
+    }
+    let mut v: Vec<BomNode> = out.into_values().collect();
+    v.sort_by(|a, b| a.level.cmp(&b.level).then(a.code.cmp(&b.code)));
+    Ok(v)
+}
+
+/// BOM 成本汇总：按参考成本（存货档案 props.ref_cost）逐层累加物料成本。
+pub fn bom_cost_rollup(db: &Db, top_code: &str, top_qty: Money) -> DbResult<Money> {
+    let nodes = bom_explode(db, top_code, top_qty)?;
+    let mut total = Money::ZERO;
+    for n in nodes {
+        if n.code == top_code {
+            continue; // 顶层成本 = 各子件成本之和
+        }
+        let ref_cost = item_ref_cost(db, &n.code)?;
+        total += (n.qty * ref_cost).round2();
+    }
+    Ok(total)
+}
+
+fn item_ref_cost(db: &Db, item_code: &str) -> DbResult<Money> {
+    let props: Option<String> = db.conn().query_row(
+        "SELECT props_json FROM aux_entity WHERE kind='item' AND code=?1",
+        [item_code],
+        |r| r.get(0),
+    ).optional()?;
+    let Some(props) = props else {
+        return Ok(Money::ZERO);
+    };
+    let map: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&props).unwrap_or_default();
+    Ok(map.get("ref_cost").map(|s| Money::parse_or_zero(s)).unwrap_or(Money::ZERO))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::mem;
+
+    fn m(s: &str) -> Money {
+        Money::parse(s).unwrap()
+    }
     
     #[test]
     fn po_crud() {
@@ -521,6 +706,54 @@ mod tests {
         let items = bom_list(&db, "1001").unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].child_code, "140301");
+    }
+
+    #[test]
+    fn bom_version_and_log() {
+        let db = mem();
+        bom_save_version(&db, "1001", "v1", &[
+            ("140301".to_string(), m("2"), m("0")),
+        ], "u").unwrap();
+        bom_save_version(&db, "1001", "v2", &[
+            ("140301".to_string(), m("3"), m("0")),
+        ], "u").unwrap();
+        // 版本隔离
+        assert_eq!(bom_list_version(&db, "1001", "v1").unwrap()[0].qty, m("2"));
+        assert_eq!(bom_list_version(&db, "1001", "v2").unwrap()[0].qty, m("3"));
+        // 变更历史
+        let log = bom_change_log(&db, "1001").unwrap();
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn bom_explode_multilevel() {
+        let db = mem();
+        // FG = 2 × SA；SA = 3 × RM
+        bom_save(&db, "FG", &[("SA".into(), m("2"), m("0"))]).unwrap();
+        bom_save(&db, "SA", &[("RM".into(), m("3"), m("0"))]).unwrap();
+        let nodes = bom_explode(&db, "FG", m("10")).unwrap();
+        // FG 10 + SA 20 + RM 60
+        let sa = nodes.iter().find(|n| n.code == "SA").unwrap();
+        assert_eq!(sa.qty, m("20"));
+        assert_eq!(sa.level, 1);
+        let rm = nodes.iter().find(|n| n.code == "RM").unwrap();
+        assert_eq!(rm.qty, m("60"));
+        assert_eq!(rm.level, 2);
+    }
+
+    #[test]
+    fn bom_substitute_crud() {
+        let db = mem();
+        bom_substitute_save(&db, &Substitute {
+            id: 0, parent_code: "FG".into(), child_code: "RM".into(),
+            substitute: "ALT".into(), ratio: m("1.2"), priority: 0,
+        }, "u").unwrap();
+        let subs = bom_substitutes(&db, "FG", "RM").unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].ratio, m("1.2"));
+        let id = subs[0].id;
+        bom_substitute_delete(&db, id, "u").unwrap();
+        assert!(bom_substitutes(&db, "FG", "RM").unwrap().is_empty());
     }
 }
 

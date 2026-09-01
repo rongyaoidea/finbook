@@ -24,6 +24,10 @@ pub enum CostMethod {
     MovingAverage,
     /// 先进先出
     Fifo,
+    /// 个别计价（出库必须指定批次单价）
+    Specific,
+    /// 标准成本（出库按预设标准成本，差异另行处理）
+    Standard,
 }
 
 impl CostMethod {
@@ -31,21 +35,32 @@ impl CostMethod {
         match self {
             CostMethod::MovingAverage => "移动加权平均",
             CostMethod::Fifo => "先进先出",
+            CostMethod::Specific => "个别计价",
+            CostMethod::Standard => "标准成本",
         }
     }
     pub fn code(&self) -> &'static str {
         match self {
             CostMethod::MovingAverage => "moving_average",
             CostMethod::Fifo => "fifo",
+            CostMethod::Specific => "specific",
+            CostMethod::Standard => "standard",
         }
     }
     pub fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "fifo" => CostMethod::Fifo,
+            "specific" | "individual" => CostMethod::Specific,
+            "standard" => CostMethod::Standard,
             _ => CostMethod::MovingAverage,
         }
     }
-    pub const ALL: &'static [CostMethod] = &[CostMethod::MovingAverage, CostMethod::Fifo];
+    pub const ALL: &'static [CostMethod] = &[
+        CostMethod::MovingAverage,
+        CostMethod::Fifo,
+        CostMethod::Specific,
+        CostMethod::Standard,
+    ];
 }
 
 /// 出入库流水（正数入库、负数出库）
@@ -74,11 +89,40 @@ pub struct StockState {
     pub lots: Vec<Lot>,
     /// 上一次已知单价（负库存出库时用）
     last_price: Money,
+    /// 标准成本单价（Standard 方法出库用）
+    standard_cost: Money,
 }
 
 impl StockState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 设置标准成本单价（Standard 方法）
+    pub fn with_standard_cost(mut self, c: Money) -> Self {
+        self.standard_cost = c;
+        self
+    }
+
+    /// 设置标准成本单价（可变引用）
+    pub fn set_standard_cost(&mut self, c: Money) {
+        self.standard_cost = c;
+    }
+
+    /// 成本调整：在数量不变的前提下把结存金额调整为指定值，
+    /// 差额即成本调整额（正=调增，负=调减）。返回调整金额。
+    pub fn adjust_amount(&mut self, new_amount: Money) -> Result<Money, FinError> {
+        let delta = new_amount - self.amount;
+        self.amount = new_amount;
+        // 同步按比例刷新批次成本，保持 FIFO 口径不漂移
+        if !self.qty.is_zero() {
+            let unit = (new_amount / self.qty).round_dp(QTY_DP + 2);
+            for lot in &mut self.lots {
+                lot.unit_cost = unit;
+            }
+            self.last_price = unit;
+        }
+        Ok(delta.round2())
     }
 
     /// 当前结存单价（零数量时为 0，避免除零）
@@ -168,6 +212,11 @@ impl StockState {
             return Ok(cost);
         }
 
+        // 个别计价：出库必须指定单价
+        if method == CostMethod::Specific {
+            return Err(FinError::msg("个别计价的出库必须指定批次单价"));
+        }
+
         let cost = match method {
             CostMethod::MovingAverage => {
                 // 结存为零时用 last_price（先出库后入库的场景）
@@ -179,6 +228,16 @@ impl StockState {
                 (want * unit).round2()
             }
             CostMethod::Fifo => self.cost_by_fifo(want),
+            CostMethod::Standard => {
+                // 标准成本：无预设时回退到结存单价
+                let unit = if self.standard_cost.is_zero() {
+                    self.unit_cost()
+                } else {
+                    self.standard_cost
+                };
+                (want * unit).round2()
+            }
+            CostMethod::Specific => unreachable!("上面已拦截"),
         };
 
         self.consume_lots(want);
@@ -333,5 +392,39 @@ mod tests {
         for c in CostMethod::ALL {
             assert_eq!(CostMethod::parse(c.code()), *c);
         }
+    }
+
+    #[test]
+    fn specific_requires_price() {
+        let moves = vec![
+            Move { qty: q("10"), price: Some(m("8")) },
+            Move { qty: q("-4"), price: None }, // 个别计价缺单价 → 报错
+        ];
+        assert!(run(&moves, CostMethod::Specific).is_err());
+        let moves = vec![
+            Move { qty: q("10"), price: Some(m("8")) },
+            Move { qty: q("-4"), price: Some(m("9")) }, // 指定批次单价
+        ];
+        let (costs, _) = run(&moves, CostMethod::Specific).unwrap();
+        assert_eq!(costs[1], Some(m("36"))); // 4 × 9
+    }
+
+    #[test]
+    fn standard_cost_fixed_unit() {
+        let mut st = StockState::new().with_standard_cost(m("7"));
+        st.apply(&Move { qty: q("10"), price: Some(m("9")) }, CostMethod::Standard).unwrap();
+        let c = st.apply(&Move { qty: q("-5"), price: None }, CostMethod::Standard).unwrap();
+        assert_eq!(c, Some(m("35"))); // 5 × 标准成本 7，与入库单价无关
+        assert_eq!(st.qty, q("5"));
+    }
+
+    #[test]
+    fn adjust_amount_delta() {
+        let mut st = StockState::new();
+        st.apply(&Move { qty: q("10"), price: Some(m("8")) }, CostMethod::MovingAverage).unwrap();
+        let delta = st.adjust_amount(m("100")).unwrap(); // 结存 80 → 100
+        assert_eq!(delta, m("20"));
+        assert_eq!(st.qty, q("10"));
+        assert_eq!(st.unit_cost(), m("10"));
     }
 }

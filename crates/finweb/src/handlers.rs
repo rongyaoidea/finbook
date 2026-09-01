@@ -96,6 +96,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/reports/compare", get(get_report_compare))
         .route("/api/reports/daily", get(get_account_daily))
         .route("/api/reports/reconcile", get(get_period_reconcile))
+        // 存货核算：成本调整
+        .route("/api/inventory/adjust", post(stock_adjust_endpoint))
         // 工艺路线 / 报工 / MRP
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
@@ -1479,6 +1481,48 @@ async fn get_period_reconcile(
     let db = state.db_for(&user.book_key)?;
     let items = findb::reports::period_reconcile(&db, period)?;
     Ok(Json(serde_json::json!({ "period": period_to_str(period), "items": items })))
+}
+
+// ---- 存货核算：成本调整 ----
+
+#[derive(Deserialize)]
+struct StockAdjustReq {
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+    pub item: String,
+    #[serde(default)]
+    pub warehouse: String,
+    /// 调整金额（正=调增，负=调减），十进制字符串
+    pub delta: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn stock_adjust_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<StockAdjustReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.item.trim().is_empty() {
+        return Err(AppError::bad_request("缺少存货 item"));
+    }
+    let delta = parse_money(&req.delta);
+    let period = if req.period > 0 {
+        Period::from_ymm(req.period)
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::business::stock_adjust(&db, period, date, &req.item, &req.warehouse, delta, &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
 // ---- 工艺路线 / 报工 ----

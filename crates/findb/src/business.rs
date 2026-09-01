@@ -29,6 +29,8 @@ pub enum StockKind {
     OtherOut,
     /// 调拨（同存货不同仓库，暂按普通出库+入库记）
     Transfer,
+    /// 成本调整（数量不变，只调金额）
+    Adjust,
 }
 
 impl StockKind {
@@ -39,6 +41,7 @@ impl StockKind {
             StockKind::OtherIn => "其他入库",
             StockKind::OtherOut => "其他出库",
             StockKind::Transfer => "调拨",
+            StockKind::Adjust => "成本调整",
         }
     }
     pub fn code(self) -> &'static str {
@@ -48,6 +51,7 @@ impl StockKind {
             StockKind::OtherIn => "other_in",
             StockKind::OtherOut => "other_out",
             StockKind::Transfer => "transfer",
+            StockKind::Adjust => "adjust",
         }
     }
     pub fn parse(s: &str) -> Self {
@@ -56,6 +60,7 @@ impl StockKind {
             "other_in" => StockKind::OtherIn,
             "other_out" => StockKind::OtherOut,
             "transfer" => StockKind::Transfer,
+            "adjust" => StockKind::Adjust,
             _ => StockKind::Purchase,
         }
     }
@@ -69,6 +74,7 @@ impl StockKind {
         StockKind::OtherIn,
         StockKind::OtherOut,
         StockKind::Transfer,
+        StockKind::Adjust,
     ];
 }
 
@@ -176,15 +182,62 @@ pub fn stock_items(db: &Db) -> DbResult<Vec<String>> {
 /// 某存货截至某期的结存（重放全部流水）
 pub fn stock_state(db: &Db, item: &str, upto: Period, method: CostMethod) -> DbResult<StockState> {
     let rows = stock_list_item(db, item, upto)?;
+    let mut st = StockState::new();
+    let mut adjusts: Vec<Money> = Vec::new();
     let moves: Vec<StockMoveIn> = rows
         .iter()
+        .filter(|r| r.kind != StockKind::Adjust)
         .map(|r| StockMoveIn {
             qty: r.qty,
             price: if r.price.is_zero() { None } else { Some(r.price) },
         })
         .collect();
-    let (_, st) = fincore::engine::costing::run(&moves, method)?;
+    for r in &rows {
+        if r.kind == StockKind::Adjust {
+            adjusts.push(r.amount);
+        }
+    }
+    let (_, st0) = fincore::engine::costing::run(&moves, method)?;
+    st = st0;
+    // 成本调整按总额叠加到结存金额
+    if !adjusts.is_empty() {
+        let sum: Money = adjusts.iter().fold(Money::ZERO, |a, b| a + *b);
+        let new_amount = st.amount + sum;
+        st.adjust_amount(new_amount)?;
+    }
     Ok(st)
+}
+
+/// 成本调整：数量不变，仅调结存金额。`delta` 正=调增、负=调减。
+/// 以 kind=adjust 的流水落库（qty=0），保证可追溯。
+pub fn stock_adjust(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    item: &str,
+    warehouse: &str,
+    delta: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    if delta.is_zero() {
+        return Err(fincore::FinError::msg("成本调整金额不能为 0").into());
+    }
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::Adjust,
+            item: item.to_string(),
+            warehouse: warehouse.to_string(),
+            qty: Money::ZERO,
+            price: Money::ZERO,
+            amount: delta,
+            voucher_id: None,
+            memo: memo.to_string(),
+        },
+    )
 }
 
 /// 期间存货收发存汇总
@@ -1140,6 +1193,25 @@ mod tests {
         let v = crate::vouchers::get(&db, id).unwrap().unwrap();
         assert!(v.balanced());
         assert_eq!(v.debit_total(), m("20"));
+    }
+
+    #[test]
+    fn stock_adjust_changes_amount_not_qty() {
+        let db = tmpdb("adj");
+        let p = Period::new(2026, 1).unwrap();
+        stock_insert(&db, &mv(p, d(2026, 1, 5), StockKind::Purchase, "10", "8")).unwrap();
+        // 调增 20 元
+        stock_adjust(&db, p, d(2026, 1, 31), "P001", "主仓", m("20"), "涨价").unwrap();
+        let st = stock_state(&db, "P001", p, CostMethod::MovingAverage).unwrap();
+        assert_eq!(st.qty, m("10"));
+        assert_eq!(st.amount, m("100")); // 80 + 20
+        assert_eq!(st.unit_cost(), m("10"));
+        // 调减 10 元
+        stock_adjust(&db, p, d(2026, 1, 31), "P001", "主仓", m("-10"), "降价").unwrap();
+        let st = stock_state(&db, "P001", p, CostMethod::MovingAverage).unwrap();
+        assert_eq!(st.amount, m("90"));
+        // 零调整报错
+        assert!(stock_adjust(&db, p, d(2026, 1, 31), "P001", "主仓", m("0"), "").is_err());
     }
 
     #[test]

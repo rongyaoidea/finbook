@@ -523,3 +523,126 @@ mod tests {
         assert_eq!(items[0].child_code, "140301");
     }
 }
+
+// ===========================================================================
+// 生产订单
+// ===========================================================================
+
+pub fn prod_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let year = period.year();
+    let month = period.month();
+    let prefix = format!("SC{:04}{:02}", year, month);
+    let sql = format!(
+        "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM production_order WHERE no LIKE ?",
+        prefix.len() + 1
+    );
+    let n: i64 = db.conn()
+        .query_row(&sql, [format!("{}%", prefix)], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(format!("{}{:04}", prefix, n))
+}
+
+pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
+    let tx = db.conn().unchecked_transaction()?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    
+    let id = if order.id > 0 {
+        tx.execute(
+            "UPDATE production_order SET period=?, date=?, item_code=?, item_name=?,
+             planned_qty=?, completed_qty=?, status=?, work_center=?, prepared_by=?, memo=?, updated_at=?
+             WHERE id=?",
+            rusqlite::params![
+                order.period.ymm(), order.date, order.item_code, order.item_name,
+                order.planned_qty.to_string(), order.completed_qty.to_string(),
+                serde_json::to_value(&order.status)?.as_str().unwrap(),
+                order.work_center, order.prepared_by, order.memo, now, order.id
+            ],
+        )?;
+        order.id
+    } else {
+        tx.execute(
+            "INSERT INTO production_order(period, no, date, item_code, item_name,
+             planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+            rusqlite::params![
+                order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
+                order.planned_qty.to_string(), order.completed_qty.to_string(),
+                serde_json::to_value(&order.status)?.as_str().unwrap(),
+                order.work_center, order.prepared_by, order.memo, now
+            ],
+        )?;
+        tx.last_insert_rowid()
+    };
+    order.id = id;
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResult<Vec<ProductionOrder>> {
+    let sql = if let Some(_s) = status {
+        format!(
+            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
+             status, work_center, prepared_by, memo
+             FROM production_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
+        )
+    } else {
+        format!(
+            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
+             status, work_center, prepared_by, memo
+             FROM production_order WHERE period=? ORDER BY date DESC, id DESC"
+        )
+    };
+    
+    let mut stmt = db.conn().prepare(&sql)?;
+    let rows = if let Some(_s) = status {
+        stmt.query_map(rusqlite::params![period.ymm(), serde_json::to_value(&_s)?.as_str().unwrap()], |r| {
+            Ok(ProductionOrder {
+                id: r.get(0)?, no: r.get(1)?, period: Period::from_ymm(r.get(2)?),
+                date: r.get(3)?, item_code: r.get(4)?, item_name: r.get(5)?,
+                planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
+                completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                status: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(ProdStatus::Draft),
+                work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([period.ymm()], |r| {
+            Ok(ProductionOrder {
+                id: r.get(0)?, no: r.get(1)?, period: Period::from_ymm(r.get(2)?),
+                date: r.get(3)?, item_code: r.get(4)?, item_name: r.get(5)?,
+                planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
+                completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                status: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(ProdStatus::Draft),
+                work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod prod_tests {
+    use super::*;
+    use crate::tests::mem;
+    
+    #[test]
+    fn prod_crud() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut order = ProductionOrder {
+            id: 0, no: String::new(), period: p,
+            date: NaiveDate::from_ymd(2026, 1, 5),
+            item_code: "1001".to_string(), item_name: "成品A".to_string(),
+            planned_qty: Money::parse("100").unwrap(), completed_qty: Money::ZERO,
+            status: ProdStatus::Draft, work_center: "WC01".to_string(),
+            prepared_by: "u1".to_string(), memo: String::new(),
+        };
+        order.no = prod_next_no(&db, p).unwrap();
+        let id = prod_save(&db, &mut order).unwrap();
+        assert!(id > 0);
+        
+        let list = prod_list(&db, p, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].no, order.no);
+    }
+}

@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -580,6 +580,58 @@ CREATE TABLE IF NOT EXISTS bom_change_log (
     changed_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_bom_log ON bom_change_log(parent_code);
+
+-- ===========================================================================
+-- v11：采购深化（请购单 / 到货 / 付款 / 历史价格）
+-- ===========================================================================
+
+-- 采购请购单
+CREATE TABLE IF NOT EXISTS purchase_req (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL UNIQUE,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    item_code   TEXT NOT NULL,
+    item_name   TEXT NOT NULL DEFAULT '',
+    qty         TEXT NOT NULL DEFAULT '0',
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft / approved / ordered / cancelled
+    requester   TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pr_period ON purchase_req(period);
+
+-- 采购到货记录
+CREATE TABLE IF NOT EXISTS po_receipt (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    qty         TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_po_rcpt ON po_receipt(po_id);
+
+-- 采购付款记录
+CREATE TABLE IF NOT EXISTS po_payment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    amount      TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_po_pay ON po_payment(po_id);
+
+-- 采购历史价格（供应商 × 物料）
+CREATE TABLE IF NOT EXISTS price_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code     TEXT NOT NULL,
+    supplier_code TEXT NOT NULL DEFAULT '',
+    unit_price    TEXT NOT NULL DEFAULT '0',
+    date          TEXT NOT NULL,
+    UNIQUE(item_code, supplier_code, date)
+);
+CREATE INDEX IF NOT EXISTS idx_ph ON price_history(item_code, supplier_code);
 
 -- ===========================================================================
 -- v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案

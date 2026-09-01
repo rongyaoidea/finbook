@@ -22,6 +22,7 @@ pub mod imports;
 pub mod invoices;
 pub mod mgmt;
 pub mod periods;
+pub mod procurement;
 pub mod security;
 pub mod reports;
 pub mod schema;

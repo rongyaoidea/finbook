@@ -31,6 +31,7 @@ const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/api/setup/status", get(get_setup_status))
+        .route("/api/books", get(list_books))
         .route("/api/login", post(post_login))
         .route("/api/logout", post(post_logout))
         .route("/api/me", get(get_me))
@@ -91,7 +92,7 @@ pub fn router(state: Arc<WebState>) -> Router {
 // ---------------------------------------------------------------------------
 
 async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<SetupStatus>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.default_db()?;
     let admin_set = users::admin_exists(&db)?;
     let opts = db.options();
     // 未建账 = 尚未设定公司名称（启用期间默认值亦视为未建账）
@@ -107,11 +108,33 @@ async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<Set
     }))
 }
 
+/// 账套列表（无需登录，登录页用于选择账套）
+async fn list_books(State(state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, AppError> {
+    let keys = state.books.list();
+    let items: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|(key, path)| {
+            let company = match state.db_for(key) {
+                Ok(db) => db.options().company,
+                Err(_) => String::new(),
+            };
+            json!({ "key": key, "path": path.display().to_string(), "company": company })
+        })
+        .collect();
+    Ok(Json(json!({ "books": items })))
+}
+
 async fn post_login(
     State(state): State<Arc<WebState>>,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, AppError> {
-    let db = state.pool.get()?;
+    // 登录到指定账套（默认首个账套；前端登录页可选）
+    let book_key = if req.book_key.trim().is_empty() {
+        state.books.first_key()
+    } else {
+        req.book_key.clone()
+    };
+    let db = state.db_for(&book_key)?;
     let username = req.username.trim().to_string();
     let count = users::count(&db)?;
 
@@ -146,7 +169,7 @@ async fn post_login(
             if !u.is_admin() {
                 state.sessions.remove_by_username(&u.username);
             }
-            let token = state.sessions.create(&u.username, &req.device_id, state.default_period);
+            let token = state.sessions.create(&u.username, &req.device_id, state.default_period, &book_key);
             let resp = LoginResp {
                 user: PublicUser::from_user(&u),
                 must_change_pwd: must_change,
@@ -187,7 +210,7 @@ async fn get_me(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<PublicUser>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let u = users::get(&db, user.username())?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
     Ok(Json(PublicUser::from_user(&u)))
@@ -198,7 +221,7 @@ async fn post_change_password(
     user: CurrentUser,
     Json(req): Json<ChangePwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let r = security::change_password_checked(&db, user.username(), &req.old, &req.new, &state.policy)?;
     match r {
         Ok(()) => Ok(Json(json!({"ok": true}))),
@@ -215,7 +238,7 @@ async fn list_users(
     user: CurrentUser,
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     user.require(Perm::UserManage)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let list = users::list(&db)?
         .into_iter()
         .map(|u| PublicUser::from_user(&u))
@@ -233,7 +256,7 @@ async fn create_user(
     if username.is_empty() || req.password.len() < 6 {
         return Err(AppError::bad_request("用户名不能为空，口令至少 6 位"));
     }
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_some() {
         return Err(AppError::bad_request("该用户名已存在"));
     }
@@ -258,7 +281,7 @@ async fn update_user(
     Json(req): Json<UpdateUserReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let mut u = users::get(&db, &username)?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
     if let Some(d) = req.display_name {
@@ -296,7 +319,7 @@ async fn reset_user_password(
     Json(req): Json<ResetPwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let r = security::admin_reset_password(&db, &username, &req.new, &state.policy)?;
     match r {
         Ok(()) => {
@@ -313,7 +336,7 @@ async fn reset_user_device(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     users::reset_device(&db, &username)?;
     // 立刻下线该用户全部会话：旧设备不能靠存量会话绕过"一人一机"
     state.sessions.remove_by_username(&username);
@@ -330,7 +353,7 @@ async fn delete_user(
     if username == user.username() {
         return Err(AppError::bad_request("不能删除当前登录的账号"));
     }
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let u = users::get(&db, &username)?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
     if u.is_admin() {
@@ -351,9 +374,9 @@ async fn delete_user(
 
 async fn get_options(
     State(state): State<Arc<WebState>>,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> Result<Json<fincore::BookOptions>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     Ok(Json(db.options()))
 }
 
@@ -363,7 +386,7 @@ async fn put_options(
     Json(opts): Json<fincore::BookOptions>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::SysOption)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     db.set_options(&opts)?;
     // 刷新公司名缓存（建账向导保存后，仪表盘立即显示新公司名）
     state.refresh_company(&db);
@@ -384,7 +407,7 @@ async fn get_dashboard(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<Dashboard>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let (v, e, a) = db.stats()?;
     let start = db.options().start_period;
     let cur = current_period(&state, &user);
@@ -404,7 +427,7 @@ async fn get_periods(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let start = db.options().start_period;
     let this_year = Period::default().year();
     let end = Period::new(this_year + 1, 12).unwrap_or(Period::default());
@@ -448,9 +471,9 @@ async fn post_period(
 
 async fn list_accounts(
     State(state): State<Arc<WebState>>,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> Result<Json<Vec<fincore::Account>>, AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     Ok(Json(accounts::list(&db)?))
 }
 
@@ -460,7 +483,7 @@ async fn next_voucher_no(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let period = q
         .get("period")
         .and_then(|s| parse_period(s))
@@ -506,7 +529,7 @@ async fn list_vouchers(
     if !can_view_vouchers(&user) {
         return Err(AppError::forbidden("没有查看凭证的权限"));
     }
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let mut query = VoucherQuery::default();
     query.asc = true;
     if let Some(p) = q.get("period").and_then(|s| parse_period(s)) {
@@ -541,7 +564,7 @@ async fn get_voucher(
     if !can_view_vouchers(&user) {
         return Err(AppError::forbidden("没有查看凭证的权限"));
     }
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
     Ok(Json(VoucherDetail::from_voucher(v)))
@@ -588,7 +611,7 @@ async fn save_voucher(
     } else {
         user.require(Perm::VoucherNew)?;
     }
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let period = parse_period(&req.period.to_string())
         .unwrap_or_else(|| current_period(&state, &user));
     let date = NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
@@ -673,11 +696,11 @@ async fn save_voucher(
 
 async fn voucher_post(
     State(state): State<Arc<WebState>>,
-    _user: CurrentUser,
+    user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 凭证已在保存时直接设为已记账（Posted）状态，本接口仅确认状态
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     // 检查是否已参与汇总
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
@@ -694,25 +717,25 @@ async fn voucher_audit(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 凭证已在保存时设为 Audited 状态，无需再次审核
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
     if v.status == VoucherStatus::Audited {
         return Ok(Json(json!({"ok": true, "already_audited": true})));
     }
     user.require(Perm::VoucherAudit)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     vouchers::audit(&db, id, user.username())?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn voucher_unaudit(
     State(state): State<Arc<WebState>>,
-    _user: CurrentUser,
+    user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 取消记账（如果已记账）
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
     if v.status == VoucherStatus::Posted {
@@ -729,7 +752,7 @@ async fn voucher_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherDelete)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     vouchers::delete(&db, id)?;
     db.log(user.username(), "凭证", "删除", &format!("凭证 #{id}"))?;
     Ok(Json(json!({"ok": true})))
@@ -789,7 +812,7 @@ async fn list_invoices(
     Query(q): Query<InvoiceListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let rows = findb::invoices::list(
         &db,
         &findb::invoices::InvoiceQuery {
@@ -808,7 +831,7 @@ async fn invoice_summary(
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let sum = findb::invoices::summary(&db)?;
     let by_kind: serde_json::Map<String, serde_json::Value> = sum
         .into_iter()
@@ -828,7 +851,7 @@ async fn create_invoice(
     Json(req): Json<InvoiceReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let inv = invoice_from_req(&req);
     let id = findb::invoices::insert(&db, &inv, user.username())?;
     Ok(Json(json!({ "id": id })))
@@ -841,7 +864,7 @@ async fn update_invoice(
     Json(req): Json<InvoiceReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherEdit)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let mut inv = invoice_from_req(&req);
     inv.id = id;
     findb::invoices::update(&db, &inv)?;
@@ -855,7 +878,7 @@ async fn delete_invoice(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherDelete)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     findb::invoices::delete(&db, id)?;
     db.log(user.username(), "发票", "删除", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
@@ -868,7 +891,7 @@ async fn invoice_set_status(
     Json(req): Json<InvoiceStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherEdit)?;
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let inv = findb::invoices::set_status(&db, id, &req.status, user.username())?;
     Ok(Json(invoice_json(&inv)))
 }
@@ -911,7 +934,7 @@ async fn get_ledger(
         .get("posted_only")
         .map(|s| s == "1" || s == "true")
         .unwrap_or(false);
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
     let lq = LedgerQuery {
         code,
@@ -931,7 +954,7 @@ fn trial_balance_data(
     user: &CurrentUser,
     q: &HashMap<String, String>,
 ) -> Result<(Vec<fincore::balance::BalanceRow>, fincore::balance::TrialBalance), AppError> {
-    let db = state.pool.get()?;
+    let db = state.db_for(&user.book_key)?;
     let start = db.options().start_period;
     let from = q
         .get("from")

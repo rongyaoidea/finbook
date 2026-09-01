@@ -14,7 +14,7 @@ use fincore::BookOptions;
 use tower::ServiceExt;
 
 use finweb::handlers;
-use finweb::state::{DbPool, WebState};
+use finweb::state::{BookRegistry, WebState};
 
 /// 建一个临时账套 + 完整 WebState，返回 (state, book_path, dir_guard)
 fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
@@ -28,9 +28,10 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     // company 留空 = 未建账（触发 needs_setup 建账向导）
     findb::Db::create_no_admin(&book_path, &opts).expect("建账失败");
 
-    let pool = DbPool::new(&book_path, 4);
+    let mut books = BookRegistry::new();
+    books.register(&book_path, 4);
     let state = WebState::new(
-        pool,
+        books,
         PasswordPolicy::default(),
         book_path.clone(),
         "".to_string(),
@@ -291,4 +292,63 @@ async fn device_binding_blocks_second_device() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "换设备应被拒绝");
+}
+#[tokio::test]
+async fn books_listed_and_login_with_book_key() {
+    // 双账套：第一个空账套（可建管理员），第二个也空账套
+    let dir = tempfile::tempdir().expect("创建临时目录失败");
+    let b1 = dir.path().join("company-a.fbk");
+    let b2 = dir.path().join("company-b.fbk");
+    let opts = BookOptions {
+        start_period: fincore::Period::new(2026, 1).unwrap(),
+        ..Default::default()
+    };
+    findb::Db::create_no_admin(&b1, &opts).unwrap();
+    findb::Db::create_no_admin(&b2, &opts).unwrap();
+
+    let books = BookRegistry::new();
+    books.register(&b1, 4);
+    books.register(&b2, 4);
+    let state = WebState::new(
+        books,
+        PasswordPolicy::default(),
+        b1.clone(),
+        "".to_string(),
+        "test".to_string(),
+        opts.start_period.ymm(),
+    );
+
+    // 账套列表应返回两个
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/books").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = body_string(resp).await;
+    assert!(s.contains("company-a"), "应包含账套 company-a：{s}");
+    assert!(s.contains("company-b"), "应包含账套 company-b：{s}");
+
+    // 登录到 company-b（带 book_key）
+    let resp = handlers::router(state.clone())
+        .oneshot(post_json(
+            "/api/login",
+            serde_json::json!({
+                "username": "boss",
+                "password": "Admin!2026",
+                "device_id": "dev-multi-1",
+                "device_name": "多账套测试",
+                "book_key": "company-b",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "登录 company-b 应成功");
+    let sid = sid_from(&resp);
+
+    // 会话绑定 company-b：dashboard 显示默认期间即可（各账套独立）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

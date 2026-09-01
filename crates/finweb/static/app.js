@@ -60,6 +60,19 @@ function can(p) { return session.user && session.user.perms.indexOf(p) >= 0; }
 async function showLogin() {
   let status = { admin_set: false };
   try { status = await api("/setup/status"); } catch (e) {}
+  // 账套列表（多账套时登录页可选）
+  let bookOpts = "";
+  try {
+    const b = await api("/books");
+    const list = (b && b.books) || [];
+    if (list.length > 1) {
+      bookOpts = `<div class="field"><label>账套 / 公司</label>
+        <select id="login-book">${list.map((x) => `<option value="${esc(x.key)}">${esc(x.company || x.key)}</option>`).join("")}</select>
+      </div>`;
+    } else if (list.length === 1) {
+      bookOpts = `<input type="hidden" id="login-book" value="${esc(list[0].key)}" />`;
+    }
+  } catch (e) {}
   const app = document.getElementById("app");
   const banner = status.admin_set
     ? `<div class="banner set">✅ <b>管理员账号已设定</b>。请输入账号口令登录。</div>`
@@ -71,6 +84,7 @@ async function showLogin() {
         <div class="sub">${esc(status.company || "Web 版")}　·　服务端账套：${esc(status.book || "")}</div>
         ${banner}
         <form id="login-form">
+          ${bookOpts}
           <div class="field"><label>账号</label><input id="u" autocomplete="username" required /></div>
           <div class="field"><label>口令</label><input id="p" type="password" autocomplete="current-password" required /></div>
           <button class="btn block" type="submit">登录</button>
@@ -82,11 +96,13 @@ async function showLogin() {
     e.preventDefault();
     const username = $("#u").value.trim();
     const password = $("#p").value;
+    const sel = $("#login-book");
+    const book_key = sel ? sel.value : "";
     try {
       const r = await api("/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password, device_id: deviceId(), device_name: deviceName() }),
+        body: JSON.stringify({ username, password, device_id: deviceId(), device_name: deviceName(), book_key }),
       });
       session.user = r.user;
       toast(r.setup ? `已创建管理员账号「${esc(username)}」` : `欢迎，${esc(r.user.display_name)}`, "ok");

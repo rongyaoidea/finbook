@@ -74,6 +74,9 @@ pub struct LoginReq {
     pub device_id: String,
     /// 设备展示名（浏览器 UA / 主机名）
     pub device_name: String,
+    /// 账套 key（空 = 默认账套）
+    #[serde(default)]
+    pub book_key: String,
 }
 
 #[derive(Serialize)]

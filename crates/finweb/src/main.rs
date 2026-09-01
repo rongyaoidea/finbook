@@ -15,13 +15,15 @@ use fincore::BookOptions;
 use findb::{users, Db};
 
 use finweb::handlers;
-use finweb::state::{DbPool, WebState};
+use finweb::state::{BookRegistry, WebState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let book = std::env::var("FINBOOK_DB").unwrap_or_else(|_| "./finbook.fbk".to_string());
     let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let path = PathBuf::from(&book);
+    // 多账套目录（可选）：扫描其中所有 *.fbk 并注册；未设置则仅注册 FINBOOK_DB 单账套
+    let book_dir = std::env::var("FINBOOK_DIR").ok().map(PathBuf::from);
 
     // 账套不存在则自动建账（不内置管理员 → 首次登录即管理员）
     let existed = path.exists();
@@ -38,9 +40,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_user = users::first_admin_username(&db)?;
     drop(db); // 释放这一连接，连接池会按需重新打开
 
-    let pool = DbPool::new(&path, 16);
+    // 账套注册表：先注册 FINBOOK_DB（单账套兼容），再扫描 FINBOOK_DIR
+    let books = BookRegistry::new();
+    books.register(&path, 16);
+    if let Some(dir) = &book_dir {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "fbk").unwrap_or(false) {
+                    books.register(&p, 16);
+                }
+            }
+        }
+    }
+
     let state = WebState::new(
-        pool,
+        books,
         PasswordPolicy::default(),
         path.clone(),
         company,
@@ -63,6 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if !existed {
         println!("  （检测到账套文件不存在，已自动创建空账套，请使用浏览器首次登录以初始化管理员）\n");
+    }
+    if book_dir.is_some() {
+        let books = state.books.list();
+        let summary = books
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  （多账套模式：已注册 {} 个账套：{}）\n", books.len(), summary);
     }
 
     axum::serve(listener, app).await?;

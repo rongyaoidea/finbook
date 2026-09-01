@@ -19,9 +19,11 @@ use serde_json::json;
 
 /// 全局共享状态（以 Arc 包裹，可被多请求并发引用）
 pub struct WebState {
-    pub pool: DbPool,
+    /// 账套注册表（多账套支持）
+    pub books: BookRegistry,
     pub sessions: SessionStore,
     pub policy: PasswordPolicy,
+    /// 默认账套路径（环境变量 FINBOOK_DB 或首个注册账套）
     pub book_path: PathBuf,
     /// 公司名缓存（RwLock：建账后可由 refresh_company 更新）
     pub company: std::sync::RwLock<String>,
@@ -32,7 +34,7 @@ pub struct WebState {
 
 impl WebState {
     pub fn new(
-        pool: DbPool,
+        books: BookRegistry,
         policy: PasswordPolicy,
         book_path: PathBuf,
         company: String,
@@ -40,7 +42,7 @@ impl WebState {
         default_period: i32,
     ) -> Arc<Self> {
         Arc::new(Self {
-            pool,
+            books,
             sessions: SessionStore::new(),
             policy,
             book_path,
@@ -60,6 +62,75 @@ impl WebState {
         if let Ok(mut c) = self.company.write() {
             *c = db.options().company;
         }
+    }
+
+    /// 借出指定账套的连接（owned，多账套）
+    pub fn db_for(&self, key: &str) -> Result<Db, DbError> {
+        self.books.open(key)
+    }
+
+    /// 借出默认（首个）账套的连接
+    pub fn default_db(&self) -> Result<Db, DbError> {
+        let key = self.books.first_key();
+        self.books.open(&key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 账套注册表（多账套）
+// ---------------------------------------------------------------------------
+
+/// 账套注册表：key（文件名，不带扩展名）→ 文件路径
+pub struct BookRegistry {
+    inner: Mutex<Vec<(String, PathBuf)>>,
+}
+
+impl BookRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 注册一个账套；key 取文件名（不含扩展名）
+    pub fn register(&self, path: &Path, _max: usize) {
+        let key = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let mut g = self.inner.lock().unwrap();
+        if g.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        g.push((key, path.to_path_buf()));
+    }
+
+    /// 所有账套 key + 文件路径（供列表展示）
+    pub fn list(&self) -> Vec<(String, PathBuf)> {
+        let g = self.inner.lock().unwrap();
+        g.iter().map(|(k, p)| (k.clone(), p.clone())).collect()
+    }
+
+    pub fn first_key(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .first()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// 打开指定账套（owned 连接，无借用生命周期问题）
+    pub fn open(&self, key: &str) -> Result<Db, DbError> {
+        let path = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, p)| p.clone())
+            .ok_or_else(|| DbError::Fin(fincore::FinError::msg(format!("账套不存在：{key}"))))?;
+        Db::open(&path).map_err(Into::into)
     }
 }
 
@@ -146,6 +217,8 @@ pub struct SessionInfo {
     pub last_active: i64,
     /// 当前工作期间（ymm），0 表示未设定（用账套默认值）
     pub period_ymm: i32,
+    /// 当前账套 key（多账套切换）
+    pub book_key: String,
 }
 
 /// 会话最长保留时间（秒）：与登录 Cookie 的 Max-Age 一致
@@ -168,7 +241,7 @@ impl SessionStore {
             .collect()
     }
 
-    pub fn create(&self, username: &str, device_id: &str, period_ymm: i32) -> String {
+    pub fn create(&self, username: &str, device_id: &str, period_ymm: i32, book_key: &str) -> String {
         let token = Self::new_token();
         let now = now_secs();
         let mut g = self.inner.lock().unwrap();
@@ -181,6 +254,7 @@ impl SessionStore {
                 device_id: device_id.to_string(),
                 last_active: now,
                 period_ymm,
+                book_key: book_key.to_string(),
             },
         );
         token
@@ -233,6 +307,8 @@ pub struct CurrentUser {
     pub user: User,
     /// 会话令牌（服务端内部使用，不向外暴露）
     pub token: String,
+    /// 当前账套 key（多账套）
+    pub book_key: String,
 }
 
 impl CurrentUser {
@@ -273,7 +349,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             .get(&token, state.policy.idle_minutes)
             .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
         // 回读数据库：管理员刚改的权限/停用状态立即生效，无需用户重登
-        let db = state.pool.get()?;
+        let db = state.db_for(&info.book_key)?;
         let user = users::get(&db, &info.username)?
             .ok_or_else(|| AppError::unauthorized("账号已不存在，请重新登录"))?;
         if user.disabled {
@@ -290,7 +366,11 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
         }
         drop(db);
         state.sessions.touch(&token);
-        Ok(CurrentUser { user, token })
+        Ok(CurrentUser {
+            user,
+            token,
+            book_key: info.book_key.clone(),
+        })
     }
 }
 

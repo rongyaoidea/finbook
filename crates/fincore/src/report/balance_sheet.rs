@@ -41,8 +41,8 @@ pub fn balance_sheet_def() -> ReportDef {
         vec![
             Term::acct(&["1122"], AmountKind::End).debit_only(),
             Term::acct(&["2203"], AmountKind::End).debit_only(),
-            // 减去坏账准备
-            Term::acct(&["1231"], AmountKind::End).neg(),
+            // 减去坏账准备（贷方余额为负，直接相加即扣减）
+            Term::acct(&["1231"], AmountKind::End),
         ],
     ));
 
@@ -78,7 +78,8 @@ pub fn balance_sheet_def() -> ReportDef {
                 &["1403", "1405", "1406", "1407", "1408", "1411", "5001"],
                 AmountKind::End,
             ),
-            Term::acct(&["1471"], AmountKind::End).neg(),
+            // 减去存货跌价准备（贷方余额为负，直接相加即扣减）
+            Term::acct(&["1471"], AmountKind::End),
         ],
     ));
 

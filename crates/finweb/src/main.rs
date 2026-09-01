@@ -20,7 +20,7 @@ use finweb::state::{BookRegistry, WebState};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let book = std::env::var("FINBOOK_DB").unwrap_or_else(|_| "./finbook.fbk".to_string());
-    let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let path = PathBuf::from(&book);
     // 多账套目录（可选）：扫描其中所有 *.fbk 并注册；未设置则仅注册 FINBOOK_DB 单账套
     let book_dir = std::env::var("FINBOOK_DIR").ok().map(PathBuf::from);

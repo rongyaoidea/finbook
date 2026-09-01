@@ -185,7 +185,7 @@ impl VoucherEdit {
         self.no = no.to_string();
         self.attachments.clear();
         self.memo.clear();
-        self.prepared_by = ctx.user().display_name.clone();
+        self.prepared_by = ctx.user().username.clone();
     }
 
     // ------------------------------------------------------------------
@@ -394,7 +394,7 @@ impl VoucherEdit {
             return;
         }
         if self.id == 0 {
-            v.prepared_by = ctx.user().display_name.clone();
+            v.prepared_by = ctx.user().username.clone();
         }
 
         // 校验（含期间锁定、借贷平衡、科目末级、辅助核算必录等）

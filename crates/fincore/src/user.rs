@@ -330,6 +330,8 @@ pub struct User {
 
 impl User {
     pub fn new(username: &str, display_name: &str, role: Role) -> Self {
+        // 非管理员默认只可见本人凭证（防御性默认），管理员保持全量权限
+        let own_voucher_only = role != Role::Admin;
         Self {
             id: 0,
             username: username.to_string(),
@@ -345,7 +347,10 @@ impl User {
             last_login_at: String::new(),
             device_id: String::new(),
             device_name: String::new(),
-            data_scope: DataScope::default(),
+            data_scope: DataScope {
+                own_voucher_only,
+                ..DataScope::default()
+            },
         }
     }
 

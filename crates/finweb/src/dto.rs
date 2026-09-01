@@ -101,6 +101,13 @@ pub struct CreateUserReq {
     pub password: String,
     #[serde(default)]
     pub role: Role,
+    /// 是否强制首次登录改密（默认 true，测试场景可设为 false）
+    #[serde(default = "default_true")]
+    pub must_change_pwd: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]

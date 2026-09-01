@@ -364,6 +364,17 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
                 "该账号已在其他设备登录，本设备会话已被下线",
             ));
         }
+        // 强制改密拦截：必须改密的用户只能访问改密和退出接口（登录接口本身不受限）
+        if user.must_change_pwd {
+            let path = parts.uri.path();
+            let is_allowed = path == "/api/change-password"
+                || path == "/api/logout"
+                || path == "/api/login";
+            if !is_allowed {
+                state.sessions.remove(&token);
+                return Err(AppError::unauthorized("你的口令已过期或需首次设置，请先修改口令"));
+            }
+        }
         drop(db);
         state.sessions.touch(&token);
         Ok(CurrentUser {
@@ -436,9 +447,16 @@ pub fn now_secs() -> i64 {
 
 /// 构造 Set-Cookie 头值
 pub fn cookie_header(token: &str, max_age_secs: i64) -> HeaderValue {
+    // Secure 标志由 FINWEB_SECURE_COOKIE 环境变量控制：
+    // - 未设置（默认 false）：不加 Secure，HTTP/HTTPS 均可工作
+    // - 显式设为 true：加 Secure，要求 HTTPS 传输（生产推荐）
+    let secure = std::env::var("FINWEB_SECURE_COOKIE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let suffix = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
-        "finbook_sid={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-        token, max_age_secs
+        "finbook_sid={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
+        token, max_age_secs, suffix
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("finbook_sid=; Path=/; Max-Age=0"))
 }

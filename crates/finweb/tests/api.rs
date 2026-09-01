@@ -228,7 +228,7 @@ async fn wrong_password_rejected() {
 #[tokio::test]
 async fn non_admin_cannot_manage_users() {
     let (state, _bp, _dir) = test_state();
-    // 管理员开通一个普通会计
+    // 管理员开通一个普通会计（must_change_pwd=false，避免测试中被拦截）
     let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
@@ -239,6 +239,7 @@ async fn non_admin_cannot_manage_users() {
                 "display_name": "会计一",
                 "password": "Acc@123456",
                 "role": "accountant",
+                "must_change_pwd": false,
             }),
         ))
         .await

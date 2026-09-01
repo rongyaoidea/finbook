@@ -266,7 +266,7 @@ async fn create_user(
     let mut u = User::new(&username, &req.display_name, req.role);
     u.set_password(&req.password);
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
-    u.must_change_pwd = true;
+    u.must_change_pwd = req.must_change_pwd;
     // 普通账户默认只能看自己填制的凭证（防越权翻看他人/全盘数据）；
     // 管理员不受此限制，可看到所有账套数据
     if !u.is_admin() {
@@ -535,6 +535,8 @@ async fn list_vouchers(
     let db = state.db_for(&user.book_key)?;
     let mut query = VoucherQuery::default();
     query.asc = true;
+    // 落地数据范围：仅本人凭证或按科目区间过滤
+    let mut query = VoucherQuery::default().with_data_scope(&user.user);
     if let Some(p) = q.get("period").and_then(|s| parse_period(s)) {
         query.from = Some(p);
         query.to = Some(p);
@@ -570,6 +572,10 @@ async fn get_voucher(
     let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    // 数据权限：非全量权限用户不得查看自己不可见的凭证
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权查看该凭证"));
+    }
     Ok(Json(VoucherDetail::from_voucher(v)))
 }
 
@@ -628,6 +634,10 @@ async fn save_voucher(
     let mut v = if req.id > 0 {
         let mut existing = vouchers::get(&db, req.id)?
             .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+        // 数据权限校验：非全量权限用户不得修改自己不可见的凭证
+        if !user.user.can_see_voucher(&existing) {
+            return Err(AppError::forbidden("无权修改该凭证"));
+        }
         if !existing.status.can_edit() {
             return Err(AppError::forbidden("该凭证当前状态不能修改（已作废）"));
         }
@@ -737,16 +747,24 @@ async fn voucher_unaudit(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // 取消记账（如果已记账）
+    user.require(Perm::VoucherAudit)?;
     let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    // 已记账 → 反记账（Posted → Audited）
     if v.status == VoucherStatus::Posted {
-        vouchers::unaudit(&db, id)?;
-        Ok(Json(json!({"ok": true, "unposted": true})))
-    } else {
-        Ok(Json(json!({"ok": false, "message": "仅可取消已记账凭证的记账"})))
+        vouchers::unpost(&db, id)?;
+        return Ok(Json(json!({"ok": true, "action": "unposted"})));
     }
+    // 已审核 → 反审核（Audited → Draft）
+    if v.status == VoucherStatus::Audited {
+        vouchers::unaudit(&db, id)?;
+        return Ok(Json(json!({"ok": true, "action": "unaudited"})));
+    }
+    Ok(Json(json!({
+        "ok": false,
+        "message": format!("凭证当前为「{}」，无需操作", v.status.label())
+    })))
 }
 
 async fn voucher_delete(
@@ -756,8 +774,35 @@ async fn voucher_delete(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
+    // 加载后做守卫校验：状态、结账期间、数据权限
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权删除该凭证"));
+    }
+    // 已记账凭证需先反记账才能删除
+    if v.status == VoucherStatus::Posted {
+        return Err(AppError::bad_request(
+            "已记账凭证不能直接删除，请先反记账",
+        ));
+    }
+    // 已审核凭证需先反审核
+    if v.status == VoucherStatus::Audited {
+        return Err(AppError::bad_request(
+            "已审核凭证不能直接删除，请先反审核",
+        ));
+    }
+    // 期间是否已结账
+    if let Some(closed) = findb::periods::closed_upto(&db)? {
+        if v.period <= closed {
+            return Err(AppError::bad_request(format!(
+                "{} 及以前期间已结账，不能删除该凭证",
+                closed.label()
+            )));
+        }
+    }
     vouchers::delete(&db, id)?;
-    db.log(user.username(), "凭证", "删除", &format!("凭证 #{id}"))?;
+    db.log(user.username(), "凭证", "删除", &v.voucher_no())?;
     Ok(Json(json!({"ok": true})))
 }
 

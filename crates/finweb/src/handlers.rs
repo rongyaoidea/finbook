@@ -908,8 +908,36 @@ pub struct InvoiceListQuery {
 }
 
 // ---------------------------------------------------------------------------
-// 数据导入（其他软件 / CSV）
+// 数据导入（其他软件 / CSV / Excel）
 // ---------------------------------------------------------------------------
+
+/// 解析 base64（纯标准 base64 字母表，无依赖实现）
+fn b64_decode(s: &str) -> Result<Vec<u8>, AppError> {
+    let s = s.trim();
+    // 兼容 data URL 前缀（data:application/...;base64,xxx）
+    let s = s.split(',').last().unwrap_or(s);
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        let v = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return Err(AppError::bad_request("文件不是合法的 base64 编码")),
+        };
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
 
 /// 预检：返回文件中引用但账套不存在的科目（供用户选择映射或忽略）
 async fn import_analyze(
@@ -919,8 +947,23 @@ async fn import_analyze(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
-    let first_col_is_code = req.kind != "voucher"; // 凭证科目在第 4 列
-    let missing = findb::imports::analyze_missing(&db, &req.text, first_col_is_code)?;
+    let tmpl = findb::imports::ImportTemplate::parse(&req.template);
+    let is_begin = req.kind != "voucher";
+    // Excel 上传：把字节转成 CSV 文本走同一套预检
+    let text = if let Some(b64) = &req.file {
+        if b64.trim().is_empty() {
+            return Err(AppError::bad_request("请选择 Excel 文件或粘贴 CSV 内容"));
+        }
+        let bytes = b64_decode(b64)?;
+        let rows = findb::imports::read_xlsx_bytes(&bytes)?;
+        findb::imports::xlsx_to_csv_text(&rows)
+    } else {
+        req.text.clone()
+    };
+    if text.trim().is_empty() {
+        return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
+    }
+    let missing = findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?;
     let items: Vec<serde_json::Value> = missing
         .iter()
         .map(|m| json!({ "code": m.code, "count": m.count }))
@@ -928,7 +971,7 @@ async fn import_analyze(
     Ok(Json(json!({ "missing": items })))
 }
 
-/// 执行导入（期初余额表 / 凭证），带科目映射
+/// 执行导入（期初余额表 / 凭证），带科目映射；支持 CSV 文本或 Excel 文件
 async fn import_run(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -937,15 +980,31 @@ async fn import_run(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let who = user.username().to_string();
+    let tmpl = findb::imports::ImportTemplate::parse(&req.template);
+    let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     let res = if req.kind == "voucher" {
         let period = if req.period > 0 {
             Period::from_ymm(req.period)
         } else {
             current_period(&state, &user)
         };
-        findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping)?
+        if has_file {
+            let bytes = b64_decode(req.file.as_deref().unwrap_or(""))?;
+            findb::imports::import_vouchers_bytes(&db, period, &bytes, &who, &req.mapping, tmpl)?
+        } else {
+            if req.text.trim().is_empty() {
+                return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
+            }
+            findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping, tmpl)?
+        }
+    } else if has_file {
+        let bytes = b64_decode(req.file.as_deref().unwrap_or(""))?;
+        findb::imports::import_begin_bytes(&db, &bytes, &who, &req.mapping, tmpl)?
     } else {
-        findb::imports::import_begin(&db, &req.text, &who, &req.mapping)?
+        if req.text.trim().is_empty() {
+            return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
+        }
+        findb::imports::import_begin(&db, &req.text, &who, &req.mapping, tmpl)?
     };
     Ok(Json(json!({
         "ok": res.ok,

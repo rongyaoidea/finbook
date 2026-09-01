@@ -340,10 +340,10 @@ mod tests {
     #[test]
     fn validation_guards() {
         let db = mem();
-        let mut inv = sample("in", "");
+        let inv = sample("in", "");
         assert!(insert(&db, &inv, "u1").is_err(), "发票号码必填");
 
-        let mut inv2 = sample("bad", "X001");
+        let inv2 = sample("bad", "X001");
         assert!(insert(&db, &inv2, "u1").is_err(), "非法类型应被拒");
 
         let mut inv3 = sample("in", "N001");

@@ -612,14 +612,14 @@ function openInvoiceEditor(main, inv) {
 }
 
 // ===========================================================================
-// 数据导入（其他软件 / CSV）
+// 数据导入（其他软件 / CSV / Excel）
 // ===========================================================================
 async function viewImports(main) {
   main.innerHTML = `
     <h2>数据导入</h2>
     <div class="panel">
       <p class="muted" style="margin:0 0 12px;line-height:1.6">
-        从其他财务软件（金蝶 / 用友 / Excel）导出的 CSV 导入数据。
+        从其他财务软件（金蝶 / 用友）或 Excel 导入数据。
         支持导入 <b>期初余额表</b> 与 <b>记账凭证</b>；遇到账套里没有的科目可手动映射。
       </p>
       <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0">
@@ -628,6 +628,12 @@ async function viewImports(main) {
           <option value="begin">期初余额表</option>
           <option value="voucher">记账凭证</option>
         </select>
+        <label>来源模板</label>
+        <select id="imp-template">
+          <option value="generic">通用</option>
+          <option value="kingdee">金蝶</option>
+          <option value="yonyou">用友</option>
+        </select>
         <label>期间（凭证用，YYYYMM）</label>
         <input id="imp-period" placeholder="202601" value="${state.current ? String(state.current).replace('-','') : ""}" style="width:90px" />
         <div class="spacer"></div>
@@ -635,9 +641,11 @@ async function viewImports(main) {
         <button class="btn" id="imp-run">执行导入</button>
       </div>
       <div style="margin-top:10px">
-        <textarea id="imp-text" rows="10" placeholder="粘贴 CSV 内容…
-期初余额表：科目编码, 方向(借/贷), 金额
-凭证：日期, 凭证字, 摘要, 科目编码, 借方, 贷方"></textarea>
+        <label style="font-weight:600">选择 Excel 文件（.xlsx / .xls / .ods，可选）</label>
+        <input type="file" id="imp-file" accept=".xlsx,.xls,.ods" style="display:block;margin:4px 0 8px" />
+        <textarea id="imp-text" rows="8" placeholder="或直接粘贴 CSV 内容…
+通用期初：科目编码, 方向(借/贷), 金额
+通用凭证：日期, 凭证字, 摘要, 科目编码, 借方, 贷方"></textarea>
       </div>
       <div id="imp-result" class="muted" style="margin-top:10px;min-height:20px;white-space:pre-wrap;font-size:13px"></div>
     </div>
@@ -647,17 +655,32 @@ async function viewImports(main) {
       <div id="imp-mapping"></div>
     </div>`;
   let mapping = {};
+  let fileB64 = "";
   // 加载科目列表供映射下拉
   let accounts = [];
   try { accounts = await api("/accounts"); } catch (e) {}
   const acctOpts = (sel) => accounts.map((a) => `<option value="${esc(a.code)}" ${sel === a.code ? "selected" : ""}>${esc(a.code)} ${esc(a.name)}</option>`).join("");
 
+  // Excel 文件 → base64
+  $("#imp-file").addEventListener("change", (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) { fileB64 = ""; return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      fileB64 = dataUrl.split(",").slice(1).join(","); // 去掉 data:...;base64, 前缀
+      $("#imp-result").textContent = `已选择文件：${f.name}（${(f.size / 1024).toFixed(1)} KB），点击「预检科目」或「执行导入」。`;
+    };
+    reader.readAsDataURL(f);
+  });
+
   $("#imp-analyze").addEventListener("click", async () => {
     const text = $("#imp-text").value;
     const kind = $("#imp-kind").value;
-    if (!text.trim()) { toast("请先粘贴 CSV 内容", "err"); return; }
+    const template = $("#imp-template").value;
+    if (!text.trim() && !fileB64) { toast("请粘贴 CSV 内容或选择 Excel 文件", "err"); return; }
     try {
-      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text }) });
+      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null }) });
       const missing = (r && r.missing) || [];
       const wrap = $("#imp-mapping-wrap");
       const box = $("#imp-mapping");
@@ -685,10 +708,11 @@ async function viewImports(main) {
   $("#imp-run").addEventListener("click", async () => {
     const text = $("#imp-text").value;
     const kind = $("#imp-kind").value;
+    const template = $("#imp-template").value;
     const period = parseInt(($("#imp-period").value || "0").replace(/[^0-9]/g, ""), 10) || 0;
-    if (!text.trim()) { toast("请先粘贴 CSV 内容", "err"); return; }
+    if (!text.trim() && !fileB64) { toast("请粘贴 CSV 内容或选择 Excel 文件", "err"); return; }
     try {
-      const r = await api("/import/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, period, mapping }) });
+      const r = await api("/import/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null, period, mapping }) });
       const lines = [`✅ 成功导入 ${r.ok} 条`, r.skipped ? `⚠ 跳过 ${r.skipped} 条` : ""].filter(Boolean);
       if (r.warnings && r.warnings.length) {
         lines.push("", "警告：");

@@ -392,6 +392,12 @@ impl From<DbError> for AppError {
     }
 }
 
+impl From<fincore::FinError> for AppError {
+    fn from(e: fincore::FinError) -> Self {
+        AppError::BadRequest(format!("导入数据有误：{e}"))
+    }
+}
+
 impl AppError {
     pub fn unauthorized(m: impl Into<String>) -> Self {
         AppError::Unauthorized(m.into())

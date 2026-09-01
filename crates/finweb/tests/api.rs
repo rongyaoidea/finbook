@@ -28,7 +28,7 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     // company 留空 = 未建账（触发 needs_setup 建账向导）
     findb::Db::create_no_admin(&book_path, &opts).expect("建账失败");
 
-    let mut books = BookRegistry::new();
+    let books = BookRegistry::new();
     books.register(&book_path, 4);
     let state = WebState::new(
         books,
@@ -351,4 +351,78 @@ async fn books_listed_and_login_with_book_key() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn import_run_kingdee_template_csv() {
+    let (state, _bp, _dir) = test_state();
+    let (status, sid) = login(&state, "boss", "Admin!2026").await;
+    assert_eq!(status, StatusCode::OK);
+    // 金蝶模板期初：科目编码,科目名称,方向,期初余额,累计借方,累计贷方
+    let csv = "\u{feff}科目编码,科目名称,方向,期初余额,累计借方,累计贷方\n\
+               1001,库存现金,借,10000,50000,30000\n\
+               100201,银行存款-工行,贷,2000,0,2000\n";
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "begin",
+                "template": "kingdee",
+                "text": csv,
+                "mapping": {},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "金蝶模板导入应成功");
+    let s = body_string(resp).await;
+    assert!(s.contains("\"ok\":2"), "应导入 2 条：{s}");
+}
+
+#[tokio::test]
+async fn import_run_excel_file_upload() {
+    let (state, _bp, _dir) = test_state();
+    let (status, sid) = login(&state, "boss", "Admin!2026").await;
+    assert_eq!(status, StatusCode::OK);
+    // 用 findb 的 fixture：用友模板期初表（Excel）
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../findb/tests/fixtures/yonyou_begin.xlsx");
+    let bytes = std::fs::read(fixture).expect("读取 fixture xlsx 失败");
+    let b64 = base64_encode(&bytes);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "begin",
+                "template": "yonyou",
+                "text": "",
+                "file": b64,
+                "mapping": {},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "Excel 上传导入应成功");
+    let s = body_string(resp).await;
+    assert!(s.contains("\"ok\":2"), "应导入 2 条：{s}");
+}
+
+/// 无依赖 base64 编码（测试辅助）
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }

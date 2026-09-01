@@ -260,8 +260,15 @@ pub struct VoucherDetail {
 pub struct ImportAnalyzeReq {
     /// begin = 期初余额表；voucher = 凭证
     pub kind: String,
-    /// CSV 文本
+    /// CSV 文本（选择文件上传时可为空）
+    #[serde(default)]
     pub text: String,
+    /// 来源模板：generic / kingdee / yonyou
+    #[serde(default)]
+    pub template: String,
+    /// Excel 文件内容（base64，.xlsx/.xls/.ods）；与 text 二选一
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 /// 导入执行请求
@@ -269,8 +276,15 @@ pub struct ImportAnalyzeReq {
 pub struct ImportRunReq {
     /// begin = 期初余额表；voucher = 凭证
     pub kind: String,
-    /// CSV 文本
+    /// CSV 文本（选择文件上传时可为空）
+    #[serde(default)]
     pub text: String,
+    /// 来源模板：generic / kingdee / yonyou
+    #[serde(default)]
+    pub template: String,
+    /// Excel 文件内容（base64，.xlsx/.xls/.ods）；与 text 二选一
+    #[serde(default)]
+    pub file: Option<String>,
     /// 凭证导入时的期间（YYYYMM）
     #[serde(default)]
     pub period: i32,

@@ -538,6 +538,17 @@ CREATE TABLE IF NOT EXISTS production_order (
 );
 CREATE INDEX IF NOT EXISTS idx_prod_period ON production_order(period, status);
 
+-- 生产成本归集表
+CREATE TABLE IF NOT EXISTS prod_cost (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL REFERENCES production_order(id) ON DELETE CASCADE,
+    cost_type   TEXT NOT NULL,
+    amount      TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pc_po ON prod_cost(po_id);
+
 "#;
 
 /// v1 → v2 需要新增到既有表上的列

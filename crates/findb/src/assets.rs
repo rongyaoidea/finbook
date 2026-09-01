@@ -464,6 +464,162 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         .or_else(|| NaiveDate::parse_from_str(s, "%Y/%m/%d").ok())
 }
 
+// ===========================================================================
+// 资产类别 / 减值 / 附属设备 / 盘点
+// ===========================================================================
+
+/// 资产类别清单（去重）
+pub fn categories(db: &Db) -> DbResult<Vec<String>> {
+    let mut st = db.conn().prepare(
+        "SELECT DISTINCT category FROM fixed_asset WHERE category <> '' ORDER BY category",
+    )?;
+    let rows = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 资产减值：记录减值金额
+pub fn impair(db: &Db, asset_id: i64, period: Period, amount: Money, memo: &str) -> DbResult<i64> {
+    if amount.is_zero() {
+        return Err(fincore::FinError::msg("减值金额不能为 0").into());
+    }
+    db.conn().execute(
+        "INSERT INTO asset_impairment(asset_id,period,amount,memo) VALUES(?1,?2,?3,?4)",
+        rusqlite::params![asset_id, period.ymm(), amount.to_string(), memo],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+pub fn impairment_sum(db: &Db, asset_id: i64) -> DbResult<Money> {
+    let mut st = db.conn().prepare("SELECT amount FROM asset_impairment WHERE asset_id=?1")?;
+    let rows = st
+        .query_map([asset_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.iter().map(|s| Money::parse_or_zero(s)).sum())
+}
+
+/// 附属设备
+#[derive(Clone, Debug)]
+pub struct Accessory {
+    pub id: i64,
+    pub asset_id: i64,
+    pub name: String,
+    pub spec: String,
+    pub qty: i32,
+    pub memo: String,
+}
+
+pub fn accessory_add(db: &Db, asset_id: i64, name: &str, spec: &str, qty: i32, memo: &str) -> DbResult<i64> {
+    db.conn().execute(
+        "INSERT INTO asset_accessory(asset_id,name,spec,qty,memo) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![asset_id, name, spec, qty, memo],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+pub fn accessory_list(db: &Db, asset_id: i64) -> DbResult<Vec<Accessory>> {
+    let mut st = db.conn().prepare(
+        "SELECT id,asset_id,name,spec,qty,memo FROM asset_accessory WHERE asset_id=?1 ORDER BY id",
+    )?;
+    let rows = st
+        .query_map([asset_id], |r| {
+            Ok(Accessory {
+                id: r.get(0)?,
+                asset_id: r.get(1)?,
+                name: r.get(2)?,
+                spec: r.get(3)?,
+                qty: r.get(4)?,
+                memo: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn accessory_delete(db: &Db, id: i64) -> DbResult<()> {
+    db.conn().execute("DELETE FROM asset_accessory WHERE id=?1", [id])?;
+    Ok(())
+}
+
+/// 资产盘点单
+#[derive(Clone, Debug)]
+pub struct AssetCount {
+    pub id: i64,
+    pub no: String,
+    pub period: Period,
+    pub date: NaiveDate,
+    pub status: String, // draft / posted
+    pub prepared_by: String,
+    pub memo: String,
+    /// (asset_id, found) 明细
+    pub lines: Vec<(i64, bool, String)>,
+}
+
+pub fn ac_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let prefix = format!("ZCPD{:04}{:02}", period.year(), period.month());
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM asset_count WHERE no LIKE ?1",
+        rusqlite::params![format!("{prefix}%")],
+        |r| r.get(0),
+    )?;
+    Ok(format!("{prefix}-{:03}", n + 1))
+}
+
+pub fn ac_save(db: &Db, c: &mut AssetCount) -> DbResult<i64> {
+    let tx = db.conn().unchecked_transaction()?;
+    let id = if c.id > 0 {
+        tx.execute(
+            "UPDATE asset_count SET period=?2, date=?3, status=?4, prepared_by=?5, memo=?6 WHERE id=?1",
+            rusqlite::params![c.id, c.period.ymm(), c.date.format("%Y-%m-%d").to_string(), c.status, c.prepared_by, c.memo],
+        )?;
+        c.id
+    } else {
+        tx.execute(
+            "INSERT INTO asset_count(no,period,date,status,prepared_by,memo) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![c.no, c.period.ymm(), c.date.format("%Y-%m-%d").to_string(), c.status, c.prepared_by, c.memo],
+        )?;
+        tx.last_insert_rowid()
+    };
+    tx.execute("DELETE FROM asset_count_line WHERE ac_id=?1", [id])?;
+    for (asset_id, found, memo) in &c.lines {
+        tx.execute(
+            "INSERT INTO asset_count_line(ac_id,asset_id,found,memo) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![id, asset_id, if *found { 1 } else { 0 }, memo],
+        )?;
+    }
+    tx.commit()?;
+    c.id = id;
+    Ok(id)
+}
+
+/// 盘点过账：盘亏（found=false）的资产标记为 Idle 并记录
+pub fn ac_post(db: &Db, id: i64) -> DbResult<usize> {
+    let mut st = db.conn().prepare(
+        "SELECT asset_id, found FROM asset_count_line WHERE ac_id=?1",
+    )?;
+    let lines: Vec<(i64, bool)> = st
+        .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut n = 0;
+    let tx = db.conn().unchecked_transaction()?;
+    for (asset_id, found) in lines {
+        if !found {
+            if let Some(mut a) = get(db, asset_id)? {
+                if a.status != AssetStatus::Disposed {
+                    a.status = AssetStatus::Idle;
+                    a.memo = format!("{} 盘亏", a.memo);
+                    update(db, &a)?;
+                    n += 1;
+                }
+            }
+        }
+    }
+    tx.execute("UPDATE asset_count SET status='posted' WHERE id=?1", [id])?;
+    tx.commit()?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +729,30 @@ mod tests {
         assert_eq!(next_code(&db).unwrap(), "GD0001");
         insert(&db, &asset("GD0001", "1000", 12)).unwrap();
         assert_eq!(next_code(&db).unwrap(), "GD0002");
+    }
+
+    #[test]
+    fn impairment_accessory_count() {
+        let db = tmpdb("imp");
+        let id = insert(&db, &asset("GD0001", "10000", 60)).unwrap();
+        // 减值 2000
+        impair(&db, id, Period::new(2026, 2).unwrap(), Money::parse("2000").unwrap(), "减值测试").unwrap();
+        assert_eq!(impairment_sum(&db, id).unwrap(), Money::parse("2000").unwrap());
+        // 类别
+        assert_eq!(categories(&db).unwrap(), vec!["电子设备".to_string()]);
+        // 附属设备
+        accessory_add(&db, id, "显卡", "RTX", 2, "").unwrap();
+        assert_eq!(accessory_list(&db, id).unwrap().len(), 1);
+        // 盘点：盘亏 → 过账后资产变 Idle
+        let p = Period::new(2026, 2).unwrap();
+        let mut c = AssetCount {
+            id: 0, no: ac_next_no(&db, p).unwrap(), period: p,
+            date: NaiveDate::from_ymd_opt(2026, 2, 28).unwrap(),
+            status: "draft".into(), prepared_by: "张三".into(), memo: String::new(),
+            lines: vec![(id, false, "盘亏".to_string())],
+        };
+        let cid = ac_save(&db, &mut c).unwrap();
+        assert_eq!(ac_post(&db, cid).unwrap(), 1);
+        assert_eq!(get(&db, id).unwrap().unwrap().status, AssetStatus::Idle);
     }
 }

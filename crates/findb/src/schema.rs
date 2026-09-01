@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -293,6 +293,53 @@ CREATE TABLE IF NOT EXISTS asset_depreciation (
     UNIQUE(asset_id, period)
 );
 CREATE INDEX IF NOT EXISTS idx_dep_period ON asset_depreciation(period);
+
+-- ===========================================================================
+-- v13：资产盘点 / 附属设备 / 减值
+-- ===========================================================================
+
+-- 资产盘点单
+CREATE TABLE IF NOT EXISTS asset_count (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL UNIQUE,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft / posted
+    prepared_by TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ac_period ON asset_count(period);
+
+-- 盘点明细（账面状态 vs 实盘）
+CREATE TABLE IF NOT EXISTS asset_count_line (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ac_id       INTEGER NOT NULL REFERENCES asset_count(id) ON DELETE CASCADE,
+    asset_id    INTEGER NOT NULL,
+    found       INTEGER NOT NULL DEFAULT 1, -- 1=盘到 0=盘亏
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_acl ON asset_count_line(ac_id);
+
+-- 资产附属设备
+CREATE TABLE IF NOT EXISTS asset_accessory (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id    INTEGER NOT NULL REFERENCES fixed_asset(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    spec        TEXT NOT NULL DEFAULT '',
+    qty         INTEGER NOT NULL DEFAULT 1,
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_acc ON asset_accessory(asset_id);
+
+-- 资产减值
+CREATE TABLE IF NOT EXISTS asset_impairment (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id    INTEGER NOT NULL REFERENCES fixed_asset(id) ON DELETE CASCADE,
+    period      INTEGER NOT NULL,
+    amount      TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_imp ON asset_impairment(asset_id);
 
 -- 汇率表（期末调汇）
 CREATE TABLE IF NOT EXISTS fx_rate (

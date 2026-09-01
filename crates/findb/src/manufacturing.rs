@@ -100,6 +100,82 @@ pub fn get_prod_total_cost(db: &Db, po_id: i64) -> DbResult<Money> {
 }
 
 // ===========================================================================
+// 在制品成本 / 成本差异 / 成本分摊
+// ===========================================================================
+
+/// 在制品成本：某期间内未完工生产订单的累计成本合计
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WipRow {
+    pub po_id: i64,
+    pub no: String,
+    pub item_name: String,
+    pub material: Money,
+    pub labor: Money,
+    pub overhead: Money,
+    pub total: Money,
+}
+
+/// 在制品汇总（按期间列未完工订单）
+pub fn wip_cost(db: &Db, period: Period) -> DbResult<Vec<WipRow>> {
+    let orders = crate::scm::prod_list(db, period, None)?;
+    let mut out = Vec::new();
+    for o in orders {
+        if matches!(o.status, ProdStatus::Completed | ProdStatus::Cancelled) {
+            continue;
+        }
+        let (m, l, oh) = get_prod_cost(db, o.id)?;
+        out.push(WipRow {
+            po_id: o.id,
+            no: o.no,
+            item_name: o.item_name,
+            material: m,
+            labor: l,
+            overhead: oh,
+            total: m + l + oh,
+        });
+    }
+    Ok(out)
+}
+
+/// 成本差异：实际累计成本 vs 标准成本（按 BOM 参考成本 × 计划量）。
+/// 返回 (实际成本, 标准成本, 差异=实际−标准)。
+pub fn cost_variance(db: &Db, po_id: i64) -> DbResult<(Money, Money, Money)> {
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::msg("生产订单不存在"))?;
+    let actual = get_prod_total_cost(db, po_id)?;
+    let standard = crate::scm::bom_cost_rollup(db, &order.item_code, order.planned_qty)?;
+    Ok((actual, standard, actual - standard))
+}
+
+/// 制造费用分摊：把一笔制造费用总额按各在制订单的已归集成本占比分摊。
+/// `amount` 为待分摊总额，返回 (po_id, 分摊额)。
+pub fn overhead_allocate(db: &Db, period: Period, amount: Money) -> DbResult<Vec<(i64, Money)>> {
+    let wip = wip_cost(db, period)?;
+    let base: Money = wip.iter().map(|w| w.material + w.labor).sum();
+    if base.is_zero() || amount.is_zero() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(wip.len());
+    let mut assigned = Money::ZERO;
+    let n = wip.len();
+    for (i, w) in wip.iter().enumerate() {
+        let share = if i == n - 1 {
+            amount - assigned // 尾差给最后一单
+        } else {
+            (((w.material + w.labor) * amount.inner()) / base.inner()).round2()
+        };
+        assigned += share;
+        out.push((w.po_id, share));
+    }
+    Ok(out)
+}
+
+/// 成本预测：按 BOM 参考成本 × 计划量预测某生产订单的物料成本
+pub fn cost_forecast(db: &Db, po_id: i64) -> DbResult<Money> {
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::msg("生产订单不存在"))?;
+    crate::scm::bom_cost_rollup(db, &order.item_code, order.planned_qty)
+}
+
+// ===========================================================================
 // BOM展开与领料
 // ===========================================================================
 
@@ -301,6 +377,10 @@ pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> 
 mod tests {
     use super::*;
     use crate::tests::mem;
+
+    fn m(s: &str) -> Money {
+        Money::parse(s).unwrap()
+    }
     
     #[test]
     fn cost_tracking() {
@@ -332,5 +412,15 @@ mod tests {
         
         let total = get_prod_total_cost(&db, po_id).unwrap();
         assert_eq!(total, Money::parse("6500").unwrap());
+
+        // 在制品成本
+        let wip = wip_cost(&db, p).unwrap();
+        assert_eq!(wip.len(), 1);
+        assert_eq!(wip[0].total, m("6500"));
+
+        // 制造费用分摊（1000 分摊到唯一在制单 → 全部）
+        let alloc = overhead_allocate(&db, p, m("1000")).unwrap();
+        assert_eq!(alloc.len(), 1);
+        assert_eq!(alloc[0].1, m("1000"));
     }
 }

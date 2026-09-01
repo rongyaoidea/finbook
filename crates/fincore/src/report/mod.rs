@@ -5,6 +5,7 @@
 
 pub mod balance_sheet;
 pub mod cashflow;
+pub mod equity;
 pub mod income;
 
 use serde::{Deserialize, Serialize};

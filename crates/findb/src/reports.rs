@@ -6,6 +6,7 @@ use fincore::report::cashflow::{
     build_cash_flow, default_cash_flow_items, CashFlowDirection, CashFlowGroup, CashFlowItem,
     CashFlowStatement, ItemAmounts,
 };
+use fincore::report::equity::{EquityStatement, CAPITAL, RESERVE, SURPLUS, UNDISTRIBUTED};
 use fincore::report::{balance_sheet, income, ReportDef};
 use fincore::Money;
 
@@ -254,6 +255,255 @@ pub fn cash_flow_statement(
     Ok(build_cash_flow(&items, &amounts, begin, end, unassigned))
 }
 
+// ---------------------------------------------------------------------------
+// 所有者权益变动表
+// ---------------------------------------------------------------------------
+
+/// 生成所有者权益变动表。
+///
+/// 取数口径：权益类科目贷方余额为正。年初 = 本年 1 月的期初余额，
+/// 本年增减 = 本年累计贷 − 本年累计借（贷方增加为正），年末 = 年初 + 本年增减。
+/// `from` 应为本会计年度首个期间（通常 1 月），`to` 为报告期末。
+pub fn equity_statement(db: &Db, from: fincore::Period, to: fincore::Period) -> DbResult<EquityStatement> {
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, to))?;
+    let names = [
+        ("实收资本", CAPITAL),
+        ("资本公积", RESERVE),
+        ("盈余公积", SURPLUS),
+        ("未分配利润", UNDISTRIBUTED),
+    ];
+    let mut inputs = Vec::with_capacity(4);
+    for (name, code) in names {
+        let r = snap.for_account(code, None);
+        // 权益类贷方正：年初 = -期初（带符号期初为贷负），本年增减 = 累计贷 - 累计借
+        let begin = r.begin.negated();
+        let change = r.ytd_credit - r.ytd_debit;
+        let end = begin + change;
+        inputs.push((name.to_string(), begin, change, end));
+    }
+    Ok(EquityStatement::build(&inputs))
+}
+
+// ---------------------------------------------------------------------------
+// 报表对比分析
+// ---------------------------------------------------------------------------
+
+/// 报表对比行：同一报表项目在两个期间的取值 + 差额 + 变动率
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CompareRow {
+    pub no: String,
+    pub name: String,
+    pub indent: u8,
+    pub style: fincore::report::LineStyle,
+    /// 当前期值
+    pub current: Money,
+    /// 对比期值
+    pub previous: Money,
+    /// 差额 = 当前 − 对比
+    pub diff: Money,
+    /// 变动率（%），对比期为 0 时记为 0
+    pub rate: Money,
+}
+
+/// 对同一张内置/自定义报表做两期对比。
+/// `key` 为 report_def 的 key，`current_from/to` 与 `prev_from/to` 分别为两期的取数区间。
+/// 每个金额列（取第一列）对比；其余列忽略。
+pub fn report_compare(
+    db: &Db,
+    key: &str,
+    current_from: fincore::Period,
+    current_to: fincore::Period,
+    prev_from: fincore::Period,
+    prev_to: fincore::Period,
+) -> DbResult<Vec<CompareRow>> {
+    let def = get_def(db, key)?.unwrap_or_else(|| match key {
+        "balance_sheet" => balance_sheet::balance_sheet_def(),
+        "income_statement" => income::income_statement_def(),
+        _ => fincore::report::ReportDef {
+            key: key.to_string(),
+            name: key.to_string(),
+            columns: vec![],
+            lines: vec![],
+        },
+    });
+    let cur_snap = BalanceSnapshot::load(db, &BalanceQuery::range(current_from, current_to))?;
+    let prev_snap = BalanceSnapshot::load(db, &BalanceQuery::range(prev_from, prev_to))?;
+    let cur_table = fincore::report::render_single(&def, &cur_snap, "", "", fincore::report::identity);
+    let prev_table = fincore::report::render_single(&def, &prev_snap, "", "", fincore::report::identity);
+    let mut out = Vec::with_capacity(cur_table.rows.len());
+    for (i, r) in cur_table.rows.iter().enumerate() {
+        let cur = r.values.first().copied().unwrap_or(Money::ZERO);
+        let prev = prev_table.rows.get(i).and_then(|x| x.values.first()).copied().unwrap_or(Money::ZERO);
+        let diff = cur - prev;
+        let rate = if prev.is_zero() {
+            Money::ZERO
+        } else {
+            ((diff.abs() * Money::from_i64(100)) / prev.abs().inner()).round2()
+        };
+        out.push(CompareRow {
+            no: r.no.clone(),
+            name: r.name.clone(),
+            indent: r.indent,
+            style: r.style,
+            current: cur,
+            previous: prev,
+            diff,
+            rate,
+        });
+    }
+    Ok(out)
+}
+
+/// 科目日报表：按日期汇总某科目的借贷发生额与日末余额
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DailyRow {
+    pub date: String,
+    pub debit: Money,
+    pub credit: Money,
+    pub balance: Money,
+}
+
+/// 科目日报表：期间内按天汇总指定科目（含下级）的借贷发生额，逐日滚动余额。
+pub fn account_daily_report(
+    db: &Db,
+    code: &str,
+    from: fincore::Period,
+    to: fincore::Period,
+) -> DbResult<Vec<DailyRow>> {
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, to))?;
+    let begin = snap.for_account(code, None).begin;
+    let pattern = format!("{code}%");
+    let mut stmt = db.conn().prepare(
+        "SELECT v.date, e.debit, e.credit
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+           AND e.account_code LIKE ?3
+         ORDER BY v.date",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![from.ymm(), to.ymm(), pattern])?;
+    // 按日期聚合
+    let mut map: std::collections::BTreeMap<String, (Money, Money)> = std::collections::BTreeMap::new();
+    while let Some(r) = rows.next()? {
+        let d: String = r.get(0)?;
+        let dr = read_money(r, 1)?;
+        let cr = read_money(r, 2)?;
+        let e = map.entry(d).or_insert((Money::ZERO, Money::ZERO));
+        e.0 += dr;
+        e.1 += cr;
+    }
+    let mut running = begin;
+    let mut out = Vec::with_capacity(map.len());
+    for (date, (debit, credit)) in map {
+        running += debit - credit;
+        out.push(DailyRow { date, debit, credit, balance: running });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 期末对账
+// ---------------------------------------------------------------------------
+
+/// 期末对账检查项
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReconcileItem {
+    /// 检查项名称
+    pub name: String,
+    /// 是否通过
+    pub ok: bool,
+    /// 明细说明
+    pub detail: String,
+}
+
+/// 期末对账：试算平衡 + 总账/明细账一致 + 银行未达账项 + 未生成凭证的业务单据。
+/// 返回检查项清单，全部 ok 即对账通过。
+pub fn period_reconcile(db: &Db, period: fincore::Period) -> DbResult<Vec<ReconcileItem>> {
+    use fincore::balance::TrialBalance;
+    let mut out = Vec::new();
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::period(period))?;
+    let chart = accounts::chart(db)?;
+
+    // 1. 试算平衡
+    let trial: TrialBalance = snap.trial_balance(&chart);
+    let balanced = trial.period_balanced();
+    out.push(ReconcileItem {
+        name: "试算平衡".into(),
+        ok: balanced,
+        detail: if balanced {
+            format!("借方 {} = 贷方 {}", trial.period_debit.fmt_money(), trial.period_credit.fmt_money())
+        } else {
+            let diff = (trial.period_debit - trial.period_credit).abs();
+            format!("借方 {} ≠ 贷方 {}，差 {}", trial.period_debit.fmt_money(), trial.period_credit.fmt_money(), diff.fmt_money())
+        },
+    });
+
+    // 2. 期末余额方向合法性：资产负债科目余额方向不匹配则列出
+    let mut wrong_dir = Vec::new();
+    for a in chart.all() {
+        if !chart.is_leaf(&a.code) {
+            continue;
+        }
+        let r = snap.for_account(&a.code, None);
+        let end = r.end();
+        if end.is_zero() {
+            continue;
+        }
+        let expected_credit = a.category.default_dir() == fincore::account::Direction::Credit;
+        let is_credit = end.is_negative();
+        if expected_credit != is_credit {
+            wrong_dir.push(format!("{}({})", a.code, a.name));
+        }
+    }
+    if wrong_dir.is_empty() {
+        out.push(ReconcileItem { name: "余额方向检查".into(), ok: true, detail: "全部科目余额方向正常".into() });
+    } else {
+        out.push(ReconcileItem {
+            name: "余额方向检查".into(),
+            ok: false,
+            detail: format!("{} 个科目余额方向异常：{}", wrong_dir.len(), wrong_dir.iter().take(5).cloned().collect::<Vec<_>>().join("、")),
+        });
+    }
+
+    // 3. 银行未达账项（本期银行对账单未勾对的笔数）
+    let unmatched: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM bank_statement WHERE period=?1 AND entry_id IS NULL",
+        rusqlite::params![period.ymm()],
+        |r| r.get(0),
+    ).unwrap_or(0);
+    out.push(ReconcileItem {
+        name: "银行未达账项".into(),
+        ok: unmatched == 0,
+        detail: format!("本期银行对账单未勾对 {unmatched} 笔"),
+    });
+
+    // 4. 未生成凭证的业务单据（存货流水/工资/报销 缺 voucher_id）
+    let biz_loose = {
+        let a: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM stock_move WHERE period=?1 AND voucher_id IS NULL",
+            rusqlite::params![period.ymm()],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let b: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM payroll WHERE period=?1 AND voucher_id IS NULL",
+            rusqlite::params![period.ymm()],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let c: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM expense_claim WHERE period=?1 AND status='paid' AND voucher_id IS NULL",
+            rusqlite::params![period.ymm()],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        a + b + c
+    };
+    out.push(ReconcileItem {
+        name: "业务单据生成凭证".into(),
+        ok: biz_loose == 0,
+        detail: format!("存货/工资/报销尚有 {biz_loose} 笔未生成凭证"),
+    });
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +661,65 @@ mod tests {
     fn aux_unused_placeholder() {
         // 保持 AuxRef 引用，避免未使用告警影响整洁
         let _ = AuxRef::default().key();
+    }
+
+    #[test]
+    fn equity_statement_computed() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        // 实收资本 100 万（贷方）
+        cash_voucher(
+            &db,
+            p,
+            5,
+            vec![
+                ("1001", "借", "1000000", Some("0301")),
+                ("4001", "贷", "1000000", None),
+            ],
+        );
+        let stmt = equity_statement(&db, p, p).unwrap();
+        let capital = stmt.lines.iter().find(|l| l.name == "实收资本").unwrap();
+        assert_eq!(capital.begin, Money::ZERO);
+        assert_eq!(capital.change, Money::parse("1000000").unwrap());
+        assert_eq!(capital.end, Money::parse("1000000").unwrap());
+        assert!(stmt.ties());
+    }
+
+    #[test]
+    fn daily_report_rolls_balance() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        cash_voucher(&db, p, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
+        cash_voucher(&db, p, 9, vec![("1001", "借", "500", Some("0103")), ("6301", "贷", "500", None)]);
+        let rows = account_daily_report(&db, "1001", p, p).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].balance, Money::parse("1000").unwrap());
+        assert_eq!(rows[1].balance, Money::parse("1500").unwrap());
+    }
+
+    #[test]
+    fn report_compare_diff() {
+        let db = mem();
+        let p1 = Period::new(2026, 1).unwrap();
+        let p2 = Period::new(2026, 2).unwrap();
+        cash_voucher(&db, p1, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
+        cash_voucher(&db, p2, 5, vec![("1001", "借", "3000", Some("0101")), ("600101", "贷", "3000", None)]);
+        let rows = report_compare(&db, "income_statement", p2, p2, p1, p1).unwrap();
+        // 营业收入行：本期 3000 vs 上期 1000 → 差额 2000
+        let rev = rows.iter().find(|r| r.no == "1").unwrap();
+        assert_eq!(rev.current, Money::parse("3000").unwrap());
+        assert_eq!(rev.previous, Money::parse("1000").unwrap());
+        assert_eq!(rev.diff, Money::parse("2000").unwrap());
+    }
+
+    #[test]
+    fn period_reconcile_lists_checks() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        cash_voucher(&db, p, 5, vec![("1001", "借", "500", Some("0101")), ("600101", "贷", "500", None)]);
+        let items = period_reconcile(&db, p).unwrap();
+        assert!(items.len() >= 3);
+        assert!(items.iter().all(|i| i.ok), "空账套+平衡凭证应全部通过：{:?}", items.iter().map(|i| &i.name).collect::<Vec<_>>());
     }
 }
 

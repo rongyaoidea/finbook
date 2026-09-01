@@ -91,6 +91,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/reports/multi-column", get(get_multi_column))
         .route("/api/reports/summary-table", get(get_summary_table))
         .route("/api/reports/ratios", get(get_fin_ratios))
+        // 财务核心：所有者权益变动表 / 报表对比 / 科目日报表 / 期末对账
+        .route("/api/reports/equity", get(get_equity_statement))
+        .route("/api/reports/compare", get(get_report_compare))
+        .route("/api/reports/daily", get(get_account_daily))
+        .route("/api/reports/reconcile", get(get_period_reconcile))
         // 工艺路线 / 报工 / MRP
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
@@ -1398,6 +1403,82 @@ async fn get_fin_ratios(
     let db = state.db_for(&user.book_key)?;
     let rows = advanced::fin_ratios(&db, period, from)?;
     Ok(Json(serde_json::json!({ "period": period_to_str(period), "ratios": rows })))
+}
+
+// ---- 所有者权益变动表 / 报表对比 / 科目日报表 / 期末对账 ----
+
+async fn get_equity_statement(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
+        fincore::Period::new(period.year(), 1).unwrap_or(period)
+    });
+    let db = state.db_for(&user.book_key)?;
+    let stmt = findb::reports::equity_statement(&db, from, period)?;
+    Ok(Json(serde_json::json!({
+        "from": period_to_str(from),
+        "to": period_to_str(period),
+        "statement": stmt,
+    })))
+}
+
+async fn get_report_compare(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let key = q.get("key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
+    let cur = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let prev = q.get("prev").and_then(|s| parse_period(s)).unwrap_or(cur.prev());
+    let yearly = q.get("yearly").map(|s| s == "1" || s == "true").unwrap_or(true);
+    // 默认按年累计：当前期 1 月→当前期；上期 1 月→上期
+    let (cur_from, prev_from) = if yearly {
+        (fincore::Period::new(cur.year(), 1).unwrap_or(cur), fincore::Period::new(prev.year(), 1).unwrap_or(prev))
+    } else {
+        (cur, prev)
+    };
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::reports::report_compare(&db, &key, cur_from, cur, prev_from, prev)?;
+    Ok(Json(serde_json::json!({
+        "key": key,
+        "current": period_to_str(cur),
+        "previous": period_to_str(prev),
+        "rows": rows,
+    })))
+}
+
+async fn get_account_daily(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let code = q.get("code").cloned().unwrap_or_default();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少科目编码 code"));
+    }
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::reports::account_daily_report(&db, &code, from, to)?;
+    Ok(Json(serde_json::json!({ "code": code, "rows": rows })))
+}
+
+async fn get_period_reconcile(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let db = state.db_for(&user.book_key)?;
+    let items = findb::reports::period_reconcile(&db, period)?;
+    Ok(Json(serde_json::json!({ "period": period_to_str(period), "items": items })))
 }
 
 // ---- 工艺路线 / 报工 ----

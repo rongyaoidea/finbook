@@ -20,7 +20,7 @@ use crate::DbError;
 /// v3：自动转账补"对方科目"，支持计提类（来源科目只取数不转出）
 /// v4：自定义报表独立建表（行 × 列 × 公式网格）
 /// v5：账号设备绑定（user.device_id / device_name）
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -438,6 +438,106 @@ CREATE TABLE IF NOT EXISTS invoice (
 );
 CREATE INDEX IF NOT EXISTS idx_invoice_kind ON invoice(kind, date);
 CREATE INDEX IF NOT EXISTS idx_invoice_number ON invoice(number);
+
+-- 采购订单
+CREATE TABLE IF NOT EXISTS purchase_order (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period          INTEGER NOT NULL,
+    no              TEXT NOT NULL UNIQUE,
+    date            TEXT NOT NULL,
+    supplier_code   TEXT NOT NULL DEFAULT '',
+    supplier_name   TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    total_amount    TEXT NOT NULL DEFAULT '0',
+    total_tax       TEXT NOT NULL DEFAULT '0',
+    received_amount TEXT NOT NULL DEFAULT '0',
+    prepared_by     TEXT NOT NULL DEFAULT '',
+    memo            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_po_period ON purchase_order(period, status);
+
+-- 采购订单行
+CREATE TABLE IF NOT EXISTS po_line (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL REFERENCES purchase_order(id) ON DELETE CASCADE,
+    item_code   TEXT NOT NULL,
+    item_name   TEXT NOT NULL DEFAULT '',
+    qty_ordered TEXT NOT NULL DEFAULT '0',
+    qty_received TEXT NOT NULL DEFAULT '0',
+    unit_price  TEXT NOT NULL DEFAULT '0',
+    tax_rate    TEXT NOT NULL DEFAULT '0',
+    amount      TEXT NOT NULL DEFAULT '0',
+    tax_amount  TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+
+-- 销售订单
+CREATE TABLE IF NOT EXISTS sales_order (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period          INTEGER NOT NULL,
+    no              TEXT NOT NULL UNIQUE,
+    date            TEXT NOT NULL,
+    customer_code   TEXT NOT NULL DEFAULT '',
+    customer_name   TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    total_amount    TEXT NOT NULL DEFAULT '0',
+    total_tax       TEXT NOT NULL DEFAULT '0',
+    shipped_amount  TEXT NOT NULL DEFAULT '0',
+    prepared_by     TEXT NOT NULL DEFAULT '',
+    memo            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_so_period ON sales_order(period, status);
+
+-- 销售订单行
+CREATE TABLE IF NOT EXISTS so_line (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_id       INTEGER NOT NULL REFERENCES sales_order(id) ON DELETE CASCADE,
+    item_code   TEXT NOT NULL,
+    item_name   TEXT NOT NULL DEFAULT '',
+    qty_ordered TEXT NOT NULL DEFAULT '0',
+    qty_shipped TEXT NOT NULL DEFAULT '0',
+    unit_price  TEXT NOT NULL DEFAULT '0',
+    tax_rate    TEXT NOT NULL DEFAULT '0',
+    amount      TEXT NOT NULL DEFAULT '0',
+    tax_amount  TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+
+-- BOM（物料清单）
+CREATE TABLE IF NOT EXISTS bom (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_code TEXT NOT NULL,
+    child_code  TEXT NOT NULL,
+    qty         TEXT NOT NULL DEFAULT '1',
+    loss_rate   TEXT NOT NULL DEFAULT '0',
+    seq         INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(parent_code, child_code)
+);
+CREATE INDEX IF NOT EXISTS idx_bom_parent ON bom(parent_code);
+
+-- 生产订单
+CREATE TABLE IF NOT EXISTS production_order (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    no              TEXT NOT NULL UNIQUE,
+    period          INTEGER NOT NULL,
+    date            TEXT NOT NULL,
+    item_code       TEXT NOT NULL,
+    item_name       TEXT NOT NULL,
+    planned_qty     TEXT NOT NULL DEFAULT '0',
+    completed_qty   TEXT NOT NULL DEFAULT '0',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    work_center     TEXT NOT NULL DEFAULT '',
+    prepared_by     TEXT NOT NULL DEFAULT '',
+    memo            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_prod_period ON production_order(period, status);
+
 "#;
 
 /// v1 → v2 需要新增到既有表上的列
@@ -469,6 +569,80 @@ const MIGRATE_V5: &[(&str, &str, &str)] = &[
     ("user", "device_name", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// v5 → v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
+const MIGRATE_V6: &[(&str, &str, &str)] = &[
+    // 采购订单表
+    ("purchase_order", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("purchase_order", "no", "TEXT NOT NULL UNIQUE"),
+    ("purchase_order", "supplier_code", "TEXT NOT NULL DEFAULT ''"),
+    ("purchase_order", "supplier_name", "TEXT NOT NULL DEFAULT ''"),
+    ("purchase_order", "status", "TEXT NOT NULL DEFAULT 'draft'"),
+    ("purchase_order", "total_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("purchase_order", "total_tax", "TEXT NOT NULL DEFAULT '0'"),
+    ("purchase_order", "received_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("purchase_order", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
+    ("purchase_order", "memo", "TEXT NOT NULL DEFAULT ''"),
+    ("purchase_order", "created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("purchase_order", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+    // 采购订单行表
+    ("po_line", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("po_line", "po_id", "INTEGER NOT NULL"),
+    ("po_line", "item_code", "TEXT NOT NULL"),
+    ("po_line", "item_name", "TEXT NOT NULL DEFAULT ''"),
+    ("po_line", "qty_ordered", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "qty_received", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "unit_price", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "tax_rate", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "tax_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("po_line", "memo", "TEXT NOT NULL DEFAULT ''"),
+    // 销售订单表
+    ("sales_order", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("sales_order", "no", "TEXT NOT NULL UNIQUE"),
+    ("sales_order", "customer_code", "TEXT NOT NULL DEFAULT ''"),
+    ("sales_order", "customer_name", "TEXT NOT NULL DEFAULT ''"),
+    ("sales_order", "status", "TEXT NOT NULL DEFAULT 'draft'"),
+    ("sales_order", "total_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("sales_order", "total_tax", "TEXT NOT NULL DEFAULT '0'"),
+    ("sales_order", "shipped_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("sales_order", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
+    ("sales_order", "memo", "TEXT NOT NULL DEFAULT ''"),
+    ("sales_order", "created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("sales_order", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+    // 销售订单行表
+    ("so_line", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("so_line", "so_id", "INTEGER NOT NULL"),
+    ("so_line", "item_code", "TEXT NOT NULL"),
+    ("so_line", "item_name", "TEXT NOT NULL DEFAULT ''"),
+    ("so_line", "qty_ordered", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "qty_shipped", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "unit_price", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "tax_rate", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "tax_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("so_line", "memo", "TEXT NOT NULL DEFAULT ''"),
+    // BOM表
+    ("bom", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("bom", "parent_code", "TEXT NOT NULL"),
+    ("bom", "child_code", "TEXT NOT NULL"),
+    ("bom", "qty", "TEXT NOT NULL DEFAULT '1'"),
+    ("bom", "loss_rate", "TEXT NOT NULL DEFAULT '0'"),
+    ("bom", "seq", "INTEGER NOT NULL DEFAULT 0"),
+    // 生产订单表
+    ("production_order", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("production_order", "no", "TEXT NOT NULL UNIQUE"),
+    ("production_order", "item_code", "TEXT NOT NULL"),
+    ("production_order", "item_name", "TEXT NOT NULL"),
+    ("production_order", "planned_qty", "TEXT NOT NULL DEFAULT '0'"),
+    ("production_order", "completed_qty", "TEXT NOT NULL DEFAULT '0'"),
+    ("production_order", "status", "TEXT NOT NULL DEFAULT 'draft'"),
+    ("production_order", "work_center", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "memo", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// 初始化 schema（幂等）
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
@@ -489,6 +663,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
     }
     if v < SCHEMA_VERSION {
         migrate_generic(conn, MIGRATE_V5)?;
+        migrate_generic(conn, MIGRATE_V6)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

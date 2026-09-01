@@ -1,0 +1,525 @@
+//! 供应链管理：采购订单 / 销售订单 / BOM / 生产订单
+//!
+//! 对标金蝶云星空 / 用友 T+ Cloud 的供应链基础模块。
+
+use chrono::NaiveDate;
+use fincore::{Money, Period};
+use rusqlite::OptionalExtension;
+
+use crate::{Db, DbResult, FinError};
+
+// ===========================================================================
+// 采购订单
+// ===========================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PoStatus { Draft, Confirmed, PartialIn, Completed, Cancelled }
+
+impl PoStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            PoStatus::Draft => "草稿", PoStatus::Confirmed => "已确认",
+            PoStatus::PartialIn => "部分入库", PoStatus::Completed => "已完成",
+            PoStatus::Cancelled => "已作废",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PoLine {
+    pub id: i64, pub po_id: i64,
+    pub item_code: String, pub item_name: String,
+    pub qty_ordered: Money, pub qty_received: Money,
+    pub unit_price: Money, pub tax_rate: Money,
+    pub amount: Money, pub tax_amount: Money, pub memo: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PurchaseOrder {
+    pub id: i64, pub period: Period, pub no: String, pub date: NaiveDate,
+    pub supplier_code: String, pub supplier_name: String,
+    pub status: PoStatus,
+    pub total_amount: Money, pub total_tax: Money, pub received_amount: Money,
+    pub prepared_by: String, pub memo: String, pub lines: Vec<PoLine>,
+}
+
+impl PurchaseOrder {
+    pub fn new(period: Period, date: NaiveDate, supplier_code: &str, supplier_name: &str, prepared_by: &str) -> Self {
+        Self { id: 0, period, no: String::new(), date,
+            supplier_code: supplier_code.to_string(), supplier_name: supplier_name.to_string(),
+            status: PoStatus::Draft, total_amount: Money::ZERO, total_tax: Money::ZERO,
+            received_amount: Money::ZERO, prepared_by: prepared_by.to_string(),
+            memo: String::new(), lines: Vec::new(),
+        }
+    }
+}
+
+// ===========================================================================
+// 销售订单
+// ===========================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SoStatus { Draft, Confirmed, PartialShip, Completed, Cancelled }
+
+impl SoStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            SoStatus::Draft => "草稿", SoStatus::Confirmed => "已确认",
+            SoStatus::PartialShip => "部分发货", SoStatus::Completed => "已完成",
+            SoStatus::Cancelled => "已作废",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SoLine {
+    pub id: i64, pub so_id: i64,
+    pub item_code: String, pub item_name: String,
+    pub qty_ordered: Money, pub qty_shipped: Money,
+    pub unit_price: Money, pub tax_rate: Money,
+    pub amount: Money, pub tax_amount: Money, pub memo: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SalesOrder {
+    pub id: i64, pub period: Period, pub no: String, pub date: NaiveDate,
+    pub customer_code: String, pub customer_name: String,
+    pub status: SoStatus,
+    pub total_amount: Money, pub total_tax: Money, pub shipped_amount: Money,
+    pub prepared_by: String, pub memo: String, pub lines: Vec<SoLine>,
+}
+
+impl SalesOrder {
+    pub fn new(period: Period, date: NaiveDate, customer_code: &str, customer_name: &str, prepared_by: &str) -> Self {
+        Self { id: 0, period, no: String::new(), date,
+            customer_code: customer_code.to_string(), customer_name: customer_name.to_string(),
+            status: SoStatus::Draft, total_amount: Money::ZERO, total_tax: Money::ZERO,
+            shipped_amount: Money::ZERO, prepared_by: prepared_by.to_string(),
+            memo: String::new(), lines: Vec::new(),
+        }
+    }
+}
+
+// ===========================================================================
+// BOM & 生产
+// ===========================================================================
+
+#[derive(Clone, Debug)]
+pub struct BomItem {
+    pub id: i64,
+    pub parent_code: String,
+    pub child_code: String,
+    pub qty: Money,
+    pub loss_rate: Money,
+    pub seq: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ProdStatus { Draft, Released, InProgress, Completed, Cancelled }
+
+impl ProdStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProdStatus::Draft => "草稿", ProdStatus::Released => "已下达",
+            ProdStatus::InProgress => "生产中", ProdStatus::Completed => "已完工",
+            ProdStatus::Cancelled => "已作废",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductionOrder {
+    pub id: i64,
+    pub no: String,
+    pub period: Period,
+    pub date: NaiveDate,
+    pub item_code: String,
+    pub item_name: String,
+    pub planned_qty: Money,
+    pub completed_qty: Money,
+    pub status: ProdStatus,
+    pub work_center: String,
+    pub prepared_by: String,
+    pub memo: String,
+}
+
+// ===========================================================================
+// 数据库操作
+// ===========================================================================
+
+pub fn po_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let year = period.year();
+    let month = period.month();
+    let prefix = format!("CG{:04}{:02}", year, month);
+    let sql = format!(
+        "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM purchase_order WHERE no LIKE ?",
+        prefix.len() + 1
+    );
+    let n: i64 = db.conn()
+        .query_row(&sql, [format!("{}%", prefix)], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(format!("{}{:04}", prefix, n))
+}
+
+pub fn so_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let year = period.year();
+    let month = period.month();
+    let prefix = format!("XS{:04}{:02}", year, month);
+    let sql = format!(
+        "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM sales_order WHERE no LIKE ?",
+        prefix.len() + 1
+    );
+    let n: i64 = db.conn()
+        .query_row(&sql, [format!("{}%", prefix)], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(format!("{}{:04}", prefix, n))
+}
+
+pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
+    let tx = db.conn().unchecked_transaction()?;
+    po.total_amount = po.lines.iter().map(|l| l.amount).sum();
+    po.total_tax = po.lines.iter().map(|l| l.tax_amount).sum();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    
+    let id = if po.id > 0 {
+        tx.execute(
+            "UPDATE purchase_order SET period=?, date=?, supplier_code=?, supplier_name=?,
+             status=?, total_amount=?, total_tax=?, received_amount=?, prepared_by=?, memo=?, updated_at=?
+             WHERE id=?",
+            rusqlite::params![
+                po.period.ymm(), po.date, po.supplier_code, po.supplier_name,
+                serde_json::to_value(&po.status)?.as_str().unwrap(),
+                po.total_amount.to_string(), po.total_tax.to_string(),
+                po.received_amount.to_string(), po.prepared_by, po.memo, now, po.id
+            ],
+        )?;
+        po.id
+    } else {
+        tx.execute(
+            "INSERT INTO purchase_order(period, no, date, supplier_code, supplier_name,
+             status, total_amount, total_tax, received_amount, prepared_by, memo, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+            rusqlite::params![
+                po.period.ymm(), po.no, po.date, po.supplier_code, po.supplier_name,
+                serde_json::to_value(&po.status)?.as_str().unwrap(),
+                po.total_amount.to_string(), po.total_tax.to_string(),
+                po.received_amount.to_string(), po.prepared_by, po.memo, now
+            ],
+        )?;
+        tx.last_insert_rowid()
+    };
+    po.id = id;
+    
+    tx.execute("DELETE FROM po_line WHERE po_id=?", [id])?;
+    for line in &po.lines {
+        tx.execute(
+            "INSERT INTO po_line(po_id, item_code, item_name, qty_ordered, qty_received,
+             unit_price, tax_rate, amount, tax_amount, memo)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                id, line.item_code, line.item_name, line.qty_ordered.to_string(),
+                line.qty_received.to_string(), line.unit_price.to_string(),
+                line.tax_rate.to_string(), line.amount.to_string(),
+                line.tax_amount.to_string(), line.memo
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn po_delete(db: &Db, id: i64) -> DbResult<()> {
+    db.conn().execute("DELETE FROM po_line WHERE po_id=?", [id])?;
+    db.conn().execute("DELETE FROM purchase_order WHERE id=?", [id])?;
+    Ok(())
+}
+
+pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Vec<PurchaseOrder>> {
+    let sql = if let Some(s) = status {
+        format!(
+            "SELECT id, period, no, date, supplier_code, supplier_name, status,
+             total_amount, total_tax, received_amount, prepared_by, memo
+             FROM purchase_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
+        )
+    } else {
+        format!(
+            "SELECT id, period, no, date, supplier_code, supplier_name, status,
+             total_amount, total_tax, received_amount, prepared_by, memo
+             FROM purchase_order WHERE period=? ORDER BY date DESC, id DESC"
+        )
+    };
+    
+    let mut stmt = db.conn().prepare(&sql)?;
+    let rows = if let Some(s) = status {
+        stmt.query_map(rusqlite::params![period.ymm(), serde_json::to_value(&s)?.as_str().unwrap()], |r| {
+            Ok(PurchaseOrder {
+                id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?, date: r.get(3)?,
+                supplier_code: r.get(4)?, supplier_name: r.get(5)?,
+                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                received_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?, memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([period.ymm()], |r| {
+            Ok(PurchaseOrder {
+                id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?, date: r.get(3)?,
+                supplier_code: r.get(4)?, supplier_name: r.get(5)?,
+                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                received_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?, memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+    
+    let mut orders = Vec::new();
+    for mut po in rows {
+        let mut stmt = db.conn().prepare(
+            "SELECT id, item_code, item_name, qty_ordered, qty_received,
+             unit_price, tax_rate, amount, tax_amount, memo
+             FROM po_line WHERE po_id=? ORDER BY id"
+        )?;
+        let lines = stmt.query_map([po.id], |r| Ok(PoLine {
+            id: r.get(0)?, po_id: po.id,
+            item_code: r.get(1)?, item_name: r.get(2)?,
+            qty_ordered: Money::parse_or_zero(&r.get::<_, String>(3)?),
+            qty_received: Money::parse_or_zero(&r.get::<_, String>(4)?),
+            unit_price: Money::parse_or_zero(&r.get::<_, String>(5)?),
+            tax_rate: Money::parse_or_zero(&r.get::<_, String>(6)?),
+            amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+            tax_amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
+            memo: r.get(9)?,
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        po.lines = lines;
+        orders.push(po);
+    }
+    Ok(orders)
+}
+
+pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
+    let tx = db.conn().unchecked_transaction()?;
+    so.total_amount = so.lines.iter().map(|l| l.amount).sum();
+    so.total_tax = so.lines.iter().map(|l| l.tax_amount).sum();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    
+    let id = if so.id > 0 {
+        tx.execute(
+            "UPDATE sales_order SET period=?, date=?, customer_code=?, customer_name=?,
+             status=?, total_amount=?, total_tax=?, shipped_amount=?, prepared_by=?, memo=?, updated_at=?
+             WHERE id=?",
+            rusqlite::params![
+                so.period.ymm(), so.date, so.customer_code, so.customer_name,
+                serde_json::to_value(&so.status)?.as_str().unwrap(),
+                so.total_amount.to_string(), so.total_tax.to_string(),
+                so.shipped_amount.to_string(), so.prepared_by, so.memo, now, so.id
+            ],
+        )?;
+        so.id
+    } else {
+        tx.execute(
+            "INSERT INTO sales_order(period, no, date, customer_code, customer_name,
+             status, total_amount, total_tax, shipped_amount, prepared_by, memo, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+            rusqlite::params![
+                so.period.ymm(), so.no, so.date, so.customer_code, so.customer_name,
+                serde_json::to_value(&so.status)?.as_str().unwrap(),
+                so.total_amount.to_string(), so.total_tax.to_string(),
+                so.shipped_amount.to_string(), so.prepared_by, so.memo, now
+            ],
+        )?;
+        tx.last_insert_rowid()
+    };
+    so.id = id;
+    
+    tx.execute("DELETE FROM so_line WHERE so_id=?", [id])?;
+    for line in &so.lines {
+        tx.execute(
+            "INSERT INTO so_line(so_id, item_code, item_name, qty_ordered, qty_shipped,
+             unit_price, tax_rate, amount, tax_amount, memo)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                id, line.item_code, line.item_name, line.qty_ordered.to_string(),
+                line.qty_shipped.to_string(), line.unit_price.to_string(),
+                line.tax_rate.to_string(), line.amount.to_string(),
+                line.tax_amount.to_string(), line.memo
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn so_delete(db: &Db, id: i64) -> DbResult<()> {
+    db.conn().execute("DELETE FROM so_line WHERE so_id=?", [id])?;
+    db.conn().execute("DELETE FROM sales_order WHERE id=?", [id])?;
+    Ok(())
+}
+
+pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Vec<SalesOrder>> {
+    let sql = if let Some(s) = status {
+        format!(
+            "SELECT id, period, no, date, customer_code, customer_name, status,
+             total_amount, total_tax, shipped_amount, prepared_by, memo
+             FROM sales_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
+        )
+    } else {
+        format!(
+            "SELECT id, period, no, date, customer_code, customer_name, status,
+             total_amount, total_tax, shipped_amount, prepared_by, memo
+             FROM sales_order WHERE period=? ORDER BY date DESC, id DESC"
+        )
+    };
+    
+    let mut stmt = db.conn().prepare(&sql)?;
+    let rows = if let Some(s) = status {
+        stmt.query_map(rusqlite::params![period.ymm(), serde_json::to_value(&s)?.as_str().unwrap()], |r| {
+            Ok(SalesOrder {
+                id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?, date: r.get(3)?,
+                customer_code: r.get(4)?, customer_name: r.get(5)?,
+                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                shipped_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?, memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([period.ymm()], |r| {
+            Ok(SalesOrder {
+                id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?, date: r.get(3)?,
+                customer_code: r.get(4)?, customer_name: r.get(5)?,
+                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                shipped_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?, memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+    
+    let mut orders = Vec::new();
+    for mut so in rows {
+        let mut stmt = db.conn().prepare(
+            "SELECT id, item_code, item_name, qty_ordered, qty_shipped,
+             unit_price, tax_rate, amount, tax_amount, memo
+             FROM so_line WHERE so_id=? ORDER BY id"
+        )?;
+        let lines = stmt.query_map([so.id], |r| Ok(SoLine {
+            id: r.get(0)?, so_id: so.id,
+            item_code: r.get(1)?, item_name: r.get(2)?,
+            qty_ordered: Money::parse_or_zero(&r.get::<_, String>(3)?),
+            qty_shipped: Money::parse_or_zero(&r.get::<_, String>(4)?),
+            unit_price: Money::parse_or_zero(&r.get::<_, String>(5)?),
+            tax_rate: Money::parse_or_zero(&r.get::<_, String>(6)?),
+            amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+            tax_amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
+            memo: r.get(9)?,
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        so.lines = lines;
+        orders.push(so);
+    }
+    Ok(orders)
+}
+
+// BOM操作
+pub fn bom_list(db: &Db, parent_code: &str) -> DbResult<Vec<BomItem>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, parent_code, child_code, qty, loss_rate, seq
+         FROM bom WHERE parent_code=? ORDER BY seq"
+    )?;
+    let rows = stmt.query_map([parent_code], |r| Ok(BomItem {
+        id: r.get(0)?,
+        parent_code: r.get(1)?,
+        child_code: r.get(2)?,
+        qty: Money::parse_or_zero(&r.get::<_, String>(3)?),
+        loss_rate: Money::parse_or_zero(&r.get::<_, String>(4)?),
+        seq: r.get(5)?,
+    }))?;
+    let mut items = Vec::new();
+    for item in rows { items.push(item?); }
+    Ok(items)
+}
+
+pub fn bom_save(db: &Db, parent_code: &str, children: &[(String, Money, Money)]) -> DbResult<()> {
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute("DELETE FROM bom WHERE parent_code=?", [parent_code])?;
+    for (i, (child_code, qty, loss_rate)) in children.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO bom(parent_code, child_code, qty, loss_rate, seq) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![parent_code, child_code, qty.to_string(), loss_rate.to_string(), i as i32]
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::mem;
+    
+    #[test]
+    fn po_crud() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = PurchaseOrder::new(p, NaiveDate::from_ymd(2026, 1, 5), "S001", "供应商A", "u1");
+        po.no = po_next_no(&db, p).unwrap();
+        po.lines.push(PoLine {
+            id: 0, po_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: Money::parse("100").unwrap(), qty_received: Money::ZERO,
+            unit_price: Money::parse("10").unwrap(), tax_rate: Money::parse("0.13").unwrap(),
+            amount: Money::parse("1000").unwrap(), tax_amount: Money::parse("130").unwrap(),
+            memo: String::new(),
+        });
+        let id = po_save(&db, &mut po).unwrap();
+        assert!(id > 0);
+        let list = po_list(&db, p, None).unwrap();
+        assert_eq!(list.len(), 1);
+        po_delete(&db, id).unwrap();
+        assert_eq!(po_list(&db, p, None).unwrap().len(), 0);
+    }
+    
+    #[test]
+    fn so_crud() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut so = SalesOrder::new(p, NaiveDate::from_ymd(2026, 1, 10), "C001", "客户B", "u1");
+        so.no = so_next_no(&db, p).unwrap();
+        so.lines.push(SoLine {
+            id: 0, so_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: Money::parse("50").unwrap(), qty_shipped: Money::ZERO,
+            unit_price: Money::parse("12").unwrap(), tax_rate: Money::parse("0.13").unwrap(),
+            amount: Money::parse("600").unwrap(), tax_amount: Money::parse("78").unwrap(),
+            memo: String::new(),
+        });
+        let id = so_save(&db, &mut so).unwrap();
+        assert!(id > 0);
+        so_delete(&db, id).unwrap();
+    }
+    
+    #[test]
+    fn bom_crud() {
+        let db = mem();
+        bom_save(&db, "1001", &[
+            ("140301".to_string(), Money::parse("2").unwrap(), Money::parse("0.02").unwrap()),
+            ("140302".to_string(), Money::parse("1").unwrap(), Money::ZERO),
+        ]).unwrap();
+        let items = bom_list(&db, "1001").unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].child_code, "140301");
+    }
+}

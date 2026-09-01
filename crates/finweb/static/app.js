@@ -198,6 +198,16 @@ function render() {
     { id: "imports", label: "数据导入", perm: "voucher_new" },
     { id: "ledger", label: "明细账", perm: "report" },
     { id: "reports", label: "报表中心", perm: "report" },
+    { id: "multi-column", label: "多栏账", perm: "report" },
+    { id: "summary-table", label: "摘要汇总表", perm: "report" },
+    { id: "ratios", label: "财务指标", perm: "report" },
+    { id: "mrp", label: "MRP 运算", perm: "account_edit" },
+    { id: "routing", label: "工艺路线", perm: "account_edit" },
+    { id: "approval", label: "审批中心", perm: "report" },
+    { id: "notes", label: "报表附注", perm: "report" },
+    { id: "archive", label: "电子档案", perm: "report" },
+    { id: "budget-versions", label: "预算版本", perm: "report" },
+    { id: "work-report", label: "工序报工", perm: "account_edit" },
     { id: "security", label: "安全中心", perm: "user_manage" },
   ].filter((n) => !n.perm || can(n.perm));
 
@@ -243,6 +253,16 @@ function renderMain() {
     case "imports": return viewImports(main);
     case "ledger": return viewLedger(main);
     case "reports": return viewReports(main);
+    case "multi-column": return viewMultiColumn(main);
+    case "summary-table": return viewSummaryTable(main);
+    case "ratios": return viewRatios(main);
+    case "mrp": return viewMrp(main);
+    case "routing": return viewRouting(main);
+    case "approval": return viewApproval(main);
+    case "notes": return viewNotes(main);
+    case "archive": return viewArchive(main);
+    case "budget-versions": return viewBudgetVersions(main);
+    case "work-report": return viewWorkReport(main);
     case "security": return viewSecurity(main);
   }
 }
@@ -910,6 +930,331 @@ function openChangePwd(forced) {
     if (np !== cp) { toast("两次输入不一致", "err"); return; }
     try { await api("/change-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ old: oldp, new: np }) }); toast("口令已更新", "ok"); closeModal(); } catch (e) { toast(e.message, "err"); }
   };
+}
+
+// ===========================================================================
+// 多栏账
+// ===========================================================================
+async function viewMultiColumn(main) {
+  main.innerHTML = `<h2>多栏账</h2>
+    <div class="toolbar">
+      <label>主科目 <input id="mc-main" value="6602" style="width:90px" /></label>
+      <label>栏目(逗号分隔) <input id="mc-cols" value="660201,660202,660203" style="width:220px" /></label>
+      <label>期间 <input id="mc-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="mc-run">查询</button>
+    </div>
+    <div id="mc-result" class="muted">填写条件后点击查询</div>`;
+  $("#mc-run").addEventListener("click", async () => {
+    const mainCode = $("#mc-main").value.trim();
+    const cols = $("#mc-cols").value.split(",").map((s) => s.trim()).filter(Boolean);
+    const p = $("#mc-period").value.trim();
+    if (!mainCode || !cols.length) { toast("请填写主科目与栏目", "err"); return; }
+    try {
+      const r = await api(`/reports/multi-column?main=${encodeURIComponent(mainCode)}&cols=${encodeURIComponent(cols.join(","))}&from=${encodeURIComponent(p)}&to=${encodeURIComponent(p)}`);
+      const rows = r.rows || [];
+      const head = ["日期", "凭证号", "摘要", "发生额", ...cols, "余额"];
+      $("#mc-result").innerHTML = `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.voucher_no)}</td><td>${esc(x.summary)}</td>
+          <td class="r">${fmt(x.amount)}</td>${cols.map((_, i) => `<td class="r">${fmt(x.cols[i])}</td>`).join("")}
+          <td class="r">${fmt(x.balance)}</td></tr>`).join("")}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 摘要汇总表
+// ===========================================================================
+async function viewSummaryTable(main) {
+  main.innerHTML = `<h2>摘要汇总表</h2>
+    <div class="toolbar">
+      <label>期间 <input id="st-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="st-run">查询</button>
+    </div>
+    <div id="st-result" class="muted">填写期间后点击查询</div>`;
+  $("#st-run").addEventListener("click", async () => {
+    const p = $("#st-period").value.trim();
+    try {
+      const r = await api(`/reports/summary-table?from=${encodeURIComponent(p)}&to=${encodeURIComponent(p)}`);
+      const rows = r.rows || [];
+      $("#st-result").innerHTML = `<table><thead><tr><th>摘要</th><th>凭证张数</th><th>借方发生额</th><th>贷方发生额</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.summary)}</td><td class="r">${x.voucher_count}</td><td class="r">${fmt(x.debit)}</td><td class="r">${fmt(x.credit)}</td></tr>`).join("")}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 财务指标
+// ===========================================================================
+async function viewRatios(main) {
+  main.innerHTML = `<h2>财务指标分析</h2>
+    <div class="toolbar">
+      <label>期间 <input id="rt-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="rt-run">查询</button>
+    </div>
+    <div id="rt-result" class="muted">填写期间后点击查询</div>`;
+  $("#rt-run").addEventListener("click", async () => {
+    const p = $("#rt-period").value.trim();
+    try {
+      const r = await api(`/reports/ratios?period=${encodeURIComponent(p)}`);
+      const rows = r.ratios || [];
+      $("#rt-result").innerHTML = `<table><thead><tr><th>指标</th><th>数值</th><th>计算公式</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.name)}</td><td class="r">${esc(x.display)}</td><td class="muted">${esc(x.formula)}</td></tr>`).join("")}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// MRP 运算
+// ===========================================================================
+async function viewMrp(main) {
+  main.innerHTML = `<h2>MRP 运算</h2>
+    <div class="toolbar">
+      <label>需求产品 <input id="mrp-item" style="width:120px" /></label>
+      <label>数量 <input id="mrp-qty" value="10" style="width:80px" /></label>
+      <button class="btn primary" id="mrp-run">运行</button>
+      <button class="btn ghost" id="mrp-latest">最近一次结果</button>
+    </div>
+    <div id="mrp-result" class="muted">输入需求产品与数量后运行</div>`;
+  const load = (rows) => {
+    $("#mrp-result").innerHTML = `<table><thead><tr><th>层级</th><th>物料</th><th>毛需求</th><th>现有库存</th><th>净需求</th><th>计划量</th><th>行动</th><th>来源</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${x.level}</td><td>${esc(x.item_code)}</td><td class="r">${fmt(x.gross_req)}</td><td class="r">${fmt(x.on_hand)}</td><td class="r">${fmt(x.net_req)}</td><td class="r">${fmt(x.planned_qty)}</td><td>${x.action === "produce" ? "生产" : x.action === "purchase" ? "采购" : "无"}</td><td>${esc(x.source)}</td></tr>`).join("")}</tbody></table>`;
+  };
+  $("#mrp-run").addEventListener("click", async () => {
+    const item = $("#mrp-item").value.trim();
+    const qty = $("#mrp-qty").value.trim();
+    if (!item || !qty) { toast("请填写需求产品与数量", "err"); return; }
+    try {
+      const r = await api("/mrp/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ demands: [{ item_code: item, qty, source: "手工" }] }) });
+      load(r.rows || []);
+      toast("MRP 运算完成", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#mrp-latest").addEventListener("click", async () => {
+    try { const r = await api("/mrp/latest"); load(r.rows || []); } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 工艺路线
+// ===========================================================================
+async function viewRouting(main) {
+  main.innerHTML = `<h2>工艺路线</h2>
+    <div class="toolbar">
+      <label>产品代码 <input id="rt-item" style="width:120px" /></label>
+      <button class="btn primary" id="rt-load">加载</button>
+    </div>
+    <div id="rt-result" class="muted">输入产品代码后加载</div>`;
+  $("#rt-load").addEventListener("click", async () => {
+    const item = $("#rt-item").value.trim();
+    if (!item) { toast("请输入产品代码", "err"); return; }
+    try {
+      const r = await api(`/routing/${encodeURIComponent(item)}`);
+      const ops = r.ops || [];
+      $("#rt-result").innerHTML = `<table><thead><tr><th>序号</th><th>工序编码</th><th>工序名称</th><th>工作中心</th><th>标准工时</th><th>小时费率</th></tr></thead>
+        <tbody>${ops.map((o) => `<tr><td>${o.seq}</td><td>${esc(o.op_code)}</td><td>${esc(o.op_name)}</td><td>${esc(o.work_center)}</td><td class="r">${fmt(o.std_hours)}</td><td class="r">${fmt(o.rate)}</td></tr>`).join("")}</tbody></table>`;
+      if (!ops.length) $("#rt-result").innerHTML = `<div class="muted">该产品暂无工艺路线。维护请调用 POST /api/routing/:item。</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 审批中心
+// ===========================================================================
+async function viewApproval(main) {
+  main.innerHTML = `<h2>审批中心</h2><div id="ap-list" class="muted">加载中…</div>`;
+  const load = async () => {
+    try {
+      const r = await api("/approvals/todo");
+      const rows = r.rows || [];
+      $("#ap-list").innerHTML = rows.length ? rows.map((a) => `
+        <div class="card"><div class="row"><b>${esc(a.title)}</b> <span class="tag">${esc(a.biz_kind)}/${a.biz_id}</span></div>
+          <div class="muted">申请人 ${esc(a.applicant)} · 当前节点 ${a.current_node}/${a.steps.length}</div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn sm" data-ap="${a.id}" data-act="1">通过</button>
+            <button class="btn danger sm" data-ap="${a.id}" data-act="0">驳回</button>
+          </div>
+        </div>`).join("") : `<div class="muted">没有待审批的单据</div>`;
+      $all("[data-ap]").forEach((b) => b.onclick = async () => {
+        const approve = b.dataset.act === "1";
+        try { await api(`/approvals/${b.dataset.ap}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approve, comment: approve ? "同意" : "驳回" }) }); toast(approve ? "已通过" : "已驳回", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { toast(e.message, "err"); }
+  };
+  load();
+}
+
+// ===========================================================================
+// 报表附注
+// ===========================================================================
+async function viewNotes(main) {
+  main.innerHTML = `<h2>报表附注</h2>
+    <div class="toolbar">
+      <label>报表 <select id="nt-key"><option value="balance_sheet">资产负债表</option><option value="income_statement">利润表</option><option value="cash_flow">现金流量表</option></select></label>
+      <label>期间 <input id="nt-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="nt-load">加载</button>
+    </div>
+    <div id="nt-list"></div>
+    <div class="card" style="margin-top:12px"><h3>新增附注</h3>
+      <div class="field"><label>标题</label><input id="nt-title" /></div>
+      <div class="field"><label>内容</label><textarea id="nt-content" rows="3"></textarea></div>
+      <button class="btn primary" id="nt-save">保存</button>
+    </div>`;
+  const load = async () => {
+    const key = $("#nt-key").value, p = $("#nt-period").value.trim();
+    try {
+      const r = await api(`/reports/notes?report_key=${key}&period=${encodeURIComponent(p)}`);
+      const rows = r.rows || [];
+      $("#nt-list").innerHTML = rows.map((n) => `<div class="card"><div class="row"><b>${n.seq} · ${esc(n.title)}</b><button class="btn danger sm" data-nt-del="${n.id}">删除</button></div><div>${esc(n.content)}</div><div class="muted">${esc(n.updated_by)} ${esc(n.updated_at)}</div></div>`).join("") || `<div class="muted">暂无附注</div>`;
+      $all("[data-nt-del]").forEach((b) => b.onclick = async () => { if (!confirm("删除该附注？")) return; try { await api(`/reports/notes/${b.dataset.ntDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#nt-load").addEventListener("click", load);
+  $("#nt-save").addEventListener("click", async () => {
+    const key = $("#nt-key").value, p = $("#nt-period").value.trim();
+    const title = $("#nt-title").value.trim(), content = $("#nt-content").value.trim();
+    if (!title) { toast("标题不能为空", "err"); return; }
+    try {
+      await api("/reports/notes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ report_key: key, period: ymm(p), title, content }) });
+      toast("已保存附注", "ok");
+      $("#nt-title").value = ""; $("#nt-content").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  load();
+}
+
+// ===========================================================================
+// 电子档案
+// ===========================================================================
+async function viewArchive(main) {
+  main.innerHTML = `<h2>会计电子档案</h2>
+    <div class="toolbar">
+      <label>期间 <input id="ar-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>类型(空=全部) <input id="ar-kind" placeholder="voucher/ledger/report/balance" style="width:180px" /></label>
+      <button class="btn primary" id="ar-load">加载</button>
+    </div>
+    <div id="ar-list"></div>
+    <div class="card" style="margin-top:12px"><h3>新增归档</h3>
+      <div class="field"><label>类型</label><input id="ar-new-kind" value="voucher" style="width:120px" /></div>
+      <div class="field"><label>标题</label><input id="ar-new-title" /></div>
+      <div class="field"><label>内容(JSON)</label><textarea id="ar-new-payload" rows="3"></textarea></div>
+      <button class="btn primary" id="ar-save">归档</button>
+    </div>`;
+  const load = async () => {
+    const p = $("#ar-period").value.trim(), k = $("#ar-kind").value.trim();
+    try {
+      const r = await api(`/archives?period=${encodeURIComponent(p)}${k ? "&kind=" + encodeURIComponent(k) : ""}`);
+      const rows = r.rows || [];
+      $("#ar-list").innerHTML = rows.map((a) => `<div class="card"><div class="row"><b>${esc(a.file_no)}</b> <span class="tag">${esc(a.kind)}</span> <span class="tag ok">${a.sealed ? "封存" : "未封存"}</span></div><div>${esc(a.title)}</div><div class="muted">${esc(a.archived_by)} ${esc(a.archived_at)} · ${esc(a.content_hash).slice(0, 16)}</div></div>`).join("") || `<div class="muted">暂无档案</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#ar-load").addEventListener("click", load);
+  $("#ar-save").addEventListener("click", async () => {
+    const p = $("#ar-period").value.trim(), kind = $("#ar-new-kind").value.trim();
+    const title = $("#ar-new-title").value.trim(), payload = $("#ar-new-payload").value.trim();
+    if (!title || !payload) { toast("标题与内容不能为空", "err"); return; }
+    try {
+      await api("/archives", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(p), kind, title, payload }) });
+      toast("已归档", "ok");
+      $("#ar-new-title").value = ""; $("#ar-new-payload").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  load();
+}
+
+// ===========================================================================
+// 预算版本
+// ===========================================================================
+async function viewBudgetVersions(main) {
+  main.innerHTML = `<h2>预算版本管理</h2>
+    <div id="bv-list" class="muted">加载中…</div>
+    <div class="card" style="margin-top:12px"><h3>新建版本</h3>
+      <div class="field"><label>版本编码</label><input id="bv-key" placeholder="v2" style="width:140px" /></div>
+      <div class="field"><label>版本名称</label><input id="bv-name" placeholder="2026 调整版" /></div>
+      <div class="field"><label>备注</label><input id="bv-memo" /></div>
+      <label class="muted"><input type="checkbox" id="bv-copy" checked /> 从当前版本复制数据</label>
+      <div style="margin-top:8px"><button class="btn primary" id="bv-save">创建版本</button></div>
+    </div>`;
+  const load = async () => {
+    try {
+      const r = await api("/budget/versions");
+      const versions = r.versions || [], current = r.current || "";
+      $("#bv-list").innerHTML = versions.length ? versions.map((v) => `
+        <div class="card"><div class="row">
+          <b>${v.is_current ? "●" : "○"} ${esc(v.name)}</b> <span class="tag">${esc(v.key)}</span>
+          <span class="grow"></span>
+          ${v.is_current ? `<span class="tag ok">当前版本</span>` : `<button class="btn ghost sm" data-bv-act="${esc(v.key)}">设为当前</button>`}
+          <button class="btn danger sm" data-bv-del="${esc(v.key)}">删除</button>
+        </div><div class="muted">${esc(v.created_at)} ${esc(v.memo)}</div></div>`).join("")
+        : `<div class="muted">暂无自定义版本，预算存于「默认」版本。当前版本：${current || "默认"}</div>`;
+      $all("[data-bv-act]").forEach((b) => b.onclick = async () => { try { await api(`/budget/versions/${encodeURIComponent(b.dataset.bvAct)}/activate`, { method: "POST" }); toast("已设为当前版本", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-bv-del]").forEach((b) => b.onclick = async () => { if (!confirm(`删除版本 ${b.dataset.bvDel} 及其全部预算数据？`)) return; try { await api(`/budget/versions/${encodeURIComponent(b.dataset.bvDel)}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#bv-save").addEventListener("click", async () => {
+    const key = $("#bv-key").value.trim(), name = $("#bv-name").value.trim(), memo = $("#bv-memo").value.trim();
+    if (!key || !name) { toast("版本编码与名称不能为空", "err"); return; }
+    try {
+      await api("/budget/versions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, name, memo, is_current: false }) });
+      if ($("#bv-copy").checked) {
+        const r = await api("/budget/versions");
+        const current = r.current || "";
+        await api("/budget/versions/copy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: current, to: key }) });
+      }
+      toast("版本已创建", "ok");
+      $("#bv-key").value = ""; $("#bv-name").value = ""; $("#bv-memo").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  load();
+}
+
+// ===========================================================================
+// 工序报工
+// ===========================================================================
+async function viewWorkReport(main) {
+  main.innerHTML = `<h2>工序报工</h2>
+    <div class="toolbar">
+      <label>生产订单 <select id="wr-po" style="min-width:180px"></select></label>
+      <button class="btn primary" id="wr-load">加载工序</button>
+    </div>
+    <div id="wr-ops" class="muted">选择生产订单后加载工序</div>`;
+  let orders = [];
+  try {
+    const r = await api("/prod");
+    orders = r.orders || [];
+  } catch (e) { toast(e.message, "err"); }
+  $("#wr-po").innerHTML = orders.map((o) => `<option value="${o.id}">${esc(o.no)} · ${esc(o.item_name)}（${o.status}）</option>`).join("") || `<option value="">当前期间无生产订单</option>`;
+  if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。请先在业务模块下达生产订单。</div>`; return; }
+  const loadOps = async () => {
+    const poId = $("#wr-po").value;
+    if (!poId) return;
+    try {
+      const r = await api(`/prod/${poId}/ops`);
+      const ops = r.ops || [];
+      $("#wr-ops").innerHTML = ops.length ? ops.map((op) => `
+        <div class="card"><div class="row">
+          <b>${esc(op.op_name)}</b> <span class="tag">${esc(op.work_center)}</span>
+          <span class="tag ${op.status === "done" ? "ok" : op.status === "in_progress" ? "" : ""}">${op.status === "done" ? "完工" : op.status === "in_progress" ? "进行中" : "待开工"}</span>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <label>完工数量 <input id="wq-${op.id}" value="0" style="width:80px" /></label>
+          <label>实际工时 <input id="wh-${op.id}" value="0" style="width:80px" /></label>
+          <button class="btn sm" data-wr-report="${op.id}">报工</button>
+          <button class="btn sm" data-wr-finish="${op.id}">完工</button>
+          <span class="muted">已累计 数量 ${fmt(op.qty_done)} · 工时 ${fmt(op.hours)}</span>
+        </div></div>`).join("") : `<div class="muted">该订单暂无工序，请先维护产品工艺路线</div>`;
+      $all("[data-wr-report]").forEach((b) => b.onclick = async () => {
+        const qty = $(`#wq-${b.dataset.wrReport}`).value.trim();
+        const hours = $(`#wh-${b.dataset.wrReport}`).value.trim();
+        if (!qty && !hours) { toast("数量与工时不能同时为空", "err"); return; }
+        try { await api("/prod/op/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op_id: parseInt(b.dataset.wrReport, 10), qty, hours }) }); toast("已报工", "ok"); loadOps(); } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-wr-finish]").forEach((b) => b.onclick = async () => { if (!confirm("将该工序标记为完工？")) return; try { await api("/prod/op/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op_id: parseInt(b.dataset.wrFinish, 10) }) }); toast("已完工", "ok"); loadOps(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wr-load").addEventListener("click", loadOps);
 }
 
 // 启动

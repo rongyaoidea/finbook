@@ -1,0 +1,1546 @@
+//! 高级功能：工艺路线 / 工序报工 / MRP / 预算多版本 / 审批流 / 报表附注 /
+//! 会计电子档案 / 摘要汇总表 / 多栏账增强
+//!
+//! 对标金蝶云星空 / 用友 U8+ 的深度功能。设计原则与核心层一致：
+//! - 金额一律 TEXT 存储、Rust 侧 Decimal 运算，不走 SQL SUM；
+//! - 所有写操作幂等（UNIQUE 约束 + upsert）；
+//! - 单据级双向追溯（业务单 ↔ 凭证）。
+
+use fincore::{FinError, Money, Period};
+use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
+
+use crate::{Db, DbResult};
+
+fn now() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn read_m(s: &str) -> Money {
+    Money::parse_or_zero(s)
+}
+
+// ===========================================================================
+// 工艺路线（Routing）
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RoutingOp {
+    pub id: i64,
+    pub item_code: String,
+    pub seq: i32,
+    pub op_code: String,
+    pub op_name: String,
+    pub work_center: String,
+    pub std_hours: Money,
+    pub rate: Money,
+}
+
+fn map_routing(r: &rusqlite::Row) -> rusqlite::Result<RoutingOp> {
+    Ok(RoutingOp {
+        id: r.get(0)?,
+        item_code: r.get(1)?,
+        seq: r.get(2)?,
+        op_code: r.get(3)?,
+        op_name: r.get(4)?,
+        work_center: r.get(5)?,
+        std_hours: read_m(&r.get::<_, String>(6)?),
+        rate: read_m(&r.get::<_, String>(7)?),
+    })
+}
+
+const RT_COLS: &str = "id,item_code,seq,op_code,op_name,work_center,std_hours,rate";
+
+pub fn routing_list(db: &Db, item_code: &str) -> DbResult<Vec<RoutingOp>> {
+    let mut st = db
+        .conn()
+        .prepare(&format!("SELECT {RT_COLS} FROM routing WHERE item_code=?1 ORDER BY seq"))?;
+    let rows = st
+        .query_map(rusqlite::params![item_code], map_routing)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 整单保存某产品的工艺路线（先删后插，事务保证原子性）
+pub fn routing_save(db: &Db, item_code: &str, ops: &[RoutingOp]) -> DbResult<()> {
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM routing WHERE item_code=?1",
+        rusqlite::params![item_code],
+    )?;
+    for op in ops {
+        tx.execute(
+            "INSERT INTO routing(item_code,seq,op_code,op_name,work_center,std_hours,rate)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![
+                item_code,
+                op.seq,
+                op.op_code,
+                op.op_name,
+                op.work_center,
+                op.std_hours.to_string(),
+                op.rate.to_string()
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn routing_delete(db: &Db, item_code: &str) -> DbResult<()> {
+    db.conn().execute(
+        "DELETE FROM routing WHERE item_code=?1",
+        rusqlite::params![item_code],
+    )?;
+    Ok(())
+}
+
+// ===========================================================================
+// 工序报工（生产订单工序进度）
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProdOp {
+    pub id: i64,
+    pub po_id: i64,
+    pub routing_id: i64,
+    pub op_name: String,
+    pub work_center: String,
+    pub qty_done: Money,
+    pub hours: Money,
+    pub status: String, // pending / in_progress / done
+    pub memo: String,
+}
+
+fn map_prod_op(r: &rusqlite::Row) -> rusqlite::Result<ProdOp> {
+    Ok(ProdOp {
+        id: r.get(0)?,
+        po_id: r.get(1)?,
+        routing_id: r.get(2)?,
+        op_name: r.get(3)?,
+        work_center: r.get(4)?,
+        qty_done: read_m(&r.get::<_, String>(5)?),
+        hours: read_m(&r.get::<_, String>(6)?),
+        status: r.get(7)?,
+        memo: r.get(8)?,
+    })
+}
+
+const PO_COLS: &str = "id,po_id,routing_id,op_name,work_center,qty_done,hours,status,memo";
+
+/// 生产订单开工时按工艺路线生成工序清单
+pub fn prod_op_init_from_routing(db: &Db, po_id: i64, item_code: &str) -> DbResult<usize> {
+    let ops = routing_list(db, item_code)?;
+    if ops.is_empty() {
+        return Ok(0);
+    }
+    // 已有工序则不重复生成
+    let cnt: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM prod_op WHERE po_id=?1",
+        [po_id],
+        |r| r.get(0),
+    )?;
+    if cnt > 0 {
+        return Ok(0);
+    }
+    let tx = db.conn().unchecked_transaction()?;
+    for op in &ops {
+        tx.execute(
+            "INSERT INTO prod_op(po_id,routing_id,op_name,work_center,qty_done,hours,status,memo)
+             VALUES(?1,?2,?3,?4,'0','0','pending','')",
+            rusqlite::params![po_id, op.id, op.op_name, op.work_center],
+        )?;
+    }
+    tx.commit()?;
+    Ok(ops.len())
+}
+
+pub fn prod_op_list(db: &Db, po_id: i64) -> DbResult<Vec<ProdOp>> {
+    let mut st = db
+        .conn()
+        .prepare(&format!("SELECT {PO_COLS} FROM prod_op WHERE po_id=?1 ORDER BY id"))?;
+    let rows = st
+        .query_map(rusqlite::params![po_id], map_prod_op)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 报工：累加完工数量与工时，自动推进状态
+pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult<()> {
+    if qty.is_negative() || hours.is_negative() {
+        return Err(FinError::msg("报工数量与工时不能为负").into());
+    }
+    // 定点累加：金额/数量一律在 Rust 侧用 Decimal 运算，绝不走 SQL 的 REAL 浮点
+    let cur = db
+        .conn()
+        .query_row(
+            "SELECT qty_done, hours FROM prod_op WHERE id=?1",
+            rusqlite::params![op_id],
+            |r| {
+                Ok((
+                    read_m(&r.get::<_, String>(0)?),
+                    read_m(&r.get::<_, String>(1)?),
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| FinError::msg(format!("工序 {op_id} 不存在")))?;
+    let new_qty = cur.0 + qty;
+    let new_hours = cur.1 + hours;
+    let status = if new_qty.is_positive() {
+        "in_progress"
+    } else {
+        "pending"
+    };
+    db.conn().execute(
+        "UPDATE prod_op SET qty_done=?2, hours=?3, status=?4 WHERE id=?1",
+        rusqlite::params![op_id, new_qty.to_string(), new_hours.to_string(), status],
+    )?;
+    Ok(())
+}
+
+/// 手工标记某工序完成
+pub fn prod_op_finish(db: &Db, op_id: i64) -> DbResult<()> {
+    db.conn().execute(
+        "UPDATE prod_op SET status='done' WHERE id=?1",
+        rusqlite::params![op_id],
+    )?;
+    Ok(())
+}
+
+/// 按工时 × 费率归集工序成本到生产订单（写入 prod_cost 的 labor/overhead）
+pub fn prod_op_collect_cost(db: &Db, po_id: i64) -> DbResult<Money> {
+    // 取该生产订单的产成品，找工艺路线费率
+    let po = crate::manufacturing::get_prod_order(db, po_id)?
+        .ok_or_else(|| FinError::msg(format!("生产订单 {po_id} 不存在")))?;
+    let routes = routing_list(db, &po.item_code)?;
+    let ops = prod_op_list(db, po_id)?;
+    let mut total = Money::ZERO;
+    for op in &ops {
+        if let Some(rt) = routes.iter().find(|r| r.id == op.routing_id) {
+            let cost = (op.hours * rt.rate.inner()).round2();
+            total += cost;
+        }
+    }
+    if !total.is_zero() {
+        crate::manufacturing::add_cost(
+            db,
+            po_id,
+            crate::manufacturing::CostType::Labor,
+            total,
+            "工序工时成本归集",
+        )?;
+    }
+    Ok(total)
+}
+
+// ===========================================================================
+// 存货计划参数 + MRP 运算
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ItemPlan {
+    pub item_code: String,
+    pub safety_stock: Money,
+    pub lead_days: i32,
+    pub lot_size: Money,
+}
+
+pub fn item_plan_get(db: &Db, item_code: &str) -> DbResult<Option<ItemPlan>> {
+    db.conn()
+        .query_row(
+            "SELECT item_code,safety_stock,lead_days,lot_size FROM item_plan WHERE item_code=?1",
+            rusqlite::params![item_code],
+            |r| {
+                Ok(ItemPlan {
+                    item_code: r.get(0)?,
+                    safety_stock: read_m(&r.get::<_, String>(1)?),
+                    lead_days: r.get(2)?,
+                    lot_size: read_m(&r.get::<_, String>(3)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn item_plan_upsert(db: &Db, p: &ItemPlan) -> DbResult<()> {
+    db.conn().execute(
+        "INSERT INTO item_plan(item_code,safety_stock,lead_days,lot_size) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(item_code) DO UPDATE SET safety_stock=excluded.safety_stock,
+            lead_days=excluded.lead_days, lot_size=excluded.lot_size",
+        rusqlite::params![
+            p.item_code,
+            p.safety_stock.to_string(),
+            p.lead_days,
+            p.lot_size.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+/// MRP 运算结果行
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MrpRow {
+    pub id: i64,
+    pub run_at: String,
+    pub item_code: String,
+    pub item_name: String,
+    pub level: i32,
+    pub gross_req: Money,
+    pub on_hand: Money,
+    pub net_req: Money,
+    pub planned_qty: Money,
+    pub action: String, // produce / purchase / none
+    pub source: String,
+}
+
+fn map_mrp(r: &rusqlite::Row) -> rusqlite::Result<MrpRow> {
+    Ok(MrpRow {
+        id: r.get(0)?,
+        run_at: r.get(1)?,
+        item_code: r.get(2)?,
+        item_name: r.get(3)?,
+        level: r.get(4)?,
+        gross_req: read_m(&r.get::<_, String>(5)?),
+        on_hand: read_m(&r.get::<_, String>(6)?),
+        net_req: read_m(&r.get::<_, String>(7)?),
+        planned_qty: read_m(&r.get::<_, String>(8)?),
+        action: r.get(9)?,
+        source: r.get(10)?,
+    })
+}
+
+const MRP_COLS: &str = "id,run_at,item_code,item_name,level,gross_req,on_hand,net_req,planned_qty,action,source";
+
+/// 查询最近一次 MRP 运算结果
+pub fn mrp_latest(db: &Db) -> DbResult<Vec<MrpRow>> {
+    let latest: Option<String> = db
+        .conn()
+        .query_row("SELECT MAX(run_at) FROM mrp_result", [], |r| r.get(0))
+        .optional()?;
+    let Some(ts) = latest else {
+        return Ok(Vec::new());
+    };
+    mrp_by_run(db, &ts)
+}
+
+pub fn mrp_by_run(db: &Db, run_at: &str) -> DbResult<Vec<MrpRow>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {MRP_COLS} FROM mrp_result WHERE run_at=?1 ORDER BY level, item_code"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![run_at], map_mrp)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 存货现有库存（stock_move 数量代数和）
+fn on_hand_qty(db: &Db, item_code: &str) -> DbResult<Money> {
+    let mut st = db
+        .conn()
+        .prepare("SELECT qty FROM stock_move WHERE item=?1")?;
+    let rows = st
+        .query_map(rusqlite::params![item_code], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut sum = Money::ZERO;
+    for s in rows {
+        sum += read_m(&s);
+    }
+    Ok(sum)
+}
+
+/// BOM 单层展开
+struct BomNode {
+    child: String,
+    qty: Money,
+    loss_rate: Money,
+}
+
+fn bom_children(db: &Db, parent: &str) -> DbResult<Vec<BomNode>> {
+    let items = crate::scm::bom_list(db, parent)?;
+    Ok(items
+        .into_iter()
+        .map(|b| BomNode {
+            child: b.child_code,
+            qty: b.qty,
+            loss_rate: b.loss_rate,
+        })
+        .collect())
+}
+
+/// MRP 主运算：输入产成品需求清单（item_code, qty, source），
+/// 按 BOM 逐层展开，算毛需求 → 净需求（扣现有库存与安全库存）→ 计划量（套批量）。
+///
+/// 有 BOM 的物料 action=produce，否则 purchase。返回本次 run_at 时间戳。
+pub fn mrp_run(db: &Db, demands: &[(String, Money, String)]) -> DbResult<String> {
+    let run_at = now();
+    // 净需求累加表：item -> (gross, level, source)
+    struct Acc {
+        gross: Money,
+        level: i32,
+        sources: Vec<String>,
+    }
+    let mut acc: std::collections::BTreeMap<String, Acc> = std::collections::BTreeMap::new();
+
+    // 用队列做逐层展开（同层可合并），guard 防 BOM 循环引用
+    let mut queue: std::collections::VecDeque<(String, Money, i32, String)> =
+        demands
+            .iter()
+            .map(|(c, q, s)| (c.clone(), *q, 0, s.clone()))
+            .collect();
+    let mut guard = 0usize;
+
+    while let Some((code, qty, level, source)) = queue.pop_front() {
+        guard += 1;
+        if guard > 10_000 {
+            return Err(FinError::msg("BOM 展开超过 10000 节点，疑似循环引用").into());
+        }
+        let e = acc.entry(code.clone()).or_insert_with(|| Acc {
+            gross: Money::ZERO,
+            level,
+            sources: Vec::new(),
+        });
+        e.gross += qty;
+        if level > e.level {
+            e.level = level;
+        }
+        if !source.is_empty() && !e.sources.contains(&source) {
+            e.sources.push(source.clone());
+        }
+        // 有 BOM 说明是自制件：净需求先按下层继续展开（这里先展开毛需求，
+        // 库存抵扣在落库时统一算，保证同层合并）
+        let children = bom_children(db, &code)?;
+        if !children.is_empty() {
+            for ch in children {
+                let eff = ch.qty * (Money::ONE + ch.loss_rate);
+                let need = (qty * eff.inner()).round_dp(fincore::money::QTY_DP);
+                queue.push_back((ch.child.clone(), need, level + 1, format!("BOM:{code}")));
+            }
+        }
+    }
+
+    // 落库：先清掉同一 run_at（理论上不会冲突），再逐条插入
+    let tx = db.conn().unchecked_transaction()?;
+    for (code, a) in &acc {
+        let on_hand = on_hand_qty(db, code)?;
+        let plan = item_plan_get(db, code)?.unwrap_or(ItemPlan {
+            item_code: code.clone(),
+            safety_stock: Money::ZERO,
+            lead_days: 0,
+            lot_size: Money::ZERO,
+        });
+        // 净需求 = 毛需求 + 安全库存 - 现有库存
+        let mut net = a.gross + plan.safety_stock - on_hand;
+        if net.is_negative() {
+            net = Money::ZERO;
+        }
+        // 计划量：套最小批量（向上取整到 lot_size 的整数倍）
+        let planned = if plan.lot_size.is_positive() && net.is_positive() {
+            let lots = (net.inner() / plan.lot_size.inner())
+                .ceil()
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(1);
+            (plan.lot_size * Money::from_i64(lots)).round_dp(fincore::money::QTY_DP)
+        } else {
+            net
+        };
+        let has_bom = !bom_children(db, code)?.is_empty();
+        let action = if net.is_zero() {
+            "none"
+        } else if has_bom {
+            "produce"
+        } else {
+            "purchase"
+        };
+        // 尝试从存货档案取名称
+        let name: String = tx
+            .query_row(
+                "SELECT name FROM aux_entity WHERE kind='item' AND code=?1",
+                rusqlite::params![code],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| code.clone());
+        tx.execute(
+            "INSERT INTO mrp_result(run_at,item_code,item_name,level,gross_req,on_hand,net_req,planned_qty,action,source)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                run_at,
+                code,
+                name,
+                a.level,
+                a.gross.to_string(),
+                on_hand.to_string(),
+                net.to_string(),
+                planned.to_string(),
+                action,
+                a.sources.join(",")
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(run_at)
+}
+
+/// 从已确认销售订单收集 MRP 需求（未发完的数量）
+pub fn mrp_demands_from_sales(db: &Db, period: Period) -> DbResult<Vec<(String, Money, String)>> {
+    let orders = crate::scm::so_list(db, period, None)?;
+    let mut out = Vec::new();
+    for so in orders {
+        if !matches!(
+            so.status,
+            crate::scm::SoStatus::Confirmed | crate::scm::SoStatus::PartialShip
+        ) {
+            continue;
+        }
+        for l in &so.lines {
+            let open = l.qty_ordered - l.qty_shipped;
+            if open.is_positive() {
+                out.push((l.item_code.clone(), open, format!("SO-{}", so.no)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// 预算多版本
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BudgetVersion {
+    pub key: String,
+    pub name: String,
+    pub is_current: bool,
+    pub created_at: String,
+    pub memo: String,
+}
+
+pub fn bversion_list(db: &Db) -> DbResult<Vec<BudgetVersion>> {
+    let mut st = db.conn().prepare(
+        "SELECT key,name,is_current,created_at,memo FROM budget_version ORDER BY created_at",
+    )?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(BudgetVersion {
+                key: r.get(0)?,
+                name: r.get(1)?,
+                is_current: r.get::<_, i64>(2)? != 0,
+                created_at: r.get(3)?,
+                memo: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn bversion_save(db: &Db, v: &BudgetVersion) -> DbResult<()> {
+    let tx = db.conn().unchecked_transaction()?;
+    if v.is_current {
+        // 单一生效版本：先把其他版本全部置为不生效
+        tx.execute("UPDATE budget_version SET is_current=0", [])?;
+    }
+    tx.execute(
+        "INSERT INTO budget_version(key,name,is_current,created_at,memo) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(key) DO UPDATE SET name=excluded.name, is_current=excluded.is_current, memo=excluded.memo",
+        rusqlite::params![v.key, v.name, if v.is_current { 1 } else { 0 }, v.created_at, v.memo],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn bversion_delete(db: &Db, key: &str) -> DbResult<()> {
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM budget WHERE version=?1",
+        rusqlite::params![key],
+    )?;
+    tx.execute(
+        "DELETE FROM budget_version WHERE key=?1",
+        rusqlite::params![key],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 当前生效版本 key（无则 ''，兼容旧数据）
+pub fn bversion_current(db: &Db) -> DbResult<String> {
+    let k: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT key FROM budget_version WHERE is_current=1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(k.unwrap_or_default())
+}
+
+/// 复制整个版本的预算行到另一个版本
+pub fn bversion_copy(db: &Db, from: &str, to: &str) -> DbResult<usize> {
+    let rows = crate::mgmt::budget_list_version(db, None, from)?;
+    let mut n = 0;
+    for b in rows {
+        crate::mgmt::budget_upsert_version(
+            db,
+            &crate::mgmt::Budget {
+                id: 0,
+                version: to.to_string(),
+                ..b
+            },
+        )?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+// ===========================================================================
+// 审批流引擎
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalStep {
+    pub id: i64,
+    pub approval_id: i64,
+    pub seq: i32,
+    pub approver: String,
+    pub action: String, // '' / approve / reject
+    pub comment: String,
+    pub acted_at: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Approval {
+    pub id: i64,
+    pub biz_kind: String,
+    pub biz_id: i64,
+    pub title: String,
+    pub applicant: String,
+    pub current_node: i32,
+    pub status: String, // pending / approved / rejected / cancelled
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub steps: Vec<ApprovalStep>,
+}
+
+fn load_steps(db: &Db, approval_id: i64) -> DbResult<Vec<ApprovalStep>> {
+    let mut st = db.conn().prepare(
+        "SELECT id,approval_id,seq,approver,action,comment,acted_at FROM approval_step
+         WHERE approval_id=?1 ORDER BY seq",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![approval_id], |r| {
+            Ok(ApprovalStep {
+                id: r.get(0)?,
+                approval_id: r.get(1)?,
+                seq: r.get(2)?,
+                approver: r.get(3)?,
+                action: r.get(4)?,
+                comment: r.get(5)?,
+                acted_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn map_approval(db: &Db, r: &rusqlite::Row) -> rusqlite::Result<Approval> {
+    let id: i64 = r.get(0)?;
+    Ok(Approval {
+        id,
+        biz_kind: r.get(1)?,
+        biz_id: r.get(2)?,
+        title: r.get(3)?,
+        applicant: r.get(4)?,
+        current_node: r.get(5)?,
+        status: r.get(6)?,
+        created_at: r.get(7)?,
+        finished_at: r.get(8)?,
+        steps: load_steps(db, id).unwrap_or_default(),
+    })
+}
+
+const AP_COLS: &str = "id,biz_kind,biz_id,title,applicant,current_node,status,created_at,finished_at";
+
+/// 发起审批流：approvers 按顺序为各级审批人
+pub fn approval_start(
+    db: &Db,
+    biz_kind: &str,
+    biz_id: i64,
+    title: &str,
+    applicant: &str,
+    approvers: &[String],
+) -> DbResult<i64> {
+    if approvers.is_empty() {
+        return Err(FinError::msg("审批流至少需要一个审批人").into());
+    }
+    // 同一单据只能有一个审批流
+    let exists: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT id FROM approval WHERE biz_kind=?1 AND biz_id=?2",
+            rusqlite::params![biz_kind, biz_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        return Err(FinError::msg("该单据已存在审批流，不能重复发起").into());
+    }
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO approval(biz_kind,biz_id,title,applicant,current_node,status,created_at)
+         VALUES(?1,?2,?3,?4,1,'pending',?5)",
+        rusqlite::params![biz_kind, biz_id, title, applicant, now()],
+    )?;
+    let id = tx.last_insert_rowid();
+    for (i, a) in approvers.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO approval_step(approval_id,seq,approver) VALUES(?1,?2,?3)",
+            rusqlite::params![id, i as i32 + 1, a],
+        )?;
+    }
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn approval_get(db: &Db, id: i64) -> DbResult<Option<Approval>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {AP_COLS} FROM approval WHERE id=?1"),
+            rusqlite::params![id],
+            |r| map_approval(db, r),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn approval_get_for_biz(db: &Db, biz_kind: &str, biz_id: i64) -> DbResult<Option<Approval>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {AP_COLS} FROM approval WHERE biz_kind=?1 AND biz_id=?2"),
+            rusqlite::params![biz_kind, biz_id],
+            |r| map_approval(db, r),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// 我待审的列表（当前节点审批人 = who，且流程待审）
+pub fn approval_todo(db: &Db, who: &str) -> DbResult<Vec<Approval>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {AP_COLS} FROM approval a WHERE a.status='pending'
+           AND EXISTS (SELECT 1 FROM approval_step s
+                       WHERE s.approval_id=a.id AND s.seq=a.current_node AND s.approver=?1)
+         ORDER BY a.created_at DESC"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![who], |r| map_approval(db, r))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 全部审批流（按创建时间倒序，可选 limit）
+pub fn approval_list(db: &Db, limit: i64) -> DbResult<Vec<Approval>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {AP_COLS} FROM approval ORDER BY created_at DESC LIMIT ?1"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![limit.max(1)], |r| map_approval(db, r))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 审批（通过/驳回）
+///
+/// 通过：当前节点标记 approve，若有下一节点则推进，否则整单 approved。
+/// 驳回：整单 rejected，不再流转。
+pub fn approval_act(
+    db: &Db,
+    id: i64,
+    who: &str,
+    approve: bool,
+    comment: &str,
+) -> DbResult<Approval> {
+    let ap = approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
+    if ap.status != "pending" {
+        return Err(FinError::msg(format!("审批流已{}，不能再操作", ap.status)).into());
+    }
+    let cur = ap
+        .steps
+        .iter()
+        .find(|s| s.seq == ap.current_node)
+        .ok_or_else(|| FinError::msg("当前审批节点异常"))?;
+    if cur.approver != who {
+        return Err(FinError::msg(format!(
+            "当前节点审批人是 {}，您（{}）无权审批",
+            cur.approver, who
+        ))
+        .into());
+    }
+    let action = if approve { "approve" } else { "reject" };
+    let tx = db.conn().unchecked_transaction()?;
+    tx.execute(
+        "UPDATE approval_step SET action=?1, comment=?2, acted_at=?3 WHERE id=?4",
+        rusqlite::params![action, comment, now(), cur.id],
+    )?;
+    if approve {
+        let next = ap.current_node + 1;
+        let has_next = ap.steps.iter().any(|s| s.seq == next);
+        if has_next {
+            tx.execute(
+                "UPDATE approval SET current_node=?2 WHERE id=?1",
+                rusqlite::params![id, next],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE approval SET status='approved', finished_at=?2 WHERE id=?1",
+                rusqlite::params![id, now()],
+            )?;
+        }
+    } else {
+        tx.execute(
+            "UPDATE approval SET status='rejected', finished_at=?2 WHERE id=?1",
+            rusqlite::params![id, now()],
+        )?;
+    }
+    tx.commit()?;
+    approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流读取失败").into())
+}
+
+/// 撤销审批流（仅申请人、且还在第一节点）
+pub fn approval_cancel(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let ap = approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
+    if ap.applicant != who {
+        return Err(FinError::msg("只有申请人可以撤销审批流").into());
+    }
+    if ap.status != "pending" || ap.current_node > 1 {
+        return Err(FinError::msg("审批已流转，不能撤销").into());
+    }
+    db.conn().execute(
+        "UPDATE approval SET status='cancelled', finished_at=?2 WHERE id=?1",
+        rusqlite::params![id, now()],
+    )?;
+    Ok(())
+}
+
+// ===========================================================================
+// 报表附注
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReportNote {
+    pub id: i64,
+    pub report_key: String,
+    pub period: Period,
+    pub seq: i32,
+    pub title: String,
+    pub content: String,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+fn map_note(r: &rusqlite::Row) -> rusqlite::Result<ReportNote> {
+    Ok(ReportNote {
+        id: r.get(0)?,
+        report_key: r.get(1)?,
+        period: Period::from_ymm(r.get(2)?),
+        seq: r.get(3)?,
+        title: r.get(4)?,
+        content: r.get(5)?,
+        updated_by: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
+}
+
+const NOTE_COLS: &str = "id,report_key,period,seq,title,content,updated_by,updated_at";
+
+pub fn note_list(db: &Db, report_key: &str, period: Period) -> DbResult<Vec<ReportNote>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {NOTE_COLS} FROM report_note WHERE report_key=?1 AND period=?2 ORDER BY seq"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![report_key, period.ymm()], map_note)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn note_save(db: &Db, n: &mut ReportNote) -> DbResult<i64> {
+    n.updated_at = now();
+    if n.id > 0 {
+        db.conn().execute(
+            "UPDATE report_note SET report_key=?2,period=?3,seq=?4,title=?5,content=?6,updated_by=?7,updated_at=?8
+             WHERE id=?1",
+            rusqlite::params![
+                n.id,
+                n.report_key,
+                n.period.ymm(),
+                n.seq,
+                n.title,
+                n.content,
+                n.updated_by,
+                n.updated_at
+            ],
+        )?;
+        Ok(n.id)
+    } else {
+        db.conn().execute(
+            "INSERT INTO report_note(report_key,period,seq,title,content,updated_by,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![
+                n.report_key,
+                n.period.ymm(),
+                n.seq,
+                n.title,
+                n.content,
+                n.updated_by,
+                n.updated_at
+            ],
+        )?;
+        Ok(db.conn().last_insert_rowid())
+    }
+}
+
+pub fn note_delete(db: &Db, id: i64) -> DbResult<()> {
+    db.conn()
+        .execute("DELETE FROM report_note WHERE id=?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+// ===========================================================================
+// 会计电子档案
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EArchive {
+    pub id: i64,
+    pub period: Period,
+    pub kind: String, // voucher / ledger / report / balance
+    pub title: String,
+    pub file_no: String,
+    pub content_hash: String,
+    pub payload: String,
+    pub archived_by: String,
+    pub archived_at: String,
+    pub sealed: bool,
+}
+
+fn map_archive(r: &rusqlite::Row) -> rusqlite::Result<EArchive> {
+    Ok(EArchive {
+        id: r.get(0)?,
+        period: Period::from_ymm(r.get(1)?),
+        kind: r.get(2)?,
+        title: r.get(3)?,
+        file_no: r.get(4)?,
+        content_hash: r.get(5)?,
+        payload: r.get(6)?,
+        archived_by: r.get(7)?,
+        archived_at: r.get(8)?,
+        sealed: r.get::<_, i64>(9)? != 0,
+    })
+}
+
+const ARC_COLS: &str =
+    "id,period,kind,title,file_no,content_hash,payload,archived_by,archived_at,sealed";
+
+fn sha256_hex(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// 归档：内容哈希 + 封存。相同 (period, kind, file_no) 重复归档会报错，保证档案唯一。
+pub fn archive_create(
+    db: &Db,
+    period: Period,
+    kind: &str,
+    title: &str,
+    file_no: &str,
+    payload: &str,
+    user: &str,
+) -> DbResult<i64> {
+    let hash = sha256_hex(payload);
+    db.conn().execute(
+        "INSERT INTO e_archive(period,kind,title,file_no,content_hash,payload,archived_by,archived_at,sealed)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1)",
+        rusqlite::params![period.ymm(), kind, title, file_no, hash, payload, user, now()],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+pub fn archive_list(db: &Db, period: Period, kind: Option<&str>) -> DbResult<Vec<EArchive>> {
+    let sql = match kind {
+        Some(_) => format!("SELECT {ARC_COLS} FROM e_archive WHERE period=?1 AND kind=?2 ORDER BY file_no"),
+        None => format!("SELECT {ARC_COLS} FROM e_archive WHERE period=?1 ORDER BY kind, file_no"),
+    };
+    let mut st = db.conn().prepare(&sql)?;
+    let rows = match kind {
+        Some(k) => st.query_map(rusqlite::params![period.ymm(), k], map_archive)?,
+        None => st.query_map(rusqlite::params![period.ymm()], map_archive)?,
+    };
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub fn archive_get(db: &Db, id: i64) -> DbResult<Option<EArchive>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {ARC_COLS} FROM e_archive WHERE id=?1"),
+            rusqlite::params![id],
+            map_archive,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// 校验档案完整性（内容是否被篡改）
+pub fn archive_verify(a: &EArchive) -> bool {
+    sha256_hex(&a.payload) == a.content_hash
+}
+
+/// 自动生成档案号：YYYYMM-kind-seq
+pub fn archive_next_no(db: &Db, period: Period, kind: &str) -> DbResult<String> {
+    let cnt: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM e_archive WHERE period=?1 AND kind=?2",
+        rusqlite::params![period.ymm(), kind],
+        |r| r.get(0),
+    )?;
+    Ok(format!("{}-{}-{:03}", period.ymm(), kind, cnt + 1))
+}
+
+// ===========================================================================
+// 摘要汇总表
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SummaryRow {
+    pub summary: String,
+    pub voucher_count: i64,
+    pub debit: Money,
+    pub credit: Money,
+}
+
+/// 摘要汇总表：期间范围内按摘要分组，统计凭证张数与借贷发生额。
+///
+/// 只统计已过账凭证（status='posted'），金额 Rust 侧 Decimal 累加。
+pub fn summary_table(db: &Db, from: Period, to: Period) -> DbResult<Vec<SummaryRow>> {
+    let mut st = db.conn().prepare(
+        "SELECT e.summary, e.debit, e.credit, v.id
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2 AND e.summary <> ''
+         ORDER BY e.summary",
+    )?;
+    let mut rows = st.query(rusqlite::params![from.ymm(), to.ymm()])?;
+    let mut map: std::collections::BTreeMap<String, (Money, Money, std::collections::BTreeSet<i64>)> =
+        std::collections::BTreeMap::new();
+    while let Some(r) = rows.next()? {
+        let summary: String = r.get(0)?;
+        let d = read_m(&r.get::<_, String>(1)?);
+        let c = read_m(&r.get::<_, String>(2)?);
+        let vid: i64 = r.get(3)?;
+        let e = map
+            .entry(summary)
+            .or_insert_with(|| (Money::ZERO, Money::ZERO, std::collections::BTreeSet::new()));
+        e.0 += d;
+        e.1 += c;
+        e.2.insert(vid);
+    }
+    Ok(map
+        .into_iter()
+        .map(|(summary, (debit, credit, vids))| SummaryRow {
+            summary,
+            voucher_count: vids.len() as i64,
+            debit,
+            credit,
+        })
+        .collect())
+}
+
+// ===========================================================================
+// 多栏账（增强版：按对方科目拆栏）
+// ===========================================================================
+
+/// 多栏账行：一行一笔发生额，各栏科目拆分到列
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MultiColRow {
+    pub date: String,
+    pub voucher_no: String,
+    pub summary: String,
+    /// 主科目本行发生额（带符号：借正贷负）
+    pub amount: Money,
+    /// 各栏对方科目的金额（与 columns 顺序对应）
+    pub cols: Vec<Money>,
+    /// 余额（主科目累计）
+    pub balance: Money,
+}
+
+/// 多栏账：以 main_code 为主科目，columns 为栏目科目（通常是对方的费用/成本明细），
+/// 按凭证逐行把主科目发生额拆到各栏目。
+///
+/// 典型用法：管理费用多栏账 main=6602，columns=660201..660212，
+/// 看每张凭证里 6602 的钱分别进了哪些费用子目。
+/// 这里更通用的实现是：主科目可以是任一上级（如 6602），
+/// 栏目取凭证中属于 columns 前缀的分录金额。
+pub fn multi_column_table(
+    db: &Db,
+    main_code: &str,
+    columns: &[String],
+    from: Period,
+    to: Period,
+) -> DbResult<Vec<MultiColRow>> {
+    // 主科目的全部已过账分录
+    let mut st = db.conn().prepare(
+        "SELECT v.date, v.word, v.no, e.summary, e.debit, e.credit, e.voucher_id
+         FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
+           AND e.account_code LIKE ?3
+         ORDER BY v.date, v.id, e.line",
+    )?;
+    let like = format!("{main_code}%");
+    let mut rows = st.query(rusqlite::params![from.ymm(), to.ymm(), like])?;
+
+    // 主科目分录：voucher_id -> (date, no, summary, amount)
+    struct MainLine {
+        date: String,
+        vno: String,
+        summary: String,
+        amount: Money,
+    }
+    let mut mains: Vec<(i64, MainLine)> = Vec::new();
+    let mut vids: Vec<i64> = Vec::new();
+    while let Some(r) = rows.next()? {
+        let vid: i64 = r.get(6)?;
+        let d = read_m(&r.get::<_, String>(4)?);
+        let c = read_m(&r.get::<_, String>(5)?);
+        let amount = d - c;
+        let word: String = r.get(1)?;
+        let no: i32 = r.get(2)?;
+        mains.push((
+            vid,
+            MainLine {
+                date: r.get(0)?,
+                vno: format!("{}-{}", word, no),
+                summary: r.get(3)?,
+                amount,
+            },
+        ));
+        vids.push(vid);
+    }
+    if mains.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 拉取这些凭证中所有属于栏目科目的分录
+    vids.sort_unstable();
+    vids.dedup();
+    let placeholders = vids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT voucher_id, account_code, debit, credit FROM voucher_entry
+         WHERE voucher_id IN ({placeholders})"
+    );
+    let mut st2 = db.conn().prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        vids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
+    let mut rr = st2.query(params.as_slice())?;
+    // vid -> Vec<(col_idx, amount)>
+    let mut colmap: std::collections::BTreeMap<i64, Vec<(usize, Money)>> =
+        std::collections::BTreeMap::new();
+    while let Some(r) = rr.next()? {
+        let vid: i64 = r.get(0)?;
+        let code: String = r.get(1)?;
+        let d = read_m(&r.get::<_, String>(2)?);
+        let c = read_m(&r.get::<_, String>(3)?);
+        // 对方科目方向与主科目相反：主科目借，对方取贷方；这里直接取符号差
+        let amount = d - c;
+        for (idx, col) in columns.iter().enumerate() {
+            if code.starts_with(col.as_str()) {
+                colmap.entry(vid).or_default().push((idx, amount));
+                break;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut balance = Money::ZERO;
+    for (vid, m) in mains {
+        let mut cols = vec![Money::ZERO; columns.len()];
+        if let Some(v) = colmap.get(&vid) {
+            for (idx, a) in v {
+                if *idx < cols.len() {
+                    cols[*idx] += *a;
+                }
+            }
+        }
+        balance += m.amount;
+        out.push(MultiColRow {
+            date: m.date,
+            voucher_no: m.vno,
+            summary: m.summary,
+            amount: m.amount,
+            cols,
+            balance,
+        });
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// 财务指标分析
+// ===========================================================================
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FinRatio {
+    pub key: String,
+    pub name: String,
+    pub value: Money,
+    /// 展示文本（比率带 %，倍数带"倍"，天数带"天"）
+    pub display: String,
+    pub formula: String,
+}
+
+/// 常用财务指标：偿债能力 / 营运能力 / 盈利能力
+///
+/// 全部基于期末余额快照计算，数据源是 BalanceSnapshot，口径与资产负债表一致。
+pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRatio>> {
+    use crate::balances::{BalanceQuery, BalanceSnapshot};
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, period))?;
+    let b = |code: &str| snap.for_account(code, None).end();
+    let occ = |code: &str| {
+        let r = snap.for_account(code, None);
+        r.credit - r.debit // 收入类贷方正
+    };
+    let exp = |code: &str| {
+        let r = snap.for_account(code, None);
+        r.debit - r.credit // 费用类借方正
+    };
+    let pct = |v: Money| format!("{}%", (v * Money::from_i64(100)).round2());
+
+    let mut out = Vec::new();
+    let mut push = |key: &str, name: &str, value: Money, display: String, formula: &str| {
+        out.push(FinRatio {
+            key: key.into(),
+            name: name.into(),
+            value,
+            display,
+            formula: formula.into(),
+        });
+    };
+
+    // 流动资产 ≈ 货币资金 + 交易性金融资产 + 应收 + 预付 + 其他应收 + 存货
+    let cur_asset = b("1001") + b("1002") + b("1012") + b("1101") + b("1121") + b("1122")
+        + b("1123") + b("1221") + b("1403") + b("1405") + b("1406") + b("1411");
+    // 流动负债 ≈ 短期借款 + 应付 + 预收 + 薪酬 + 税费 + 其他应付
+    let cur_liab = (b("2001") + b("2201") + b("2202") + b("2203") + b("2211") + b("2221")
+        + b("2241"))
+    .negated(); // 负债贷方余额为负，取负得正数
+    let total_asset = {
+        // 全部 1 开头资产类（借方正）合计
+        let mut s = Money::ZERO;
+        for a in crate::accounts::list(db)?.iter().filter(|a| {
+            matches!(
+                a.category,
+                fincore::account::AcctCategory::Asset
+            ) && a.code.len() == 4
+        }) {
+            s += b(&a.code);
+        }
+        s
+    };
+    let total_liab = {
+        let mut s = Money::ZERO;
+        for a in crate::accounts::list(db)?.iter().filter(|a| {
+            matches!(
+                a.category,
+                fincore::account::AcctCategory::Liability
+            ) && a.code.len() == 4
+        }) {
+            s += b(&a.code).negated();
+        }
+        s
+    };
+    let equity = total_asset - total_liab;
+    let revenue = occ("6001") + occ("6051");
+    let cost = exp("6401") + exp("6402");
+    let net_profit = revenue - cost - exp("6403") - exp("6601") - exp("6602") - exp("6603")
+        - exp("6701") + occ("6301") - exp("6711") - exp("6801");
+
+    let div = |a: Money, b: Money| -> Money {
+        if b.is_zero() {
+            Money::ZERO
+        } else {
+            Money::new(a.inner() / b.inner()).round2()
+        }
+    };
+
+    push(
+        "current_ratio",
+        "流动比率",
+        div(cur_asset, cur_liab),
+        format!("{}倍", div(cur_asset, cur_liab)),
+        "流动资产 ÷ 流动负债",
+    );
+    let quick_asset = cur_asset - b("1403") - b("1405") - b("1406") - b("1411");
+    push(
+        "quick_ratio",
+        "速动比率",
+        div(quick_asset, cur_liab),
+        format!("{}倍", div(quick_asset, cur_liab)),
+        "(流动资产 − 存货) ÷ 流动负债",
+    );
+    push(
+        "debt_ratio",
+        "资产负债率",
+        div(total_liab, total_asset),
+        pct(div(total_liab, total_asset)),
+        "负债总额 ÷ 资产总额",
+    );
+    push(
+        "gross_margin",
+        "毛利率",
+        div(revenue - cost, revenue),
+        pct(div(revenue - cost, revenue)),
+        "(营业收入 − 营业成本) ÷ 营业收入",
+    );
+    push(
+        "net_margin",
+        "净利率",
+        div(net_profit, revenue),
+        pct(div(net_profit, revenue)),
+        "净利润 ÷ 营业收入",
+    );
+    push(
+        "roe",
+        "净资产收益率(ROE)",
+        div(net_profit, equity),
+        pct(div(net_profit, equity)),
+        "净利润 ÷ 所有者权益",
+    );
+    push(
+        "roa",
+        "总资产报酬率(ROA)",
+        div(net_profit, total_asset),
+        pct(div(net_profit, total_asset)),
+        "净利润 ÷ 资产总额",
+    );
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fincore::account::AuxKind;
+    use fincore::auxiliary::AuxEntity;
+    use fincore::voucher::{Entry, Voucher};
+
+    fn tmpdb(name: &str) -> Db {
+        let p = std::env::temp_dir().join(format!("finbook_adv_{name}.fbk"));
+        let _ = std::fs::remove_file(&p);
+        Db::create(&p, &fincore::BookOptions::default()).unwrap()
+    }
+    fn m(s: &str) -> Money {
+        Money::parse(s).unwrap()
+    }
+
+    fn post(db: &Db, period: Period, no: i32, lines: &[(&str, &str, &str)]) {
+        let date = period.first_day();
+        let mut v = Voucher::new(period, date, "记", no);
+        for (i, (acc, d, c)) in lines.iter().enumerate() {
+            let mut aux = fincore::voucher::AuxRef::default();
+            if acc.starts_with("1002") {
+                aux.bank = Some("B01".into());
+            }
+            v.push_entry(Entry {
+                debit: m(d),
+                credit: m(c),
+                aux,
+                ..Entry::new(i as i32 + 1, *acc, "测试摘要")
+            });
+        }
+        let id = crate::vouchers::save(db, &mut v).unwrap();
+        crate::vouchers::audit(db, id, "a").unwrap();
+        crate::vouchers::post(db, id, "p").unwrap();
+    }
+
+    #[test]
+    fn routing_and_ops() {
+        let db = tmpdb("routing");
+        routing_save(
+            &db,
+            "FG01",
+            &[
+                RoutingOp {
+                    id: 0,
+                    item_code: "FG01".into(),
+                    seq: 1,
+                    op_code: "OP1".into(),
+                    op_name: "下料".into(),
+                    work_center: "WC1".into(),
+                    std_hours: m("2"),
+                    rate: m("50"),
+                },
+                RoutingOp {
+                    id: 0,
+                    item_code: "FG01".into(),
+                    seq: 2,
+                    op_code: "OP2".into(),
+                    op_name: "装配".into(),
+                    work_center: "WC2".into(),
+                    std_hours: m("3"),
+                    rate: m("60"),
+                },
+            ],
+        )
+        .unwrap();
+        let ops = routing_list(&db, "FG01").unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].op_name, "装配");
+    }
+
+    #[test]
+    fn mrp_basic() {
+        let db = tmpdb("mrp");
+        // BOM: FG01 = 2 × RM01
+        crate::scm::bom_save(&db, "FG01", &[("RM01".into(), m("2"), m("0"))]).unwrap();
+        let run = mrp_run(&db, &[("FG01".into(), m("10"), "SO-001".into())]).unwrap();
+        let rows = mrp_by_run(&db, &run).unwrap();
+        let fg = rows.iter().find(|r| r.item_code == "FG01").unwrap();
+        assert_eq!(fg.gross_req, m("10"));
+        assert_eq!(fg.action, "produce");
+        let rm = rows.iter().find(|r| r.item_code == "RM01").unwrap();
+        assert_eq!(rm.gross_req, m("20"));
+        assert_eq!(rm.action, "purchase");
+    }
+
+    #[test]
+    fn mrp_lot_size_and_safety_stock() {
+        let db = tmpdb("mrp_lot");
+        item_plan_upsert(
+            &db,
+            &ItemPlan {
+                item_code: "RM01".into(),
+                safety_stock: m("5"),
+                lead_days: 3,
+                lot_size: m("10"),
+            },
+        )
+        .unwrap();
+        let run = mrp_run(&db, &[("RM01".into(), m("7"), "X".into())]).unwrap();
+        let rows = mrp_by_run(&db, &run).unwrap();
+        let rm = &rows[0];
+        // 毛需求 7 + 安全库存 5 = 12 → 套批量 10 → 计划 20
+        assert_eq!(rm.net_req, m("12"));
+        assert_eq!(rm.planned_qty, m("20"));
+    }
+
+    #[test]
+    fn approval_flow() {
+        let db = tmpdb("appr");
+        let id = approval_start(&db, "claim", 1, "报销单", "alice", &["bob".into(), "carol".into()])
+            .unwrap();
+        // 非当前节点审批人拒绝
+        assert!(approval_act(&db, id, "carol", true, "").is_err());
+        // bob 通过 → 推进到 carol
+        let ap = approval_act(&db, id, "bob", true, "同意").unwrap();
+        assert_eq!(ap.current_node, 2);
+        assert_eq!(ap.status, "pending");
+        // carol 通过 → 整单 approved
+        let ap = approval_act(&db, id, "carol", true, "同意").unwrap();
+        assert_eq!(ap.status, "approved");
+        // 重复发起报错
+        assert!(approval_start(&db, "claim", 1, "x", "alice", &["bob".into()]).is_err());
+    }
+
+    #[test]
+    fn approval_reject_stops_flow() {
+        let db = tmpdb("appr_rj");
+        let id = approval_start(&db, "po", 5, "采购单", "alice", &["bob".into()]).unwrap();
+        let ap = approval_act(&db, id, "bob", false, "价格太高").unwrap();
+        assert_eq!(ap.status, "rejected");
+        assert!(approval_act(&db, id, "bob", true, "").is_err());
+    }
+
+    #[test]
+    fn archive_and_verify() {
+        let db = tmpdb("arch");
+        let p = Period::new(2026, 1).unwrap();
+        let no = archive_next_no(&db, p, "voucher").unwrap();
+        assert!(no.starts_with("202601-voucher-"));
+        let id = archive_create(&db, p, "voucher", "1月凭证", &no, "{\"a\":1}", "admin").unwrap();
+        let a = archive_get(&db, id).unwrap().unwrap();
+        assert!(archive_verify(&a));
+        // 篡改内容后校验失败
+        let mut tampered = a.clone();
+        tampered.payload = "{\"a\":2}".into();
+        assert!(!archive_verify(&tampered));
+        // 重复 file_no 归档报错
+        assert!(archive_create(&db, p, "voucher", "x", &no, "{}", "admin").is_err());
+    }
+
+    #[test]
+    fn summary_and_multicol() {
+        let db = tmpdb("sumtab");
+        let p = Period::new(2026, 1).unwrap();
+        post(&db, p, 1, &[("100201", "1000", "0"), ("600101", "0", "1000")]);
+        post(&db, p, 2, &[("660201", "300", "0"), ("100201", "0", "300")]);
+        let rows = summary_table(&db, p, p).unwrap();
+        assert!(!rows.is_empty());
+        let r = rows.iter().find(|r| r.summary == "测试摘要").unwrap();
+        assert_eq!(r.voucher_count, 2);
+        assert_eq!(r.debit, m("1300"));
+        assert_eq!(r.credit, m("1300"));
+
+        // 多栏账：主科目 6602，栏目 660201
+        let mc = multi_column_table(&db, "6602", &["1002".to_string()], p, p).unwrap();
+        assert_eq!(mc.len(), 1);
+        assert_eq!(mc[0].amount, m("300"));
+        assert_eq!(mc[0].balance, m("300"));
+        // 对方科目 100201 命中栏目 1002 前缀
+        assert_eq!(mc[0].cols[0], m("-300"));
+    }
+
+    #[test]
+    fn budget_versions() {
+        let db = tmpdb("bver");
+        bversion_save(
+            &db,
+            &BudgetVersion {
+                key: "v1".into(),
+                name: "初稿".into(),
+                is_current: true,
+                created_at: "2026-01-01".into(),
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        bversion_save(
+            &db,
+            &BudgetVersion {
+                key: "v2".into(),
+                name: "调整版".into(),
+                is_current: true,
+                created_at: "2026-02-01".into(),
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        // 单一生效：v1 被顶掉
+        assert_eq!(bversion_current(&db).unwrap(), "v2");
+        let list = bversion_list(&db).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(!list[0].is_current);
+    }
+
+    #[test]
+    fn ratios_smoke() {
+        let db = tmpdb("ratio");
+        let p = Period::new(2026, 1).unwrap();
+        crate::auxs::insert(&db, &AuxEntity::new(AuxKind::Bank, "B01", "工行")).unwrap();
+        post(&db, p, 1, &[("100201", "100000", "0"), ("600101", "0", "100000")]);
+        post(&db, p, 2, &[("6401", "60000", "0"), ("100201", "0", "60000")]);
+        let ratios = fin_ratios(&db, p, p).unwrap();
+        assert!(ratios.len() >= 6);
+        let gm = ratios.iter().find(|r| r.key == "gross_margin").unwrap();
+        // 毛利率 = (100000-60000)/100000 = 40%
+        assert_eq!(gm.value, m("0.4"));
+    }
+}

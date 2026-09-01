@@ -48,6 +48,20 @@ pub enum NavItem {
     DimProfit,
     /// 自定义报表
     CustomReport,
+    /// 多栏账
+    MultiColumn,
+    /// 摘要汇总表
+    SummaryTable,
+    /// 财务指标分析
+    Ratios,
+    /// 工艺路线 / 报工 / MRP
+    Manufacturing,
+    /// 审批中心
+    Approval,
+    /// 报表附注
+    ReportNotes,
+    /// 电子档案
+    Archive,
     /// 凭证模板
     Template,
     /// 辅助档案
@@ -90,6 +104,13 @@ impl NavItem {
             NavItem::Budget => "预算管理".to_string(),
             NavItem::DimProfit => "多维损益".to_string(),
             NavItem::CustomReport => "自定义报表".to_string(),
+            NavItem::MultiColumn => "多栏账".to_string(),
+            NavItem::SummaryTable => "摘要汇总表".to_string(),
+            NavItem::Ratios => "财务指标".to_string(),
+            NavItem::Manufacturing => "制造管理".to_string(),
+            NavItem::Approval => "审批中心".to_string(),
+            NavItem::ReportNotes => "报表附注".to_string(),
+            NavItem::Archive => "电子档案".to_string(),
             NavItem::Template => "凭证模板".to_string(),
             NavItem::Aux(k) => format!("{}档案", k.label()),
             NavItem::Users => "用户权限".to_string(),
@@ -112,12 +133,16 @@ impl NavItem {
             NavItem::Ledger | NavItem::BalanceTable | NavItem::Reports | NavItem::CustomReport => {
                 "账簿报表"
             }
+            NavItem::MultiColumn | NavItem::SummaryTable | NavItem::Ratios | NavItem::ReportNotes => {
+                "账簿报表"
+            }
             NavItem::PeriodEnd
             | NavItem::Assets
             | NavItem::BankRec
             | NavItem::Settle
             | NavItem::Automation => "期末",
-            NavItem::Inventory | NavItem::Payroll | NavItem::Claims => "业务",
+            NavItem::Inventory | NavItem::Payroll | NavItem::Claims | NavItem::Manufacturing => "业务",
+            NavItem::Approval | NavItem::Archive => "系统",
             NavItem::Budget | NavItem::DimProfit => "管理会计",
             NavItem::Users | NavItem::Security | NavItem::Options | NavItem::Backup
             | NavItem::Logs | NavItem::Help | NavItem::About => "系统",
@@ -137,6 +162,10 @@ impl NavItem {
                 Some(Perm::VoucherNew)
             }
             NavItem::Budget | NavItem::DimProfit | NavItem::CustomReport => Some(Perm::Report),
+            NavItem::MultiColumn | NavItem::SummaryTable | NavItem::Ratios | NavItem::ReportNotes
+            | NavItem::Archive => Some(Perm::Report),
+            NavItem::Manufacturing => Some(Perm::AccountEdit),
+            NavItem::Approval => Some(Perm::VoucherNew),
             NavItem::Template => Some(Perm::VoucherNew),
             NavItem::Users | NavItem::Security => Some(Perm::UserManage),
             NavItem::Options => Some(Perm::SysOption),
@@ -167,14 +196,21 @@ impl NavItem {
             NavItem::BalanceTable,
             NavItem::Reports,
             NavItem::CustomReport,
+            NavItem::MultiColumn,
+            NavItem::SummaryTable,
+            NavItem::Ratios,
+            NavItem::ReportNotes,
             NavItem::PeriodEnd,
             NavItem::Assets,
             NavItem::BankRec,
             NavItem::Settle,
             NavItem::Automation,
             NavItem::Inventory,
+            NavItem::Manufacturing,
             NavItem::Payroll,
             NavItem::Claims,
+            NavItem::Approval,
+            NavItem::Archive,
             NavItem::Budget,
             NavItem::DimProfit,
             NavItem::Users,

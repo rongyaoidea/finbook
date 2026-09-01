@@ -10,9 +10,10 @@ use axum::{Json, Router};
 use axum::routing::{get, post, put};
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
-use fincore::{AuxRef, Entry, Period, Role, User, Voucher, VoucherStatus};
+use fincore::{AuxRef, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
 use findb::accounts;
+use findb::advanced;
 use findb::balances::{self, BalanceSnapshot, BalanceQuery, LedgerQuery};
 use findb::periods;
 use findb::security::{self, DeviceIdentity};
@@ -86,6 +87,37 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/api/reports/trial-balance/export",
             get(export_trial_balance),
         )
+        // 高级功能：多栏账 / 摘要汇总表 / 财务指标
+        .route("/api/reports/multi-column", get(get_multi_column))
+        .route("/api/reports/summary-table", get(get_summary_table))
+        .route("/api/reports/ratios", get(get_fin_ratios))
+        // 工艺路线 / 报工 / MRP
+        .route("/api/routing/:item", get(get_routing).post(post_routing))
+        .route("/api/routing/:item/delete", post(delete_routing))
+        .route("/api/prod", get(list_prod_orders))
+        .route("/api/prod/:id/ops", get(get_prod_ops))
+        .route("/api/prod/op/report", post(report_prod_op))
+        .route("/api/prod/op/finish", post(finish_prod_op))
+        .route("/api/mrp/latest", get(get_mrp_latest))
+        .route("/api/mrp/run", post(run_mrp))
+        // 预算版本
+        .route("/api/budget/versions", get(list_budget_versions).post(save_budget_version))
+        .route("/api/budget/versions/:key/delete", post(delete_budget_version))
+        .route("/api/budget/versions/:key/activate", post(activate_budget_version))
+        .route("/api/budget/versions/copy", post(copy_budget_version))
+        // 审批流
+        .route("/api/approvals", get(list_approvals).post(start_approval))
+        .route("/api/approvals/todo", get(list_approval_todo))
+        .route("/api/approvals/:id", get(get_approval))
+        .route("/api/approvals/:id/act", post(act_approval))
+        .route("/api/approvals/:id/cancel", post(cancel_approval))
+        // 报表附注
+        .route("/api/reports/notes", get(list_notes).post(save_note))
+        .route("/api/reports/notes/:id/delete", post(delete_note))
+        // 会计电子档案
+        .route("/api/archives", get(list_archives).post(create_archive))
+        .route("/api/archives/:id", get(get_archive))
+        .route("/api/archives/:id/verify", get(verify_archive))
         .route("/api/health", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -1308,4 +1340,558 @@ fn parse_voucher_status(s: &str) -> Option<fincore::VoucherStatus> {
         "void" => Some(fincore::VoucherStatus::Void),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 高级功能：多栏账 / 摘要汇总表 / 财务指标 / 工艺路线 / 报工 / MRP / 预算版本 /
+// 审批流 / 报表附注 / 电子档案
+// ---------------------------------------------------------------------------
+
+async fn get_multi_column(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let main = q.get("main").cloned().unwrap_or_default();
+    if main.is_empty() {
+        return Err(AppError::bad_request("缺少主科目 main"));
+    }
+    let cols: Vec<String> = q
+        .get("cols")
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    if cols.is_empty() {
+        return Err(AppError::bad_request("缺少栏目科目 cols（逗号分隔）"));
+    }
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::multi_column_table(&db, &main, &cols, from, to)?;
+    Ok(Json(serde_json::json!({ "main": main, "cols": cols, "rows": rows })))
+}
+
+async fn get_summary_table(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::summary_table(&db, from, to)?;
+    Ok(Json(serde_json::json!({ "from": period_to_str(from), "to": period_to_str(to), "rows": rows })))
+}
+
+async fn get_fin_ratios(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
+        // 默认年初（同一会计年度 1 月）
+        fincore::Period::new(period.year(), 1).unwrap_or(period)
+    });
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::fin_ratios(&db, period, from)?;
+    Ok(Json(serde_json::json!({ "period": period_to_str(period), "ratios": rows })))
+}
+
+// ---- 工艺路线 / 报工 ----
+
+#[derive(Deserialize)]
+struct RoutingOpDto {
+    #[serde(default)]
+    pub seq: i32,
+    pub op_code: String,
+    pub op_name: String,
+    #[serde(default)]
+    pub work_center: String,
+    #[serde(default)]
+    pub std_hours: String,
+    #[serde(default)]
+    pub rate: String,
+}
+
+async fn get_routing(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(item): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let ops = advanced::routing_list(&db, &item)?;
+    Ok(Json(serde_json::json!({ "item_code": item, "ops": ops })))
+}
+
+async fn post_routing(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(item): Path<String>,
+    Json(req): Json<Vec<RoutingOpDto>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let ops: Vec<advanced::RoutingOp> = req
+        .into_iter()
+        .map(|d| advanced::RoutingOp {
+            id: 0,
+            item_code: item.clone(),
+            seq: d.seq,
+            op_code: d.op_code,
+            op_name: d.op_name,
+            work_center: d.work_center,
+            std_hours: parse_money(&d.std_hours),
+            rate: parse_money(&d.rate),
+        })
+        .collect();
+    advanced::routing_save(&db, &item, &ops)?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": ops.len() })))
+}
+
+async fn delete_routing(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(item): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::routing_delete(&db, &item)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn list_prod_orders(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let orders = findb::scm::prod_list(&db, period, None)?;
+    let items: Vec<serde_json::Value> = orders
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "id": o.id,
+                "no": o.no,
+                "item_code": o.item_code,
+                "item_name": o.item_name,
+                "planned_qty": o.planned_qty.fmt_qty(),
+                "completed_qty": o.completed_qty.fmt_qty(),
+                "status": format!("{:?}", o.status),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "period": period_to_str(period), "orders": items })))
+}
+
+async fn get_prod_ops(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let ops = advanced::prod_op_list(&db, id)?;
+    Ok(Json(serde_json::json!({ "po_id": id, "ops": ops })))
+}
+
+#[derive(Deserialize)]
+struct OpReportReq {
+    pub op_id: i64,
+    #[serde(default)]
+    pub qty: String,
+    #[serde(default)]
+    pub hours: String,
+}
+
+async fn report_prod_op(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<OpReportReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::prod_op_report(&db, req.op_id, parse_money(&req.qty), parse_money(&req.hours))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct OpFinishReq {
+    pub op_id: i64,
+}
+
+async fn finish_prod_op(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<OpFinishReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::prod_op_finish(&db, req.op_id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---- MRP ----
+
+async fn get_mrp_latest(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::mrp_latest(&db)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct MrpDemandDto {
+    pub item_code: String,
+    #[serde(default)]
+    pub qty: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Deserialize)]
+struct MrpRunReq {
+    #[serde(default)]
+    pub demands: Vec<MrpDemandDto>,
+    /// 若为 true 且 demands 为空，则从已确认销售订单收集需求
+    #[serde(default)]
+    pub from_sales: bool,
+}
+
+async fn run_mrp(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<MrpRunReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut demands: Vec<(String, Money, String)> = req
+        .demands
+        .into_iter()
+        .map(|d| (d.item_code, parse_money(&d.qty), d.source))
+        .collect();
+    if demands.is_empty() && req.from_sales {
+        demands = advanced::mrp_demands_from_sales(&db, current_period(&state, &user))?;
+    }
+    if demands.is_empty() {
+        return Err(AppError::bad_request("请提供需求清单，或勾选「从销售订单收集」"));
+    }
+    let run_at = advanced::mrp_run(&db, &demands)?;
+    let rows = advanced::mrp_by_run(&db, &run_at)?;
+    Ok(Json(serde_json::json!({ "run_at": run_at, "rows": rows })))
+}
+
+// ---- 预算版本 ----
+
+async fn list_budget_versions(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let versions = advanced::bversion_list(&db)?;
+    let current = advanced::bversion_current(&db)?;
+    Ok(Json(serde_json::json!({ "versions": versions, "current": current })))
+}
+
+#[derive(Deserialize)]
+struct BVersionReq {
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub is_current: bool,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn save_budget_version(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BVersionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::bversion_save(
+        &db,
+        &advanced::BudgetVersion {
+            key: req.key,
+            name: req.name,
+            is_current: req.is_current,
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            memo: req.memo,
+        },
+    )?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_budget_version(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::bversion_delete(&db, &key)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn activate_budget_version(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut v = advanced::bversion_list(&db)?
+        .into_iter()
+        .find(|v| v.key == key)
+        .ok_or_else(|| AppError::NotFound(format!("预算版本 {key} 不存在")))?;
+    v.is_current = true;
+    advanced::bversion_save(&db, &v)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct BCopyReq {
+    pub from: String,
+    pub to: String,
+}
+
+async fn copy_budget_version(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BCopyReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let n = advanced::bversion_copy(&db, &req.from, &req.to)?;
+    Ok(Json(serde_json::json!({ "ok": true, "copied": n })))
+}
+
+// ---- 审批流 ----
+
+async fn list_approvals(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::approval_list(&db, 100)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn list_approval_todo(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::approval_todo(&db, user.username())?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_approval(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let ap = advanced::approval_get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("审批流不存在".to_string()))?;
+    Ok(Json(serde_json::json!({ "approval": ap })))
+}
+
+#[derive(Deserialize)]
+struct ApprovalStartReq {
+    pub biz_kind: String,
+    pub biz_id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub approvers: Vec<String>,
+}
+
+async fn start_approval(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ApprovalStartReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = advanced::approval_start(
+        &db,
+        &req.biz_kind,
+        req.biz_id,
+        &req.title,
+        user.username(),
+        &req.approvers,
+    )?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+#[derive(Deserialize)]
+struct ApprovalActReq {
+    pub approve: bool,
+    #[serde(default)]
+    pub comment: String,
+}
+
+async fn act_approval(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ApprovalActReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let ap = advanced::approval_act(&db, id, user.username(), req.approve, &req.comment)?;
+    Ok(Json(serde_json::json!({ "approval": ap })))
+}
+
+async fn cancel_approval(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::approval_cancel(&db, id, user.username())?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---- 报表附注 ----
+
+async fn list_notes(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let report_key = q.get("report_key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::note_list(&db, &report_key, period)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct NoteReq {
+    #[serde(default)]
+    pub id: i64,
+    pub report_key: String,
+    pub period: i32,
+    #[serde(default)]
+    pub seq: i32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+async fn save_note(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<NoteReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut n = advanced::ReportNote {
+        id: req.id,
+        report_key: req.report_key,
+        period: Period::from_ymm(req.period),
+        seq: req.seq,
+        title: req.title,
+        content: req.content,
+        updated_by: user.username().to_string(),
+        updated_at: String::new(),
+    };
+    let id = advanced::note_save(&db, &mut n)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn delete_note(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    advanced::note_delete(&db, id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---- 会计电子档案 ----
+
+async fn list_archives(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let kind = q.get("kind").map(|s| s.as_str());
+    let db = state.db_for(&user.book_key)?;
+    let rows = advanced::archive_list(&db, period, kind)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct ArchiveReq {
+    pub period: i32,
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub file_no: String,
+    pub payload: String,
+}
+
+async fn create_archive(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ArchiveReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = Period::from_ymm(req.period);
+    let file_no = if req.file_no.trim().is_empty() {
+        advanced::archive_next_no(&db, period, &req.kind)?
+    } else {
+        req.file_no
+    };
+    let id = advanced::archive_create(&db, period, &req.kind, &req.title, &file_no, &req.payload, user.username())?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "file_no": file_no })))
+}
+
+async fn get_archive(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = advanced::archive_get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("档案不存在".to_string()))?;
+    Ok(Json(serde_json::json!({ "archive": a })))
+}
+
+async fn verify_archive(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = advanced::archive_get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("档案不存在".to_string()))?;
+    let ok = advanced::archive_verify(&a);
+    Ok(Json(serde_json::json!({ "ok": ok, "content_hash": a.content_hash })))
 }

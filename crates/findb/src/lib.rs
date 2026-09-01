@@ -10,6 +10,7 @@
 //! - 备份恢复、操作日志
 
 pub mod accounts;
+pub mod advanced;
 pub mod attach;
 pub mod automation;
 pub mod assets;

@@ -5,6 +5,7 @@
 //! 编什么、怎么比交给用户在界面上定，不替他做假设。
 
 use egui::{Align2, RichText, Ui};
+use findb::advanced::{self, BudgetVersion};
 use findb::mgmt::{self, Budget, BudgetRow};
 use fincore::account::AuxKind;
 use fincore::{Money, Period, Perm};
@@ -47,6 +48,16 @@ pub struct BudgetView {
     pub gen_from: String,
     pub gen_to: String,
     pub gen_ratio: String,
+    /// 预算版本（'' = 默认版本）
+    pub version: String,
+    /// 版本清单（切换/新建/复制用）
+    pub versions: Vec<BudgetVersion>,
+    /// 新建版本弹窗
+    pub ver_open: bool,
+    pub ver_key: String,
+    pub ver_name: String,
+    pub ver_memo: String,
+    pub ver_copy_from: String,
     pub rows: Vec<BudgetRow>,
     pub sum_budget: Money,
     pub sum_actual: Money,
@@ -76,6 +87,13 @@ impl Default for BudgetView {
             gen_from: String::new(),
             gen_to: String::new(),
             gen_ratio: "1".to_string(),
+            version: String::new(),
+            versions: Vec::new(),
+            ver_open: false,
+            ver_key: String::new(),
+            ver_name: String::new(),
+            ver_memo: String::new(),
+            ver_copy_from: String::new(),
             rows: Vec::new(),
             sum_budget: Money::ZERO,
             sum_actual: Money::ZERO,
@@ -113,7 +131,7 @@ impl BudgetView {
 
     fn reload(&mut self, ctx: &mut AppCtx<'_>) {
         let p = self.period(ctx);
-        let key = format!("{}|{:?}|{}", p.ymm(), self.tab, self.yearly);
+        let key = format!("{}|{:?}|{}|{}", p.ymm(), self.tab, self.yearly, self.version);
         if !self.dirty && self.key == key {
             return;
         }
@@ -122,11 +140,12 @@ impl BudgetView {
         self.sel = None;
 
         self.dept_options = findb::auxs::codes(ctx.db(), AuxKind::Dept).unwrap_or_default();
+        self.versions = advanced::bversion_list(ctx.db()).unwrap_or_default();
 
         match self.tab {
             BudgetTab::Edit => {
                 self.rows.clear();
-                match mgmt::budget_list(ctx.db(), p) {
+                match mgmt::budget_list_version(ctx.db(), Some(p), &self.version) {
                     Ok(v) => {
                         let chart = ctx.chart();
                         self.names = v
@@ -230,6 +249,36 @@ impl BudgetView {
                 ui.separator();
                 ui.selectable_value(&mut self.yearly, false, "按月");
                 ui.selectable_value(&mut self.yearly, true, "按年累计");
+            }
+            if self.tab == BudgetTab::Edit {
+                ui.separator();
+                ui.label("版本");
+                let mut ver = self.version.clone();
+                let ver_text = if ver.is_empty() {
+                    "默认".to_string()
+                } else {
+                    self.versions
+                        .iter()
+                        .find(|v| v.key == ver)
+                        .map(|v| v.name.clone())
+                        .unwrap_or_else(|| ver.clone())
+                };
+                egui::ComboBox::from_id_salt("bg_ver_sel")
+                    .selected_text(ver_text)
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut ver, String::new(), "默认");
+                        for v in &self.versions {
+                            ui.selectable_value(&mut ver, v.key.clone(), v.name.clone());
+                        }
+                    });
+                if ver != self.version {
+                    self.version = ver;
+                    self.dirty = true;
+                }
+                if ui.button("版本管理").clicked() {
+                    self.ver_open = true;
+                }
             }
             ui.separator();
             if ui.button("刷新").clicked() {
@@ -416,6 +465,169 @@ impl BudgetView {
         }
 
         self.show_gen_window(ctx, ui);
+        self.show_version_window(ctx, ui);
+    }
+
+    fn show_version_window(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        if !self.ver_open {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        let mut want_new = false;
+        let mut want_copy = false;
+        let mut want_activate: Option<String> = None;
+        let mut want_delete: Option<String> = None;
+        egui::Window::new("预算版本管理")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(RichText::new("每个版本独立存一套预算；「当前版本」用于执行分析，同时只能有一个生效。").weak());
+                ui.add_space(6.0);
+                let versions = self.versions.clone();
+                for v in &versions {
+                    ui.horizontal(|ui| {
+                        let cur = advanced::bversion_current(ctx.db()).unwrap_or_default() == v.key;
+                        if cur {
+                            ui.label(RichText::new("●").color(palette::OK));
+                        } else {
+                            ui.label(RichText::new("○").weak());
+                        }
+                        ui.label(RichText::new(&v.name).strong());
+                        ui.label(RichText::new(&v.key).monospace().weak());
+                        ui.label(RichText::new(&v.created_at).weak());
+                        if !cur && ui.button("设为当前").clicked() {
+                            want_activate = Some(v.key.clone());
+                        }
+                        if ui.button("删除").clicked() {
+                            want_delete = Some(v.key.clone());
+                        }
+                    });
+                }
+                if versions.is_empty() {
+                    ui.label(RichText::new("暂无自定义版本，预算存于「默认」版本。").weak());
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("版本编码");
+                    widgets::text_input(ui, &mut self.ver_key, 100.0, "v2");
+                    ui.label("版本名称");
+                    widgets::text_input(ui, &mut self.ver_name, 140.0, "2026 调整版");
+                    ui.label("备注");
+                    widgets::text_input(ui, &mut self.ver_memo, 120.0, "选填");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("复制自");
+                    let mut src = self.ver_copy_from.clone();
+                    egui::ComboBox::from_id_salt("bg_ver_copy_from")
+                        .selected_text(if src.is_empty() { "默认".to_string() } else { src.clone() })
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut src, String::new(), "默认");
+                            for v in &self.versions {
+                                ui.selectable_value(&mut src, v.key.clone(), v.name.clone());
+                            }
+                        });
+                    self.ver_copy_from = src;
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("关闭").clicked() {
+                            close = true;
+                        }
+                        if ui.button("新建版本(复制数据)").clicked() {
+                            want_copy = true;
+                        }
+                        if ui.button("仅建空版本").clicked() {
+                            want_new = true;
+                        }
+                    });
+                });
+            });
+        if !open || close {
+            self.ver_open = false;
+        }
+        // 操作在窗口外执行，避免在闭包里可变借用 self
+        if let Some(key) = want_activate {
+            self.activate_version(ctx, &key);
+        }
+        if let Some(key) = want_delete {
+            self.delete_version(ctx, &key);
+        }
+        if want_new {
+            self.new_version(ctx, false);
+        }
+        if want_copy {
+            self.new_version(ctx, true);
+        }
+    }
+
+    fn activate_version(&mut self, ctx: &mut AppCtx<'_>, key: &str) {
+        if let Some(mut v) = self.versions.iter().find(|v| v.key == key).cloned() {
+            v.is_current = true;
+            if ctx.handle(advanced::bversion_save(ctx.db(), &v)).is_some() {
+                ctx.info(format!("已把版本「{}」设为当前", v.name));
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn delete_version(&mut self, ctx: &mut AppCtx<'_>, key: &str) {
+        let name = self
+            .versions
+            .iter()
+            .find(|v| v.key == key)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| key.to_string());
+        if ctx.handle(advanced::bversion_delete(ctx.db(), key)).is_some() {
+            ctx.info(format!("已删除版本「{name}」及其预算数据"));
+            if self.version == key {
+                self.version.clear();
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn new_version(&mut self, ctx: &mut AppCtx<'_>, copy_data: bool) {
+        let key = self.ver_key.trim().to_string();
+        let name = self.ver_name.trim().to_string();
+        if key.is_empty() || name.is_empty() {
+            ctx.error("版本编码与名称不能为空");
+            return;
+        }
+        if self.versions.iter().any(|v| v.key == key) {
+            ctx.error(format!("版本编码「{key}」已存在"));
+            return;
+        }
+        let v = BudgetVersion {
+            key: key.clone(),
+            name: name.clone(),
+            is_current: false,
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            memo: self.ver_memo.trim().to_string(),
+        };
+        if ctx.handle(advanced::bversion_save(ctx.db(), &v)).is_none() {
+            return;
+        }
+        if copy_data {
+            match advanced::bversion_copy(ctx.db(), &self.ver_copy_from, &key) {
+                Ok(n) => ctx.info(format!("已建版本「{name}」并复制 {n} 行预算")),
+                Err(e) => ctx.error(e.to_string()),
+            }
+        } else {
+            ctx.info(format!("已建空版本「{name}」"));
+        }
+        self.version = key;
+        self.ver_key.clear();
+        self.ver_name.clear();
+        self.ver_memo.clear();
+        self.ver_copy_from.clear();
+        self.ver_open = false;
+        self.dirty = true;
     }
 
     fn add_row(&mut self, ctx: &mut AppCtx<'_>, p: Period) {
@@ -433,8 +645,9 @@ impl BudgetView {
             dept: self.new_dept.trim().to_string(),
             amount: Money::parse_or_zero(&self.new_amount).round2(),
             memo: self.new_memo.trim().to_string(),
+            version: self.version.clone(),
         };
-        let r = mgmt::budget_upsert(ctx.db(), &rec);
+        let r = mgmt::budget_upsert_version(ctx.db(), &rec);
         if ctx.handle(r).is_some() {
             ctx.log(
                 "预算",
@@ -481,6 +694,7 @@ impl BudgetView {
             dept: b.dept.clone(),
             amount: Money::parse_or_zero(self.amount_buf.get(i).map_or("", |s| s.as_str())).round2(),
             memo: self.memo_buf.get(i).cloned().unwrap_or_default(),
+            version: b.version.clone(),
         };
         if rec.amount == b.amount && rec.memo == b.memo {
             return;

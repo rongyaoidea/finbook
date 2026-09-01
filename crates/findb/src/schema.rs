@@ -20,7 +20,9 @@ use crate::DbError;
 /// v3：自动转账补"对方科目"，支持计提类（来源科目只取数不转出）
 /// v4：自定义报表独立建表（行 × 列 × 公式网格）
 /// v5：账号设备绑定（user.device_id / device_name）
-pub const SCHEMA_VERSION: i64 = 6;
+/// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
+/// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -394,7 +396,8 @@ CREATE TABLE IF NOT EXISTS budget (
     dept        TEXT NOT NULL DEFAULT '',
     amount      TEXT NOT NULL DEFAULT '0',
     memo        TEXT NOT NULL DEFAULT '',
-    UNIQUE(period, account_code, dept)
+    version     TEXT NOT NULL DEFAULT '',   -- v7: 预算版本（''=默认/当前）
+    UNIQUE(period, account_code, dept, version)
 );
 CREATE INDEX IF NOT EXISTS idx_budget_period ON budget(period);
 
@@ -549,6 +552,127 @@ CREATE TABLE IF NOT EXISTS prod_cost (
 );
 CREATE INDEX IF NOT EXISTS idx_pc_po ON prod_cost(po_id);
 
+-- ===========================================================================
+-- v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
+-- ===========================================================================
+
+-- 工艺路线（一个产品一条路线，含多道工序）
+CREATE TABLE IF NOT EXISTS routing (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code   TEXT NOT NULL,              -- 产成品存货 code
+    seq         INTEGER NOT NULL DEFAULT 0, -- 工序顺序
+    op_code     TEXT NOT NULL DEFAULT '',   -- 工序编码
+    op_name     TEXT NOT NULL DEFAULT '',   -- 工序名称
+    work_center TEXT NOT NULL DEFAULT '',   -- 工作中心
+    std_hours   TEXT NOT NULL DEFAULT '0',  -- 标准工时（小时）
+    rate        TEXT NOT NULL DEFAULT '0',  -- 小时费率（人工/制造费用）
+    UNIQUE(item_code, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code);
+
+-- 生产订单工序进度（报工记录）
+CREATE TABLE IF NOT EXISTS prod_op (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL REFERENCES production_order(id) ON DELETE CASCADE,
+    routing_id  INTEGER NOT NULL DEFAULT 0,
+    op_name     TEXT NOT NULL DEFAULT '',
+    work_center TEXT NOT NULL DEFAULT '',
+    qty_done    TEXT NOT NULL DEFAULT '0',  -- 累计完工数量
+    hours       TEXT NOT NULL DEFAULT '0',  -- 累计实际工时
+    status      TEXT NOT NULL DEFAULT 'pending', -- pending / in_progress / done
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_prod_op ON prod_op(po_id);
+
+-- 存货计划参数（MRP 用）
+CREATE TABLE IF NOT EXISTS item_plan (
+    item_code    TEXT PRIMARY KEY,          -- 存货档案 code
+    safety_stock TEXT NOT NULL DEFAULT '0', -- 安全库存
+    lead_days    INTEGER NOT NULL DEFAULT 0,-- 采购/生产提前期（天）
+    lot_size     TEXT NOT NULL DEFAULT '0'  -- 最小批量（0=按净需求）
+);
+
+-- MRP 运算结果快照
+CREATE TABLE IF NOT EXISTS mrp_result (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at      TEXT NOT NULL DEFAULT '',   -- 运算时间
+    item_code   TEXT NOT NULL,
+    item_name   TEXT NOT NULL DEFAULT '',
+    level       INTEGER NOT NULL DEFAULT 0, -- BOM 层级（0=产成品）
+    gross_req   TEXT NOT NULL DEFAULT '0',  -- 毛需求
+    on_hand     TEXT NOT NULL DEFAULT '0',  -- 现有库存
+    net_req     TEXT NOT NULL DEFAULT '0',  -- 净需求
+    planned_qty TEXT NOT NULL DEFAULT '0',  -- 计划量（套用批量后）
+    action      TEXT NOT NULL DEFAULT '',   -- produce / purchase / none
+    source      TEXT NOT NULL DEFAULT ''    -- 需求来源说明（如 SO-xxx / MO-xxx）
+);
+CREATE INDEX IF NOT EXISTS idx_mrp_run ON mrp_result(run_at);
+
+-- 预算版本
+CREATE TABLE IF NOT EXISTS budget_version (
+    key         TEXT PRIMARY KEY,           -- 版本编码
+    name        TEXT NOT NULL,              -- 版本名称（如 2026年初稿/调整版）
+    is_current  INTEGER NOT NULL DEFAULT 0, -- 是否当前生效版本
+    created_at  TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+
+-- 报表附注
+CREATE TABLE IF NOT EXISTS report_note (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_key  TEXT NOT NULL,              -- balance_sheet / income_statement / cash_flow
+    period      INTEGER NOT NULL,
+    seq         INTEGER NOT NULL DEFAULT 0,
+    title       TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '',
+    updated_by  TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_note_report ON report_note(report_key, period);
+
+-- 审批流实例（通用单据审批：报销单/采购订单/销售订单/生产订单等）
+CREATE TABLE IF NOT EXISTS approval (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    biz_kind    TEXT NOT NULL,              -- claim / po / so / prod
+    biz_id      INTEGER NOT NULL,
+    title       TEXT NOT NULL DEFAULT '',
+    applicant   TEXT NOT NULL DEFAULT '',
+    current_node INTEGER NOT NULL DEFAULT 0,-- 当前节点序号（从 1 起）
+    status      TEXT NOT NULL DEFAULT 'pending', -- pending / approved / rejected / cancelled
+    created_at  TEXT NOT NULL DEFAULT '',
+    finished_at TEXT,
+    UNIQUE(biz_kind, biz_id)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_biz ON approval(biz_kind, biz_id);
+
+-- 审批流节点记录
+CREATE TABLE IF NOT EXISTS approval_step (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id INTEGER NOT NULL REFERENCES approval(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    approver    TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL DEFAULT '',   -- approve / reject（空=未处理）
+    comment     TEXT NOT NULL DEFAULT '',
+    acted_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apstep ON approval_step(approval_id);
+
+-- 会计电子档案（凭证/账簿/报表的归档快照，含哈希防篡改）
+CREATE TABLE IF NOT EXISTS e_archive (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    period      INTEGER NOT NULL,
+    kind        TEXT NOT NULL,              -- voucher / ledger / report / balance
+    title       TEXT NOT NULL DEFAULT '',
+    file_no     TEXT NOT NULL DEFAULT '',   -- 档案号（如 2026-01-记-001）
+    content_hash TEXT NOT NULL DEFAULT '',  -- 内容 SHA-256
+    payload     TEXT NOT NULL DEFAULT '',   -- JSON 快照
+    archived_by TEXT NOT NULL DEFAULT '',
+    archived_at TEXT NOT NULL DEFAULT '',
+    sealed      INTEGER NOT NULL DEFAULT 1, -- 归档即封存，不可改
+    UNIQUE(period, kind, file_no)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_period ON e_archive(period, kind);
+
 "#;
 
 /// v1 → v2 需要新增到既有表上的列
@@ -654,6 +778,40 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     ("production_order", "updated_at", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// v6 → v7：深度制造（工艺路线 / MRP / 工序报工）+ 管理会计（预算多版本 /
+/// 报表附注 / 审批流 / 电子档案）。这些全是新表，DDL 的 IF NOT EXISTS 已覆盖。
+/// 唯一需要迁移的是 budget 表：UNIQUE 约束从 (period,account,dept) 扩展为
+/// (period,account,dept,version)，SQLite 的 ALTER 改不了约束，必须重建表。
+///
+/// 其他 v7 新表（routing / prod_op / item_plan / mrp_result / budget_version /
+/// report_note / approval / approval_step / e_archive）由 DDL 的
+/// `CREATE TABLE IF NOT EXISTS` 在 init 时自动创建。
+
+/// v6 → v7：重建 budget 表以支持多版本
+fn migrate_v7(conn: &Connection) -> Result<(), DbError> {
+    if column_exists(conn, "budget", "version")? {
+        return Ok(()); // 已是新结构
+    }
+    conn.execute_batch(
+        "CREATE TABLE budget_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            period      INTEGER NOT NULL,
+            account_code TEXT NOT NULL,
+            dept        TEXT NOT NULL DEFAULT '',
+            amount      TEXT NOT NULL DEFAULT '0',
+            memo        TEXT NOT NULL DEFAULT '',
+            version     TEXT NOT NULL DEFAULT '',
+            UNIQUE(period, account_code, dept, version)
+         );
+         INSERT INTO budget_new(id,period,account_code,dept,amount,memo,version)
+             SELECT id,period,account_code,dept,amount,memo,'' FROM budget;
+         DROP TABLE budget;
+         ALTER TABLE budget_new RENAME TO budget;
+         CREATE INDEX IF NOT EXISTS idx_budget_period ON budget(period);",
+    )?;
+    Ok(())
+}
+
 /// 初始化 schema（幂等）
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
@@ -675,6 +833,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
     if v < SCHEMA_VERSION {
         migrate_generic(conn, MIGRATE_V5)?;
         migrate_generic(conn, MIGRATE_V6)?;
+        migrate_v7(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

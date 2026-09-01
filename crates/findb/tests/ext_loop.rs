@@ -515,6 +515,7 @@ fn t95_mgmt_template_summary_attach_loop() {
             dept: String::new(),
             amount: m("3000"),
             memo: String::new(),
+            version: String::new(),
         },
     )
     .unwrap();

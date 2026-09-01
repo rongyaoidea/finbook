@@ -13,5 +13,6 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 calamine = "0.26"

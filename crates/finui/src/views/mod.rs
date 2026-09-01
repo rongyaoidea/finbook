@@ -2,6 +2,7 @@
 
 pub mod about;
 pub mod account;
+pub mod advanced;
 pub mod assets;
 pub mod aux_view;
 pub mod automation;
@@ -47,6 +48,13 @@ pub struct Views {
     pub period_end: period_end::PeriodEndView,
     pub budget: budget::BudgetView,
     pub dim_profit: dim_profit::DimProfitView,
+    pub multi_column: advanced::MultiColumnView,
+    pub summary_table: advanced::SummaryTableView,
+    pub ratios: advanced::RatiosView,
+    pub manufacturing: advanced::ManufacturingView,
+    pub approval: advanced::ApprovalView,
+    pub report_notes: advanced::ReportNotesView,
+    pub archive: advanced::ArchiveView,
     pub aux: aux_view::AuxView,
     pub users: users::UsersView,
     pub security: security::SecurityView,
@@ -87,6 +95,13 @@ impl Views {
         self.period_end.invalidate();
         self.budget.invalidate();
         self.dim_profit.invalidate();
+        self.multi_column.invalidate();
+        self.summary_table.invalidate();
+        self.ratios.invalidate();
+        self.manufacturing.invalidate();
+        self.approval.invalidate();
+        self.report_notes.invalidate();
+        self.archive.invalidate();
         self.aux.invalidate();
         self.users.invalidate();
         self.security.invalidate();
@@ -107,6 +122,9 @@ impl Views {
                 self.period_end.invalidate();
                 self.budget.invalidate();
                 self.dim_profit.invalidate();
+                self.multi_column.invalidate();
+                self.summary_table.invalidate();
+                self.ratios.invalidate();
             }
             DataKind::Account => {
                 self.account.invalidate();
@@ -175,6 +193,13 @@ impl Views {
                 NavItem::Claims => self.claims.enter(ctx),
                 NavItem::Budget => self.budget.enter(ctx),
                 NavItem::DimProfit => self.dim_profit.enter(ctx),
+                NavItem::MultiColumn => self.multi_column.enter(ctx),
+                NavItem::SummaryTable => self.summary_table.enter(ctx),
+                NavItem::Ratios => self.ratios.enter(ctx),
+                NavItem::Manufacturing => self.manufacturing.enter(ctx),
+                NavItem::Approval => self.approval.enter(ctx),
+                NavItem::ReportNotes => self.report_notes.enter(ctx),
+                NavItem::Archive => self.archive.enter(ctx),
                 NavItem::Aux(_) => self.aux.invalidate(),
                 NavItem::Users => self.users.invalidate(),
                 NavItem::Security => self.security.enter(ctx),
@@ -220,6 +245,13 @@ impl Views {
             NavItem::Claims => self.claims.show(ctx, ui),
             NavItem::Budget => self.budget.show(ctx, ui),
             NavItem::DimProfit => self.dim_profit.show(ctx, ui),
+            NavItem::MultiColumn => self.multi_column.show(ctx, ui),
+            NavItem::SummaryTable => self.summary_table.show(ctx, ui),
+            NavItem::Ratios => self.ratios.show(ctx, ui),
+            NavItem::Manufacturing => self.manufacturing.show(ctx, ui),
+            NavItem::Approval => self.approval.show(ctx, ui),
+            NavItem::ReportNotes => self.report_notes.show(ctx, ui),
+            NavItem::Archive => self.archive.show(ctx, ui),
             NavItem::Aux(k) => self.aux.show(ctx, ui, k),
             NavItem::Users => self.users.show(ctx, ui),
             NavItem::Security => self.security.show(ctx, ui),

@@ -25,6 +25,8 @@ pub struct Budget {
     pub dept: String,
     pub amount: Money,
     pub memo: String,
+    /// 预算版本（'' = 默认版本，兼容旧数据）
+    pub version: String,
 }
 
 fn map_budget(r: &rusqlite::Row) -> rusqlite::Result<Budget> {
@@ -35,10 +37,11 @@ fn map_budget(r: &rusqlite::Row) -> rusqlite::Result<Budget> {
         dept: r.get(3)?,
         amount: Money::parse_or_zero(&r.get::<_, String>(4)?),
         memo: r.get(5)?,
+        version: r.get::<_, String>(6).unwrap_or_default(),
     })
 }
 
-const BG_COLS: &str = "id,period,account_code,dept,amount,memo";
+const BG_COLS: &str = "id,period,account_code,dept,amount,memo,version";
 
 pub fn budget_list(db: &Db, period: Period) -> DbResult<Vec<Budget>> {
     let mut st = db.conn().prepare(&format!(
@@ -48,6 +51,48 @@ pub fn budget_list(db: &Db, period: Period) -> DbResult<Vec<Budget>> {
         .query_map(rusqlite::params![period.ymm()], map_budget)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 按版本列预算（period 为 None 时列全部期间）
+pub fn budget_list_version(db: &Db, period: Option<Period>, version: &str) -> DbResult<Vec<Budget>> {
+    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match period {
+        Some(p) => (
+            format!("SELECT {BG_COLS} FROM budget WHERE period=?1 AND version=?2 ORDER BY account_code, dept"),
+            vec![Box::new(p.ymm()), Box::new(version.to_string())],
+        ),
+        None => (
+            format!("SELECT {BG_COLS} FROM budget WHERE version=?1 ORDER BY period, account_code"),
+            vec![Box::new(version.to_string())],
+        ),
+    };
+    let mut st = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = st
+        .query_map(refs.as_slice(), map_budget)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 带版本 upsert（UNIQUE(period,account_code,dept,version)）
+pub fn budget_upsert_version(db: &Db, b: &Budget) -> DbResult<i64> {
+    db.conn().execute(
+        "INSERT INTO budget(period,account_code,dept,amount,memo,version) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(period,account_code,dept,version) DO UPDATE SET amount=excluded.amount, memo=excluded.memo",
+        rusqlite::params![
+            b.period.ymm(),
+            b.account_code,
+            b.dept,
+            b.amount.to_string(),
+            b.memo,
+            b.version
+        ],
+    )?;
+    let id: i64 = db.conn().query_row(
+        "SELECT id FROM budget WHERE period=?1 AND account_code=?2 AND dept=?3 AND version=?4",
+        rusqlite::params![b.period.ymm(), b.account_code, b.dept, b.version],
+        |r| r.get(0),
+    )?;
+    Ok(id)
 }
 
 /// 全年预算（12 个月）
@@ -75,23 +120,7 @@ pub fn budget_get(db: &Db, id: i64) -> DbResult<Option<Budget>> {
 }
 
 pub fn budget_upsert(db: &Db, b: &Budget) -> DbResult<i64> {
-    db.conn().execute(
-        "INSERT INTO budget(period,account_code,dept,amount,memo) VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(period,account_code,dept) DO UPDATE SET amount=excluded.amount, memo=excluded.memo",
-        rusqlite::params![
-            b.period.ymm(),
-            b.account_code,
-            b.dept,
-            b.amount.to_string(),
-            b.memo
-        ],
-    )?;
-    let id: i64 = db.conn().query_row(
-        "SELECT id FROM budget WHERE period=?1 AND account_code=?2 AND dept=?3",
-        rusqlite::params![b.period.ymm(), b.account_code, b.dept],
-        |r| r.get(0),
-    )?;
-    Ok(id)
+    budget_upsert_version(db, b)
 }
 
 pub fn budget_delete(db: &Db, id: i64) -> DbResult<()> {
@@ -125,6 +154,7 @@ pub fn budget_from_actual(
                 dept: String::new(),
                 amount: (actual * ratio).round2(),
                 memo: format!("按 {} 实际生成", from_period.label()),
+                version: String::new(),
             },
         )?;
         n += 1;
@@ -558,6 +588,7 @@ mod tests {
                 dept: String::new(),
                 amount: m("10000"),
                 memo: String::new(),
+                version: String::new(),
             },
         )
         .unwrap();
@@ -571,6 +602,7 @@ mod tests {
                 dept: String::new(),
                 amount: m("12000"),
                 memo: "调整".into(),
+                version: String::new(),
             },
         )
         .unwrap();

@@ -87,6 +87,8 @@ pub struct StockMove {
     pub kind: StockKind,
     pub item: String,
     pub warehouse: String,
+    /// 批次号（批次管理，空=不分批）
+    pub batch_no: String,
     /// 正=入库 负=出库
     pub qty: Money,
     pub price: Money,
@@ -105,15 +107,16 @@ fn map_move(r: &rusqlite::Row) -> rusqlite::Result<StockMove> {
         kind: StockKind::parse(&r.get::<_, String>(3)?),
         item: r.get(4)?,
         warehouse: r.get(5)?,
-        qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
-        price: Money::parse_or_zero(&r.get::<_, String>(7)?),
-        amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
-        voucher_id: r.get(9)?,
-        memo: r.get(10)?,
+        batch_no: r.get::<_, String>(6).unwrap_or_default(),
+        qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
+        price: Money::parse_or_zero(&r.get::<_, String>(8)?),
+        amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+        voucher_id: r.get(10)?,
+        memo: r.get(11)?,
     })
 }
 
-const MV_COLS: &str = "id,period,biz_date,kind,item,warehouse,qty,price,amount,voucher_id,memo";
+const MV_COLS: &str = "id,period,biz_date,kind,item,warehouse,batch_no,qty,price,amount,voucher_id,memo";
 
 pub fn stock_list(db: &Db, period: Period) -> DbResult<Vec<StockMove>> {
     let mut st = db.conn().prepare(&format!(
@@ -137,14 +140,15 @@ pub fn stock_list_item(db: &Db, item: &str, upto: Period) -> DbResult<Vec<StockM
 
 pub fn stock_insert(db: &Db, m: &StockMove) -> DbResult<i64> {
     db.conn().execute(
-        "INSERT INTO stock_move(period,biz_date,kind,item,warehouse,qty,price,amount,voucher_id,memo)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO stock_move(period,biz_date,kind,item,warehouse,batch_no,qty,price,amount,voucher_id,memo)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         rusqlite::params![
             m.period.ymm(),
             m.biz_date.format("%Y-%m-%d").to_string(),
             m.kind.code(),
             m.item,
             m.warehouse,
+            m.batch_no,
             m.qty.to_string(),
             m.price.to_string(),
             m.amount.to_string(),
@@ -231,6 +235,7 @@ pub fn stock_adjust(
             kind: StockKind::Adjust,
             item: item.to_string(),
             warehouse: warehouse.to_string(),
+            batch_no: String::new(),
             qty: Money::ZERO,
             price: Money::ZERO,
             amount: delta,
@@ -1153,6 +1158,7 @@ mod tests {
             kind,
             item: "P001".into(),
             warehouse: "主仓".into(),
+            batch_no: String::new(),
             qty: m(qty),
             price: m(price),
             amount: m(qty).abs() * m(price).abs(),

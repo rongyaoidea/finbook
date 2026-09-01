@@ -30,6 +30,7 @@ pub mod settle;
 pub mod template;
 pub mod scm;
 pub mod manufacturing;
+pub mod stock;
 pub mod users;
 pub mod vouchers;
 

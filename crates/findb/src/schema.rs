@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -331,9 +331,10 @@ CREATE TABLE IF NOT EXISTS stock_move (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     period      INTEGER NOT NULL,
     biz_date    TEXT NOT NULL,
-    kind        TEXT NOT NULL,      -- purchase / sale / other_in / other_out / transfer
+    kind        TEXT NOT NULL,      -- purchase / sale / other_in / other_out / transfer / adjust
     item        TEXT NOT NULL,      -- 存货档案 code
     warehouse   TEXT NOT NULL DEFAULT '',
+    batch_no    TEXT NOT NULL DEFAULT '',  -- v8: 批次号（批次管理）
     qty         TEXT NOT NULL,      -- 正数入库，负数出库
     price       TEXT NOT NULL DEFAULT '0',
     amount      TEXT NOT NULL DEFAULT '0',
@@ -673,6 +674,36 @@ CREATE TABLE IF NOT EXISTS e_archive (
 );
 CREATE INDEX IF NOT EXISTS idx_archive_period ON e_archive(period, kind);
 
+-- ===========================================================================
+-- v8：库存盘点 / 批次管理
+-- ===========================================================================
+
+-- 库存盘点单（盘盈盘亏）
+CREATE TABLE IF NOT EXISTS stock_count (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL UNIQUE,
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    warehouse   TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft / posted
+    prepared_by TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE(no)
+);
+CREATE INDEX IF NOT EXISTS idx_sc_period ON stock_count(period);
+
+-- 盘点单明细（账面数 vs 实盘数）
+CREATE TABLE IF NOT EXISTS stock_count_line (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sc_id       INTEGER NOT NULL REFERENCES stock_count(id) ON DELETE CASCADE,
+    item        TEXT NOT NULL,
+    book_qty    TEXT NOT NULL DEFAULT '0',
+    count_qty   TEXT NOT NULL DEFAULT '0',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_scl ON stock_count_line(sc_id);
+
 "#;
 
 /// v1 → v2 需要新增到既有表上的列
@@ -812,6 +843,11 @@ fn migrate_v7(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// v7 → v8：库存盘点表（新表，DDL 覆盖）+ stock_move 补批次列
+const MIGRATE_V8: &[(&str, &str, &str)] = &[
+    ("stock_move", "batch_no", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// 初始化 schema（幂等）
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
@@ -834,6 +870,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
         migrate_generic(conn, MIGRATE_V5)?;
         migrate_generic(conn, MIGRATE_V6)?;
         migrate_v7(conn)?;
+        migrate_generic(conn, MIGRATE_V8)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

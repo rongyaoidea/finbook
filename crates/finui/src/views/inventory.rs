@@ -43,6 +43,7 @@ pub struct MoveDraft {
     kind: StockKind,
     item: String,
     warehouse: String,
+    batch_no: String,
     qty: String,
     price: String,
     memo: String,
@@ -339,6 +340,7 @@ impl InventoryView {
                 self.item.clone()
             },
             warehouse: String::new(),
+            batch_no: String::new(),
             qty: String::new(),
             price: String::new(),
             memo: String::new(),
@@ -354,6 +356,7 @@ impl InventoryView {
             kind: m.kind,
             item: m.item.clone(),
             warehouse: m.warehouse.clone(),
+            batch_no: m.batch_no.clone(),
             qty: m.qty.abs().fmt_qty(),
             price: if m.price.is_zero() {
                 String::new()
@@ -397,6 +400,7 @@ impl InventoryView {
             kind: d.kind,
             item: d.item.trim().to_string(),
             warehouse: d.warehouse.trim().to_string(),
+            batch_no: d.batch_no.trim().to_string(),
             qty: if d.kind.is_inbound() { qty } else { -qty },
             price,
             amount,
@@ -462,6 +466,9 @@ impl InventoryView {
                         ui.end_row();
                         ui.label("仓库：");
                         widgets::text_input(ui, &mut d.warehouse, 180.0, "可留空");
+                        ui.end_row();
+                        ui.label("批次：");
+                        widgets::text_input(ui, &mut d.batch_no, 120.0, "可留空");
                         ui.end_row();
                         ui.label("数量：");
                         widgets::money_input(ui, &mut d.qty, 120.0);

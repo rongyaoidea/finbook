@@ -51,7 +51,9 @@ pub struct SetupStatus {
     pub needs_setup: bool,
     pub company: String,
     pub version: String,
-    pub book: String,
+    /// 账套文件路径（内部诊断用，前端不展示）
+    #[serde(skip_serializing)]
+    pub book: Option<String>,
 }
 
 impl VoucherDetail {

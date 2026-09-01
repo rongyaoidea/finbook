@@ -107,21 +107,23 @@ async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<Set
         needs_setup,
         company: opts.company,
         version: state.version.clone(),
-        book: state.book_path.display().to_string(),
+        book: None, // 不暴露账套路径，防止目录结构泄露
     }))
 }
 
 /// 账套列表（无需登录，登录页用于选择账套）
+/// 注意：不返回文件路径，防止目录结构泄露
 async fn list_books(State(state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, AppError> {
     let keys = state.books.list();
     let items: Vec<serde_json::Value> = keys
         .iter()
-        .map(|(key, path)| {
+        .map(|(key, _path)| {
+            // 只返回 key 和公司名，不返回文件路径
             let company = match state.db_for(key) {
                 Ok(db) => db.options().company,
                 Err(_) => String::new(),
             };
-            json!({ "key": key, "path": path.display().to_string(), "company": company })
+            json!({ "key": key, "company": company })
         })
         .collect();
     Ok(Json(json!({ "books": items })))

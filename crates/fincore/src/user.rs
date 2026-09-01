@@ -441,6 +441,10 @@ fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
 ///
 /// 旧版 `salt$sha256(...)` 格式仍可被 [`verify_password`] 验证（兼容旧账套），
 /// 登录成功后会由持久化层透明升级为 argon2（见 findb::security::login）。
+///
+/// # Panics
+/// 若 argon2 哈希失败（极端情况下），直接 panic 而非降级为弱哈希，
+/// 防止新账户意外落库为 sha256 格式。
 pub fn hash_password(plain: &str) -> String {
     use argon2::password_hash::{rand_core::OsRng, SaltString};
     use argon2::{Argon2, PasswordHasher};
@@ -448,7 +452,7 @@ pub fn hash_password(plain: &str) -> String {
     Argon2::default()
         .hash_password(plain.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .unwrap_or_else(|_| legacy_hash_password(plain))
+        .expect("argon2 哈希失败：系统随机源异常，请检查 OsRng 是否正常")
 }
 
 /// 校验口令：兼容 argon2 PHC 与旧版 `salt$sha256` 两种存储格式

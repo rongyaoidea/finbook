@@ -81,7 +81,7 @@ async function showLogin() {
     <div class="login-wrap">
       <div class="login-card">
         <h1>FinBook 财务管理系统</h1>
-        <div class="sub">${esc(status.company || "Web 版")}　·　服务端账套：${esc(status.book || "")}</div>
+        <div class="sub">${esc(status.company || "Web 版")}</div>
         ${banner}
         <form id="login-form">
           ${bookOpts}

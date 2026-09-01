@@ -254,3 +254,27 @@ pub struct VoucherDetail {
     /// 期间 "YYYY-MM"
     pub period_label: String,
 }
+
+/// 导入预检请求
+#[derive(Deserialize)]
+pub struct ImportAnalyzeReq {
+    /// begin = 期初余额表；voucher = 凭证
+    pub kind: String,
+    /// CSV 文本
+    pub text: String,
+}
+
+/// 导入执行请求
+#[derive(Deserialize)]
+pub struct ImportRunReq {
+    /// begin = 期初余额表；voucher = 凭证
+    pub kind: String,
+    /// CSV 文本
+    pub text: String,
+    /// 凭证导入时的期间（YYYYMM）
+    #[serde(default)]
+    pub period: i32,
+    /// 缺失科目映射：源编码 → 目标编码
+    #[serde(default)]
+    pub mapping: std::collections::HashMap<String, String>,
+}

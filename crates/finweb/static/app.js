@@ -195,6 +195,7 @@ function render() {
     { id: "dashboard", label: "仪表盘", perm: null },
     { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
     { id: "invoices", label: "发票管理", perm: "report" },
+    { id: "imports", label: "数据导入", perm: "voucher_new" },
     { id: "ledger", label: "明细账", perm: "report" },
     { id: "reports", label: "报表中心", perm: "report" },
     { id: "security", label: "安全中心", perm: "user_manage" },
@@ -239,6 +240,7 @@ function renderMain() {
     case "dashboard": return viewDashboard(main);
     case "vouchers": return viewVouchers(main);
     case "invoices": return viewInvoices(main);
+    case "imports": return viewImports(main);
     case "ledger": return viewLedger(main);
     case "reports": return viewReports(main);
     case "security": return viewSecurity(main);
@@ -606,6 +608,97 @@ function openInvoiceEditor(main, inv) {
       closeModal();
       renderInvoices(main, await loadInvoices());
     } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 数据导入（其他软件 / CSV）
+// ===========================================================================
+async function viewImports(main) {
+  main.innerHTML = `
+    <h2>数据导入</h2>
+    <div class="panel">
+      <p class="muted" style="margin:0 0 12px;line-height:1.6">
+        从其他财务软件（金蝶 / 用友 / Excel）导出的 CSV 导入数据。
+        支持导入 <b>期初余额表</b> 与 <b>记账凭证</b>；遇到账套里没有的科目可手动映射。
+      </p>
+      <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0">
+        <label>导入类型</label>
+        <select id="imp-kind">
+          <option value="begin">期初余额表</option>
+          <option value="voucher">记账凭证</option>
+        </select>
+        <label>期间（凭证用，YYYYMM）</label>
+        <input id="imp-period" placeholder="202601" value="${state.current ? String(state.current).replace('-','') : ""}" style="width:90px" />
+        <div class="spacer"></div>
+        <button class="btn primary" id="imp-analyze">预检科目</button>
+        <button class="btn" id="imp-run">执行导入</button>
+      </div>
+      <div style="margin-top:10px">
+        <textarea id="imp-text" rows="10" placeholder="粘贴 CSV 内容…
+期初余额表：科目编码, 方向(借/贷), 金额
+凭证：日期, 凭证字, 摘要, 科目编码, 借方, 贷方"></textarea>
+      </div>
+      <div id="imp-result" class="muted" style="margin-top:10px;min-height:20px;white-space:pre-wrap;font-size:13px"></div>
+    </div>
+    <div class="panel" id="imp-mapping-wrap" style="display:none">
+      <h3 style="margin:0 0 10px">缺失科目映射</h3>
+      <p class="muted" style="margin:0 0 10px">以下科目在当前账套中不存在，请为每个选择目标科目（留空 = 忽略该科目对应行）。</p>
+      <div id="imp-mapping"></div>
+    </div>`;
+  let mapping = {};
+  // 加载科目列表供映射下拉
+  let accounts = [];
+  try { accounts = await api("/accounts"); } catch (e) {}
+  const acctOpts = (sel) => accounts.map((a) => `<option value="${esc(a.code)}" ${sel === a.code ? "selected" : ""}>${esc(a.code)} ${esc(a.name)}</option>`).join("");
+
+  $("#imp-analyze").addEventListener("click", async () => {
+    const text = $("#imp-text").value;
+    const kind = $("#imp-kind").value;
+    if (!text.trim()) { toast("请先粘贴 CSV 内容", "err"); return; }
+    try {
+      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text }) });
+      const missing = (r && r.missing) || [];
+      const wrap = $("#imp-mapping-wrap");
+      const box = $("#imp-mapping");
+      if (missing.length === 0) {
+        wrap.style.display = "none";
+        $("#imp-result").textContent = "✅ 预检通过：所有科目在账套中均存在，可直接执行导入。";
+        return;
+      }
+      box.innerHTML = missing.map((m) => `
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <span style="min-width:140px;font-family:monospace">${esc(m.code)} <span class="muted">×${m.count}</span></span>
+          <select class="imp-map" data-code="${esc(m.code)}" style="flex:1">
+            <option value="">— 忽略 —</option>
+            ${acctOpts("")}
+          </select>
+        </div>`).join("");
+      wrap.style.display = "";
+      $("#imp-result").textContent = `找到 ${missing.length} 个缺失科目，请选择映射或忽略。`;
+      $all(".imp-map", box).forEach((s) => s.addEventListener("change", () => {
+        mapping[s.dataset.code] = s.value;
+      }));
+    } catch (e) { $("#imp-result").textContent = "预检失败：" + e.message; }
+  });
+
+  $("#imp-run").addEventListener("click", async () => {
+    const text = $("#imp-text").value;
+    const kind = $("#imp-kind").value;
+    const period = parseInt(($("#imp-period").value || "0").replace(/[^0-9]/g, ""), 10) || 0;
+    if (!text.trim()) { toast("请先粘贴 CSV 内容", "err"); return; }
+    try {
+      const r = await api("/import/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, period, mapping }) });
+      const lines = [`✅ 成功导入 ${r.ok} 条`, r.skipped ? `⚠ 跳过 ${r.skipped} 条` : ""].filter(Boolean);
+      if (r.warnings && r.warnings.length) {
+        lines.push("", "警告：");
+        r.warnings.slice(0, 20).forEach((w) => lines.push("  · " + w));
+        if (r.warnings.length > 20) lines.push(`  …共 ${r.warnings.length} 条警告`);
+      }
+      $("#imp-result").textContent = lines.join("\n");
+      toast(`已导入 ${r.ok} 条`, "ok");
+      state.view = "dashboard";
+    } catch (e) { $("#imp-result").textContent = "导入失败：" + e.message; }
   });
 }
 

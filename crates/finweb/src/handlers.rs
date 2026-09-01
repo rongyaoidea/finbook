@@ -72,6 +72,9 @@ pub fn router(state: Arc<WebState>) -> Router {
             put(update_invoice).delete(delete_invoice),
         )
         .route("/api/invoices/:id/status", post(invoice_set_status))
+        // 数据导入（其他软件 / CSV）
+        .route("/api/import/analyze", post(import_analyze))
+        .route("/api/import/run", post(import_run))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
         .route("/api/reports/trial-balance", get(get_trial_balance))
@@ -902,6 +905,53 @@ pub struct InvoiceListQuery {
     pub kind: String,
     pub status: String,
     pub keyword: String,
+}
+
+// ---------------------------------------------------------------------------
+// 数据导入（其他软件 / CSV）
+// ---------------------------------------------------------------------------
+
+/// 预检：返回文件中引用但账套不存在的科目（供用户选择映射或忽略）
+async fn import_analyze(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ImportAnalyzeReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let first_col_is_code = req.kind != "voucher"; // 凭证科目在第 4 列
+    let missing = findb::imports::analyze_missing(&db, &req.text, first_col_is_code)?;
+    let items: Vec<serde_json::Value> = missing
+        .iter()
+        .map(|m| json!({ "code": m.code, "count": m.count }))
+        .collect();
+    Ok(Json(json!({ "missing": items })))
+}
+
+/// 执行导入（期初余额表 / 凭证），带科目映射
+async fn import_run(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ImportRunReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let who = user.username().to_string();
+    let res = if req.kind == "voucher" {
+        let period = if req.period > 0 {
+            Period::from_ymm(req.period)
+        } else {
+            current_period(&state, &user)
+        };
+        findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping)?
+    } else {
+        findb::imports::import_begin(&db, &req.text, &who, &req.mapping)?
+    };
+    Ok(Json(json!({
+        "ok": res.ok,
+        "skipped": res.skipped,
+        "warnings": res.warnings,
+    })))
 }
 
 // ---------------------------------------------------------------------------

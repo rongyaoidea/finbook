@@ -268,8 +268,18 @@ pub fn split_csv(line: &str) -> Vec<String> {
 }
 
 fn parse_money(s: &str) -> Money {
-    // 去掉千分位逗号与货币符号，兼容 "1,234.56" / "¥1,234.56"
-    let cleaned: String = s
+    // 先规范化 Unicode 字符：全角数字、Unicode 负号（U+2212）、全角括号等
+    let normalized: String = s
+        .chars()
+        .map(|c| match c {
+            '\u{ff0d}' => '-', // 全角减号
+            '\u{2212}' => '-', // Unicode 减号
+            '\u{FF00}'..='\u{FF60}' => (c as u32 - 0xFFEE) as u8 as char, // 全角数字转半角
+            _ => c,
+        })
+        .collect();
+    // 去掉千分位逗号与货币符号，兼容 "1,234.56" / "¥1,234.56" / "−100"
+    let cleaned: String = normalized
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
         .collect();

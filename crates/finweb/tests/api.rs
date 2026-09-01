@@ -220,9 +220,9 @@ async fn wrong_password_rejected() {
     let (state, _bp, _dir) = test_state();
     // 先建出管理员：首次登录用 boss
     let (_, _) = login(&state, "boss", "Admin!2026").await;
-    // 错误口令
+    // 错误口令 → 与用户名不存在返回相同状态码，防止枚举
     let (status, _) = login(&state, "boss", "WrongPass123!").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

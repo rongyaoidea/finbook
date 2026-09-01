@@ -184,16 +184,18 @@ async fn post_login(
                 .insert(header::SET_COOKIE, crate::state::cookie_header(&token, SESSION_SECS));
             Ok(resp)
         }
-        security::LoginResult::BadPassword { remaining } => Err(AppError::bad_request(format!(
-            "口令错误，还剩 {remaining} 次机会"
-        ))),
-        security::LoginResult::Locked { minutes } => Err(AppError::bad_request(format!(
+        security::LoginResult::BadPassword { remaining: _ } => Err(AppError::unauthorized(
+            "用户名或口令错误",
+        )),
+        security::LoginResult::Locked { minutes } => Err(AppError::unauthorized(format!(
             "账户已被锁定，请 {minutes} 分钟后再试"
         ))),
         security::LoginResult::Disabled => {
-            Err(AppError::forbidden("该账户已停用，请联系管理员"))
+            Err(AppError::unauthorized("账户已停用，请联系管理员"))
         }
-        security::LoginResult::NoSuchUser => Err(AppError::unauthorized("用户不存在")),
+        security::LoginResult::NoSuchUser => Err(AppError::unauthorized(
+            "用户名或口令错误", // 与 BadPassword 统一响应，防止用户名枚举
+        )),
         security::LoginResult::DeviceBound { device_name } => Err(AppError::forbidden(format!(
             "该账号已绑定设备「{device_name}」，如需在新设备登录请联系管理员在「安全中心 → 用户管理」中重置设备绑定"
         ))),

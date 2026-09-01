@@ -166,18 +166,31 @@ pub fn settle(
         .into());
     }
 
+    // 读取现有累计核销额（TEXT 列，避免在 SQL 侧做字符串加法）
+    let existing = db
+        .conn()
+        .query_row(
+            "SELECT amount FROM settle_record WHERE from_entry=?1 AND to_entry=?2",
+            rusqlite::params![from_entry, to_entry],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    let old_amount = Money::parse_or_zero(&existing);
+    let new_amount = old_amount + amount;
+
     db.conn().execute(
         "INSERT INTO settle_record(period,account_code,aux_key,from_entry,to_entry,amount,
             settled_by,settled_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-         ON CONFLICT(from_entry,to_entry) DO UPDATE SET amount=amount+excluded.amount",
+         ON CONFLICT(from_entry,to_entry) DO UPDATE SET
+             amount=excluded.amount, settled_by=excluded.settled_by, settled_at=excluded.settled_at",
         rusqlite::params![
             f.period.ymm(),
             f.account_code,
             f.aux_key,
             from_entry,
             to_entry,
-            amount.to_string(),
+            crate::money_param(new_amount), // 无千分位的定点数，保证后续计算正确
             who,
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         ],

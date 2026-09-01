@@ -23,6 +23,10 @@ pub enum DepMethod {
     DoubleDeclining,
     /// 年数总和法
     SumOfYears,
+    /// 一次性摊销法（启用当期全额计提，适合低值易耗品/小额资产）
+    OneTime,
+    /// 五五摊销法（启用期计提 50%，最后一期计提 50%）
+    FiftyFifty,
 }
 
 impl DepMethod {
@@ -31,6 +35,8 @@ impl DepMethod {
             DepMethod::Straight => "直线法",
             DepMethod::DoubleDeclining => "双倍余额递减法",
             DepMethod::SumOfYears => "年数总和法",
+            DepMethod::OneTime => "一次性摊销法",
+            DepMethod::FiftyFifty => "五五摊销法",
         }
     }
 
@@ -38,6 +44,8 @@ impl DepMethod {
         match s.trim().to_lowercase().as_str() {
             "ddb" | "doubledeclining" | "double_declining" => DepMethod::DoubleDeclining,
             "sum" | "sum_of_years" | "sumofyears" | "sy" => DepMethod::SumOfYears,
+            "onetime" | "one_time" | "ot" => DepMethod::OneTime,
+            "fiftyfifty" | "fifty_fifty" | "ff" => DepMethod::FiftyFifty,
             _ => DepMethod::Straight,
         }
     }
@@ -47,6 +55,8 @@ impl DepMethod {
             DepMethod::Straight => "straight",
             DepMethod::DoubleDeclining => "ddb",
             DepMethod::SumOfYears => "sum_of_years",
+            DepMethod::OneTime => "one_time",
+            DepMethod::FiftyFifty => "fifty_fifty",
         }
     }
 
@@ -54,6 +64,8 @@ impl DepMethod {
         DepMethod::Straight,
         DepMethod::DoubleDeclining,
         DepMethod::SumOfYears,
+        DepMethod::OneTime,
+        DepMethod::FiftyFifty,
     ];
 }
 
@@ -205,6 +217,25 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
             let months_in_year = (n - (y - 1) * 12).clamp(1, 12);
             (year_amount / Money::from_i64(months_in_year as i64)).round2()
         }
+        DepMethod::OneTime => {
+            // 一次性摊销：启用当期全额计提，其余各期 0
+            if i == 1 {
+                total
+            } else {
+                Money::ZERO
+            }
+        }
+        DepMethod::FiftyFifty => {
+            // 五五摊销：启用期计提 50%，最后一期（报废前一期）计提 50%
+            if n == 1 {
+                return total;
+            }
+            if i == 1 || i == n {
+                (total / Money::from_i64(2)).round2()
+            } else {
+                Money::ZERO
+            }
+        }
     }
 }
 
@@ -321,5 +352,62 @@ mod tests {
         }
         assert_eq!(DepMethod::parse("ddb"), DepMethod::DoubleDeclining);
         assert_eq!(DepMethod::parse("未知"), DepMethod::Straight);
+    }
+
+    #[test]
+    fn one_time_amortizes_in_first_period() {
+        let input = DepInput {
+            original: m("3000"),
+            residual_rate: m("0"),
+            life_months: 12,
+            method: DepMethod::OneTime,
+        };
+        let rows = schedule(&input).unwrap();
+        assert_eq!(rows.len(), 12);
+        // 第 1 期全额计提
+        assert_eq!(rows[0].amount, m("3000"));
+        assert_eq!(rows[0].accum, m("3000"));
+        // 其余各期 0
+        assert_eq!(rows[1].amount, Money::ZERO);
+        assert_eq!(rows.last().unwrap().amount, Money::ZERO);
+        // 累计 = 原值，净值 0
+        assert_eq!(rows.last().unwrap().accum, m("3000"));
+        assert_eq!(rows.last().unwrap().net, Money::ZERO);
+    }
+
+    #[test]
+    fn fifty_fifty_splits_whole_life_periods() {
+        let input = DepInput {
+            original: m("6000"),
+            residual_rate: m("0"),
+            life_months: 10,
+            method: DepMethod::FiftyFifty,
+        };
+        let rows = schedule(&input).unwrap();
+        assert_eq!(rows.len(), 10);
+        // 第 1 期 50%
+        assert_eq!(rows[0].amount, m("3000"));
+        // 中间各期 0
+        assert_eq!(rows[4].amount, Money::ZERO);
+        // 最后一期 50%（尾差调整后为剩余全部）
+        assert_eq!(rows.last().unwrap().amount, m("3000"));
+        assert_eq!(rows.last().unwrap().accum, m("6000"));
+        assert_eq!(rows.last().unwrap().net, Money::ZERO);
+    }
+
+    #[test]
+    fn fifty_fifty_single_period_takes_all() {
+        // 生命周期仅 1 期时，五五摊销=一次全额
+        let input = DepInput {
+            original: m("1000"),
+            residual_rate: m("0.1"),
+            life_months: 1,
+            method: DepMethod::FiftyFifty,
+        };
+        let rows = schedule(&input).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount, m("900"));
+        assert_eq!(rows[0].accum, m("900"));
+        assert_eq!(rows[0].net, m("100"));
     }
 }

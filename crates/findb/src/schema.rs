@@ -269,7 +269,7 @@ CREATE TABLE IF NOT EXISTS fixed_asset (
     original_value TEXT NOT NULL DEFAULT '0',    -- 原值
     residual_rate  TEXT NOT NULL DEFAULT '0.05', -- 残值率
     life_months    INTEGER NOT NULL DEFAULT 60,  -- 预计使用月数
-    method         TEXT NOT NULL DEFAULT 'straight', -- straight / ddb / sum_of_years
+    method         TEXT NOT NULL DEFAULT 'straight', -- straight / ddb / sum_of_years / one_time / fifty_fifty
     start_period   INTEGER NOT NULL,             -- 开始计提期间
     disposed_period INTEGER,                     -- 清理期间
     dispose_amount TEXT,

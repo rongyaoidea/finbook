@@ -229,6 +229,11 @@ const NAV_ITEMS = [
   { id: "notes", label: "报表附注", perm: "report" },
   { id: "archive", label: "电子档案", perm: "report" },
   { id: "budget-versions", label: "预算版本", perm: "report" },
+  { id: "budget-alerts", label: "预算预警", perm: "report" },
+  { id: "po-reconcile", label: "采购对账", perm: "report" },
+  { id: "so-reconcile", label: "销售对账", perm: "report" },
+  { id: "inv-aging", label: "库存账龄", perm: "report" },
+  { id: "inv-abc", label: "库存ABC", perm: "report" },
   { id: "work-report", label: "工序报工", perm: "account_edit" },
   { id: "security", label: "安全中心", perm: "user_manage" },
 ];
@@ -254,6 +259,11 @@ const VIEWS = {
   "notes": viewNotes,
   "archive": viewArchive,
   "budget-versions": viewBudgetVersions,
+  "budget-alerts": viewBudgetAlerts,
+  "po-reconcile": viewPoReconcile,
+  "so-reconcile": viewSoReconcile,
+  "inv-aging": viewInvAging,
+  "inv-abc": viewInvAbc,
   "work-report": viewWorkReport,
   "security": viewSecurity,
 };
@@ -1391,6 +1401,81 @@ async function viewReconcile(main) {
       $("#rc-result").innerHTML = items.map((i) => `<div class="card"><div class="row"><b>${esc(i.name)}</b><span class="tag ${i.ok ? "ok" : "err"}">${i.ok ? "通过" : "异常"}</span></div><div class="muted">${esc(i.detail)}</div></div>`).join("") || `<div class="muted">暂无对账数据</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
+}
+
+// ===========================================================================
+// 预算预警
+// ===========================================================================
+async function viewBudgetAlerts(main) {
+  main.innerHTML = `<h2>预算预警</h2>
+    <div class="toolbar">
+      <label>期间 <input id="ba-period" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>阈值(%) <input id="ba-thr" value="90" style="width:60px" /></label>
+      <button class="btn primary" id="ba-run">查询</button></div>
+    <div id="ba-result" class="muted">填写期间后点击查询</div>`;
+  $("#ba-run").addEventListener("click", async () => {
+    const p = $("#ba-period").value.trim(), thr = $("#ba-thr").value.trim() || "90";
+    try {
+      const r = await api(`/budget/alerts?period=${encodeURIComponent(p)}&threshold=${encodeURIComponent(thr)}`);
+      const rows = r.rows || [];
+      $("#ba-result").innerHTML = rows.length
+        ? `<table><thead><tr><th>科目</th><th>部门</th><th>预算数</th><th>实际数</th><th>执行率</th><th>超支额</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.account_code)} ${esc(x.account_name)}</td><td>${esc(x.dept || "—")}</td><td class="r">${fmt(x.budget)}</td><td class="r">${fmt(x.actual)}</td><td class="r">${x.rate}%</td><td class="r" style="color:var(--err)">${fmt(x.over_amount)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">无预警科目</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 采购对账
+// ===========================================================================
+async function viewPoReconcile(main) {
+  main.innerHTML = `<h2>采购对账</h2><div id="pr-result" class="muted">加载中…</div>`;
+  try {
+    const r = await api("/procure/reconcile");
+    const rows = r.rows || [];
+    $("#pr-result").innerHTML = `<table><thead><tr><th>订单号</th><th>供应商</th><th>订单金额</th><th>已付款</th><th>未付款</th><th>暂估</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.no)}</td><td>${esc(x.supplier)}</td><td class="r">${fmt(x.order_amount)}</td><td class="r">${fmt(x.paid)}</td><td class="r">${fmt(x.unpaid)}</td><td class="r">${fmt(x.open_estimate)}</td></tr>`).join("")}</tbody></table>`;
+  } catch (e) { $("#pr-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// ===========================================================================
+// 销售对账
+// ===========================================================================
+async function viewSoReconcile(main) {
+  main.innerHTML = `<h2>销售对账</h2><div id="sr-result" class="muted">加载中…</div>`;
+  try {
+    const r = await api("/sales/reconcile");
+    const rows = r.rows || [];
+    $("#sr-result").innerHTML = `<table><thead><tr><th>订单号</th><th>客户</th><th>订单金额</th><th>已收款</th><th>未收款</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.no)}</td><td>${esc(x.customer)}</td><td class="r">${fmt(x.order_amount)}</td><td class="r">${fmt(x.received)}</td><td class="r">${fmt(x.unreceived)}</td></tr>`).join("")}</tbody></table>`;
+  } catch (e) { $("#sr-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// ===========================================================================
+// 库存账龄
+// ===========================================================================
+async function viewInvAging(main) {
+  main.innerHTML = `<h2>库存账龄分析</h2><div id="ia-result" class="muted">加载中…</div>`;
+  try {
+    const r = await api("/inventory/aging");
+    const rows = r.rows || [];
+    $("#ia-result").innerHTML = `<table><thead><tr><th>存货</th><th>最近入库</th><th>账龄(天)</th><th>结存数量</th><th>结存金额</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.item)}</td><td>${esc(x.last_in || "—")}</td><td class="r">${x.days}</td><td class="r">${fmt(x.qty)}</td><td class="r">${fmt(x.amount)}</td></tr>`).join("")}</tbody></table>`;
+  } catch (e) { $("#ia-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// ===========================================================================
+// 库存 ABC
+// ===========================================================================
+async function viewInvAbc(main) {
+  main.innerHTML = `<h2>库存 ABC 分析</h2><div id="ib-result" class="muted">加载中…</div>`;
+  try {
+    const r = await api("/inventory/abc");
+    const rows = r.rows || [];
+    $("#ib-result").innerHTML = `<table><thead><tr><th>存货</th><th>结存金额</th><th>累计占比</th><th>分类</th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${esc(x.item)}</td><td class="r">${fmt(x.amount)}</td><td class="r">${x.cum_pct}%</td><td>${esc(x.class)}</td></tr>`).join("")}</tbody></table>`;
+  } catch (e) { $("#ib-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
 }
 
 // 启动

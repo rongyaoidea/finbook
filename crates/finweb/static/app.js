@@ -234,6 +234,14 @@ const NAV_ITEMS = [
   { id: "so-reconcile", label: "销售对账", perm: "report" },
   { id: "inv-aging", label: "库存账龄", perm: "report" },
   { id: "inv-abc", label: "库存ABC", perm: "report" },
+  { id: "inv-serial", label: "序列号", perm: "account_edit" },
+  { id: "inv-unit", label: "多单位换算", perm: "account_edit" },
+  { id: "inv-assemble", label: "组装拆卸", perm: "account_edit" },
+  { id: "inv-warehouse", label: "分仓库库存", perm: "report" },
+  { id: "inv-transfer", label: "调拨报表", perm: "report" },
+  { id: "po-estimate", label: "采购暂估", perm: "account_edit" },
+  { id: "procure-quota", label: "供应商配额", perm: "account_edit" },
+  { id: "order-change-log", label: "订单变更", perm: "report" },
   { id: "work-report", label: "工序报工", perm: "account_edit" },
   { id: "security", label: "安全中心", perm: "user_manage" },
 ];
@@ -264,6 +272,14 @@ const VIEWS = {
   "so-reconcile": viewSoReconcile,
   "inv-aging": viewInvAging,
   "inv-abc": viewInvAbc,
+  "inv-serial": viewInvSerial,
+  "inv-unit": viewInvUnit,
+  "inv-assemble": viewInvAssemble,
+  "inv-warehouse": viewInvWarehouse,
+  "inv-transfer": viewInvTransfer,
+  "po-estimate": viewPoEstimate,
+  "procure-quota": viewProcureQuota,
+  "order-change-log": viewOrderChangeLog,
   "work-report": viewWorkReport,
   "security": viewSecurity,
 };
@@ -1476,6 +1492,258 @@ async function viewInvAbc(main) {
     $("#ib-result").innerHTML = `<table><thead><tr><th>存货</th><th>结存金额</th><th>累计占比</th><th>分类</th></tr></thead>
       <tbody>${rows.map((x) => `<tr><td>${esc(x.item)}</td><td class="r">${fmt(x.amount)}</td><td class="r">${x.cum_pct}%</td><td>${esc(x.class)}</td></tr>`).join("")}</tbody></table>`;
   } catch (e) { $("#ib-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// ===========================================================================
+// 库存深度：序列号 / 多单位 / 组装拆卸 / 分仓库 / 调拨
+// ===========================================================================
+function postJson(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+async function viewInvSerial(main) {
+  main.innerHTML = `<h2>序列号管理</h2>
+    <div class="toolbar">
+      <label>存货 <input id="is-item" style="width:140px" /></label>
+      <button class="btn primary" id="is-load">查询在库</button>
+      <span class="grow"></span>
+    </div>
+    <div class="toolbar">
+      <label>日期 <input id="is-date" style="width:110px" /></label>
+      <label>批次 <input id="is-batch" style="width:110px" /></label>
+      <label>序列号(逗号分隔) <input id="is-serials" style="width:240px" placeholder="S001,S002" /></label>
+      <button class="btn" id="is-in">入库登记</button>
+      <button class="btn" id="is-out">出库登记</button>
+    </div>
+    <div id="is-result" class="muted">填写存货后点击查询</div>`;
+  $("#is-date").value = new Date().toISOString().slice(0, 10);
+  $("#is-load").addEventListener("click", async () => {
+    const item = $("#is-item").value.trim();
+    if (!item) { toast("请填写存货", "err"); return; }
+    try {
+      const r = await api(`/inventory/serial?item=${encodeURIComponent(item)}`);
+      const rows = r.rows || [];
+      $("#is-result").innerHTML = rows.length
+        ? `<table><thead><tr><th>序列号</th><th>存货</th><th>批次</th><th>状态</th><th>入库日期</th><th>出库日期</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.serial)}</td><td>${esc(x.item)}</td><td>${esc(x.batch_no)}</td><td>${esc(x.status === "in" ? "在库" : x.status === "out" ? "已出库" : "报废")}</td><td>${esc(x.in_date)}</td><td>${esc(x.out_date || "—")}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">无序列号记录</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#is-in").addEventListener("click", async () => {
+    const item = $("#is-item").value.trim();
+    const serials = ($("#is-serials").value || "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (!item || !serials.length) { toast("请填写存货与序列号", "err"); return; }
+    try {
+      const r = await postJson("/inventory/serial", { item, serials, batch_no: $("#is-batch").value.trim(), date: $("#is-date").value.trim() });
+      toast(`已入库 ${r.count} 个序列号`, "ok");
+      $("#is-serials").value = "";
+      $("#is-load").click();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#is-out").addEventListener("click", async () => {
+    const serials = ($("#is-serials").value || "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (!serials.length) { toast("请填写序列号", "err"); return; }
+    try {
+      const r = await postJson("/inventory/serial/out", { serials, date: $("#is-date").value.trim() });
+      toast(`已出库 ${r.count} 个序列号`, "ok");
+      $("#is-serials").value = "";
+      $("#is-load").click();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function viewInvUnit(main) {
+  main.innerHTML = `<h2>多单位换算</h2>
+    <div class="toolbar">
+      <label>存货 <input id="iu-item" style="width:140px" /></label>
+      <button class="btn primary" id="iu-load">载入</button>
+      <span class="grow"></span>
+    </div>
+    <div class="toolbar">
+      <label>主单位 <input id="iu-base" style="width:90px" /></label>
+      <label>辅助单位 <input id="iu-alt" style="width:90px" /></label>
+      <label>系数(1主=系数辅) <input id="iu-factor" style="width:90px" /></label>
+      <button class="btn" id="iu-save">保存换算</button>
+    </div>
+    <div id="iu-info" class="muted"></div>`;
+  $("#iu-load").addEventListener("click", async () => {
+    const item = $("#iu-item").value.trim();
+    if (!item) { toast("请填写存货", "err"); return; }
+    try {
+      const r = await api(`/inventory/unit?item=${encodeURIComponent(item)}`);
+      if (r.unit) { $("#iu-base").value = r.unit.base_unit || ""; $("#iu-alt").value = r.unit.alt_unit || ""; $("#iu-factor").value = r.unit.factor || ""; $("#iu-info").textContent = "已载入现有换算"; }
+      else { $("#iu-base").value = ""; $("#iu-alt").value = ""; $("#iu-factor").value = ""; $("#iu-info").textContent = "该存货尚未设置换算"; }
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#iu-save").addEventListener("click", async () => {
+    const item = $("#iu-item").value.trim();
+    if (!item) { toast("请填写存货", "err"); return; }
+    try {
+      await postJson("/inventory/unit", { item, base_unit: $("#iu-base").value.trim(), alt_unit: $("#iu-alt").value.trim(), factor: $("#iu-factor").value.trim() });
+      toast("已保存换算", "ok");
+      $("#iu-load").click();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function viewInvAssemble(main) {
+  main.innerHTML = `<h2>组装 / 拆卸</h2>
+    <div class="toolbar">
+      <label>日期 <input id="ia-date" style="width:110px" /></label>
+      <label>成品/母件 <input id="ia-parent" style="width:140px" /></label>
+      <label>备注 <input id="ia-memo" style="width:160px" /></label>
+      <span class="grow"></span>
+    </div>
+    <div class="toolbar">
+      <label>子件(名称:数量, 每行一个)</label>
+      <textarea id="ia-children" style="width:420px;height:70px" placeholder="RM1:2&#10;RM2:1"></textarea>
+      <button class="btn" id="ia-do">组装</button>
+      <button class="btn" id="ia-undo">拆卸</button>
+    </div>`;
+  $("#ia-date").value = new Date().toISOString().slice(0, 10);
+  const doOp = async (disassemble) => {
+    const parent = $("#ia-parent").value.trim();
+    const children = ($("#ia-children").value || "").split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+      const i = l.search(/[:：]/);
+      return i < 0 ? [l, "0"] : [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+    });
+    if (!parent || !children.length) { toast("请填写母件与子件", "err"); return; }
+    try {
+      await postJson(disassemble ? "/inventory/disassemble" : "/inventory/assemble", { parent, children, memo: $("#ia-memo").value.trim(), date: $("#ia-date").value.trim() });
+      toast(disassemble ? "已拆卸" : "已组装", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#ia-do").addEventListener("click", () => doOp(false));
+  $("#ia-undo").addEventListener("click", () => doOp(true));
+}
+
+async function viewInvWarehouse(main) {
+  main.innerHTML = `<h2>分仓库库存</h2>
+    <div class="toolbar">
+      <label>存货 <input id="iw-item" style="width:160px" /></label>
+      <button class="btn primary" id="iw-load">查询</button>
+    </div>
+    <div id="iw-result" class="muted">填写存货后点击查询</div>`;
+  $("#iw-load").addEventListener("click", async () => {
+    const item = $("#iw-item").value.trim();
+    if (!item) { toast("请填写存货", "err"); return; }
+    try {
+      const r = await api(`/inventory/warehouse-stock?item=${encodeURIComponent(item)}`);
+      const rows = r.rows || [];
+      $("#iw-result").innerHTML = rows.length
+        ? `<table><thead><tr><th>仓库</th><th>存货</th><th>结存数量</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.warehouse)}</td><td>${esc(x.item)}</td><td class="r">${fmt(x.qty)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">无库存</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function viewInvTransfer(main) {
+  main.innerHTML = `<h2>调拨报表</h2><div id="it-result" class="muted">加载中…</div>`;
+  try {
+    const r = await api("/inventory/transfer");
+    const rows = r.rows || [];
+    $("#it-result").innerHTML = rows.length
+      ? `<table><thead><tr><th>日期</th><th>存货</th><th>仓库</th><th>数量</th><th>备注</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.item)}</td><td>${esc(x.warehouse)}</td><td class="r">${fmt(x.qty)}</td><td>${esc(x.memo || "")}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="muted">本期间无调拨流水</div>`;
+  } catch (e) { $("#it-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// ===========================================================================
+// 采购/销售深度：采购暂估 / 供应商配额 / 订单变更
+// ===========================================================================
+async function viewPoEstimate(main) {
+  main.innerHTML = `<h2>采购暂估</h2>
+    <div class="toolbar">
+      <label>采购订单ID <input id="pe-poid" style="width:90px" /></label>
+      <button class="btn primary" id="pe-load">查询暂估</button>
+      <span class="grow"></span>
+    </div>
+    <div class="toolbar">
+      <label>存货 <input id="pe-item" style="width:140px" /></label>
+      <label>暂估金额 <input id="pe-amount" style="width:110px" /></label>
+      <button class="btn" id="pe-add">登记暂估</button>
+    </div>
+    <div id="pe-result" class="muted">填写订单ID后查询</div>`;
+  const load = async () => {
+    const poId = $("#pe-poid").value.trim();
+    if (!poId) { toast("请填写采购订单ID", "err"); return; }
+    try {
+      const r = await api(`/procure/estimate?po_id=${encodeURIComponent(poId)}`);
+      const rows = r.rows || [];
+      const open = rows.filter((x) => !x.settled).reduce((s, x) => s + Number(x.est_amount || 0), 0);
+      $("#pe-result").innerHTML = `<div class="muted">未冲回暂估合计：<b>${fmtMoney(String(open))}</b></div>` + (rows.length
+        ? `<table><thead><tr><th>#</th><th>存货</th><th>暂估金额</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${x.id}</td><td>${esc(x.item)}</td><td class="r">${fmt(x.est_amount)}</td><td>${x.settled ? "已冲回" : "未冲回"}</td><td>${x.settled ? "" : `<button class="btn sm" data-settle="${x.id}">冲回</button>`}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">无暂估记录</div>`);
+      $all("[data-settle]", $("#pe-result")).forEach((b) => b.onclick = async () => {
+        try { await postJson(`/procure/estimate/${b.dataset.settle}/settle`, {}); toast("已冲回", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#pe-load").addEventListener("click", load);
+  $("#pe-add").addEventListener("click", async () => {
+    const po_id = parseInt($("#pe-poid").value.trim(), 10);
+    if (!po_id) { toast("请填写采购订单ID", "err"); return; }
+    try {
+      await postJson("/procure/estimate", { po_id, item: $("#pe-item").value.trim(), est_amount: $("#pe-amount").value.trim() });
+      toast("已登记暂估", "ok");
+      $("#pe-amount").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function viewProcureQuota(main) {
+  main.innerHTML = `<h2>供应商配额</h2>
+    <div class="toolbar">
+      <label>供应商 <input id="pq-sup" style="width:140px" /></label>
+      <label>物料 <input id="pq-item" style="width:140px" /></label>
+      <label>配额数量 <input id="pq-qty" style="width:110px" /></label>
+      <button class="btn" id="pq-save">保存配额</button>
+      <button class="btn primary" id="pq-query">查询剩余</button>
+    </div>
+    <div id="pq-result" class="muted"></div>`;
+  $("#pq-save").addEventListener("click", async () => {
+    const supplier = $("#pq-sup").value.trim(), item = $("#pq-item").value.trim();
+    if (!supplier || !item) { toast("请填写供应商与物料", "err"); return; }
+    try {
+      await postJson("/procure/quota", { supplier, item, quota_qty: $("#pq-qty").value.trim() });
+      toast("已保存配额", "ok");
+      $("#pq-result").textContent = `剩余配额：${fmt($("#pq-qty").value.trim())}`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#pq-query").addEventListener("click", async () => {
+    const supplier = $("#pq-sup").value.trim(), item = $("#pq-item").value.trim();
+    if (!supplier || !item) { toast("请填写供应商与物料", "err"); return; }
+    try {
+      const r = await api(`/procure/quota?supplier=${encodeURIComponent(supplier)}&item=${encodeURIComponent(item)}`);
+      $("#pq-result").textContent = r.remaining == null ? "该供应商/物料未设置配额" : `剩余配额：${fmt(String(r.remaining))}`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function viewOrderChangeLog(main) {
+  main.innerHTML = `<h2>订单变更历史</h2>
+    <div class="toolbar">
+      <label>类型 <select id="ocl-type"><option value="po">采购订单</option><option value="so">销售订单</option></select></label>
+      <label>订单ID <input id="ocl-id" style="width:90px" /></label>
+      <button class="btn primary" id="ocl-load">查询</button>
+    </div>
+    <div id="ocl-result" class="muted">填写订单ID后查询</div>`;
+  $("#ocl-load").addEventListener("click", async () => {
+    const type = $("#ocl-type").value, id = $("#ocl-id").value.trim();
+    if (!id) { toast("请填写订单ID", "err"); return; }
+    try {
+      const r = await api(`/order/change-log?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}`);
+      const rows = r.rows || [];
+      $("#ocl-result").innerHTML = rows.length
+        ? `<table><thead><tr><th>字段</th><th>旧值</th><th>新值</th><th>操作人</th><th>时间</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x[0])}</td><td>${esc(x[1])}</td><td>${esc(x[2])}</td><td>${esc(x[3])}</td><td>${esc(x[4])}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">无变更记录</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 // 启动

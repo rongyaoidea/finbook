@@ -11,6 +11,7 @@ pub mod balance_table;
 pub mod bank_rec;
 pub mod begin;
 pub mod budget;
+pub mod budget_alerts;
 pub mod claims;
 pub mod custom_report;
 pub mod dashboard;
@@ -18,6 +19,7 @@ pub mod dim_profit;
 pub mod export;
 pub mod help;
 pub mod inventory;
+pub mod inventory_deep;
 pub mod ledger;
 pub mod login;
 pub mod logs;
@@ -27,6 +29,7 @@ pub mod period_end;
 pub mod reports;
 pub mod security;
 pub mod settle_view;
+pub mod scm_deep;
 pub mod template;
 pub mod users;
 pub mod voucher_edit;
@@ -47,6 +50,7 @@ pub struct Views {
     pub custom_report: custom_report::CustomReportView,
     pub period_end: period_end::PeriodEndView,
     pub budget: budget::BudgetView,
+    pub budget_alerts: budget_alerts::BudgetAlertsView,
     pub dim_profit: dim_profit::DimProfitView,
     pub multi_column: advanced::MultiColumnView,
     pub summary_table: advanced::SummaryTableView,
@@ -67,6 +71,8 @@ pub struct Views {
     pub settle: settle_view::SettleView,
     pub automation: automation::AutomationView,
     pub inventory: inventory::InventoryView,
+    pub inventory_deep: inventory_deep::InventoryDeepView,
+    pub scm_deep: scm_deep::ScmDeepView,
     pub payroll: payroll::PayrollView,
     pub claims: claims::ClaimsView,
     pub help: help::HelpView,
@@ -94,6 +100,7 @@ impl Views {
         self.custom_report.invalidate();
         self.period_end.invalidate();
         self.budget.invalidate();
+        self.budget_alerts.invalidate();
         self.dim_profit.invalidate();
         self.multi_column.invalidate();
         self.summary_table.invalidate();
@@ -108,6 +115,8 @@ impl Views {
         self.options.invalidate();
         self.logs.invalidate();
         self.help.invalidate();
+        self.inventory_deep.invalidate();
+        self.scm_deep.invalidate();
     }
 
     /// 某模块数据变动后，让相关界面刷新
@@ -189,9 +198,12 @@ impl Views {
                 NavItem::Settle => self.settle.enter(ctx),
                 NavItem::Automation => self.automation.enter(ctx),
                 NavItem::Inventory => self.inventory.enter(ctx),
+                NavItem::InventoryDeep => self.inventory_deep.enter(ctx),
+                NavItem::ScmDeep => self.scm_deep.enter(ctx),
                 NavItem::Payroll => self.payroll.enter(ctx),
                 NavItem::Claims => self.claims.enter(ctx),
                 NavItem::Budget => self.budget.enter(ctx),
+                NavItem::BudgetAlerts => self.budget_alerts.enter(ctx),
                 NavItem::DimProfit => self.dim_profit.enter(ctx),
                 NavItem::MultiColumn => self.multi_column.enter(ctx),
                 NavItem::SummaryTable => self.summary_table.enter(ctx),
@@ -241,9 +253,12 @@ impl Views {
             NavItem::Settle => self.settle.show(ctx, ui),
             NavItem::Automation => self.automation.show(ctx, ui),
             NavItem::Inventory => self.inventory.show(ctx, ui),
+            NavItem::InventoryDeep => self.inventory_deep.show(ctx, ui),
+            NavItem::ScmDeep => self.scm_deep.show(ctx, ui),
             NavItem::Payroll => self.payroll.show(ctx, ui),
             NavItem::Claims => self.claims.show(ctx, ui),
             NavItem::Budget => self.budget.show(ctx, ui),
+            NavItem::BudgetAlerts => self.budget_alerts.show(ctx, ui),
             NavItem::DimProfit => self.dim_profit.show(ctx, ui),
             NavItem::MultiColumn => self.multi_column.show(ctx, ui),
             NavItem::SummaryTable => self.summary_table.show(ctx, ui),

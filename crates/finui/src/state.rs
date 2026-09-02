@@ -38,6 +38,12 @@ pub enum NavItem {
     Automation,
     /// 存货核算
     Inventory,
+    /// 库存深度（序列号/多单位/账龄/ABC/组装拆卸/分仓库/调拨）
+    InventoryDeep,
+    /// 采购/销售深度（暂估/对账/配额/订单变更）
+    ScmDeep,
+    /// 预算预警
+    BudgetAlerts,
     /// 工资管理
     Payroll,
     /// 费用报销
@@ -99,6 +105,9 @@ impl NavItem {
             NavItem::Settle => "往来核销".to_string(),
             NavItem::Automation => "月末自动化".to_string(),
             NavItem::Inventory => "存货核算".to_string(),
+            NavItem::InventoryDeep => "库存深度".to_string(),
+            NavItem::ScmDeep => "采购销售".to_string(),
+            NavItem::BudgetAlerts => "预算预警".to_string(),
             NavItem::Payroll => "工资管理".to_string(),
             NavItem::Claims => "费用报销".to_string(),
             NavItem::Budget => "预算管理".to_string(),
@@ -141,9 +150,10 @@ impl NavItem {
             | NavItem::BankRec
             | NavItem::Settle
             | NavItem::Automation => "期末",
-            NavItem::Inventory | NavItem::Payroll | NavItem::Claims | NavItem::Manufacturing => "业务",
+            NavItem::Inventory | NavItem::InventoryDeep | NavItem::ScmDeep | NavItem::Payroll
+            | NavItem::Claims | NavItem::Manufacturing => "业务",
             NavItem::Approval | NavItem::Archive => "系统",
-            NavItem::Budget | NavItem::DimProfit => "管理会计",
+            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit => "管理会计",
             NavItem::Users | NavItem::Security | NavItem::Options | NavItem::Backup
             | NavItem::Logs | NavItem::Help | NavItem::About => "系统",
         }
@@ -157,11 +167,15 @@ impl NavItem {
             NavItem::Aux(_) => Some(Perm::AuxEdit),
             NavItem::BeginBalance => Some(Perm::Opening),
             NavItem::PeriodEnd | NavItem::Automation => Some(Perm::CarryForward),
-            NavItem::Assets | NavItem::Inventory => Some(Perm::AccountEdit),
+            NavItem::Assets | NavItem::Inventory | NavItem::InventoryDeep | NavItem::ScmDeep => {
+                Some(Perm::AccountEdit)
+            }
             NavItem::BankRec | NavItem::Settle | NavItem::Payroll | NavItem::Claims => {
                 Some(Perm::VoucherNew)
             }
-            NavItem::Budget | NavItem::DimProfit | NavItem::CustomReport => Some(Perm::Report),
+            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit | NavItem::CustomReport => {
+                Some(Perm::Report)
+            }
             NavItem::MultiColumn | NavItem::SummaryTable | NavItem::Ratios | NavItem::ReportNotes
             | NavItem::Archive => Some(Perm::Report),
             NavItem::Manufacturing => Some(Perm::AccountEdit),
@@ -206,12 +220,15 @@ impl NavItem {
             NavItem::Settle,
             NavItem::Automation,
             NavItem::Inventory,
+            NavItem::InventoryDeep,
+            NavItem::ScmDeep,
             NavItem::Manufacturing,
             NavItem::Payroll,
             NavItem::Claims,
             NavItem::Approval,
             NavItem::Archive,
             NavItem::Budget,
+            NavItem::BudgetAlerts,
             NavItem::DimProfit,
             NavItem::Users,
             NavItem::Security,

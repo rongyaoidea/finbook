@@ -107,8 +107,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/assemble", post(assemble_endpoint))
         .route("/api/inventory/disassemble", post(disassemble_endpoint))
         .route("/api/inventory/warehouse-stock", get(get_warehouse_stock))
+        .route("/api/inventory/transfer", get(get_transfer_report))
         // 采购/销售深度：暂估 / 对账 / 配额 / 订单变更
-        .route("/api/procure/estimate", post(add_estimate))
+        .route("/api/procure/estimate", get(list_estimates).post(add_estimate))
+        .route("/api/procure/estimate/:id/settle", post(settle_estimate))
         .route("/api/procure/reconcile", get(get_po_reconcile))
         .route("/api/procure/quota", get(get_quota).post(set_quota))
         .route("/api/sales/reconcile", get(get_so_reconcile))
@@ -1730,6 +1732,28 @@ async fn get_warehouse_stock(
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
+async fn get_transfer_report(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::transfer_report(&db, current_period(&state, &user))?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "date": m.biz_date.format("%Y-%m-%d").to_string(),
+                "item": m.item,
+                "warehouse": m.warehouse,
+                "qty": m.qty.fmt_qty(),
+                "memo": m.memo,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "rows": items })))
+}
+
 // ---- 采购/销售深度：暂估 / 对账 / 配额 / 订单变更 ----
 
 #[derive(Deserialize)]
@@ -1752,6 +1776,35 @@ async fn add_estimate(
     let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
     let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money(&req.est_amount))?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn list_estimates(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let po_id = q
+        .get("po_id")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if po_id == 0 {
+        return Err(AppError::bad_request("缺少 po_id"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::scm2::po_estimate_list(&db, po_id)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn settle_estimate(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::scm2::po_estimate_settle(&db, id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn get_po_reconcile(

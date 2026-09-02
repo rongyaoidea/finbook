@@ -43,6 +43,37 @@ pub fn po_estimate_open_sum(db: &Db, po_id: i64) -> DbResult<Money> {
     Ok(rows.iter().map(|s| m(s)).sum())
 }
 
+/// 某采购订单的暂估明细
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PoEstimate {
+    pub id: i64,
+    pub po_id: i64,
+    pub period: i32,
+    pub item: String,
+    pub est_amount: Money,
+    pub settled: bool,
+}
+
+/// 列出某采购订单的全部暂估明细
+pub fn po_estimate_list(db: &Db, po_id: i64) -> DbResult<Vec<PoEstimate>> {
+    let mut st = db.conn().prepare(
+        "SELECT id, po_id, period, item, est_amount, settled FROM po_estimate WHERE po_id=?1 ORDER BY id",
+    )?;
+    let rows = st
+        .query_map([po_id], |r| {
+            Ok(PoEstimate {
+                id: r.get(0)?,
+                po_id: r.get(1)?,
+                period: r.get(2)?,
+                item: r.get(3)?,
+                est_amount: m(&r.get::<_, String>(4)?),
+                settled: r.get::<_, i64>(5)? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ===========================================================================
 // 对账
 // ===========================================================================

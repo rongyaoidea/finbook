@@ -98,6 +98,23 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/reports/reconcile", get(get_period_reconcile))
         // 存货核算：成本调整
         .route("/api/inventory/adjust", post(stock_adjust_endpoint))
+        // 库存深度：序列号 / 多单位 / 账龄 / ABC / 组装拆卸 / 分仓库
+        .route("/api/inventory/serial", get(list_serial).post(serial_in_endpoint))
+        .route("/api/inventory/serial/out", post(serial_out_endpoint))
+        .route("/api/inventory/unit", get(get_unit).post(set_unit))
+        .route("/api/inventory/aging", get(get_inv_aging))
+        .route("/api/inventory/abc", get(get_abc))
+        .route("/api/inventory/assemble", post(assemble_endpoint))
+        .route("/api/inventory/disassemble", post(disassemble_endpoint))
+        .route("/api/inventory/warehouse-stock", get(get_warehouse_stock))
+        // 采购/销售深度：暂估 / 对账 / 配额 / 订单变更
+        .route("/api/procure/estimate", post(add_estimate))
+        .route("/api/procure/reconcile", get(get_po_reconcile))
+        .route("/api/procure/quota", get(get_quota).post(set_quota))
+        .route("/api/sales/reconcile", get(get_so_reconcile))
+        .route("/api/order/change-log", get(get_change_log))
+        // 预算预警
+        .route("/api/budget/alerts", get(get_budget_alerts))
         // 工艺路线 / 报工 / MRP
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
@@ -1523,6 +1540,303 @@ async fn stock_adjust_endpoint(
     };
     let id = findb::business::stock_adjust(&db, period, date, &req.item, &req.warehouse, delta, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+// ---- 库存深度：序列号 / 多单位 / 账龄 / ABC / 组装拆卸 / 分仓库 ----
+
+#[derive(Deserialize)]
+struct SerialInReq {
+    pub item: String,
+    pub serials: Vec<String>,
+    #[serde(default)]
+    pub batch_no: String,
+    #[serde(default)]
+    pub date: String,
+}
+
+async fn serial_in_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SerialInReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let n = findb::inventory2::serial_in(&db, &req.item, &req.serials, &req.batch_no, date)?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": n })))
+}
+
+#[derive(Deserialize)]
+struct SerialOutReq {
+    pub serials: Vec<String>,
+    #[serde(default)]
+    pub date: String,
+}
+
+async fn serial_out_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SerialOutReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let n = findb::inventory2::serial_out(&db, &req.serials, date)?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": n })))
+}
+
+async fn list_serial(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let item = q.get("item").cloned().unwrap_or_default();
+    if item.is_empty() {
+        return Err(AppError::bad_request("缺少 item"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::serial_list(&db, &item)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_unit(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let item = q.get("item").cloned().unwrap_or_default();
+    let db = state.db_for(&user.book_key)?;
+    let u = findb::inventory2::unit_get(&db, &item)?;
+    Ok(Json(serde_json::json!({ "unit": u })))
+}
+
+#[derive(Deserialize)]
+struct UnitReq {
+    pub item: String,
+    #[serde(default)]
+    pub base_unit: String,
+    #[serde(default)]
+    pub alt_unit: String,
+    #[serde(default)]
+    pub factor: String,
+}
+
+async fn set_unit(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<UnitReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::inventory2::unit_set(&db, &findb::inventory2::ItemUnit {
+        item: req.item,
+        base_unit: req.base_unit,
+        alt_unit: req.alt_unit,
+        factor: parse_money(&req.factor),
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn get_inv_aging(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::inv_aging(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_abc(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::abc_analysis(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct AssembleReq {
+    pub parent: String,
+    pub children: Vec<(String, String)>,
+    #[serde(default)]
+    pub memo: String,
+    #[serde(default)]
+    pub date: String,
+}
+
+async fn assemble_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AssembleReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let children: Vec<(String, Money)> = req.children.into_iter().map(|(i, q)| (i, parse_money(&q))).collect();
+    findb::inventory2::assemble(&db, period, date, &req.parent, &children, &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn disassemble_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AssembleReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let children: Vec<(String, Money)> = req.children.into_iter().map(|(i, q)| (i, parse_money(&q))).collect();
+    findb::inventory2::disassemble(&db, period, date, &req.parent, &children, &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn get_warehouse_stock(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let item = q.get("item").cloned().unwrap_or_default();
+    if item.is_empty() {
+        return Err(AppError::bad_request("缺少 item"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::warehouse_stock(&db, &item)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+// ---- 采购/销售深度：暂估 / 对账 / 配额 / 订单变更 ----
+
+#[derive(Deserialize)]
+struct EstimateReq {
+    pub po_id: i64,
+    #[serde(default)]
+    pub period: i32,
+    pub item: String,
+    #[serde(default)]
+    pub est_amount: String,
+}
+
+async fn add_estimate(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<EstimateReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money(&req.est_amount))?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn get_po_reconcile(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::scm2::po_reconcile(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_so_reconcile(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::scm2::so_reconcile(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_quota(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let supplier = q.get("supplier").cloned().unwrap_or_default();
+    let item = q.get("item").cloned().unwrap_or_default();
+    let remaining = findb::scm2::quota_remaining(&db, period, &supplier, &item)?;
+    Ok(Json(serde_json::json!({ "remaining": remaining })))
+}
+
+#[derive(Deserialize)]
+struct QuotaReq {
+    #[serde(default)]
+    pub period: i32,
+    pub supplier: String,
+    pub item: String,
+    #[serde(default)]
+    pub quota_qty: String,
+}
+
+async fn set_quota(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<QuotaReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money(&req.quota_qty))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn get_change_log(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let order_type = q.get("type").cloned().unwrap_or_else(|| "po".to_string());
+    let order_id = q.get("id").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let rows = findb::scm2::change_log_list(&db, &order_type, order_id)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+// ---- 预算预警 ----
+
+async fn get_budget_alerts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| fincore::Period::new(period.year(), 1).unwrap_or(period));
+    let threshold = q.get("threshold").and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+    let rows = findb::mgmt::budget_alerts(&db, period, from, threshold)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
 // ---- 工艺路线 / 报工 ----

@@ -5,13 +5,14 @@ let session = { user: null };
 let state = { view: "dashboard", periods: [], current: null, accounts: null, users: null };
 
 // ---------- 工具 ----------
-function esc(s) {
-  if (s == null) return "";
-  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-}
-function fmt(n) { return (n == null ? "" : String(n)); }
+// esc / fmt / fmtMoney / ymm 抽到 util.js（无 DOM 依赖，可单测），此处经全局复用。
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+
+// 请求竞态防护：每个视图一个请求序号，返回时才采纳最新一次的结果
+const reqSeq = { v: 0 };
+function nextReq(scope) { reqSeq[scope] = (reqSeq[scope] || 0) + 1; return reqSeq[scope]; }
+function staleReq(scope, id) { return reqSeq[scope] !== id; }
 
 async function api(path, opts = {}) {
   const r = await fetch(API + path, Object.assign({ credentials: "same-origin" }, opts));
@@ -24,14 +25,21 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error((data && data.error) || ("请求失败 " + r.status));
   return data;
 }
+
+const MAX_TOASTS = 5;
 function toast(msg, kind) {
+  const wrap = document.getElementById("toast");
+  // 上限：挤掉最旧
+  while (wrap.children.length >= MAX_TOASTS) wrap.removeChild(wrap.firstChild);
   const t = document.createElement("div");
   t.className = "toast " + (kind || "");
   t.textContent = msg;
-  document.getElementById("toast").appendChild(t);
+  wrap.appendChild(t);
   requestAnimationFrame(() => t.classList.add("show"));
   setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 250); }, 2600);
 }
+
+let modalStack = [];
 function modal(html, wide) {
   const root = document.getElementById("modal-root");
   const mask = document.createElement("div");
@@ -39,9 +47,21 @@ function modal(html, wide) {
   mask.innerHTML = `<div class="modal ${wide ? "wide" : ""}">${html}</div>`;
   root.appendChild(mask);
   mask.addEventListener("click", (e) => { if (e.target === mask) closeModal(); });
+  modalStack.push(mask);
+  // 焦点移入弹窗首个可聚焦元素
+  const first = mask.querySelector("input, select, textarea, button");
+  if (first) first.focus();
   return mask;
 }
-function closeModal() { document.getElementById("modal-root").innerHTML = ""; }
+function closeModal() {
+  const root = document.getElementById("modal-root");
+  root.innerHTML = "";
+  modalStack = [];
+}
+// Esc 关闭最近弹窗
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && modalStack.length) closeModal();
+});
 
 // ---------- 设备指纹 ----------
 function deviceId() {
@@ -187,30 +207,56 @@ async function showSetupWizard() {
 // ===========================================================================
 // 应用骨架
 // ===========================================================================
-function render() {
-  if (!session.user) { showLogin(); return; }
+
+// 导航项配置（新增页面只改这里 + VIEWS 注册表，无需改 switch）
+const NAV_ITEMS = [
+  { id: "dashboard", label: "仪表盘", perm: null },
+  { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
+  { id: "invoices", label: "发票管理", perm: "report" },
+  { id: "imports", label: "数据导入", perm: "voucher_new" },
+  { id: "ledger", label: "明细账", perm: "report" },
+  { id: "reports", label: "报表中心", perm: "report" },
+  { id: "multi-column", label: "多栏账", perm: "report" },
+  { id: "summary-table", label: "摘要汇总表", perm: "report" },
+  { id: "ratios", label: "财务指标", perm: "report" },
+  { id: "mrp", label: "MRP 运算", perm: "account_edit" },
+  { id: "routing", label: "工艺路线", perm: "account_edit" },
+  { id: "approval", label: "审批中心", perm: "report" },
+  { id: "notes", label: "报表附注", perm: "report" },
+  { id: "archive", label: "电子档案", perm: "report" },
+  { id: "budget-versions", label: "预算版本", perm: "report" },
+  { id: "work-report", label: "工序报工", perm: "account_edit" },
+  { id: "security", label: "安全中心", perm: "user_manage" },
+];
+
+// 视图注册表：id → 渲染函数（函数声明已提升，可在顶层引用）
+const VIEWS = {
+  "dashboard": viewDashboard,
+  "vouchers": viewVouchers,
+  "invoices": viewInvoices,
+  "imports": viewImports,
+  "ledger": viewLedger,
+  "reports": viewReports,
+  "multi-column": viewMultiColumn,
+  "summary-table": viewSummaryTable,
+  "ratios": viewRatios,
+  "mrp": viewMrp,
+  "routing": viewRouting,
+  "approval": viewApproval,
+  "notes": viewNotes,
+  "archive": viewArchive,
+  "budget-versions": viewBudgetVersions,
+  "work-report": viewWorkReport,
+  "security": viewSecurity,
+};
+
+let shellBuilt = false;
+
+// 骨架只渲染一次；切换视图只更新 .main，不再重建 topbar/sidebar
+function renderShell() {
   const u = session.user;
   const app = document.getElementById("app");
-  const nav = [
-    { id: "dashboard", label: "仪表盘", perm: null },
-    { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
-    { id: "invoices", label: "发票管理", perm: "report" },
-    { id: "imports", label: "数据导入", perm: "voucher_new" },
-    { id: "ledger", label: "明细账", perm: "report" },
-    { id: "reports", label: "报表中心", perm: "report" },
-    { id: "multi-column", label: "多栏账", perm: "report" },
-    { id: "summary-table", label: "摘要汇总表", perm: "report" },
-    { id: "ratios", label: "财务指标", perm: "report" },
-    { id: "mrp", label: "MRP 运算", perm: "account_edit" },
-    { id: "routing", label: "工艺路线", perm: "account_edit" },
-    { id: "approval", label: "审批中心", perm: "report" },
-    { id: "notes", label: "报表附注", perm: "report" },
-    { id: "archive", label: "电子档案", perm: "report" },
-    { id: "budget-versions", label: "预算版本", perm: "report" },
-    { id: "work-report", label: "工序报工", perm: "account_edit" },
-    { id: "security", label: "安全中心", perm: "user_manage" },
-  ].filter((n) => !n.perm || can(n.perm));
-
+  const nav = NAV_ITEMS.filter((n) => !n.perm || can(n.perm));
   const periodOpts = state.periods.map((p) => `<option value="${p}" ${p === state.current ? "selected" : ""}>${p}</option>`).join("");
   app.innerHTML = `
     <div class="app">
@@ -227,44 +273,35 @@ function render() {
       </div>
       <div class="main" id="main"></div>
     </div>`;
+
+  // 事件委托：nav-item 只在 sidebar 容器上绑一次
+  $(".sidebar").addEventListener("click", (e) => {
+    const btn = e.target.closest(".nav-item");
+    if (!btn) return;
+    state.view = btn.dataset.view;
+    $all(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === state.view));
+    renderMain();
+  });
   $("#period-sel").addEventListener("change", async (e) => {
     state.current = e.target.value;
     try { await api("/period", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ymm: ymm(e.target.value) }) }); } catch (err) {}
     renderMain();
   });
-  $all(".nav-item").forEach((b) => b.addEventListener("click", () => { state.view = b.dataset.view; render(); }));
   $("#logout").addEventListener("click", logout);
   $("#change-pwd").addEventListener("click", () => openChangePwd(false));
-  renderMain();
+  shellBuilt = true;
 }
 
-function ymm(s) {
-  // "2026-01" -> 202601
-  const [y, m] = s.split("-");
-  return parseInt(y, 10) * 100 + parseInt(m, 10);
+function render() {
+  if (!session.user) { shellBuilt = false; showLogin(); return; }
+  if (!shellBuilt) renderShell();
+  renderMain();
 }
 
 function renderMain() {
   const main = document.getElementById("main");
-  switch (state.view) {
-    case "dashboard": return viewDashboard(main);
-    case "vouchers": return viewVouchers(main);
-    case "invoices": return viewInvoices(main);
-    case "imports": return viewImports(main);
-    case "ledger": return viewLedger(main);
-    case "reports": return viewReports(main);
-    case "multi-column": return viewMultiColumn(main);
-    case "summary-table": return viewSummaryTable(main);
-    case "ratios": return viewRatios(main);
-    case "mrp": return viewMrp(main);
-    case "routing": return viewRouting(main);
-    case "approval": return viewApproval(main);
-    case "notes": return viewNotes(main);
-    case "archive": return viewArchive(main);
-    case "budget-versions": return viewBudgetVersions(main);
-    case "work-report": return viewWorkReport(main);
-    case "security": return viewSecurity(main);
-  }
+  const fn = VIEWS[state.view] || viewDashboard;
+  return fn(main);
 }
 
 async function logout() {
@@ -294,9 +331,9 @@ async function viewDashboard(main) {
       <div class="card"><div class="k">已结账至</div><div class="v">${esc(d.closed_upto || "未结账")}</div></div>
     </div>
     <div class="cards" style="margin-top:14px">
-      <div class="card"><div class="k">凭证数</div><div class="v">${d.vouchers}</div></div>
-      <div class="card"><div class="k">分录数</div><div class="v">${d.entries}</div></div>
-      <div class="card"><div class="k">科目数</div><div class="v">${d.accounts}</div></div>
+      <div class="card"><div class="k">凭证数</div><div class="v">${esc(d.vouchers)}</div></div>
+      <div class="card"><div class="k">分录数</div><div class="v">${esc(d.entries)}</div></div>
+      <div class="card"><div class="k">科目数</div><div class="v">${esc(d.accounts)}</div></div>
     </div>`;
 }
 

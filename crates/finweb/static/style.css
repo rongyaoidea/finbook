@@ -386,3 +386,41 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 ::-webkit-scrollbar-thumb { background: var(--z-300); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--z-400); }
 ::selection { background: var(--primary-t); }
+/* ── P2-7 响应式：窄屏折叠 sidebar、表格横向滚动 ─────────────── */
+.panel { overflow-x: auto; }
+table.grid { min-width: 100%; }
+@media (max-width: 900px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar {
+    position: static;
+    flex-direction: row; flex-wrap: wrap;
+    gap: 4px; padding: 8px;
+  }
+  .nav-item { white-space: nowrap; }
+}
+@media (max-width: 600px) {
+  .topbar { flex-wrap: wrap; gap: 6px; }
+  .cards { grid-template-columns: 1fr; }
+  .toolbar { flex-wrap: wrap; }
+}
+
+/* ── P2-7 暗色模式：复用调色板变量覆写 ──────────────────────── */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1220;
+    --surface: #131c2e;
+    --panel: #131c2e;
+    --panel-border: rgba(148, 163, 184, .18);
+    --panel-border-strong: rgba(148, 163, 184, .30);
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --muted: #64748b;
+    --subtle: #475569;
+    --shadow: 0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
+    --shadow-lg: 0 10px 40px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.3);
+    --ok-bg: #0c2316; --warn-bg: #2a1c0c; --err-bg: #2a1010;
+  }
+}
+
+/* ── loading 骨架态 ───────────────────────────────────────── */
+.loading { color: var(--muted); padding: 24px; text-align: center; }

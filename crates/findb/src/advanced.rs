@@ -1336,10 +1336,31 @@ pub struct FinRatio {
     pub formula: String,
 }
 
-/// 常用财务指标：偿债能力 / 营运能力 / 盈利能力
-///
-/// 全部基于期末余额快照计算，数据源是 BalanceSnapshot，口径与资产负债表一致。
-pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRatio>> {
+/// 财务概况总量（管理员「账目总览」与财务指标共用同一口径）
+#[derive(Clone, Debug)]
+pub struct FinTotals {
+    /// 流动资产
+    pub cur_asset: Money,
+    /// 速动资产（流动资产 − 存货）
+    pub quick_asset: Money,
+    /// 流动负债
+    pub cur_liab: Money,
+    /// 资产总额
+    pub total_asset: Money,
+    /// 负债总额
+    pub total_liab: Money,
+    /// 所有者权益
+    pub equity: Money,
+    /// 营业收入
+    pub revenue: Money,
+    /// 营业成本
+    pub cost: Money,
+    /// 净利润
+    pub net_profit: Money,
+}
+
+/// 计算 [from, period] 区间的财务总量，口径与资产负债表 / 利润表一致
+pub fn financial_totals(db: &Db, period: Period, from: Period) -> DbResult<FinTotals> {
     use crate::balances::{BalanceQuery, BalanceSnapshot};
     let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, period))?;
     let b = |code: &str| snap.for_account(code, None).end();
@@ -1351,27 +1372,6 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
         let r = snap.for_account(code, None);
         r.debit - r.credit // 费用类借方正
     };
-    let pct = |v: Option<Money>| match v {
-        Some(x) => format!("{}%", (x * Money::from_i64(100)).round2()),
-        None => "—".to_string(),
-    };
-    let times = |v: Option<Money>| match v {
-        Some(x) => format!("{}倍", x),
-        None => "—".to_string(),
-    };
-    let val = |v: Option<Money>| v.unwrap_or(Money::ZERO);
-
-    let mut out = Vec::new();
-    let mut push = |key: &str, name: &str, value: Money, display: String, formula: &str| {
-        out.push(FinRatio {
-            key: key.into(),
-            name: name.into(),
-            value,
-            display,
-            formula: formula.into(),
-        });
-    };
-
     // 流动资产 ≈ 货币资金 + 交易性金融资产 + 应收 + 预付 + 其他应收 + 存货
     let cur_asset = b("1001") + b("1002") + b("1012") + b("1101") + b("1121") + b("1122")
         + b("1123") + b("1221") + b("1403") + b("1405") + b("1406") + b("1411");
@@ -1409,6 +1409,50 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
     let cost = exp("6401") + exp("6402");
     let net_profit = revenue - cost - exp("6403") - exp("6601") - exp("6602") - exp("6603")
         - exp("6701") + occ("6301") - exp("6711") - exp("6801");
+    // 速动资产 = 流动资产 − 存货（1403 原材料 / 1405 库存商品 / 1406 发出商品 / 1411 周转材料）
+    let quick_asset = cur_asset - b("1403") - b("1405") - b("1406") - b("1411");
+    Ok(FinTotals {
+        cur_asset,
+        quick_asset,
+        cur_liab,
+        total_asset,
+        total_liab,
+        equity,
+        revenue,
+        cost,
+        net_profit,
+    })
+}
+
+/// 常用财务指标：偿债能力 / 营运能力 / 盈利能力
+///
+/// 全部基于期末余额快照计算，数据源是 BalanceSnapshot，口径与资产负债表一致。
+pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRatio>> {
+    let t = financial_totals(db, period, from)?;
+    let (cur_asset, cur_liab) = (t.cur_asset, t.cur_liab);
+    let (total_asset, total_liab, equity) = (t.total_asset, t.total_liab, t.equity);
+    let (revenue, cost, net_profit) = (t.revenue, t.cost, t.net_profit);
+
+    let pct = |v: Option<Money>| match v {
+        Some(x) => format!("{}%", (x * Money::from_i64(100)).round2()),
+        None => "—".to_string(),
+    };
+    let times = |v: Option<Money>| match v {
+        Some(x) => format!("{}倍", x),
+        None => "—".to_string(),
+    };
+    let val = |v: Option<Money>| v.unwrap_or(Money::ZERO);
+
+    let mut out = Vec::new();
+    let mut push = |key: &str, name: &str, value: Money, display: String, formula: &str| {
+        out.push(FinRatio {
+            key: key.into(),
+            name: name.into(),
+            value,
+            display,
+            formula: formula.into(),
+        });
+    };
 
     // 分母阈值：绝对值小于 1 分钱视为数据不足，比率无意义（避免分母接近 0 时算出 100% 之类的假值）
     let div = |a: Money, b: Money| -> Option<Money> {
@@ -1427,8 +1471,7 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
         times(current_ratio),
         "流动资产 ÷ 流动负债",
     );
-    let quick_asset = cur_asset - b("1403") - b("1405") - b("1406") - b("1411");
-    let quick_ratio = div(quick_asset, cur_liab);
+    let quick_ratio = div(t.quick_asset, cur_liab);
     push(
         "quick_ratio",
         "速动比率",

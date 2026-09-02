@@ -141,6 +141,27 @@ impl OptionsView {
         widgets::kv(ui, "凭证数", &v.to_string());
         widgets::kv(ui, "分录数", &e.to_string());
         widgets::kv(ui, "科目数", &a.to_string());
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("科目表维护").strong());
+        ui.horizontal(|ui| {
+            if ui.button("补齐新版科目表").clicked() {
+                match findb::accounts::fill_missing_defaults(ctx.db()) {
+                    Ok(0) => ctx.info("科目表已完整，无需补齐"),
+                    Ok(n) => {
+                        ctx.log("科目", "补齐科目表", &format!("补入 {n} 个内置科目"));
+                        ctx.info(format!("已补入 {n} 个内置科目"));
+                        ctx.reload_chart();
+                        // 直接落库，无需经过账套参数的「保存」
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
+            ui.label(
+                RichText::new("旧账套一键补入新版默认科目表中缺少的科目（当前内置 199 个），不影响已有科目。")
+                    .weak(),
+            );
+        });
     }
 
     fn save(&mut self, ctx: &mut AppCtx<'_>) {

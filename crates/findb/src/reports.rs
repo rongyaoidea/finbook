@@ -504,9 +504,80 @@ pub fn period_reconcile(db: &Db, period: fincore::Period) -> DbResult<Vec<Reconc
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// 管理员「账目总览」：只读视角的账目全貌
+// ---------------------------------------------------------------------------
+
+/// 总览数据（口径与仪表盘 / 资产负债表 / 利润表一致）
+#[derive(Clone, Debug)]
+pub struct Overview {
+    pub company: String,
+    pub period: fincore::Period,
+    pub closed_upto: Option<fincore::Period>,
+    /// 凭证总数（全账套）
+    pub vouchers: i64,
+    /// 分录总数（全账套）
+    pub entries: i64,
+    /// 科目数（全账套）
+    pub accounts: i64,
+    /// 当期未记账张数（含历史"已审核"）
+    pub unposted: i64,
+    /// 当期已记账张数
+    pub posted: i64,
+    /// 财务总量（年初至今）
+    pub totals: crate::advanced::FinTotals,
+    /// 进项发票：（价税合计, 张数）
+    pub invoice_in: (Money, i64),
+    /// 销项发票：（价税合计, 张数）
+    pub invoice_out: (Money, i64),
+    /// 最近 10 张凭证（全账套，含分录摘要与借贷合计）
+    pub recent: Vec<fincore::Voucher>,
+}
+
+/// 汇总账目全貌，供管理员只读查看（不做任何写操作）
+pub fn overview(db: &Db, period: fincore::Period) -> DbResult<Overview> {
+    let company = db.options().company.clone();
+    let closed_upto = crate::periods::closed_upto(db)?;
+    let (vouchers, entries, accounts) = db.stats()?;
+    let (draft, audited, posted, _void) = crate::vouchers::status_summary(db, period)?;
+    let from = fincore::Period::new(period.year(), 1).unwrap_or(period);
+    let totals = crate::advanced::financial_totals(db, period, from)?;
+    let mut invoice_in = (Money::ZERO, 0i64);
+    let mut invoice_out = (Money::ZERO, 0i64);
+    for (kind, amount_tax, _tax, count) in crate::invoices::summary(db)? {
+        match kind.as_str() {
+            "in" => invoice_in = (amount_tax, count),
+            "out" => invoice_out = (amount_tax, count),
+            _ => {}
+        }
+    }
+    let q = crate::vouchers::VoucherQuery {
+        asc: false,
+        limit: Some(10),
+        ..Default::default()
+    };
+    let mut recent = crate::vouchers::list(db, &q)?;
+    crate::vouchers::fill_entries(db, &mut recent)?;
+    Ok(Overview {
+        company,
+        period,
+        closed_upto,
+        vouchers,
+        entries,
+        accounts,
+        unposted: draft + audited,
+        posted,
+        totals,
+        invoice_in,
+        invoice_out,
+        recent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::invoices;
     use crate::tests::mem;
     use crate::vouchers;
     use chrono::NaiveDate;
@@ -719,6 +790,47 @@ mod tests {
         let items = period_reconcile(&db, p).unwrap();
         assert!(items.len() >= 3);
         assert!(items.iter().all(|i| i.ok), "空账套+平衡凭证应全部通过：{:?}", items.iter().map(|i| &i.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn overview_aggregates() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        cash_voucher(&db, p, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
+
+        let inv = invoices::Invoice {
+            id: 0,
+            kind: "in".into(),
+            code: "044001900111".into(),
+            number: "INV001".into(),
+            date: "2026-01-10".into(),
+            buyer: "甲公司".into(),
+            seller: "乙公司".into(),
+            amount_tax: Money::parse("1130").unwrap(),
+            amount: Money::parse("1000").unwrap(),
+            tax: Money::parse("130").unwrap(),
+            tax_rate: "0.13".into(),
+            status: "pending".into(),
+            memo: String::new(),
+            attach_id: 0,
+            created_by: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        invoices::insert(&db, &inv, "张三").unwrap();
+
+        let o = overview(&db, p).unwrap();
+        assert_eq!(o.vouchers, 1, "凭证总数=1");
+        assert_eq!(o.entries, 2, "分录总数=2");
+        assert_eq!(o.accounts, fincore::chart::default_accounts().len() as i64, "科目数=内置科目数");
+        assert_eq!(o.unposted, 0);
+        assert_eq!(o.posted, 1);
+        assert_eq!(o.totals.total_asset, Money::parse("1000").unwrap());
+        assert_eq!(o.totals.revenue, Money::parse("1000").unwrap());
+        assert_eq!(o.invoice_in, (Money::parse("1130").unwrap(), 1));
+        assert_eq!(o.invoice_out, (Money::ZERO, 0));
+        assert_eq!(o.recent.len(), 1);
+        assert_eq!(o.recent[0].debit_total(), Money::parse("1000").unwrap());
     }
 }
 

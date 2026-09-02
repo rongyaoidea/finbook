@@ -41,6 +41,24 @@ pub fn list(db: &Db) -> DbResult<Vec<Account>> {
     Ok(rows)
 }
 
+/// 补齐内置科目表：把当前版本默认科目表中账套里还没有的科目补进来。
+///
+/// 旧账套建账时灌入的是当时的科目表（早期版本仅 119 个，新版已扩到 199 个），
+/// 本函数只做"缺哪个补哪个"，不改动任何已有科目，返回补入数量。
+pub fn fill_missing_defaults(db: &Db) -> DbResult<usize> {
+    let existing: std::collections::HashSet<String> =
+        list(db)?.into_iter().map(|a| a.code).collect();
+    let mut n = 0usize;
+    for a in fincore::chart::default_accounts() {
+        if existing.contains(&a.code) {
+            continue;
+        }
+        insert(db, &a)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 pub fn get(db: &Db, code: &str) -> DbResult<Option<Account>> {
     db.conn()
         .query_row(
@@ -248,5 +266,34 @@ mod tests {
         let db = mem();
         assert!(!search(&db, "现金", 20).unwrap().is_empty());
         assert!(search(&db, "不存在的科目xyz", 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fill_missing_defaults_restores_old_chart() {
+        let db = mem();
+        let full = fincore::chart::default_accounts().len();
+        assert_eq!(list(&db).unwrap().len(), full, "新账套应包含完整默认科目表");
+
+        // 模拟旧版账套：只保留 1001/1002 两个一级科目，其余全部删掉
+        let keep: std::collections::HashSet<String> = ["1001", "1002"].iter().map(|s| s.to_string()).collect();
+        let codes: Vec<String> = list(&db)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.code)
+            .filter(|c| !keep.contains(c))
+            .collect();
+        for c in codes {
+            delete(&db, &c).unwrap();
+        }
+        let before = list(&db).unwrap().len();
+        assert_eq!(before, 2, "模拟旧账套仅剩 2 个科目");
+
+        // 一键补齐：补入全部缺失的内置科目，且不重复
+        let inserted = fill_missing_defaults(&db).unwrap();
+        assert_eq!(inserted, full - 2, "应补入缺失的科目");
+        let after = list(&db).unwrap().len();
+        assert_eq!(after, full);
+        // 幂等：再次补齐不再新增
+        assert_eq!(fill_missing_defaults(&db).unwrap(), 0);
     }
 }

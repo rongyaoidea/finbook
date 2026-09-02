@@ -54,10 +54,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 账套参数 / 仪表盘 / 期间
         .route("/api/options", get(get_options).put(put_options))
         .route("/api/dashboard", get(get_dashboard))
+        .route("/api/overview", get(get_overview))
         .route("/api/periods", get(get_periods))
         .route("/api/period", post(post_period))
         // 科目 / 凭证
         .route("/api/accounts", get(list_accounts))
+        .route("/api/accounts/fill-defaults", post(fill_default_accounts))
         .route("/api/vouchers/next-no", get(next_voucher_no))
         .route("/api/vouchers", get(list_vouchers).post(save_voucher))
         .route("/api/vouchers/:id", get(get_voucher))
@@ -487,6 +489,45 @@ async fn get_dashboard(
     }))
 }
 
+/// 管理员「账目总览」：只读视角的账目全貌（仅系统管理员可访问）
+async fn get_overview(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("该入口仅限系统管理员使用"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let o = findb::reports::overview(&db, period)?;
+    let recent: Vec<VoucherListItem> = o.recent.iter().map(to_item).collect();
+    Ok(Json(json!({
+        "company": o.company,
+        "period": period_to_str(o.period),
+        "closed_upto": o.closed_upto.map(period_to_str),
+        "vouchers": o.vouchers,
+        "entries": o.entries,
+        "accounts": o.accounts,
+        "unposted": o.unposted,
+        "posted": o.posted,
+        "totals": {
+            "total_asset": o.totals.total_asset.fmt_money(),
+            "total_liab": o.totals.total_liab.fmt_money(),
+            "equity": o.totals.equity.fmt_money(),
+            "revenue": o.totals.revenue.fmt_money(),
+            "cost": o.totals.cost.fmt_money(),
+            "net_profit": o.totals.net_profit.fmt_money(),
+        },
+        "invoice_in": {"amount_tax": o.invoice_in.0.fmt_money(), "count": o.invoice_in.1},
+        "invoice_out": {"amount_tax": o.invoice_out.0.fmt_money(), "count": o.invoice_out.1},
+        "recent": recent,
+    })))
+}
+
 async fn get_periods(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -539,6 +580,31 @@ async fn list_accounts(
 ) -> Result<Json<Vec<fincore::Account>>, AppError> {
     let db = state.db_for(&user.book_key)?;
     Ok(Json(accounts::list(&db)?))
+}
+
+/// 补齐内置科目表（旧账套补入新版本新增的科目，仅管理员）
+async fn fill_default_accounts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("该操作仅限系统管理员"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let before = accounts::list(&db)?.len();
+    let inserted = accounts::fill_missing_defaults(&db)?;
+    if inserted > 0 {
+        db.log(
+            user.username(),
+            "科目",
+            "补齐科目表",
+            &format!("补入 {inserted} 个内置科目（{before} → {}）", before + inserted),
+        )?;
+    }
+    Ok(Json(json!({
+        "inserted": inserted,
+        "total": before + inserted,
+    })))
 }
 
 async fn next_voucher_no(

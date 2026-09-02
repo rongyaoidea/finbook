@@ -24,6 +24,7 @@ pub mod ledger;
 pub mod login;
 pub mod logs;
 pub mod options;
+pub mod overview;
 pub mod payroll;
 pub mod period_end;
 pub mod reports;
@@ -40,6 +41,7 @@ use crate::state::{AppCtx, DataKind, NavItem};
 #[derive(Default)]
 pub struct Views {
     pub dashboard: dashboard::Dashboard,
+    pub overview: overview::OverviewView,
     pub voucher_edit: voucher_edit::VoucherEdit,
     pub voucher_list: voucher_list::VoucherList,
     pub account: account::AccountView,
@@ -90,6 +92,7 @@ impl Views {
     /// 切换期间 / 账套数据变动后，让所有界面下次渲染时重新取数
     pub fn invalidate_all(&mut self) {
         self.dashboard.invalidate();
+        self.overview.invalidate();
         self.voucher_edit.invalidate();
         self.voucher_list.invalidate();
         self.account.invalidate();
@@ -122,6 +125,7 @@ impl Views {
     /// 某模块数据变动后，让相关界面刷新
     pub fn data_changed(&mut self, what: DataKind) {
         self.dashboard.invalidate();
+        self.overview.invalidate();
         match what {
             DataKind::Voucher => {
                 self.voucher_list.invalidate();
@@ -183,6 +187,7 @@ impl Views {
         if self.last != Some(nav) {
             match nav {
                 NavItem::Dashboard => self.dashboard.invalidate(),
+                NavItem::Overview => self.overview.enter(ctx),
                 NavItem::VoucherNew => self.voucher_edit.invalidate(),
                 NavItem::VoucherList => self.voucher_list.enter(ctx),
                 NavItem::Template => self.template.enter(ctx),
@@ -226,6 +231,7 @@ impl Views {
 
         match nav {
             NavItem::Dashboard => self.dashboard.show(ctx, ui),
+            NavItem::Overview => self.overview.show(ctx, ui),
             NavItem::VoucherNew => self.voucher_edit.show(ctx, ui),
             NavItem::Template => self.template.show(ctx, ui),
             NavItem::VoucherList => match self.voucher_list.show(ctx, ui) {

@@ -14,6 +14,8 @@ pub struct LoginView {
     pub username: String,
     pub password: String,
     pub users: Vec<String>,
+    /// 当前账套尚无任何账号（首次登录输入的账号将成为系统管理员）
+    pub first_run: bool,
 
     /// 正在新建账套
     pub creating: bool,
@@ -34,6 +36,7 @@ impl Default for LoginView {
             username: String::new(),
             password: String::new(),
             users: Vec::new(),
+            first_run: false,
             creating: false,
             new_path: String::new(),
             new_company: String::new(),
@@ -150,7 +153,7 @@ impl LoginView {
                 ui.label(
                     RichText::new(
                         "一个账套就是一个 .fbk 文件，备份只需复制该文件。\n\
-                         默认管理员：admin / admin123，登录后请立即修改密码。",
+                         首次使用：账套尚无账号时，登录页输入的账号与密码将被创建为系统管理员。",
                     )
                     .weak(),
                 );
@@ -234,7 +237,7 @@ impl LoginView {
     // 登录
     // --------------------------------------------------------------
     fn show_login(&mut self, ui: &mut Ui, st: &mut AppState) {
-        // 切换账套后重新拉用户列表
+        // 切换账套后重新拉用户列表，并判断是否为「首次使用」（账套尚无任何账号）
         if self.loaded_book.as_ref() != st.book_path.as_ref() {
             self.users = findb::users::list(st.db.as_ref().unwrap())
                 .unwrap_or_default()
@@ -243,7 +246,8 @@ impl LoginView {
                 .map(|u| u.username)
                 .collect();
             self.loaded_book = st.book_path.clone();
-            if self.username.is_empty() {
+            self.first_run = findb::users::count(st.db.as_ref().unwrap()).unwrap_or(1) == 0;
+            if self.username.is_empty() || self.first_run {
                 self.username = self.users.first().cloned().unwrap_or_default();
             }
         }
@@ -269,6 +273,13 @@ impl LoginView {
                 .strong()
                 .size(18.0));
                 ui.label(RichText::new(path).weak().size(12.0));
+                if self.first_run {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        palette::WARN,
+                        "首次使用：账套尚无任何账号，您输入的账号与密码将被创建为系统管理员。",
+                    );
+                }
                 ui.add_space(14.0);
 
                 if !self.err.is_empty() {
@@ -374,10 +385,11 @@ impl LoginView {
             enable_qty: false,
             enable_foreign: false,
             require_cashier: false,
-            require_audit: true,
+            require_audit: false, // 审核环节已移除（未记账 → 记账两态）
             voucher_words: fincore::chart::default_voucher_words(),
         };
-        match Db::create(&path, &opts) {
+        // 不内置管理员：首次登录输入的账号与密码即为系统管理员
+        match Db::create_no_admin(&path, &opts) {
             Ok(db) => {
                 if let Err(e) = st.attach(Arc::new(db), Some(path.clone())) {
                     self.err = e;
@@ -396,6 +408,20 @@ impl LoginView {
             self.err = "尚未选择账套".to_string();
             return;
         };
+        // 首次使用：账套尚无任何用户时，用本次输入的账号与密码创建系统管理员
+        // （与 Web 端「首次登录即管理员」口径一致，不再内置固定账号）
+        if self.first_run && findb::users::count(&db).unwrap_or(1) == 0 {
+            let username = self.username.trim().to_string();
+            if username.is_empty() || self.password.len() < 6 {
+                self.err = "首次使用请设置管理员账号：用户名不能为空，密码至少 6 位".to_string();
+                return;
+            }
+            if let Err(e) = findb::users::create_admin(&db, &username, &self.password, &username) {
+                self.err = e.to_string();
+                return;
+            }
+            self.first_run = false;
+        }
         // 完整登录流程：失败计数 → 锁定 → 设备绑定 → 口令策略 → 强制改密
         let policy = findb::security::password_policy(&db);
         let device = crate::platform::device_identity();

@@ -242,7 +242,9 @@ async function showSetupWizard() {
 // ===========================================================================
 
 // 导航项配置（新增页面只改这里 + VIEWS 注册表，无需改 switch）
+// admin: true 表示仅系统管理员可见（只读视角入口）
 const NAV_ITEMS = [
+  { id: "overview", label: "账目总览", admin: true },
   { id: "dashboard", label: "仪表盘", perm: null },
   { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
   { id: "invoices", label: "发票管理", perm: "report" },
@@ -281,6 +283,7 @@ const NAV_ITEMS = [
 
 // 视图注册表：id → 渲染函数（函数声明已提升，可在顶层引用）
 const VIEWS = {
+  "overview": viewOverview,
   "dashboard": viewDashboard,
   "vouchers": viewVouchers,
   "invoices": viewInvoices,
@@ -336,7 +339,11 @@ function renderShell() {
         <button class="btn ghost sm" id="logout">退出登录</button>
       </div>
       <div class="sidebar">
-        ${nav.map((n) => `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`).join("")}
+        ${session.user.is_admin ? `<div class="group">管理员 · 只读总览</div>` : ""}
+        ${nav.map((n) => {
+          if (n.admin && !session.user.is_admin) return "";
+          return `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`;
+        }).join("")}
       </div>
       <div class="main" id="main"></div>
     </div>`;
@@ -402,6 +409,68 @@ async function viewDashboard(main) {
       <div class="card"><div class="k">分录数</div><div class="v">${esc(d.entries)}</div></div>
       <div class="card"><div class="k">科目数</div><div class="v">${esc(d.accounts)}</div></div>
     </div>`;
+}
+
+// ===========================================================================
+// 管理员 · 账目总览（只读视角，仅系统管理员可见）
+// ===========================================================================
+async function viewOverview(main) {
+  main.innerHTML = `<h2>账目总览</h2><div class="muted">加载中…</div>`;
+  let d;
+  try { d = await api(`/overview?period=${encodeURIComponent(state.current || "")}`); } catch (e) {
+    main.innerHTML = `<h2>账目总览</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`;
+    return;
+  }
+  const t = d.totals || {};
+  const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
+  const card = (k, v, style) => `<div class="card"><div class="k">${k}</div><div class="v" ${style ? `style="${style}"` : ""}>${v}</div></div>`;
+  main.innerHTML = `
+    <h2>账目总览</h2>
+    <p class="muted" style="margin:0 0 12px">
+      ${esc(d.company || "")} · 期间 ${esc(d.period || "")} · 已结账至 ${esc(d.closed_upto || "未结账")}
+      —— 管理员只读视角：查看账目全貌，不做录入；录入请用「记账凭证」，明细见左侧各查询页。
+    </p>
+    <div class="cards">
+      ${card("资产总额", t.total_asset || "—", "font-size:18px")}
+      ${card("负债总额", t.total_liab || "—", "font-size:18px")}
+      ${card("所有者权益", t.equity || "—", "font-size:18px")}
+      ${card("净利润（年初至今）", t.net_profit || "—", "font-size:18px")}
+    </div>
+    <div class="cards" style="margin-top:14px">
+      ${card("营业收入（年初至今）", t.revenue || "—")}
+      ${card("营业成本（年初至今）", t.cost || "—")}
+      ${card("进项发票价税合计", `${(d.invoice_in && d.invoice_in.amount_tax) || "0.00"}（${(d.invoice_in && d.invoice_in.count) || 0} 张）`)}
+      ${card("销项发票价税合计", `${(d.invoice_out && d.invoice_out.amount_tax) || "0.00"}（${(d.invoice_out && d.invoice_out.count) || 0} 张）`)}
+    </div>
+    <div class="cards" style="margin-top:14px">
+      ${card("凭证总数（全账套）", esc(d.vouchers))}
+      ${card("当期未记账", esc(d.unposted))}
+      ${card("当期已记账", esc(d.posted))}
+      ${card("科目数（全账套）", esc(d.accounts))}
+    </div>
+    <div class="toolbar" style="margin-top:14px">
+      <span class="muted">科目表维护：</span>
+      <button class="btn ghost sm" id="ov-fill">补齐新版科目表</button>
+      <span class="muted">内置模板共 199 个科目；旧账套一键补入缺少的科目，不影响已有科目。</span>
+    </div>
+    <div class="panel" style="margin-top:14px;padding:0;overflow:hidden">
+      <table class="grid"><thead><tr>
+        <th>期间</th><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>状态</th><th>制单</th>
+      </tr></thead><tbody>
+        ${(d.recent || []).length ? d.recent.map((v) => {
+          const s = stMap[v.status] || [v.status_label, ""];
+          return `<tr><td>${esc(v.period)}</td><td>${esc(v.date)}</td><td>${esc(v.voucher_no)}</td><td>${esc(v.summary)}</td><td class="num">${esc(v.debit_total)}</td><td class="num">${esc(v.credit_total)}</td><td><span class="tag ${s[1]}">${esc(s[0])}</span></td><td>${esc(v.prepared_by)}</td></tr>`;
+        }).join("") : `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">暂无凭证</td></tr>`}
+      </tbody></table>
+    </div>`;
+  const fillBtn = $("#ov-fill", main);
+  if (fillBtn) fillBtn.addEventListener("click", async () => {
+    try {
+      const r = await api("/accounts/fill-defaults", { method: "POST" });
+      toast(r.inserted > 0 ? `已补入 ${r.inserted} 个科目，当前共 ${r.total} 个` : `科目表已完整（共 ${r.total} 个）`, "ok");
+      viewOverview(main);
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 // ===========================================================================

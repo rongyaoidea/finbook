@@ -12,6 +12,8 @@ use fincore::{AuxKind, Chart, Perm, Period, User};
 pub enum NavItem {
     /// 首页工作台
     Dashboard,
+    /// 管理员 · 账目总览（只读视角，仅系统管理员可见）
+    Overview,
     /// 凭证填制（新增）
     VoucherNew,
     /// 凭证查询
@@ -92,6 +94,7 @@ impl NavItem {
     pub fn label(&self) -> String {
         match self {
             NavItem::Dashboard => "首页".to_string(),
+            NavItem::Overview => "账目总览".to_string(),
             NavItem::VoucherNew => "填制凭证".to_string(),
             NavItem::VoucherList => "凭证查询".to_string(),
             NavItem::Account => "会计科目".to_string(),
@@ -136,6 +139,7 @@ impl NavItem {
     pub fn group(&self) -> &'static str {
         match self {
             NavItem::Dashboard => "开始",
+            NavItem::Overview => "管理员 · 只读",
             NavItem::Template => "凭证", // TEMP
             NavItem::VoucherNew | NavItem::VoucherList => "凭证",
             NavItem::Account | NavItem::BeginBalance | NavItem::Aux(_) => "基础资料",
@@ -190,10 +194,16 @@ impl NavItem {
         }
     }
 
+    /// 是否为管理员专属入口（只读视角），非管理员不可见
+    pub fn admin_only(&self) -> bool {
+        matches!(self, NavItem::Overview)
+    }
+
     /// 侧边栏顺序（含分组）
     pub fn menu() -> &'static [NavItem] {
         &[
             NavItem::Dashboard,
+            NavItem::Overview,
             NavItem::VoucherNew,
             NavItem::VoucherList,
             NavItem::Template,

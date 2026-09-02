@@ -573,6 +573,10 @@ fn side_bar(st: &mut AppState, ui: &mut Ui) {
                 ui.add_space(6.0);
                 let mut last_group = String::new();
                 for item in NavItem::menu() {
+                    // 管理员专属入口：非管理员连分组标题一起隐藏
+                    if item.admin_only() && !st.user.as_ref().map(|u| u.is_admin()).unwrap_or(false) {
+                        continue;
+                    }
                     let g = item.group();
                     if g != last_group {
                         ui.add_space(8.0);

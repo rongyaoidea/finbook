@@ -19,11 +19,15 @@ fn main() {
         enable_qty: false,
         enable_foreign: false,
         require_cashier: false,
-        require_audit: true,
+        require_audit: false, // 审核环节已移除（未记账 → 记账两态）
         voucher_words: fincore::chart::default_voucher_words(),
     };
-    let db = Db::create(&path, &opts).expect("create");
-    let _ = db.log("admin", "系统", "建账", "由 CLI 创建");
+    // 不内置固定管理员：首次登录输入的账号与密码即为系统管理员
+    let db = Db::create_no_admin(&path, &opts).expect("create");
+    let _ = db.log("-", "系统", "建账", "由 CLI 创建");
     drop(db);
-    println!("已创建 {}", path.display());
+    println!(
+        "已创建 {}（无内置账号：首次登录输入的账号将成为系统管理员）",
+        path.display()
+    );
 }

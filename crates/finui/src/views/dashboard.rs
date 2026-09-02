@@ -56,7 +56,16 @@ impl Dashboard {
 
     fn reload(&mut self, ctx: &mut AppCtx<'_>) {
         let p = ctx.period();
-        let key = format!("{}|{}", ctx.db().path().display(), p.ymm());
+        // key 含数据量：新增科目 / 凭证后即使错过失效通知也能自动刷新
+        let (v, e, a) = ctx.db().stats().unwrap_or((0, 0, 0));
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            ctx.db().path().display(),
+            p.ymm(),
+            v,
+            e,
+            a
+        );
         if self.key == key {
             return;
         }
@@ -68,9 +77,8 @@ impl Dashboard {
         self.audited = audited;
         self.posted = posted;
         self.void = void;
-        let (_, entries, accounts) = db.stats().unwrap_or((0, 0, 0));
-        self.entries = entries;
-        self.accounts = accounts;
+        self.entries = e;
+        self.accounts = a;
 
         let chart = ctx.chart();
         let tb = match findb::balances::BalanceSnapshot::load(db, &BalanceQuery::period(p)) {
@@ -163,7 +171,7 @@ impl Dashboard {
                     &mut cols[1],
                     "待处理",
                     &format!("{}", self.draft + self.audited),
-                    &format!("草稿 {} · 待审核 {}", self.draft, self.audited),
+                    "未记账凭证，核对后点「记账」",
                     if self.draft + self.audited > 0 {
                         palette::WARN
                     } else {

@@ -18,6 +18,7 @@ pub enum Tab {
     Close,
     Unclose,
     Maintain,
+    Reconcile,
 }
 
 pub struct PeriodEndView {
@@ -30,6 +31,7 @@ pub struct PeriodEndView {
     pub profit_balance: Money,
     pub closed: Vec<Period>,
     pub closed_upto: Option<Period>,
+    pub reconcile: Vec<findb::reports::ReconcileItem>,
     pub dirty: bool,
     key: String,
 }
@@ -46,6 +48,7 @@ impl Default for PeriodEndView {
             profit_balance: Money::ZERO,
             closed: Vec::new(),
             closed_upto: None,
+            reconcile: Vec::new(),
             dirty: true,
             key: String::new(),
         }
@@ -81,6 +84,7 @@ impl PeriodEndView {
         self.closed = findb::periods::list_closed(ctx.db()).unwrap_or_default();
         self.issues =
             findb::periods::precheck(ctx.db(), p, self.require_carry).unwrap_or_default();
+        self.reconcile = findb::reports::period_reconcile(ctx.db(), p).unwrap_or_default();
 
         let snap = findb::balances::BalanceSnapshot::load(ctx.db(), &BalanceQuery::period(p));
         match snap {
@@ -118,6 +122,7 @@ impl PeriodEndView {
             ui.selectable_value(&mut self.tab, Tab::Carry, "结转损益");
             ui.selectable_value(&mut self.tab, Tab::Close, "期末结账");
             ui.selectable_value(&mut self.tab, Tab::Unclose, "反结账");
+            ui.selectable_value(&mut self.tab, Tab::Reconcile, "期末对账");
             ui.selectable_value(&mut self.tab, Tab::Maintain, "数据维护");
             ui.separator();
             ui.label("期间");
@@ -143,6 +148,47 @@ impl PeriodEndView {
             Tab::Close => self.show_close(ctx, ui, p),
             Tab::Unclose => self.show_unclose(ctx, ui, p),
             Tab::Maintain => self.show_maintain(ctx, ui, p),
+            Tab::Reconcile => self.show_reconcile(ui),
+        }
+    }
+
+    // ------------------------- 期末对账 -------------------------
+    fn show_reconcile(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new(
+                "期末对账：检查试算平衡、余额方向、银行未达账项与未生成凭证的业务单据。",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        let rows = self.reconcile.clone();
+        let cols = [
+            widgets::TCol::new("检查项", 220.0),
+            widgets::TCol::new("结果", 80.0).fixed(),
+            widgets::TCol::new("说明", 400.0),
+        ];
+        widgets::grid(ui, "reconcile", &cols, rows.len(), 24.0, |i, c, ui| {
+            let r = &rows[i];
+            match c {
+                0 => {
+                    ui.label(RichText::new(&r.name).strong());
+                }
+                1 => {
+                    if r.ok {
+                        ui.colored_label(crate::theme::palette::OK, "通过");
+                    } else {
+                        ui.colored_label(crate::theme::palette::CREDIT, "异常");
+                    }
+                }
+                2 => {
+                    ui.label(RichText::new(&r.detail).weak());
+                }
+                _ => {}
+            }
+        });
+        if rows.is_empty() {
+            widgets::empty_hint(ui, "暂无对账数据");
         }
     }
 

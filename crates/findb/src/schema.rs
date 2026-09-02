@@ -22,7 +22,7 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -876,6 +876,69 @@ CREATE TABLE IF NOT EXISTS stock_count_line (
     memo        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_scl ON stock_count_line(sc_id);
+
+-- ===========================================================================
+-- v14：库存深度（序列号 / 多单位换算 / 库存状态）
+-- ===========================================================================
+
+-- 存货序列号（一码一物，唯一）
+CREATE TABLE IF NOT EXISTS item_serial (
+    serial     TEXT PRIMARY KEY,
+    item       TEXT NOT NULL,
+    batch_no   TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'in', -- in=在库 / out=已出库 / scrapped=报废
+    in_date    TEXT NOT NULL DEFAULT '',
+    out_date   TEXT,
+    memo       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_serial_item ON item_serial(item, status);
+
+-- 存货多单位换算（1 主单位 = factor 辅助单位）
+CREATE TABLE IF NOT EXISTS item_unit (
+    item       TEXT PRIMARY KEY,
+    base_unit  TEXT NOT NULL DEFAULT '',   -- 主单位（如 个）
+    alt_unit   TEXT NOT NULL DEFAULT '',   -- 辅助单位（如 箱）
+    factor     TEXT NOT NULL DEFAULT '1'   -- 1 主单位 = factor 辅助单位
+);
+
+-- ===========================================================================
+-- v15：采购/销售深度（暂估 / 对账 / 配额 / 订单变更）
+-- ===========================================================================
+
+-- 采购暂估（入库先暂估、发票后冲回）
+CREATE TABLE IF NOT EXISTS po_estimate (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id       INTEGER NOT NULL,
+    period      INTEGER NOT NULL,
+    item        TEXT NOT NULL,
+    est_amount  TEXT NOT NULL DEFAULT '0', -- 暂估金额
+    settled     INTEGER NOT NULL DEFAULT 0 -- 是否已冲回
+);
+CREATE INDEX IF NOT EXISTS idx_pe_po ON po_estimate(po_id);
+
+-- 供应商配额（配额期间 × 供应商 × 物料）
+CREATE TABLE IF NOT EXISTS supplier_quota (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    period        INTEGER NOT NULL,
+    supplier_code TEXT NOT NULL,
+    item          TEXT NOT NULL,
+    quota_qty     TEXT NOT NULL DEFAULT '0',
+    used_qty      TEXT NOT NULL DEFAULT '0',
+    UNIQUE(period, supplier_code, item)
+);
+
+-- 订单变更历史（采购/销售订单共用的追溯日志）
+CREATE TABLE IF NOT EXISTS order_change_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_type  TEXT NOT NULL,             -- po / so
+    order_id    INTEGER NOT NULL,
+    field       TEXT NOT NULL DEFAULT '',
+    old_value   TEXT NOT NULL DEFAULT '',
+    new_value   TEXT NOT NULL DEFAULT '',
+    changed_by  TEXT NOT NULL DEFAULT '',
+    changed_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ocl ON order_change_log(order_type, order_id);
 
 "#;
 

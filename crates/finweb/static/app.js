@@ -219,6 +219,10 @@ const NAV_ITEMS = [
   { id: "multi-column", label: "多栏账", perm: "report" },
   { id: "summary-table", label: "摘要汇总表", perm: "report" },
   { id: "ratios", label: "财务指标", perm: "report" },
+  { id: "equity", label: "权益变动表", perm: "report" },
+  { id: "compare", label: "报表对比", perm: "report" },
+  { id: "daily", label: "科目日报表", perm: "report" },
+  { id: "reconcile", label: "期末对账", perm: "report" },
   { id: "mrp", label: "MRP 运算", perm: "account_edit" },
   { id: "routing", label: "工艺路线", perm: "account_edit" },
   { id: "approval", label: "审批中心", perm: "report" },
@@ -240,6 +244,10 @@ const VIEWS = {
   "multi-column": viewMultiColumn,
   "summary-table": viewSummaryTable,
   "ratios": viewRatios,
+  "equity": viewEquity,
+  "compare": viewCompare,
+  "daily": viewDaily,
+  "reconcile": viewReconcile,
   "mrp": viewMrp,
   "routing": viewRouting,
   "approval": viewApproval,
@@ -1292,6 +1300,97 @@ async function viewWorkReport(main) {
     } catch (e) { toast(e.message, "err"); }
   };
   $("#wr-load").addEventListener("click", loadOps);
+}
+
+// ===========================================================================
+// 权益变动表
+// ===========================================================================
+async function viewEquity(main) {
+  main.innerHTML = `<h2>所有者权益变动表</h2>
+    <div class="toolbar"><label>期间 <input id="eq-period" value="${esc(state.current)}" style="width:90px" /></label>
+    <button class="btn primary" id="eq-run">查询</button></div>
+    <div id="eq-result" class="muted">填写期间后点击查询</div>`;
+  $("#eq-run").addEventListener("click", async () => {
+    const p = $("#eq-period").value.trim();
+    try {
+      const r = await api(`/reports/equity?period=${encodeURIComponent(p)}`);
+      const s = r.statement;
+      const rows = [...s.lines, s.total];
+      $("#eq-result").innerHTML = `<table><thead><tr><th>项目</th><th>本年年初余额</th><th>本年增减变动</th><th>本年年末余额</th></tr></thead>
+        <tbody>${rows.map((l) => `<tr><td>${esc(l.name)}</td><td class="r">${fmt(l.begin)}</td><td class="r">${fmt(l.change)}</td><td class="r">${fmt(l.end)}</td></tr>`).join("")}</tbody></table>
+        <div class="muted">${s.ties ? "✔ 年初 + 增减 = 年末，勾稽通过" : "✖ 勾稽不符"}</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 报表对比
+// ===========================================================================
+async function viewCompare(main) {
+  main.innerHTML = `<h2>报表对比分析</h2>
+    <div class="toolbar">
+      <label>报表 <select id="cp-key"><option value="balance_sheet">资产负债表</option><option value="income_statement">利润表</option></select></label>
+      <label>当前期 <input id="cp-cur" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>对比期 <input id="cp-prev" style="width:90px" /></label>
+      <button class="btn primary" id="cp-run">对比</button></div>
+    <div id="cp-result" class="muted">填写期间后点击对比</div>`;
+  const p = $("#cp-cur").value.trim();
+  try { $("#cp-prev").value = prevPeriod(p); } catch (e) {}
+  $("#cp-run").addEventListener("click", async () => {
+    const key = $("#cp-key").value, cur = $("#cp-cur").value.trim(), prev = $("#cp-prev").value.trim();
+    try {
+      const r = await api(`/reports/compare?key=${encodeURIComponent(key)}&period=${encodeURIComponent(cur)}&prev=${encodeURIComponent(prev)}`);
+      const rows = r.rows || [];
+      $("#cp-result").innerHTML = `<table><thead><tr><th>项目</th><th>当前期</th><th>对比期</th><th>差额</th><th>变动率</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.name)}</td><td class="r">${fmt(x.current)}</td><td class="r">${fmt(x.previous)}</td><td class="r">${fmt(x.diff)}</td><td class="r">${x.rate == null ? "—" : x.rate + "%"}</td></tr>`).join("")}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+function prevPeriod(p) {
+  const [y, m] = String(p).split("-").map(Number);
+  const pm = m - 1 < 1 ? 12 : m - 1, py = m - 1 < 1 ? y - 1 : y;
+  return `${py}-${String(pm).padStart(2, "0")}`;
+}
+
+// ===========================================================================
+// 科目日报表
+// ===========================================================================
+async function viewDaily(main) {
+  main.innerHTML = `<h2>科目日报表</h2>
+    <div class="toolbar">
+      <label>科目 <input id="dl-code" placeholder="1001" style="width:90px" /></label>
+      <label>期间 <input id="dl-from" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="dl-run">查询</button></div>
+    <div id="dl-result" class="muted">填写科目与期间后点击查询</div>`;
+  $("#dl-run").addEventListener("click", async () => {
+    const code = $("#dl-code").value.trim();
+    if (!code) { toast("请输入科目编码", "err"); return; }
+    const from = $("#dl-from").value.trim();
+    try {
+      const r = await api(`/reports/daily?code=${encodeURIComponent(code)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(from)}`);
+      const rows = r.rows || [];
+      $("#dl-result").innerHTML = `<table><thead><tr><th>日期</th><th>借方</th><th>贷方</th><th>日末余额</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td class="r">${fmt(x.debit)}</td><td class="r">${fmt(x.credit)}</td><td class="r">${fmt(x.balance)}</td></tr>`).join("")}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 期末对账
+// ===========================================================================
+async function viewReconcile(main) {
+  main.innerHTML = `<h2>期末对账</h2>
+    <div class="toolbar"><label>期间 <input id="rc-period" value="${esc(state.current)}" style="width:90px" /></label>
+    <button class="btn primary" id="rc-run">对账</button></div>
+    <div id="rc-result" class="muted">填写期间后点击对账</div>`;
+  $("#rc-run").addEventListener("click", async () => {
+    const p = $("#rc-period").value.trim();
+    try {
+      const r = await api(`/reports/reconcile?period=${encodeURIComponent(p)}`);
+      const items = r.items || [];
+      $("#rc-result").innerHTML = items.map((i) => `<div class="card"><div class="row"><b>${esc(i.name)}</b><span class="tag ${i.ok ? "ok" : "err"}">${i.ok ? "通过" : "异常"}</span></div><div class="muted">${esc(i.detail)}</div></div>`).join("") || `<div class="muted">暂无对账数据</div>`;
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 // 启动

@@ -246,6 +246,51 @@ pub fn budget_vs_actual(
     Ok(out)
 }
 
+/// 预算预警：执行率超过阈值（默认 100% = 超支）的科目
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BudgetAlert {
+    pub account_code: String,
+    pub account_name: String,
+    pub dept: String,
+    pub budget: Money,
+    pub actual: Money,
+    /// 执行率（%）
+    pub rate: Money,
+    /// 超支金额（费用类 actual-budget）
+    pub over_amount: Money,
+}
+
+/// 预算预警：返回执行率 >= threshold（百分比，如 90）的科目，按超支额降序。
+pub fn budget_alerts(
+    db: &Db,
+    period: Period,
+    from: Period,
+    threshold_pct: i64,
+) -> DbResult<Vec<BudgetAlert>> {
+    let rows = budget_vs_actual(db, period, from)?;
+    let mut out = Vec::new();
+    for r in rows {
+        // 只有预算的科目才谈得上预警
+        if r.budget.is_zero() {
+            continue;
+        }
+        let pct = ((r.actual.abs() * Money::from_i64(100)) / r.budget.abs().inner()).round2();
+        if pct.to_f64() >= threshold_pct as f64 {
+            out.push(BudgetAlert {
+                account_code: r.account_code,
+                account_name: r.account_name,
+                dept: r.dept,
+                budget: r.budget,
+                actual: r.actual,
+                rate: pct,
+                over_amount: if r.diff.is_positive() { r.diff } else { Money::ZERO },
+            });
+        }
+    }
+    out.sort_by(|a, b| b.over_amount.cmp(&a.over_amount));
+    Ok(out)
+}
+
 // ===========================================================================
 // 多维损益
 // ===========================================================================

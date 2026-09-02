@@ -2,6 +2,7 @@
 
 use egui::{RichText, Ui};
 use findb::balances::{BalanceQuery, LedgerQuery};
+use findb::reports::DailyRow;
 use fincore::{signed_to_dir_amount, GeneralLedgerRow, JournalRow, LedgerRow, Money, Period};
 
 use crate::state::AppCtx;
@@ -12,6 +13,7 @@ pub enum Tab {
     Detail,
     General,
     Journal,
+    Daily,
 }
 
 pub struct LedgerView {
@@ -27,6 +29,7 @@ pub struct LedgerView {
     pub detail: Vec<LedgerRow>,
     pub general: Vec<GeneralLedgerRow>,
     pub journal: Vec<JournalRow>,
+    pub daily: Vec<DailyRow>,
     pub begin: Money,
     /// 数据范围拦截：所选科目不在可见范围内
     pub scope_blocked: bool,
@@ -48,6 +51,7 @@ impl Default for LedgerView {
             detail: Vec::new(),
             general: Vec::new(),
             journal: Vec::new(),
+            daily: Vec::new(),
             begin: Money::ZERO,
             scope_blocked: false,
             dirty: true,
@@ -95,6 +99,7 @@ impl LedgerView {
             self.detail.clear();
             self.general.clear();
             self.journal.clear();
+            self.daily.clear();
             self.begin = Money::ZERO;
             self.scope_blocked = true;
             return;
@@ -118,6 +123,9 @@ impl LedgerView {
             }
             Tab::Journal => {
                 self.journal = findb::balances::journal(ctx.db(), ctx.chart(), &q).unwrap_or_default();
+            }
+            Tab::Daily => {
+                self.daily = findb::reports::account_daily_report(ctx.db(), &code, from, to).unwrap_or_default();
             }
         }
         // 期初余额
@@ -154,6 +162,7 @@ impl LedgerView {
             ui.selectable_value(&mut self.tab, Tab::Detail, "明细账");
             ui.selectable_value(&mut self.tab, Tab::General, "总账");
             ui.selectable_value(&mut self.tab, Tab::Journal, "日记账");
+            ui.selectable_value(&mut self.tab, Tab::Daily, "科目日报表");
             ui.separator();
             ui.label("科目");
             ui.add_sized([100.0, 22.0], egui::TextEdit::singleline(&mut self.code));
@@ -202,6 +211,7 @@ impl LedgerView {
                         Tab::Detail => self.detail.len(),
                         Tab::General => self.general.len(),
                         Tab::Journal => self.journal.len(),
+                        Tab::Daily => self.daily.len(),
                     },
                 );
             });
@@ -211,6 +221,7 @@ impl LedgerView {
             Tab::Detail => self.show_detail(ui),
             Tab::General => self.show_general(ui),
             Tab::Journal => self.show_journal(ui),
+            Tab::Daily => self.show_daily(ui),
         }
 
         if let Some(code) = self.picker.show(&ectx, ctx.chart()) {
@@ -357,6 +368,48 @@ impl LedgerView {
         });
     }
 
+    fn show_daily(&mut self, ui: &mut Ui) {
+        let page = self.paging.slice(&self.daily).to_vec();
+        let cols = [
+            widgets::TCol::new("日期", 120.0).fixed(),
+            widgets::TCol::new("借方", 140.0).right(),
+            widgets::TCol::new("贷方", 140.0).right(),
+            widgets::TCol::new("日末余额", 150.0).right(),
+        ];
+        widgets::grid(ui, "ledger_daily", &cols, page.len(), 24.0, |i, c, ui| {
+            let r = &page[i];
+            match c {
+                0 => {
+                    ui.label(&r.date);
+                }
+                1 => widgets::amount_label(ui, r.debit),
+                2 => widgets::amount_label(ui, r.credit),
+                3 => widgets::amount_label(ui, r.balance),
+                _ => {}
+            }
+        });
+        if page.is_empty() {
+            return;
+        }
+        let mut td = Money::ZERO;
+        let mut tc = Money::ZERO;
+        for r in &self.daily {
+            td += r.debit;
+            tc += r.credit;
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "期间合计：借 {} / 贷 {}",
+                    td.fmt_money(),
+                    tc.fmt_money()
+                ))
+                .strong(),
+            );
+        });
+    }
+
     fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
         let name = ctx
             .chart()
@@ -367,6 +420,7 @@ impl LedgerView {
             Tab::Detail => "明细账",
             Tab::General => "总账",
             Tab::Journal => "日记账",
+            Tab::Daily => "科目日报表",
         };
         let title = format!("{}_{}", self.code, name);
         let print_title = format!("{} {}_{}", tab_name, self.code, name);
@@ -444,6 +498,21 @@ impl LedgerView {
                         r.debit.fmt_plain(),
                         r.credit.fmt_plain(),
                         r.dir.label().to_string(),
+                        r.balance.fmt_plain(),
+                    ]);
+                }
+                sh
+            }
+            Tab::Daily => {
+                let mut sh = crate::views::export::Sheet::new(
+                    "科目日报表",
+                    vec!["日期".into(), "借方".into(), "贷方".into(), "日末余额".into()],
+                );
+                for r in &self.daily {
+                    sh.push(vec![
+                        r.date.clone(),
+                        r.debit.fmt_plain(),
+                        r.credit.fmt_plain(),
                         r.balance.fmt_plain(),
                     ]);
                 }

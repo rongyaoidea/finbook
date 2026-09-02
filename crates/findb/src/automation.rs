@@ -749,7 +749,6 @@ mod tests {
             });
         }
         let id = crate::vouchers::save(db, &mut v).unwrap();
-        crate::vouchers::audit(db, id, "auditor").unwrap();
         crate::vouchers::post(db, id, "poster").unwrap();
         id
     }
@@ -797,7 +796,6 @@ mod tests {
             ..Entry::new(2, "600101", "出口销售")
         });
         let id = crate::vouchers::save(&db, &mut v).unwrap();
-        crate::vouchers::audit(&db, id, "a").unwrap();
         crate::vouchers::post(&db, id, "p").unwrap();
 
         // 期末汇率 7.2 → 本位币应为 7200，调增 200

@@ -64,8 +64,9 @@ impl VoucherQuery {
     pub fn with_data_scope(mut self, u: &User) -> Self {
         let scope = &u.data_scope;
         if scope.own_voucher_only {
-            // 凭证的 prepared_by 存的是显示名（填制时写 display_name）
-            self.prepared_by = Some(u.display_name.clone());
+            // 凭证的 prepared_by 存的是登录账号（username），保存侧写 username，
+            // 这里必须按 username 过滤，否则 display_name ≠ username 的用户一张都看不到
+            self.prepared_by = Some(u.username.clone());
         }
         self
     }
@@ -158,6 +159,40 @@ pub fn entries_of(db: &Db, voucher_id: i64) -> DbResult<Vec<Entry>> {
         .query_map(rusqlite::params![voucher_id], map_entry)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 为列表结果批量补充分录（列表界面展示摘要与借贷合计依赖分录）。
+/// 一次 IN 查询按批取回，避免逐张 N+1。
+pub fn fill_entries(db: &Db, vouchers: &mut [Voucher]) -> DbResult<()> {
+    const CHUNK: usize = 500; // SQLite 绑定参数上限以下，分批防超限
+    for chunk in vouchers.chunks_mut(CHUNK) {
+        let ids: Vec<i64> = chunk.iter().map(|v| v.id).collect();
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT id,voucher_id,line,summary,account_code,aux_json,debit,credit,qty,price,\
+                    currency,amount_for,rate,settle_type,settle_no,biz_date,cf_item
+             FROM voucher_entry WHERE voucher_id IN ({}) ORDER BY voucher_id, line",
+            placeholders.join(",")
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |r| {
+                let vid: i64 = r.get(1)?;
+                Ok((vid, map_entry(r)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut by_id: std::collections::HashMap<i64, Vec<Entry>> =
+            std::collections::HashMap::new();
+        for (vid, e) in rows {
+            by_id.entry(vid).or_default().push(e);
+        }
+        for v in chunk.iter_mut() {
+            v.entries = by_id.remove(&v.id).unwrap_or_default();
+        }
+    }
+    Ok(())
 }
 
 /// 条件查询（只含表头，列表界面不需要分录）
@@ -433,43 +468,7 @@ fn set_status(db: &Db, id: i64, s: VoucherStatus) -> DbResult<()> {
     Ok(())
 }
 
-/// 审核（并写审核人）
-pub fn audit(db: &Db, id: i64, who: &str) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let mut iss = fincore::engine::validate_audit(&v, who);
-    if !v.balanced() {
-        iss.push("凭证借贷不平衡，不能审核".to_string());
-    }
-    iss.into_result()?;
-    db.conn().execute(
-        "UPDATE voucher SET status='audited', audited_by=?2, updated_at=?3 WHERE id=?1",
-        rusqlite::params![
-            id,
-            who,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-        ],
-    )?;
-    db.log(who, "凭证", "审核", &v.voucher_no())?;
-    Ok(())
-}
-
-/// 反审核
-pub fn unaudit(db: &Db, id: i64) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let mut iss = Issues::new();
-    if v.status != VoucherStatus::Audited {
-        iss.push(format!("凭证当前状态为「{}」，不能反审核", v.status.label()));
-    }
-    iss.into_result()?;
-    db.conn().execute(
-        "UPDATE voucher SET status='draft', audited_by=NULL, updated_at=?2 WHERE id=?1",
-        rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
-    )?;
-    db.log(v.audited_by.as_deref().unwrap_or_default(), "凭证", "反审核", &v.voucher_no())?;
-    Ok(())
-}
-
-/// 记账
+/// 记账（未记账 → 已记账；无审核环节，核对无误后直接记账）
 pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
     let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
     let opts = db.options();
@@ -495,13 +494,13 @@ pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// 反记账
+/// 反记账（已记账 → 未记账）
 pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
     let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
     let iss = fincore::engine::validate_unpost(&v, crate::periods::closed_upto(db)?);
     iss.into_result()?;
     db.conn().execute(
-        "UPDATE voucher SET status='audited', posted_by=NULL, updated_at=?2 WHERE id=?1",
+        "UPDATE voucher SET status='draft', posted_by=NULL, updated_at=?2 WHERE id=?1",
         rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
     )?;
     db.log(v.posted_by.as_deref().unwrap_or_default(), "凭证", "反记账", &v.voucher_no())?;
@@ -556,51 +555,7 @@ pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// 批量审核
-pub fn audit_many(db: &Db, ids: &[i64], who: &str) -> DbResult<(usize, Vec<String>)> {
-    let mut ok = 0usize;
-    let mut errs = Vec::new();
-    let mut labels = Vec::new();
-    let tx = db.conn().unchecked_transaction()?;
-    for id in ids {
-        match audit_tx(&tx, *id, who) {
-            Ok(label) => {
-                ok += 1;
-                labels.push(label);
-            }
-            Err(e) => errs.push(format!("#{id}：{e}")),
-        }
-    }
-    tx.commit()?;
-    if !labels.is_empty() {
-        db.log(who, "凭证", "批量审核", &labels.join("、"))?;
-    }
-    Ok((ok, errs))
-}
-
-/// 返回该凭证的凭证号，供调用方写操作日志
-fn audit_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbError> {
-    let v: Voucher = tx
-        .query_row(
-            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
-            rusqlite::params![id],
-            map_voucher,
-        )
-        .optional()?
-        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let mut iss = fincore::engine::validate_audit(&v, who);
-    if !v.balanced() {
-        iss.push("凭证借贷不平衡，不能审核".to_string());
-    }
-    iss.into_result()?;
-    tx.execute(
-        "UPDATE voucher SET status='audited', audited_by=?2 WHERE id=?1",
-        rusqlite::params![id, who],
-    )?;
-    Ok(v.voucher_no())
-}
-
-/// 批量记账
+/// 批量记账（未记账 → 已记账）
 pub fn post_many(db: &Db, ids: &[i64], who: &str) -> DbResult<(usize, Vec<String>)> {
     let mut ok = 0usize;
     let mut errs = Vec::new();
@@ -632,7 +587,7 @@ fn post_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbE
         )
         .optional()?
         .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    if v.status != VoucherStatus::Audited {
+    if !v.status.can_post() {
         return Err(FinError::state(format!("状态为「{}」，不能记账", v.status.label())).into());
     }
     // 与单条记账保持同一套把关：借贷必须平衡，期间不能已结账
@@ -818,24 +773,21 @@ mod tests {
     }
 
     #[test]
-    fn flow_audit_post() {
+    fn flow_post_unpost() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
         let mut v = sample(p, 5, 1);
         let id = save(&db, &mut v).unwrap();
 
-        // 制单人与审核人不能是同一人
-        assert!(audit(&db, id, "张三").is_err());
-        // 未审核不能记账
-        assert!(post(&db, id, "李四").is_err());
-        audit(&db, id, "李四").unwrap();
-        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Audited);
-        post(&db, id, "王五").unwrap();
+        // 无审核环节：未记账凭证直接记账
+        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Draft);
+        post(&db, id, "张三").unwrap();
         assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Posted);
         unpost(&db, id).unwrap();
-        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Audited);
-        unaudit(&db, id).unwrap();
         assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Draft);
+        // 反记账后再记账
+        post(&db, id, "张三").unwrap();
+        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Posted);
     }
 
     #[test]
@@ -909,14 +861,15 @@ mod tests {
 
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
+        // prepared_by 存的是登录账号（username），与保存侧一致
         let mut v1 = sample(p, 5, 1);
-        v1.prepared_by = "张三".to_string();
+        v1.prepared_by = "zhangsan".to_string();
         save(&db, &mut v1).unwrap();
         let mut v2 = sample(p, 6, 2);
-        v2.prepared_by = "李四".to_string();
+        v2.prepared_by = "lisi".to_string();
         save(&db, &mut v2).unwrap();
 
-        // 张三：只看到自己填制的 1 张
+        // zhangsan：只看到自己填制的 1 张（display_name 与 username 不同，仍应按 username 过滤）
         let mut zhang = fincore::User::new("zhangsan", "张三", fincore::Role::Accountant);
         zhang.data_scope = DataScope {
             own_voucher_only: true,
@@ -924,7 +877,7 @@ mod tests {
         };
         let rows = list(&db, &VoucherQuery::period(p).with_data_scope(&zhang)).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].prepared_by, "张三");
+        assert_eq!(rows[0].prepared_by, "zhangsan");
 
         // 管理员/无限制用户：2 张都可见
         let admin = fincore::User::new("admin", "管理员", fincore::Role::Admin);

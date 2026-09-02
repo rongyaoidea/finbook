@@ -1,6 +1,6 @@
 //! 核心业务闭环端到端测试
 //!
-//! 覆盖：新建账套 → 科目表 → 辅助档案 → 期初建账 → 填制凭证 → 审核 → 记账
+//! 覆盖：新建账套 → 科目表 → 辅助档案 → 期初建账 → 填制凭证 → 记账
 //!       → 明细账/总账/余额表/试算平衡 → 资产负债表/利润表/现金流量表
 //!       → 结转损益 → 期末结账 → 反结账
 //!
@@ -202,7 +202,7 @@ fn t03_opening_balance() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. 凭证录入 / 校验 / 审核 / 记账
+// 3. 凭证录入 / 校验 / 记账
 // ---------------------------------------------------------------------------
 
 /// 一月份 8 张业务凭证。返回每张凭证的分录定义。
@@ -488,7 +488,7 @@ fn t04_voucher_entry_and_validation() {
     // 凭证号连续，无断号
     assert!(vouchers::find_gaps(&db, p1(), "记").unwrap().is_empty());
 
-    // 全部是草稿
+    // 全部是未记账
     let (drafts, audited, posted, void) = vouchers::status_summary(&db, p1()).unwrap();
     assert_eq!((drafts, audited, posted, void), (8, 0, 0, 0));
 
@@ -577,28 +577,19 @@ fn t05_reject_bad_vouchers() {
 }
 
 #[test]
-fn t06_audit_then_post() {
+fn t06_post_vouchers() {
     let (db, chart) = book();
     let ids = enter_all_vouchers(&db, &chart);
 
-    // 未审核不能直接记账
-    vouchers::post(&db, ids[0], "李主管").expect_err("草稿凭证不能直接记账");
-
-    // 审核
-    let (ok, errs) = vouchers::audit_many(&db, &ids, "李主管").unwrap();
-    assert_eq!(ok, 8, "审核失败：{errs:?}");
-    let (drafts, audited, posted, _) = vouchers::status_summary(&db, p1()).unwrap();
-    assert_eq!((drafts, audited, posted), (0, 8, 0));
-
-    // 已审核的凭证不能改
-    let v = vouchers::get(&db, ids[0]).unwrap().unwrap();
-    assert!(!v.status.can_edit());
-
-    // 记账
+    // 无审核环节：未记账凭证直接批量记账
     let (ok, errs) = vouchers::post_many(&db, &ids, "李主管").unwrap();
     assert_eq!(ok, 8, "记账失败：{errs:?}");
-    let (_, audited, posted, _) = vouchers::status_summary(&db, p1()).unwrap();
-    assert_eq!((audited, posted), (0, 8));
+    let (drafts, audited, posted, _) = vouchers::status_summary(&db, p1()).unwrap();
+    assert_eq!((drafts, audited, posted), (0, 0, 8));
+
+    // 已记账的凭证不能改（需先反记账）
+    let v = vouchers::get(&db, ids[0]).unwrap().unwrap();
+    assert!(!v.status.can_edit());
 
     // 未记账数归零，可以结账
     assert_eq!(periods::unposted_count(&db, p1()).unwrap(), 0);
@@ -608,21 +599,14 @@ fn t06_audit_then_post() {
 fn t07_unpost_and_void() {
     let (db, chart) = book();
     let ids = enter_all_vouchers(&db, &chart);
-    vouchers::audit_many(&db, &ids, "李主管").unwrap();
     vouchers::post_many(&db, &ids, "李主管").unwrap();
 
-    // 反记账 → 回到已审核
+    // 反记账 → 回到未记账（可编辑）
     vouchers::unpost(&db, ids[0]).unwrap();
-    let v = vouchers::get(&db, ids[0]).unwrap().unwrap();
-    assert!(v.status.can_post());
-
-    // 反审核 → 回到草稿
-    vouchers::unaudit(&db, ids[0]).unwrap();
     let v = vouchers::get(&db, ids[0]).unwrap().unwrap();
     assert!(v.status.can_edit());
 
-    // 作废后不计入账簿
-    vouchers::audit(&db, ids[0], "李主管").unwrap();
+    // 重新记账
     vouchers::post(&db, ids[0], "李主管").unwrap();
     let before = BalanceSnapshot::load(&db, &BalanceQuery::period(p1()))
         .unwrap()
@@ -651,7 +635,6 @@ fn t07_unpost_and_void() {
 fn posted_book() -> (Db, Chart, Vec<i64>) {
     let (db, chart) = book();
     let ids = enter_all_vouchers(&db, &chart);
-    vouchers::audit_many(&db, &ids, "李主管").unwrap();
     vouchers::post_many(&db, &ids, "李主管").unwrap();
     (db, chart, ids)
 }
@@ -921,7 +904,6 @@ fn t15_carry_forward() {
     assert_eq!(v.debit_total(), m("255000.00"));
 
     let id = vouchers::save(&db, &mut v).unwrap();
-    vouchers::audit(&db, id, "李主管").unwrap();
     vouchers::post(&db, id, "李主管").unwrap();
 
     // 结转后所有损益类科目余额归零
@@ -966,7 +948,6 @@ fn carried_book() -> (Db, Chart) {
     )
     .unwrap();
     let id = vouchers::save(&db, &mut v).unwrap();
-    vouchers::audit(&db, id, "李主管").unwrap();
     vouchers::post(&db, id, "李主管").unwrap();
     (db, chart)
 }
@@ -1016,19 +997,12 @@ fn t17_close_blocked_by_unposted() {
     let (db, _chart) = book();
     enter_all_vouchers(&db, &accounts::chart(&db).unwrap());
 
-    // 全部是草稿，结账应被拦下
+    // 全部未记账，结账应被拦下
     let issues = periods::precheck(&db, p1(), true).unwrap();
     assert!(!issues.is_empty());
-    assert!(issues.iter().any(|s| s.contains("记账") || s.contains("审核")));
+    assert!(issues.iter().any(|s| s.contains("记账")));
 
-    // 批量记账只处理"已审核"的凭证，草稿不在此列
-    let (n, _) = periods::post_all(&db, p1(), "李主管").unwrap();
-    assert_eq!(n, 0, "全是草稿时批量记账应为 0 张");
-
-    // 先审核，再批量记账
-    let list = vouchers::list(&db, &vouchers::VoucherQuery::period(p1())).unwrap();
-    let all: Vec<i64> = list.iter().map(|v| v.id).collect();
-    vouchers::audit_many(&db, &all, "李主管").unwrap();
+    // 批量记账直接处理未记账凭证
     let (n, errs) = periods::post_all(&db, p1(), "李主管").unwrap();
     assert_eq!(n, 8, "批量记账：{errs:?}");
     let issues = periods::precheck(&db, p1(), false).unwrap();
@@ -1069,7 +1043,6 @@ fn t18_second_period_carries_forward() {
     v.push_entry(e1);
     v.push_entry(e2);
     let id = vouchers::save(&db, &mut v).unwrap();
-    vouchers::audit(&db, id, "李主管").unwrap();
     vouchers::post(&db, id, "李主管").unwrap();
 
     let s2 = BalanceSnapshot::load(&db, &BalanceQuery::period(p2)).unwrap();
@@ -1112,7 +1085,6 @@ fn t19_year_end_carry() {
     assert!(v.balanced());
 
     let id = vouchers::save(&db, &mut v).unwrap();
-    vouchers::audit(&db, id, "李主管").unwrap();
     vouchers::post(&db, id, "李主管").unwrap();
 
     let after = BalanceSnapshot::load(&db, &BalanceQuery::period(pm(12))).unwrap();
@@ -1149,10 +1121,9 @@ fn t20_backup_and_integrity() {
 }
 
 #[test]
-fn t21_audit_log() {
+fn t21_op_log() {
     let (db, chart) = book();
     let ids = enter_all_vouchers(&db, &chart);
-    vouchers::audit_many(&db, &ids, "李主管").unwrap();
     vouchers::post_many(&db, &ids, "李主管").unwrap();
 
     let logs = db.recent_logs(100).unwrap();

@@ -1351,7 +1351,15 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
         let r = snap.for_account(code, None);
         r.debit - r.credit // 费用类借方正
     };
-    let pct = |v: Money| format!("{}%", (v * Money::from_i64(100)).round2());
+    let pct = |v: Option<Money>| match v {
+        Some(x) => format!("{}%", (x * Money::from_i64(100)).round2()),
+        None => "—".to_string(),
+    };
+    let times = |v: Option<Money>| match v {
+        Some(x) => format!("{}倍", x),
+        None => "—".to_string(),
+    };
+    let val = |v: Option<Money>| v.unwrap_or(Money::ZERO);
 
     let mut out = Vec::new();
     let mut push = |key: &str, name: &str, value: Money, display: String, formula: &str| {
@@ -1402,62 +1410,70 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
     let net_profit = revenue - cost - exp("6403") - exp("6601") - exp("6602") - exp("6603")
         - exp("6701") + occ("6301") - exp("6711") - exp("6801");
 
-    let div = |a: Money, b: Money| -> Money {
-        if b.is_zero() {
-            Money::ZERO
+    // 分母阈值：绝对值小于 1 分钱视为数据不足，比率无意义（避免分母接近 0 时算出 100% 之类的假值）
+    let div = |a: Money, b: Money| -> Option<Money> {
+        if b.abs() < Money::from_cents(1) {
+            None
         } else {
-            Money::new(a.inner() / b.inner()).round2()
+            Some(Money::new(a.inner() / b.inner()).round2())
         }
     };
 
+    let current_ratio = div(cur_asset, cur_liab);
     push(
         "current_ratio",
         "流动比率",
-        div(cur_asset, cur_liab),
-        format!("{}倍", div(cur_asset, cur_liab)),
+        val(current_ratio),
+        times(current_ratio),
         "流动资产 ÷ 流动负债",
     );
     let quick_asset = cur_asset - b("1403") - b("1405") - b("1406") - b("1411");
+    let quick_ratio = div(quick_asset, cur_liab);
     push(
         "quick_ratio",
         "速动比率",
-        div(quick_asset, cur_liab),
-        format!("{}倍", div(quick_asset, cur_liab)),
+        val(quick_ratio),
+        times(quick_ratio),
         "(流动资产 − 存货) ÷ 流动负债",
     );
+    let debt_ratio = div(total_liab, total_asset);
     push(
         "debt_ratio",
         "资产负债率",
-        div(total_liab, total_asset),
-        pct(div(total_liab, total_asset)),
+        val(debt_ratio),
+        pct(debt_ratio),
         "负债总额 ÷ 资产总额",
     );
+    let gross_margin = div(revenue - cost, revenue);
     push(
         "gross_margin",
         "毛利率",
-        div(revenue - cost, revenue),
-        pct(div(revenue - cost, revenue)),
+        val(gross_margin),
+        pct(gross_margin),
         "(营业收入 − 营业成本) ÷ 营业收入",
     );
+    let net_margin = div(net_profit, revenue);
     push(
         "net_margin",
         "净利率",
-        div(net_profit, revenue),
-        pct(div(net_profit, revenue)),
+        val(net_margin),
+        pct(net_margin),
         "净利润 ÷ 营业收入",
     );
+    let roe = div(net_profit, equity);
     push(
         "roe",
         "净资产收益率(ROE)",
-        div(net_profit, equity),
-        pct(div(net_profit, equity)),
+        val(roe),
+        pct(roe),
         "净利润 ÷ 所有者权益",
     );
+    let roa = div(net_profit, total_asset);
     push(
         "roa",
         "总资产报酬率(ROA)",
-        div(net_profit, total_asset),
-        pct(div(net_profit, total_asset)),
+        val(roa),
+        pct(roa),
         "净利润 ÷ 资产总额",
     );
     Ok(out)
@@ -1495,7 +1511,6 @@ mod tests {
             });
         }
         let id = crate::vouchers::save(db, &mut v).unwrap();
-        crate::vouchers::audit(db, id, "a").unwrap();
         crate::vouchers::post(db, id, "p").unwrap();
     }
 

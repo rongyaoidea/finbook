@@ -666,7 +666,8 @@ pub struct BookOptions {
     pub enable_foreign: bool,
     /// 凭证需要出纳签字
     pub require_cashier: bool,
-    /// 凭证必须审核后才能记账
+    /// （已废弃）审核环节已移除：未记账凭证核对后直接记账。
+    /// 字段仅为兼容旧账套序列化而保留，不再生效。
     pub require_audit: bool,
     /// 凭证字号方案
     pub voucher_words: Vec<String>,

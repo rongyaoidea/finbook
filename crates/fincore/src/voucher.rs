@@ -10,13 +10,14 @@ use crate::account::{AuxKind, AuxMask, Direction};
 use crate::money::Money;
 use crate::period::Period;
 
-/// 凭证状态机：`草稿 → 已审核 → 已记账`，另设"作废"终态
+/// 凭证状态机：`未记账 → 已记账`（另设"作废"终态；历史数据中的"已审核"视同未记账）。
+/// 无独立审核环节：未记账凭证核对无误后手动「记账」确认入账。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoucherStatus {
-    /// 草稿（刚录入）
+    /// 未记账（刚录入，待确认）
     Draft,
-    /// 已审核
+    /// 已审核（历史遗留状态，视同未记账）
     Audited,
     /// 已记账（登记账簿）
     Posted,
@@ -27,28 +28,25 @@ pub enum VoucherStatus {
 impl VoucherStatus {
     pub fn label(self) -> &'static str {
         match self {
-            VoucherStatus::Draft => "草稿",
+            VoucherStatus::Draft => "未记账",
             VoucherStatus::Audited => "已审核",
             VoucherStatus::Posted => "已记账",
             VoucherStatus::Void => "已作废",
         }
     }
-    /// 是否参与账簿汇总（草稿/已审核/已记账均参与，已作废不参与）
+    /// 是否参与账簿汇总（未记账/已记账均参与，已作废不参与）
     pub fn counts(self) -> bool {
         self != VoucherStatus::Void
     }
-    /// 是否可编辑：草稿与已记账都可改（记录即生效，允许回改修正后重新保存）
+    /// 是否可编辑：未记账可改（历史"已审核"视同未记账）；已记账需先反记账
     pub fn can_edit(self) -> bool {
-        matches!(self, VoucherStatus::Draft | VoucherStatus::Posted)
+        matches!(self, VoucherStatus::Draft | VoucherStatus::Audited)
     }
     pub fn can_delete(self) -> bool {
-        self == VoucherStatus::Draft
-    }
-    pub fn can_audit(self) -> bool {
-        self == VoucherStatus::Draft
+        matches!(self, VoucherStatus::Draft | VoucherStatus::Audited)
     }
     pub fn can_post(self) -> bool {
-        self == VoucherStatus::Audited
+        matches!(self, VoucherStatus::Draft | VoucherStatus::Audited)
     }
     pub fn can_unpost(self) -> bool {
         self == VoucherStatus::Posted

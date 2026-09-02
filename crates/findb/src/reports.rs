@@ -554,7 +554,6 @@ mod tests {
             v.push_entry(e);
         }
         let id = vouchers::save(db, &mut v).unwrap();
-        vouchers::audit(db, id, "李四").unwrap();
         vouchers::post(db, id, "王五").unwrap();
     }
 

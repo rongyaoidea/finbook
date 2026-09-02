@@ -79,6 +79,24 @@ impl FinBookApp {
         let mut ctx = AppCtx { st, now: 0.0 };
         match act {
             ConfirmAction::DeleteVoucher(id) => {
+                // 与 web 端及引擎 validate_delete 口径一致：仅草稿可删、已结账期间不可删
+                let db = ctx.db();
+                let closed = findb::periods::closed_upto(db).unwrap_or(None);
+                let guard = match findb::vouchers::get(db, id) {
+                    Ok(Some(v)) => fincore::engine::validate_delete(&v, closed),
+                    Ok(None) => {
+                        ctx.error("凭证不存在");
+                        return;
+                    }
+                    Err(e) => {
+                        ctx.error(e.to_string());
+                        return;
+                    }
+                };
+                if let Err(e) = guard.into_result() {
+                    ctx.error(e.to_string());
+                    return;
+                }
                 let r = findb::vouchers::delete(ctx.db(), id);
                 if ctx.handle(r).is_some() {
                     ctx.log("凭证", "删除凭证", &format!("凭证 #{id}"));

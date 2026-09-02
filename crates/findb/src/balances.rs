@@ -866,7 +866,6 @@ mod tests {
             v.push_entry(e);
         }
         let id = vouchers::save(db, &mut v).unwrap();
-        vouchers::audit(db, id, "李四").unwrap();
         vouchers::post(db, id, "王五").unwrap();
         id
     }
@@ -1029,7 +1028,6 @@ mod tests {
             ..Entry::new(3, "1001", "办公费")
         });
         let id = vouchers::save(&db, &mut v).unwrap();
-        vouchers::audit(&db, id, "李四").unwrap();
         vouchers::post(&db, id, "王五").unwrap();
 
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();
@@ -1102,7 +1100,6 @@ mod tests {
         v.push_entry(e1);
         v.push_entry(e2);
         let id = vouchers::save(&db, &mut v).unwrap();
-        vouchers::audit(&db, id, "李四").unwrap();
         vouchers::post(&db, id, "王五").unwrap();
 
         let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p)).unwrap();

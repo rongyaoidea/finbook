@@ -90,6 +90,8 @@ impl Dashboard {
         q = q.with_data_scope(ctx.user());
         let u = ctx.user().clone();
         let mut recent = findb::vouchers::list(db, &q).unwrap_or_default();
+        // 最近凭证要展示摘要与借贷合计，且科目范围过滤依赖分录：先批量补充分录
+        let _ = findb::vouchers::fill_entries(db, &mut recent);
         if !u.data_scope.is_unrestricted() {
             recent.retain(|v| u.can_see_voucher(v));
         }
@@ -100,7 +102,7 @@ impl Dashboard {
         if draft + audited > 0 {
             todos.push((
                 format!("{} 张凭证未记账", draft + audited),
-                "去凭证查询批量审核记账".to_string(),
+                "到「凭证查询」勾选后批量记账，或在「期末处理」批量记账".to_string(),
             ));
         }
         if let Ok(Some(closed)) = findb::periods::closed_upto(db) {

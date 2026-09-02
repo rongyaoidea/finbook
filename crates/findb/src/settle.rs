@@ -573,7 +573,6 @@ mod tests {
         v.push_entry(e1);
         v.push_entry(e2);
         let vid = crate::vouchers::save(db, &mut v).unwrap();
-        crate::vouchers::audit(db, vid, "auditor").unwrap();
         crate::vouchers::post(db, vid, "poster").unwrap();
         let entries = crate::vouchers::entries_of(db, vid).unwrap();
         (vid, entries[0].id)

@@ -646,7 +646,6 @@ mod tests {
             ..Entry::new(2, "112201", "收货款")
         });
         let vid = crate::vouchers::save(&db, &mut v).unwrap();
-        crate::vouchers::audit(&db, vid, "auditor").unwrap();
         crate::vouchers::post(&db, vid, "poster").unwrap();
         let _ = VoucherStatus::Posted;
 

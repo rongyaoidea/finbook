@@ -177,28 +177,17 @@ pub fn unposted_count(db: &Db, p: Period) -> DbResult<i64> {
     Ok(c)
 }
 
-/// 批量记账某期间的待记账凭证
-///
-/// 账套设置了"必须审核后才能记账"时只处理已审核的；否则草稿也能直接记账。
+/// 批量记账某期间的待记账凭证（无审核环节：所有未记账凭证一并记账）
 pub fn post_all(db: &Db, p: Period, who: &str) -> DbResult<(usize, Vec<String>)> {
-    let require_audit = db.options().require_audit;
     let q = vouchers::VoucherQuery {
         from: Some(p),
         to: Some(p),
-        status: if require_audit {
-            Some(fincore::VoucherStatus::Audited)
-        } else {
-            None
-        },
         ..Default::default()
     };
     let list = vouchers::list(db, &q)?;
     let ids: Vec<i64> = list
         .iter()
-        .filter(|v| {
-            v.status == fincore::VoucherStatus::Audited
-                || (!require_audit && v.status == fincore::VoucherStatus::Draft)
-        })
+        .filter(|v| v.status.can_post())
         .map(|v| v.id)
         .collect();
     vouchers::post_many(db, &ids, who)

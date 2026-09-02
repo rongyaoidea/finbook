@@ -30,7 +30,7 @@ pub struct VoucherList {
     key: String,
 }
 
-const STATUS_OPTS: [&str; 5] = ["全部", "草稿", "已审核", "已记账", "已作废"];
+const STATUS_OPTS: [&str; 4] = ["全部", "未记账", "已记账", "已作废"];
 
 impl Default for VoucherList {
     fn default() -> Self {
@@ -72,9 +72,8 @@ impl VoucherList {
         let to = Period::parse(&self.to).ok();
         let st = match self.status {
             1 => Some(VoucherStatus::Draft),
-            2 => Some(VoucherStatus::Audited),
-            3 => Some(VoucherStatus::Posted),
-            4 => Some(VoucherStatus::Void),
+            2 => Some(VoucherStatus::Posted),
+            3 => Some(VoucherStatus::Void),
             _ => None,
         };
         findb::vouchers::VoucherQuery {
@@ -118,6 +117,8 @@ impl VoucherList {
         // 这里对结果逐张过滤
         let u = ctx.user().clone();
         let mut rows = findb::vouchers::list(ctx.db(), &q).unwrap_or_default();
+        // 列表要展示摘要/借贷合计，且科目范围过滤依赖分录：批量补充分录后再过滤
+        let _ = findb::vouchers::fill_entries(ctx.db(), &mut rows);
         if !u.data_scope.is_unrestricted() {
             rows.retain(|v| u.can_see_voucher(v));
         }
@@ -176,30 +177,23 @@ impl VoucherList {
             if ui.button("填制凭证").clicked() && ctx.can(Perm::VoucherNew) {
                 act = Action::New;
             }
-            ui.separator();
-            if ui.button("审核").clicked() && ctx.can(Perm::VoucherAudit) {
-                let ids: Vec<i64> = self.sel.iter().copied().collect();
+            // 与 Web 端一致：无审核环节，仅保留批量记账（未记账 → 已记账）
+            if ui.button("批量记账").clicked() && ctx.can(Perm::VoucherPost) {
+                let ids: Vec<i64> = self
+                    .sel
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.rows
+                            .iter()
+                            .any(|v| v.id == *id && v.status.can_post())
+                    })
+                    .collect();
                 if ids.is_empty() {
-                    ctx.error("请先勾选凭证");
+                    ctx.error("请先勾选未记账的凭证");
                 } else {
-                    let who = ctx.user().display_name.clone();
-                    let r = findb::vouchers::audit_many(ctx.db(), &ids, &who);
-                    if let Some((n, errs)) = ctx.handle(r) {
-                        ctx.info(format!("已审核 {n} 张"));
-                        for e in errs.iter().take(5) {
-                            ctx.error(e.clone());
-                        }
-                        ctx.log("凭证", "批量审核", &format!("{n} 张"));
-                        self.dirty = true;
-                    }
-                }
-            }
-            if ui.button("记账").clicked() && ctx.can(Perm::VoucherPost) {
-                let ids: Vec<i64> = self.sel.iter().copied().collect();
-                if ids.is_empty() {
-                    ctx.error("请先勾选凭证");
-                } else {
-                    let who = ctx.user().display_name.clone();
+                    // posted_by 与 prepared_by 口径一致：存 username
+                    let who = ctx.user().username.clone();
                     let r = findb::vouchers::post_many(ctx.db(), &ids, &who);
                     if let Some((n, errs)) = ctx.handle(r) {
                         ctx.info(format!("已记账 {n} 张"));
@@ -209,27 +203,6 @@ impl VoucherList {
                         ctx.log("凭证", "批量记账", &format!("{n} 张"));
                         self.dirty = true;
                     }
-                }
-            }
-            ui.separator();
-            let ids: Vec<i64> = self.sel.iter().copied().collect();
-            for (label, what) in [
-                ("反审核", "unaudit"),
-                ("反记账", "unpost"),
-                ("作废", "void"),
-            ] {
-                if ui.button(label).clicked() {
-                    if ids.is_empty() {
-                        ctx.error("请先勾选凭证");
-                        continue;
-                    }
-                    let mut n = 0;
-                    for id in &ids {
-                        crate::views::voucher_edit::do_status(ctx, *id, what);
-                        n += 1;
-                    }
-                    ctx.info(format!("已处理 {n} 张"));
-                    self.dirty = true;
                 }
             }
             ui.separator();

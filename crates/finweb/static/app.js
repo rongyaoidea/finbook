@@ -58,6 +58,39 @@ function closeModal() {
   root.innerHTML = "";
   modalStack = [];
 }
+// 确认对话框（Promise 化，替代浏览器原生 confirm）
+// 自包含：只关闭自身遮罩，不影响下方已打开的其它弹窗（如凭证编辑器）
+function confirmDialog(message, danger) {
+  return new Promise((resolve) => {
+    const root = document.getElementById("modal-root");
+    const mask = document.createElement("div");
+    mask.className = "modal-mask";
+    mask.innerHTML = `<div class="modal">
+      <h3>确认操作</h3>
+      <p class="muted" style="margin:0 0 16px;line-height:1.6">${esc(message)}</p>
+      <div class="foot">
+        <button class="btn ghost" id="cf-cancel">取消</button>
+        <button class="btn ${danger ? "danger" : "primary"}" id="cf-ok">确定</button>
+      </div>
+    </div>`;
+    root.appendChild(mask);
+    const done = (val) => {
+      document.removeEventListener("keydown", onKey, true);
+      mask.remove();
+      resolve(val);
+    };
+    const onKey = (e) => {
+      // 捕获阶段拦截并阻止冒泡，避免触发全局 Esc 关闭其它弹窗
+      if (e.key === "Escape") { e.stopPropagation(); done(false); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    mask.addEventListener("click", (e) => { if (e.target === mask) done(false); });
+    $("#cf-ok", mask).onclick = () => done(true);
+    $("#cf-cancel", mask).onclick = () => done(false);
+    // 危险操作默认聚焦「取消」，防止回车误删；普通操作聚焦「确定」
+    (danger ? $("#cf-cancel", mask) : $("#cf-ok", mask)).focus();
+  });
+}
 // Esc 关闭最近弹窗
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && modalStack.length) closeModal();
@@ -393,7 +426,7 @@ async function viewVouchers(main) {
       <input id="v-q" placeholder="摘要 / 凭证号 / 科目" style="width:200px" />
       <select id="v-status">
         <option value="">全部状态</option>
-        <option value="draft">草稿</option><option value="audited">已审核</option>
+        <option value="draft">未记账</option>
         <option value="posted">已记账</option><option value="void">已作废</option>
       </select>
       <button class="btn ghost sm" id="v-refresh">查询</button>
@@ -420,7 +453,7 @@ async function loadVouchers() {
   let rows;
   try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="9" style="color:var(--err)">${esc(e.message)}</td></tr>`; return; }
   if (!rows.length) { tb.innerHTML = `<tr><td colspan="9" class="muted">暂无凭证</td></tr>`; return; }
-  const stMap = { draft: ["草稿", "warn"], audited: ["已审核", ""], posted: ["已记账", "ok"], void: ["已作废", "err"] };
+  const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
   tb.innerHTML = rows.map((v) => {
     const s = stMap[v.status] || [v.status_label, ""];
     return `<tr>
@@ -445,7 +478,9 @@ async function openVoucherEditor(id) {
   } else {
     try { const n = await api(`/vouchers/next-no?period=${encodeURIComponent(state.current || "")}&word=记`); v.no = n.no; } catch (e) {}
   }
-  const editable = (id === 0) || status === "draft";
+  // 可编辑状态与后端 can_edit() 对齐：未记账（含历史"已审核"）可改；已记账需先反记账
+  const editable = (id === 0) || status === "draft" || status === "audited";
+  const canPost = status === "draft" || status === "audited";
   const mask = modal(`
     <h3>记账凭证 ${esc(voucher_no)}</h3>
     <div class="toolbar">
@@ -462,10 +497,9 @@ async function openVoucherEditor(id) {
     <div style="margin-top:10px" class="muted">合计：借 <b id="v-dt">0.00</b> 　贷 <b id="v-ct">0.00</b> 　差额 <b id="v-diff">0.00</b></div>
     <div class="foot">
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
-      ${can("voucher_audit") && status === "draft" ? `<button class="btn" id="v-audit">审核</button>` : ""}
-      ${can("voucher_unaudit") && status === "audited" ? `<button class="btn ghost" id="v-unaudit">反审核</button>` : ""}
-      ${can("voucher_post") && status === "audited" ? `<button class="btn" id="v-post">记账</button>` : ""}
-      ${can("voucher_delete") && status === "draft" ? `<button class="btn danger" id="v-del">删除</button>` : ""}
+      ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
+      ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
+      ${can("voucher_delete") && (status === "draft" || status === "audited") ? `<button class="btn danger" id="v-del">删除</button>` : ""}
       <button class="btn ghost" id="v-close">关闭</button>
     </div>
   `, true);
@@ -518,10 +552,9 @@ async function openVoucherEditor(id) {
     } catch (e) { toast(e.message, "err"); }
   };
   if (editable) $("#v-save", mask).onclick = save;
-  if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
-  if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-post", mask)) $("#v-post", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/post`, { method: "POST" }); toast("已记账", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
-  if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!confirm("确定删除该凭证？")) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   $("#v-close", mask).onclick = closeModal;
 }
 function today() { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
@@ -631,11 +664,11 @@ function renderInvoices(main, d) {
         const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "verified" }) });
         if (up) { toast("已认证", "ok"); renderInvoices(main, await loadInvoices()); }
       } else if (act === "reject") {
-        if (!confirm("确定作废该发票？")) return;
+        if (!(await confirmDialog("确定作废该发票？", true))) return;
         const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rejected" }) });
         if (up) { toast("已作废", "ok"); renderInvoices(main, await loadInvoices()); }
       } else if (act === "del") {
-        if (!confirm("确定删除该发票？")) return;
+        if (!(await confirmDialog("确定删除该发票？", true))) return;
         await api(`/invoices/${id}`, { method: "DELETE" });
         toast("已删除", "ok");
         renderInvoices(main, await loadInvoices());
@@ -948,14 +981,14 @@ async function loadUsers() {
   $all("[data-reset-pwd]").forEach((b) => b.onclick = () => openAdminResetPwd(b.dataset.resetPwd));
   $all("[data-toggle]").forEach((b) => b.onclick = async () => {
     const dis = b.dataset.next === "1";
-    if (dis && !confirm(`停用 ${b.dataset.toggle}？其全部会话将被立即下线。`)) return;
+    if (dis && !(await confirmDialog(`停用 ${b.dataset.toggle}？其全部会话将被立即下线。`, true))) return;
     try {
       await api(`/users/${encodeURIComponent(b.dataset.toggle)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ disabled: dis }) });
       toast(dis ? "已停用" : "已启用", "ok"); loadUsers();
     } catch (e) { toast(e.message, "err"); }
   });
-  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!confirm(`重置 ${b.dataset.resetDev} 的设备绑定？该账号可在新设备重新登录。`)) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
-  $all("[data-del]").forEach((b) => b.onclick = async () => { if (!confirm(`删除用户 ${b.dataset.del}？`)) return; try { await api(`/users/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`重置 ${b.dataset.resetDev} 的设备绑定？该账号可在新设备重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`删除用户 ${b.dataset.del}？`, true))) return; try { await api(`/users/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
 }
 
 function openNewUser() {
@@ -1176,7 +1209,7 @@ async function viewNotes(main) {
       const r = await api(`/reports/notes?report_key=${key}&period=${encodeURIComponent(p)}`);
       const rows = r.rows || [];
       $("#nt-list").innerHTML = rows.map((n) => `<div class="card"><div class="row"><b>${n.seq} · ${esc(n.title)}</b><button class="btn danger sm" data-nt-del="${n.id}">删除</button></div><div>${esc(n.content)}</div><div class="muted">${esc(n.updated_by)} ${esc(n.updated_at)}</div></div>`).join("") || `<div class="muted">暂无附注</div>`;
-      $all("[data-nt-del]").forEach((b) => b.onclick = async () => { if (!confirm("删除该附注？")) return; try { await api(`/reports/notes/${b.dataset.ntDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-nt-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该附注？", true))) return; try { await api(`/reports/notes/${b.dataset.ntDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
     } catch (e) { toast(e.message, "err"); }
   };
   $("#nt-load").addEventListener("click", load);
@@ -1260,7 +1293,7 @@ async function viewBudgetVersions(main) {
         </div><div class="muted">${esc(v.created_at)} ${esc(v.memo)}</div></div>`).join("")
         : `<div class="muted">暂无自定义版本，预算存于「默认」版本。当前版本：${current || "默认"}</div>`;
       $all("[data-bv-act]").forEach((b) => b.onclick = async () => { try { await api(`/budget/versions/${encodeURIComponent(b.dataset.bvAct)}/activate`, { method: "POST" }); toast("已设为当前版本", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
-      $all("[data-bv-del]").forEach((b) => b.onclick = async () => { if (!confirm(`删除版本 ${b.dataset.bvDel} 及其全部预算数据？`)) return; try { await api(`/budget/versions/${encodeURIComponent(b.dataset.bvDel)}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-bv-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`删除版本 ${b.dataset.bvDel} 及其全部预算数据？`, true))) return; try { await api(`/budget/versions/${encodeURIComponent(b.dataset.bvDel)}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
     } catch (e) { toast(e.message, "err"); }
   };
   $("#bv-save").addEventListener("click", async () => {
@@ -1322,7 +1355,7 @@ async function viewWorkReport(main) {
         if (!qty && !hours) { toast("数量与工时不能同时为空", "err"); return; }
         try { await api("/prod/op/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op_id: parseInt(b.dataset.wrReport, 10), qty, hours }) }); toast("已报工", "ok"); loadOps(); } catch (e) { toast(e.message, "err"); }
       });
-      $all("[data-wr-finish]").forEach((b) => b.onclick = async () => { if (!confirm("将该工序标记为完工？")) return; try { await api("/prod/op/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op_id: parseInt(b.dataset.wrFinish, 10) }) }); toast("已完工", "ok"); loadOps(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-wr-finish]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("将该工序标记为完工？"))) return; try { await api("/prod/op/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op_id: parseInt(b.dataset.wrFinish, 10) }) }); toast("已完工", "ok"); loadOps(); } catch (e) { toast(e.message, "err"); } });
     } catch (e) { toast(e.message, "err"); }
   };
   $("#wr-load").addEventListener("click", loadOps);

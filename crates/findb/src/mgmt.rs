@@ -615,7 +615,6 @@ mod tests {
             });
         }
         let id = crate::vouchers::save(db, &mut v).unwrap();
-        crate::vouchers::audit(db, id, "a").unwrap();
         crate::vouchers::post(db, id, "p").unwrap();
         id
     }

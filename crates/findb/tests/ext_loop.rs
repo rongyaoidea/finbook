@@ -65,7 +65,6 @@ fn post_two(
     v.push_entry(e1);
     v.push_entry(e2);
     let id = vouchers::save(db, &mut v).unwrap();
-    vouchers::audit(db, id, "审核员").unwrap();
     vouchers::post(db, id, "记账员").unwrap();
     let entries = vouchers::entries_of(db, id).unwrap();
     (id, entries.iter().map(|e| e.id).collect())
@@ -128,7 +127,6 @@ fn t90_asset_dep_loop() {
     v.push_entry(e2);
     assert_eq!(v.diff(), Money::ZERO);
     let vid = vouchers::save(&db, &mut v).unwrap();
-    vouchers::audit(&db, vid, "u").unwrap();
     vouchers::post(&db, vid, "u").unwrap();
 
     // 落一条折旧记录，下期可查

@@ -227,32 +227,14 @@ pub fn validate_entry(
     }
 }
 
-/// 审核前校验：状态与制单/审核人分离
-pub fn validate_audit(v: &Voucher, who: &str) -> Issues {
-    let mut iss = Issues::new();
-    if !v.status.can_audit() {
-        iss.push(format!("凭证当前状态为「{}」，不能审核", v.status.label()));
-    }
-    if !v.prepared_by.is_empty() && v.prepared_by == who {
-        iss.push("制单人与审核人不能是同一人，不符合不相容职务分离要求");
-    }
-    if v.entries.iter().any(|e| e.is_blank()) && v.effective_lines() < 2 {
-        iss.push("凭证内容为空，不能审核");
-    }
-    iss
-}
-
-/// 记账前校验
+/// 记账前校验（无审核环节：未记账凭证核对无误后直接记账）
 pub fn validate_post(v: &Voucher, opts: &BookOptions) -> Issues {
     let mut iss = Issues::new();
     if !v.status.can_post() {
         iss.push(format!("凭证当前状态为「{}」，不能记账", v.status.label()));
     }
-    if opts.require_audit && v.audited_by.is_none() {
-        iss.push("该账套要求先审核后记账");
-    }
     if opts.require_cashier && v.cashier.is_none() {
-        iss.push("该账套要求出纳签字后才能记账");
+        iss.push("该账套要求出纳签字后才能记账".to_string());
     }
     iss
 }
@@ -271,11 +253,11 @@ pub fn validate_unpost(v: &Voucher, closed_upto: Option<Period>) -> Issues {
     iss
 }
 
-/// 删除前校验
+/// 删除前校验（未记账凭证可删；已记账需先反记账）
 pub fn validate_delete(v: &Voucher, closed_upto: Option<Period>) -> Issues {
     let mut iss = Issues::new();
-    if v.status != VoucherStatus::Draft {
-        iss.push(format!("凭证已{}，不能删除，请先反审核并反记账", v.status.label()));
+    if !v.status.can_delete() {
+        iss.push(format!("凭证已{}，不能删除，请先反记账", v.status.label()));
     }
     if let Some(upto) = closed_upto {
         if v.period <= upto {
@@ -395,13 +377,5 @@ mod tests {
         v.date = chrono::NaiveDate::from_ymd_opt(2026, 2, 3).unwrap();
         let iss = validate_voucher(&v, &ctx);
         assert!(iss.iter().any(|s| s.contains("不一致")));
-    }
-
-    #[test]
-    fn audit_segregation() {
-        let v = base_voucher();
-        let iss = validate_audit(&v, "张三");
-        assert!(iss.iter().any(|s| s.contains("制单人与审核人")));
-        assert!(validate_audit(&v, "李四").is_empty());
     }
 }

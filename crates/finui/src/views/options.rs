@@ -121,7 +121,7 @@ impl OptionsView {
         ui.separator();
         ui.label(RichText::new("业务控制").strong());
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut o.require_audit, "凭证必须审核后才能记账");
+            // 审核环节已移除（无审核，未记账→记账两态），不再提供 require_audit 开关
             ui.checkbox(&mut o.require_cashier, "涉及现金银行的凭证需出纳签字");
             ui.checkbox(&mut o.enable_qty, "启用数量核算");
             ui.checkbox(&mut o.enable_foreign, "启用外币核算");
@@ -190,9 +190,6 @@ impl OptionsView {
 /// 供状态栏显示
 pub fn options_hint(o: &BookOptions) -> String {
     let mut s = Vec::new();
-    if o.require_audit {
-        s.push("需审核");
-    }
     if o.require_cashier {
         s.push("需出纳签字");
     }

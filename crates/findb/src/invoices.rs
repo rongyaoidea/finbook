@@ -177,7 +177,7 @@ pub fn insert(db: &Db, inv: &Invoice, who: &str) -> DbResult<i64> {
 /// 更新发票字段与状态
 pub fn update(db: &Db, inv: &Invoice) -> DbResult<()> {
     validate(inv)?;
-    db.conn().execute(
+    let n = db.conn().execute(
         "UPDATE invoice SET kind=?2,code=?3,number=?4,date=?5,buyer=?6,seller=?7,
             amount_tax=?8,amount=?9,tax=?10,tax_rate=?11,status=?12,memo=?13,attach_id=?14,
             updated_at=?15 WHERE id=?1",
@@ -199,6 +199,9 @@ pub fn update(db: &Db, inv: &Invoice) -> DbResult<()> {
             now(),
         ],
     )?;
+    if n == 0 {
+        return Err(FinError::not_found(format!("发票 #{} 不存在", inv.id)).into());
+    }
     db.log("", "发票", "更新", &format!("#{} {}", inv.id, inv.number))?;
     Ok(())
 }
@@ -221,7 +224,10 @@ pub fn set_status(db: &Db, id: i64, status: &str, who: &str) -> DbResult<Invoice
 
 /// 删除发票
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
-    db.conn().execute("DELETE FROM invoice WHERE id=?1", [id])?;
+    let n = db.conn().execute("DELETE FROM invoice WHERE id=?1", [id])?;
+    if n == 0 {
+        return Err(FinError::not_found(format!("发票 #{id} 不存在")).into());
+    }
     db.log("", "发票", "删除", &format!("#{id}"))?;
     Ok(())
 }

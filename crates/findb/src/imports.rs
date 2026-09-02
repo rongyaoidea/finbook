@@ -10,7 +10,7 @@
 
 use std::io::Cursor;
 
-use fincore::{AuxRef, Entry, Money, Period, Voucher, VoucherSource, VoucherStatus};
+use fincore::{AuxRef, Entry, Money, Period, Voucher, VoucherSource};
 
 use crate::balances::{self, BeginRow};
 use crate::vouchers;
@@ -639,9 +639,7 @@ fn import_vouchers_rows(
             let word = if line.word.trim().is_empty() { "记" } else { line.word.trim() };
             let no = vouchers::next_no(db, period, word)?;
             let mut v = Voucher::new(period, date, word.to_string(), no);
-            v.source = VoucherSource::Import;
-            v.status = VoucherStatus::Posted; // 记录即生效（与录入一致）
-            v.posted_by = Some(who.to_string());
+            v.source = VoucherSource::Import; // 导入后为未记账，与录入一致，核对后在期末处理批量记账
             pending = Some(v);
         }
         let v = pending.as_mut().unwrap();
@@ -669,6 +667,7 @@ fn import_vouchers_rows(
 mod tests {
     use super::*;
     use crate::tests::mem;
+    use fincore::VoucherStatus;
 
     #[test]
     fn csv_split_handles_quotes() {
@@ -779,10 +778,10 @@ mod tests {
         .unwrap();
         assert_eq!(res.ok, 2, "应导入 2 张：{:?}", res.warnings);
         assert_eq!(res.skipped, 0);
-        // 验证已落库并参与汇总
+        // 验证已落库并参与汇总（导入后为未记账，与录入一致）
         let all = vouchers::list(&db, &vouchers::VoucherQuery::period(p)).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].status, VoucherStatus::Posted);
+        assert_eq!(all[0].status, VoucherStatus::Draft);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! 这是整个软件用得最多的界面，交互参照金蝶/用友：
 //! - 摘要可复制上一行、科目支持编码直输与弹窗选择
 //! - 借贷不平不能保存，差额一键补平
-//! - 已审核/已记账的凭证只读，杜绝事后篡改
+//! - 与 Web 端一致：无需审核，保存即记账（Posted），已作废凭证只读
 
 use chrono::NaiveDate;
 use egui::{Align, Color32, Layout, RichText, Ui};
@@ -415,12 +415,7 @@ impl VoucherEdit {
             return;
         }
 
-        // 保存即生效：直接进入已记账（Posted）状态，无草稿/审核流程
-        v.status = VoucherStatus::Posted;
-        if v.posted_by.is_none() {
-            v.posted_by = Some(ctx.user().display_name.clone());
-        }
-
+        // 保存为「未记账」，核对无误后点「记账」确认入账（与 Web 端一致，无审核环节）
         match findb::vouchers::save(ctx.db(), &mut v) {
             Ok(id) => {
                 let label = v.voucher_no();
@@ -545,18 +540,7 @@ impl VoucherEdit {
                 self.balance(ctx);
             }
             ui.separator();
-            if ui.button("审核").clicked() && self.status.can_audit() {
-                if ctx.can(Perm::VoucherAudit) {
-                    do_status(ctx, self.id, "audit");
-                    self.reload_after(ctx);
-                }
-            }
-            if ui.button("反审核").clicked() && self.status == VoucherStatus::Audited {
-                if ctx.can(Perm::VoucherUnaudit) {
-                    do_status(ctx, self.id, "unaudit");
-                    self.reload_after(ctx);
-                }
-            }
+            // 与 Web 端一致：无审核环节，未记账凭证核对后手动记账确认入账
             if ui.button("记账").clicked() && self.status.can_post() {
                 if ctx.can(Perm::VoucherPost) {
                     do_status(ctx, self.id, "post");
@@ -579,10 +563,6 @@ impl VoucherEdit {
             ui.separator();
             if ui.button("打印预览").clicked() {
                 self.print_open = true;
-            }
-            if ui.button("作废/恢复").clicked() {
-                do_status(ctx, self.id, "void");
-                self.reload_after(ctx);
             }
             if ui.button("删除").clicked() && self.id > 0 {
                 ctx.confirm_dangerous(
@@ -636,7 +616,7 @@ impl VoucherEdit {
         if readonly {
             ui.colored_label(
                 palette::WARN,
-                "该凭证已审核或记账，处于只读状态。如需修改请先反记账/反审核。",
+                "该凭证已记账或已作废，处于只读状态（已记账请先反记账后再修改）。",
             );
         }
 
@@ -1107,34 +1087,18 @@ pub fn do_status(ctx: &mut AppCtx<'_>, id: i64, what: &str) {
         ctx.error("请先保存凭证");
         return;
     }
-    let who = ctx.user().display_name.clone();
+    // 与凭证 prepared_by/posted_by 的存储口径一致：登录账号 username
+    let who = ctx.user().username.clone();
     let r = match what {
-        "audit" => findb::vouchers::audit(ctx.db(), id, &who),
-        "unaudit" => findb::vouchers::unaudit(ctx.db(), id),
         "post" => findb::vouchers::post(ctx.db(), id, &who),
         "unpost" => findb::vouchers::unpost(ctx.db(), id),
-        "void" => {
-            let cur = findb::vouchers::get(ctx.db(), id).ok().flatten();
-            match cur {
-                Some(v) => {
-                    findb::vouchers::set_void(ctx.db(), id, v.status != VoucherStatus::Void, &who)
-                }
-                None => {
-                    ctx.error("凭证不存在");
-                    return;
-                }
-            }
-        }
         _ => return,
     };
     match r {
         Ok(()) => {
             let label: &str = match what {
-                "audit" => "审核凭证",
-                "unaudit" => "反审核",
                 "post" => "记账",
                 "unpost" => "反记账",
-                "void" => "作废/恢复",
                 _ => "状态变更",
             };
             ctx.log("凭证", label, &format!("凭证 #{id}"));

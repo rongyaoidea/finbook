@@ -62,8 +62,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers", get(list_vouchers).post(save_voucher))
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
-        .route("/api/vouchers/:id/audit", post(voucher_audit))
-        .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
+        .route("/api/vouchers/:id/unpost", post(voucher_unpost))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
         // 发票管理
         .route("/api/invoices", get(list_invoices).post(create_invoice))
@@ -595,10 +594,9 @@ async fn list_vouchers(
         return Err(AppError::forbidden("没有查看凭证的权限"));
     }
     let db = state.db_for(&user.book_key)?;
-    let mut query = VoucherQuery::default();
-    query.asc = true;
     // 落地数据范围：仅本人凭证或按科目区间过滤
     let mut query = VoucherQuery::default().with_data_scope(&user.user);
+    query.asc = true;
     if let Some(p) = q.get("period").and_then(|s| parse_period(s)) {
         query.from = Some(p);
         query.to = Some(p);
@@ -616,10 +614,12 @@ async fn list_vouchers(
         .get("limit")
         .and_then(|s| s.parse::<i64>().ok())
         .or(Some(200));
-    let list = vouchers::list(&db, &query)?
-        .iter()
-        .map(to_item)
-        .collect();
+    let mut list = vouchers::list(&db, &query)?;
+    // 列表需要摘要与借贷合计：`vouchers::list` 只读表头，这里批量补充分录
+    vouchers::fill_entries(&db, &mut list)?;
+    // 数据范围：科目区间等限制需逐张过滤（查询层只处理了「仅本人凭证」）
+    list.retain(|v| user.user.can_see_voucher(v));
+    let list = list.iter().map(to_item).collect();
     Ok(Json(list))
 }
 
@@ -701,7 +701,9 @@ async fn save_voucher(
             return Err(AppError::forbidden("无权修改该凭证"));
         }
         if !existing.status.can_edit() {
-            return Err(AppError::forbidden("该凭证当前状态不能修改（已作废）"));
+            return Err(AppError::forbidden(
+                "该凭证已记账或已作废，不能修改（已记账请先反记账）",
+            ));
         }
         // 日期不能漂移到凭证期间之外（期间本身不可改，改的是日期）
         if (date.year(), date.month()) != (existing.period.year(), existing.period.month()) {
@@ -754,11 +756,8 @@ async fn save_voucher(
     if !v.balanced() {
         return Err(AppError::bad_request("借贷不平衡，请检查分录金额"));
     }
-    // 保存即生效（直接进入余额表/账簿汇总），无草稿/审核流程
-    v.status = VoucherStatus::Posted;
-    if v.posted_by.is_none() {
-        v.posted_by = Some(user.username().to_string());
-    }
+    // 保存为「未记账」，核对无误后在界面点「记账」确认入账（无审核环节）
+    v.status = VoucherStatus::Draft;
     let id = vouchers::save(&db, &mut v)?;
     db.log(
         user.username(),
@@ -774,59 +773,32 @@ async fn voucher_post(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // 凭证已在保存时直接设为已记账（Posted）状态，本接口仅确认状态
+    user.require(Perm::VoucherPost)?;
     let db = state.db_for(&user.book_key)?;
-    // 检查是否已参与汇总
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
-    if !v.status.counts() {
+    if v.status == VoucherStatus::Posted {
+        return Ok(Json(json!({"ok": true, "already_posted": true})));
+    }
+    if v.status == VoucherStatus::Void {
         return Err(AppError::bad_request("该凭证不参与账簿汇总"));
     }
-    // 已是已记账状态，直接返回成功
-    Ok(Json(json!({"ok": true, "already_posted": true})))
-}
-
-async fn voucher_audit(
-    State(state): State<Arc<WebState>>,
-    user: CurrentUser,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // 凭证已在保存时设为 Audited 状态，无需再次审核
-    let db = state.db_for(&user.book_key)?;
-    let v = vouchers::get(&db, id)?
-        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
-    if v.status == VoucherStatus::Audited {
-        return Ok(Json(json!({"ok": true, "already_audited": true})));
-    }
-    user.require(Perm::VoucherAudit)?;
-    let db = state.db_for(&user.book_key)?;
-    vouchers::audit(&db, id, user.username())?;
+    vouchers::post(&db, id, user.username())?;
     Ok(Json(json!({"ok": true})))
 }
 
-async fn voucher_unaudit(
+async fn voucher_unpost(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherAudit)?;
+    // 反记账（已记账 → 未记账），修改前需先反记账
+    user.require(Perm::VoucherUnpost)?;
     let db = state.db_for(&user.book_key)?;
-    let v = vouchers::get(&db, id)?
+    vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
-    // 已记账 → 反记账（Posted → Audited）
-    if v.status == VoucherStatus::Posted {
-        vouchers::unpost(&db, id)?;
-        return Ok(Json(json!({"ok": true, "action": "unposted"})));
-    }
-    // 已审核 → 反审核（Audited → Draft）
-    if v.status == VoucherStatus::Audited {
-        vouchers::unaudit(&db, id)?;
-        return Ok(Json(json!({"ok": true, "action": "unaudited"})));
-    }
-    Ok(Json(json!({
-        "ok": false,
-        "message": format!("凭证当前为「{}」，无需操作", v.status.label())
-    })))
+    vouchers::unpost(&db, id)?;
+    Ok(Json(json!({"ok": true, "action": "unposted"})))
 }
 
 async fn voucher_delete(
@@ -842,16 +814,10 @@ async fn voucher_delete(
     if !user.user.can_see_voucher(&v) {
         return Err(AppError::forbidden("无权删除该凭证"));
     }
-    // 已记账凭证需先反记账才能删除
+    // 已记账凭证需先反记账才能删除（未记账凭证可直接删除）
     if v.status == VoucherStatus::Posted {
         return Err(AppError::bad_request(
             "已记账凭证不能直接删除，请先反记账",
-        ));
-    }
-    // 已审核凭证需先反审核
-    if v.status == VoucherStatus::Audited {
-        return Err(AppError::bad_request(
-            "已审核凭证不能直接删除，请先反审核",
         ));
     }
     // 期间是否已结账
@@ -1009,8 +975,11 @@ async fn invoice_set_status(
 /// 发票列表查询参数
 #[derive(Deserialize, Default)]
 pub struct InvoiceListQuery {
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub keyword: String,
 }
 

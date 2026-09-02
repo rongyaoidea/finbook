@@ -505,6 +505,32 @@ async fn get_overview(
         .unwrap_or_else(|| current_period(&state, &user));
     let o = findb::reports::overview(&db, period)?;
     let recent: Vec<VoucherListItem> = o.recent.iter().map(to_item).collect();
+    let a = findb::advanced::financial_analysis(&db, period)?;
+    let trend: Vec<serde_json::Value> = a
+        .trend
+        .iter()
+        .map(|t| {
+            json!({
+                "period": period_to_str(t.period),
+                "revenue": t.revenue.fmt_money(),
+                "cost": t.cost.fmt_money(),
+                "net_profit": t.net_profit.fmt_money(),
+                "cum_revenue": t.cum_revenue.fmt_money(),
+                "cum_cost": t.cum_cost.fmt_money(),
+                "cum_net_profit": t.cum_net_profit.fmt_money(),
+                "anomaly_revenue": t.anomaly_revenue,
+                "anomaly_cost": t.anomaly_cost,
+                "anomaly_net_profit": t.anomaly_net_profit,
+            })
+        })
+        .collect();
+    let driver_json = |d: &findb::advanced::DriverItem| {
+        json!({
+            "name": d.name,
+            "amount": d.amount.fmt_money(),
+            "prev_amount": d.prev_amount.fmt_money(),
+        })
+    };
     Ok(Json(json!({
         "company": o.company,
         "period": period_to_str(o.period),
@@ -525,6 +551,16 @@ async fn get_overview(
         "invoice_in": {"amount_tax": o.invoice_in.0.fmt_money(), "count": o.invoice_in.1},
         "invoice_out": {"amount_tax": o.invoice_out.0.fmt_money(), "count": o.invoice_out.1},
         "recent": recent,
+        "analysis": {
+            "trend": trend,
+            "revenue_drivers": a.revenue_drivers.iter().map(driver_json).collect::<Vec<_>>(),
+            "cost_drivers": a.cost_drivers.iter().map(driver_json).collect::<Vec<_>>(),
+            "profit_drivers": a.profit_drivers.iter().map(driver_json).collect::<Vec<_>>(),
+            "anomaly_notes": a.anomaly_notes,
+            "ratios": a.ratios.iter().map(|r| json!({
+                "key": r.key, "name": r.name, "value": r.value.fmt_plain(), "display": r.display, "formula": r.formula,
+            })).collect::<Vec<_>>(),
+        },
     })))
 }
 

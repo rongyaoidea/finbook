@@ -414,6 +414,149 @@ async function viewDashboard(main) {
 // ===========================================================================
 // 管理员 · 账目总览（只读视角，仅系统管理员可见）
 // ===========================================================================
+
+// 金额字符串（"1,234.56" / "-1,234.56"）转数字
+function moneyNum(s) {
+  const n = parseFloat(String(s == null ? "0" : s).replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+function moneyFmt(n) {
+  const neg = n < 0;
+  const a = Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return neg ? "-" + a : a;
+}
+function pctFmt(n) { return n.toLocaleString("en-US", { maximumFractionDigits: 1 }) + "%"; }
+
+// 折线图（SVG，纯原生实现）。series: [{name, color, values:number[], anomalies:bool[]}]
+function lineChartSvg(labels, series, height) {
+  const W = 760, H = height || 250;
+  const padL = 62, padR = 14, padT = 16, padB = 30;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const n = labels.length;
+  if (!n) return "";
+  let min = 0, max = 0;
+  for (const s of series) for (const v of s.values) { if (v < min) min = v; if (v > max) max = v; }
+  if (max === min) max = min + 1;
+  const span = max - min || 1;
+  const x = (i) => padL + (n === 1 ? iw / 2 : (iw * i) / (n - 1));
+  const y = (v) => padT + ih - ((v - min) / span) * ih;
+  const y0 = min < 0 && max > 0 ? y(0) : null;
+
+  // 网格与 Y 轴刻度（4 档）
+  let grid = "", yticks = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = min + (span * k) / 4;
+    const gy = y(v);
+    grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="var(--z-200)" stroke-width="1"/>`;
+    yticks += `<text x="${padL - 8}" y="${gy + 4}" text-anchor="end" class="ctick">${moneyFmt(v)}</text>`;
+  }
+  // X 轴标签（最多显示 12 个）
+  let xlabels = "";
+  const step = Math.ceil(n / 12);
+  for (let i = 0; i < n; i += step) {
+    xlabels += `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" class="ctick">${esc(labels[i])}</text>`;
+  }
+
+  let lines = "", dots = "";
+  for (const s of series) {
+    const pts = s.values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+    lines += `<polyline points="${pts}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    s.values.forEach((v, i) => {
+      dots += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${s.anomalies && s.anomalies[i] ? 4.5 : 2.6}" fill="${s.anomalies && s.anomalies[i] ? "#dc2626" : s.color}"/>`;
+    });
+  }
+  const zeroAxis = y0 != null ? `<line x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}" stroke="var(--z-400)" stroke-width="1" stroke-dasharray="4 3"/>` : "";
+
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart">${grid}${zeroAxis}${lines}${dots}${yticks}${xlabels}</svg>`;
+}
+
+// 分组柱状图（当月发生额）。groups: [{name, color, values, anomalies}]
+function barChartSvg(labels, groups, height) {
+  const W = 760, H = height || 250;
+  const padL = 62, padR = 14, padT = 16, padB = 30;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const n = labels.length;
+  if (!n) return "";
+  let min = 0, max = 0;
+  for (const g of groups) for (const v of g.values) { if (v < min) min = v; if (v > max) max = v; }
+  if (max === min) max = min + 1;
+  const span = max - min || 1;
+  const y = (v) => padT + ih - ((v - min) / span) * ih;
+  const y0 = min < 0 && max > 0 ? y(0) : null;
+
+  let grid = "", yticks = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = min + (span * k) / 4;
+    const gy = y(v);
+    grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="var(--z-200)" stroke-width="1"/>`;
+    yticks += `<text x="${padL - 8}" y="${gy + 4}" text-anchor="end" class="ctick">${moneyFmt(v)}</text>`;
+  }
+  let xlabels = "";
+  const step = Math.ceil(n / 12);
+  for (let i = 0; i < n; i += step) {
+    xlabels += `<text x="${barX(i)}" y="${H - 8}" text-anchor="middle" class="ctick">${esc(labels[i])}</text>`;
+  }
+
+  const g = groups.length;
+  const slot = iw / n;
+  const bw = Math.min(18, (slot * 0.7) / g);
+  let bars = "";
+  groups.forEach((grp, gi) => {
+    grp.values.forEach((v, i) => {
+      const cx = barX(i) + (gi - (g - 1) / 2) * (bw + 2);
+      const vy = y(v), base = y0 != null ? y0 : y(0);
+      const h = Math.abs(base - vy);
+      bars += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${Math.min(vy, base).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(h, 1).toFixed(1)}" fill="${grp.color}" rx="1.5"/>`;
+      if (grp.anomalies && grp.anomalies[i]) {
+        bars += `<path d="M ${cx.toFixed(1)} ${(vy - 7).toFixed(1)} l 4 7 l -8 0 z" fill="#dc2626"/>`;
+      }
+    });
+  });
+
+  function barX(i) { return padL + slot * (i + 0.5); }
+  const zeroAxis = y0 != null ? `<line x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}" stroke="var(--z-400)" stroke-width="1" stroke-dasharray="4 3"/>` : "";
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart">${grid}${zeroAxis}${bars}${yticks}${xlabels}</svg>`;
+}
+
+// 指标内因：横向条形列表（带环比变化与占比）
+function driverBars(items, signed) {
+  const maxAbs = Math.max(1, ...items.map((it) => Math.abs(moneyNum(it.amount))));
+  return items.map((it) => {
+    const cur = moneyNum(it.amount);
+    const prev = moneyNum(it.prev_amount);
+    const w = Math.round((Math.abs(cur) / maxAbs) * 100);
+    const color = signed ? (cur < 0 ? "var(--err)" : "var(--ok)") : "var(--primary)";
+    let change = "";
+    if (prev !== 0) {
+      const pct = ((cur - prev) / Math.abs(prev)) * 100;
+      const dir = pct > 0.5 ? "▲" : pct < -0.5 ? "▼" : "—";
+      change = `<span class="drv-chg ${pct > 0.5 ? "up" : pct < -0.5 ? "down" : ""}">${dir} ${pctFmt(Math.abs(pct))}</span>`;
+    } else if (cur !== 0) {
+      change = `<span class="drv-chg up">▲ 新增</span>`;
+    }
+    return `<div class="drv-row">
+      <div class="drv-head"><span class="drv-name">${esc(it.name)}</span>
+        <span class="drv-amt">${moneyFmt(cur)}</span>${change}</div>
+      <div class="drv-bar"><i style="width:${w}%;background:${color}"></i></div>
+    </div>`;
+  }).join("");
+}
+
+// 财务指标解读（阀值判断，给出好/中/差）
+function ratioVerdict(key, v) {
+  switch (key) {
+    case "current_ratio": return v >= 2 ? "good" : v >= 1 ? "warn" : "bad";
+    case "quick_ratio": return v >= 1 ? "good" : v >= 0.5 ? "warn" : "bad";
+    case "debt_ratio": return v <= 0.5 ? "good" : v <= 0.7 ? "warn" : "bad";
+    case "gross_margin": return v >= 0.3 ? "good" : v >= 0.1 ? "warn" : "bad";
+    case "net_margin": return v >= 0.1 ? "good" : v >= 0 ? "warn" : "bad";
+    case "roe": return v >= 0.1 ? "good" : v >= 0 ? "warn" : "bad";
+    case "roa": return v >= 0.05 ? "good" : v >= 0 ? "warn" : "bad";
+    default: return "warn";
+  }
+}
+const VERDICT_LABEL = { good: "健康", warn: "关注", bad: "预警" };
+
 async function viewOverview(main) {
   main.innerHTML = `<h2>账目总览</h2><div class="muted">加载中…</div>`;
   let d;
@@ -422,8 +565,26 @@ async function viewOverview(main) {
     return;
   }
   const t = d.totals || {};
+  const a = d.analysis || {};
   const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
   const card = (k, v, style) => `<div class="card"><div class="k">${k}</div><div class="v" ${style ? `style="${style}"` : ""}>${v}</div></div>`;
+
+  // ---- 走势图数据 ----
+  const trend = a.trend || [];
+  const labels = trend.map((x) => String(x.period).slice(5) + "月");
+  const cumSeries = [
+    { name: "累计营业收入", color: "#2563eb", values: trend.map((x) => moneyNum(x.cum_revenue)), anomalies: trend.map((x) => x.anomaly_revenue) },
+    { name: "累计营业成本", color: "#f59e0b", values: trend.map((x) => moneyNum(x.cum_cost)), anomalies: trend.map((x) => x.anomaly_cost) },
+    { name: "累计净利润", color: "#16a34a", values: trend.map((x) => moneyNum(x.cum_net_profit)), anomalies: trend.map((x) => x.anomaly_net_profit) },
+  ];
+  const monthGroups = [
+    { name: "营业收入", color: "#2563eb", values: trend.map((x) => moneyNum(x.revenue)), anomalies: trend.map((x) => x.anomaly_revenue) },
+    { name: "营业成本", color: "#f59e0b", values: trend.map((x) => moneyNum(x.cost)), anomalies: trend.map((x) => x.anomaly_cost) },
+    { name: "净利润", color: "#16a34a", values: trend.map((x) => moneyNum(x.net_profit)), anomalies: trend.map((x) => x.anomaly_net_profit) },
+  ];
+  const legend = (series) => series.map((s) =>
+    `<span class="lg-item"><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("");
+
   main.innerHTML = `
     <h2>账目总览</h2>
     <p class="muted" style="margin:0 0 12px">
@@ -436,17 +597,63 @@ async function viewOverview(main) {
       ${card("所有者权益", t.equity || "—", "font-size:18px")}
       ${card("净利润（年初至今）", t.net_profit || "—", "font-size:18px")}
     </div>
-    <div class="cards" style="margin-top:14px">
-      ${card("营业收入（年初至今）", t.revenue || "—")}
-      ${card("营业成本（年初至今）", t.cost || "—")}
-      ${card("进项发票价税合计", `${(d.invoice_in && d.invoice_in.amount_tax) || "0.00"}（${(d.invoice_in && d.invoice_in.count) || 0} 张）`)}
-      ${card("销项发票价税合计", `${(d.invoice_out && d.invoice_out.amount_tax) || "0.00"}（${(d.invoice_out && d.invoice_out.count) || 0} 张）`)}
+
+    <div class="panel" style="margin-top:14px">
+      <div class="chart-head"><b>财务走势 · 年初至今累计</b><span class="lg">${legend(cumSeries)}</span></div>
+      <div class="chart-box">${lineChartSvg(labels, cumSeries, 230)}</div>
+      <div class="chart-note">红线圆点 = 异常月份（偏离年内均值 ±2σ 或出现亏损）；折线为 1 月起累计值。</div>
     </div>
+    <div class="panel" style="margin-top:14px">
+      <div class="chart-head"><b>当月发生额（逐月对比）</b><span class="lg">${legend(monthGroups)}</span></div>
+      <div class="chart-box">${barChartSvg(labels, monthGroups, 230)}</div>
+      <div class="chart-note">红三角 = 异常月份；柱状为各月发生额，便于发现突增突减与亏损月。</div>
+    </div>
+
+    ${(a.anomaly_notes || []).length ? `<div class="panel warn-panel" style="margin-top:14px">
+      <b>⚠ 异常提示</b>
+      ${(a.anomaly_notes || []).slice(0, 6).map((n) => `<div class="anom">${esc(n)}</div>`).join("")}
+      ${(a.anomaly_notes || []).length > 6 ? `<div class="muted">…共 ${a.anomaly_notes.length} 条</div>` : ""}
+    </div>` : ""}
+
+    <div class="grid-3" style="margin-top:14px">
+      <div class="panel">
+        <h4>营业收入构成（本月 vs 上月）</h4>
+        ${driverBars(a.revenue_drivers || [], false) || `<div class="muted">暂无数据</div>`}
+      </div>
+      <div class="panel">
+        <h4>营业成本构成（本月 vs 上月）</h4>
+        ${driverBars(a.cost_drivers || [], false) || `<div class="muted">暂无数据</div>`}
+      </div>
+      <div class="panel">
+        <h4>净利润构成（利润表口径）</h4>
+        ${driverBars(a.profit_drivers || [], true) || `<div class="muted">暂无数据</div>`}
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <b>财务状况分析</b>
+      <div class="ratio-grid">
+        ${(a.ratios || []).map((r) => {
+          const verdict = ratioVerdict(r.key, parseFloat(r.value));
+          return `<div class="ratio-card ${verdict}">
+            <div class="rc-name">${esc(r.name)}</div>
+            <div class="rc-val">${esc(r.display)}</div>
+            <div class="rc-tag ${verdict}">${VERDICT_LABEL[verdict]}</div>
+            <div class="rc-formula">${esc(r.formula)}</div>
+          </div>`;
+        }).join("") || `<div class="muted">暂无指标</div>`}
+      </div>
+    </div>
+
     <div class="cards" style="margin-top:14px">
       ${card("凭证总数（全账套）", esc(d.vouchers))}
       ${card("当期未记账", esc(d.unposted))}
       ${card("当期已记账", esc(d.posted))}
       ${card("科目数（全账套）", esc(d.accounts))}
+    </div>
+    <div class="cards" style="margin-top:14px">
+      ${card("进项发票价税合计", `${(d.invoice_in && d.invoice_in.amount_tax) || "0.00"}（${(d.invoice_in && d.invoice_in.count) || 0} 张）`)}
+      ${card("销项发票价税合计", `${(d.invoice_out && d.invoice_out.amount_tax) || "0.00"}（${(d.invoice_out && d.invoice_out.count) || 0} 张）`)}
     </div>
     <div class="toolbar" style="margin-top:14px">
       <span class="muted">科目表维护：</span>

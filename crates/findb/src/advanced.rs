@@ -1522,6 +1522,239 @@ pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRati
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// 财务分析：逐月趋势 / 指标内因构成 / 异常检测（供管理员只读总览）
+// ---------------------------------------------------------------------------
+
+/// 逐月趋势点
+#[derive(Clone, Debug)]
+pub struct TrendPoint {
+    pub period: Period,
+    /// 当月营业收入
+    pub revenue: Money,
+    /// 当月营业成本
+    pub cost: Money,
+    /// 当月净利润
+    pub net_profit: Money,
+    /// 年初至今累计营业收入
+    pub cum_revenue: Money,
+    /// 年初至今累计营业成本
+    pub cum_cost: Money,
+    /// 年初至今累计净利润
+    pub cum_net_profit: Money,
+    pub anomaly_revenue: bool,
+    pub anomaly_cost: bool,
+    pub anomaly_net_profit: bool,
+}
+
+/// 指标内因构成项（营业收入/营业成本/净利润的驱动科目或利润表行）
+#[derive(Clone, Debug)]
+pub struct DriverItem {
+    pub code: String,
+    pub name: String,
+    /// 本月金额（有符号：收入类为正，成本费用类为负）
+    pub amount: Money,
+    /// 上月金额（环比基准）
+    pub prev_amount: Money,
+}
+
+/// 财务分析结果
+#[derive(Clone, Debug)]
+pub struct FinancialAnalysis {
+    pub trend: Vec<TrendPoint>,
+    pub revenue_drivers: Vec<DriverItem>,
+    pub cost_drivers: Vec<DriverItem>,
+    /// 净利润构成（利润表口径：收入、成本、各项费用，正=增利、负=减利）
+    pub profit_drivers: Vec<DriverItem>,
+    /// 异常说明（人类可读）
+    pub anomaly_notes: Vec<String>,
+    /// 偿债/营运/盈利指标（复用 fin_ratios）
+    pub ratios: Vec<FinRatio>,
+}
+
+/// 异常检测：均值 ± 2σ 之外视为异常（样本过少或方差为 0 时不标记）
+fn flag_series(vals: &[Money]) -> Vec<bool> {
+    if vals.len() < 3 {
+        return vec![false; vals.len()];
+    }
+    let f: Vec<f64> = vals.iter().map(|v| v.to_f64()).collect();
+    let n = f.len() as f64;
+    let mean = f.iter().sum::<f64>() / n;
+    let var = f.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let std = var.sqrt();
+    if std.abs() < 1e-6 {
+        return vec![false; vals.len()];
+    }
+    f.iter().map(|x| (x - mean).abs() > 2.0 * std).collect()
+}
+
+/// 计算 [1月, period] 区间的逐月趋势与异常，并给出指标内因构成
+pub fn financial_analysis(db: &Db, period: Period) -> DbResult<FinancialAnalysis> {
+    use crate::balances::{BalanceQuery, BalanceSnapshot};
+
+    let jan = Period::new(period.year(), 1).unwrap_or(period);
+
+    // ---- 逐月趋势 ----
+    let mut months: Vec<Period> = Vec::new();
+    let mut m = jan;
+    loop {
+        if m > period {
+            break;
+        }
+        months.push(m);
+        m = m.next();
+    }
+
+    let mut trend: Vec<TrendPoint> = Vec::with_capacity(months.len());
+    let mut cum_rev = Money::ZERO;
+    let mut cum_cost = Money::ZERO;
+    let mut cum_np = Money::ZERO;
+    for mo in &months {
+        let t = financial_totals(db, *mo, *mo)?;
+        cum_rev += t.revenue;
+        cum_cost += t.cost;
+        cum_np += t.net_profit;
+        trend.push(TrendPoint {
+            period: *mo,
+            revenue: t.revenue,
+            cost: t.cost,
+            net_profit: t.net_profit,
+            cum_revenue: cum_rev,
+            cum_cost: cum_cost,
+            cum_net_profit: cum_np,
+            anomaly_revenue: false,
+            anomaly_cost: false,
+            anomaly_net_profit: false,
+        });
+    }
+
+    // 异常标记（均值 ± 2σ）
+    let rev_flags = flag_series(&trend.iter().map(|t| t.revenue).collect::<Vec<_>>());
+    let cost_flags = flag_series(&trend.iter().map(|t| t.cost).collect::<Vec<_>>());
+    let np_flags = flag_series(&trend.iter().map(|t| t.net_profit).collect::<Vec<_>>());
+    let mut anomaly_notes: Vec<String> = Vec::new();
+    for (i, tp) in trend.iter_mut().enumerate() {
+        tp.anomaly_revenue = rev_flags[i];
+        tp.anomaly_cost = cost_flags[i];
+        // 净利润异常：统计离群 或 当月亏损
+        tp.anomaly_net_profit = np_flags[i] || tp.net_profit.is_negative();
+        if tp.anomaly_revenue {
+            anomaly_notes.push(format!(
+                "{} 营业收入 {} 显著偏离年内均值，请核查收入确认时点",
+                tp.period.label(),
+                tp.revenue.fmt_money()
+            ));
+        }
+        if tp.anomaly_cost {
+            anomaly_notes.push(format!(
+                "{} 营业成本 {} 显著偏离年内均值，请核查成本结转口径",
+                tp.period.label(),
+                tp.cost.fmt_money()
+            ));
+        }
+        if np_flags[i] {
+            anomaly_notes.push(format!(
+                "{} 净利润 {} 异常波动，请核查收入成本配比",
+                tp.period.label(),
+                tp.net_profit.fmt_money()
+            ));
+        } else if tp.net_profit.is_negative() {
+            anomaly_notes.push(format!(
+                "{} 出现亏损（净利润 {}），建议关注费用与毛利",
+                tp.period.label(),
+                tp.net_profit.fmt_money()
+            ));
+        }
+    }
+
+    // ---- 内因构成（本月 vs 上月，环比展示变化） ----
+    let prev = period.prev();
+    let snap_cur = BalanceSnapshot::load(db, &BalanceQuery::period(period))?;
+    let snap_prev = BalanceSnapshot::load(db, &BalanceQuery::period(prev))?;
+    let occ = |snap: &BalanceSnapshot, code: &str| {
+        let r = snap.for_account(code, None);
+        r.credit - r.debit // 收入类贷方正
+    };
+    let exp = |snap: &BalanceSnapshot, code: &str| {
+        let r = snap.for_account(code, None);
+        r.debit - r.credit // 费用类借方正
+    };
+    // 有符号项：正=增利，负=减利
+    let signed = |snap: &BalanceSnapshot, code: &str, dir: i8| {
+        let v = if dir > 0 { occ(snap, code) } else { exp(snap, code) };
+        if dir > 0 { v } else { v.negated() }
+    };
+
+    let revenue_drivers = [("6001", "主营业务收入", 1i8), ("6051", "其他业务收入", 1)]
+        .iter()
+        .map(|(c, n, d)| DriverItem {
+            code: c.to_string(),
+            name: n.to_string(),
+            amount: signed(&snap_cur, c, *d),
+            prev_amount: signed(&snap_prev, c, *d),
+        })
+        .collect();
+
+    let cost_drivers = [("6401", "主营业务成本", -1i8), ("6402", "其他业务成本", -1)]
+        .iter()
+        .map(|(c, n, _d)| {
+            // 营业成本构成显示为正数（成本规模）
+            let cur = exp(&snap_cur, c);
+            let prv = exp(&snap_prev, c);
+            DriverItem {
+                code: c.to_string(),
+                name: n.to_string(),
+                amount: cur,
+                prev_amount: prv,
+            }
+        })
+        .collect();
+
+    // 净利润构成（利润表口径）：营业收入、营业成本、税金、三项费用、资产减值、营业外、所得税
+    let profit_drivers = [
+        ("_rev", "营业收入", 1i8),
+        ("_cost", "营业成本", -1i8),
+        ("6403", "税金及附加", -1i8),
+        ("6601", "销售费用", -1i8),
+        ("6602", "管理费用", -1i8),
+        ("6603", "财务费用", -1i8),
+        ("6701", "资产减值损失", -1i8),
+        ("6301", "营业外收入", 1i8),
+        ("6711", "营业外支出", -1i8),
+        ("6801", "所得税费用", -1i8),
+    ]
+    .iter()
+    .map(|(c, n, d)| {
+        let (cur, prv) = if *c == "_rev" {
+            (occ(&snap_cur, "6001") + occ(&snap_cur, "6051"), occ(&snap_prev, "6001") + occ(&snap_prev, "6051"))
+        } else if *c == "_cost" {
+            let a = exp(&snap_cur, "6401") + exp(&snap_cur, "6402");
+            let b = exp(&snap_prev, "6401") + exp(&snap_prev, "6402");
+            (a.negated(), b.negated())
+        } else {
+            (signed(&snap_cur, c, *d), signed(&snap_prev, c, *d))
+        };
+        DriverItem {
+            code: c.to_string(),
+            name: n.to_string(),
+            amount: cur,
+            prev_amount: prv,
+        }
+    })
+    .collect();
+
+    let ratios = fin_ratios(db, period, jan)?;
+
+    Ok(FinancialAnalysis {
+        trend,
+        revenue_drivers,
+        cost_drivers,
+        profit_drivers,
+        anomaly_notes,
+        ratios,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1814,5 +2047,38 @@ mod tests {
         let gm = ratios.iter().find(|r| r.key == "gross_margin").unwrap();
         // 毛利率 = (100000-60000)/100000 = 40%
         assert_eq!(gm.value, m("0.4"));
+    }
+
+    #[test]
+    fn financial_analysis_trend_and_drivers() {
+        let db = tmpdb("finanalysis");
+        let p = Period::new(2026, 2).unwrap();
+        crate::auxs::insert(&db, &AuxEntity::new(AuxKind::Bank, "B01", "工行")).unwrap();
+        // 1 月：收入 100000，成本 40000
+        let jan = Period::new(2026, 1).unwrap();
+        post(&db, jan, 1, &[("100201", "100000", "0"), ("600101", "0", "100000")]);
+        post(&db, jan, 2, &[("6401", "40000", "0"), ("100201", "0", "40000")]);
+        // 2 月：收入 30000，成本 10000
+        post(&db, p, 1, &[("100201", "30000", "0"), ("600101", "0", "30000")]);
+        post(&db, p, 2, &[("6401", "10000", "0"), ("100201", "0", "10000")]);
+
+        let a = financial_analysis(&db, p).unwrap();
+        assert_eq!(a.trend.len(), 2, "应含 1、2 两月趋势点");
+        assert_eq!(a.trend[0].revenue, m("100000"));
+        assert_eq!(a.trend[0].net_profit, m("60000"));
+        // 年初至今累计收入 = 100000 + 30000
+        assert_eq!(a.trend[1].cum_revenue, m("130000"));
+        assert_eq!(a.trend[1].cum_net_profit, m("80000"));
+
+        // 营业收入构成：主营业务收入 6001 本月 30000，上月 100000
+        let rev = &a.revenue_drivers[0];
+        assert_eq!(rev.code, "6001");
+        assert_eq!(rev.amount, m("30000"));
+        assert_eq!(rev.prev_amount, m("100000"));
+        // 净利润构成首项为营业收入（本月 30000）
+        assert_eq!(a.profit_drivers[0].name, "营业收入");
+        assert_eq!(a.profit_drivers[0].amount, m("30000"));
+        // 指标至少含 ROE/ROA 等
+        assert!(a.ratios.iter().any(|r| r.key == "roe"));
     }
 }

@@ -17,8 +17,12 @@ pub struct PublicUser {
     pub device_name: String,
     /// 是否已停用（前端据此显示账号状态）
     pub disabled: bool,
-    /// 该用户拥有的权限（snake_case 名称）
+    /// 该用户拥有的权限（snake_case 名称，最终生效口径）
     pub perms: Vec<String>,
+    /// 在角色基础上额外授予的权限（snake_case）
+    pub extra_perms: Vec<String>,
+    /// 在角色基础上明确关闭的权限（snake_case）
+    pub deny_perms: Vec<String>,
     /// 下次登录是否强制改密
     pub must_change_pwd: bool,
     /// 锁定截止时刻（`%Y-%m-%d %H:%M:%S`），None 表示未锁定
@@ -33,13 +37,19 @@ pub struct PublicUser {
 
 impl PublicUser {
     pub fn from_user(u: &User) -> Self {
+        let perm_code = |p: &Perm| {
+            serde_json::to_value(*p)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
         let perms = Perm::all()
             .iter()
             .filter(|p| u.can(**p))
-            .map(|p| serde_json::to_value(p).ok())
-            .flatten()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .map(perm_code)
             .collect();
+        let extra_perms = u.extra_perms.iter().map(perm_code).collect();
+        let deny_perms = u.deny_perms.iter().map(perm_code).collect();
         PublicUser {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
@@ -49,6 +59,8 @@ impl PublicUser {
             device_name: u.device_name.clone(),
             disabled: u.disabled,
             perms,
+            extra_perms,
+            deny_perms,
             must_change_pwd: u.must_change_pwd,
             locked_until: u.locked_until.clone(),
             last_login_at: u.last_login_at.clone(),
@@ -124,6 +136,12 @@ pub struct CreateUserReq {
     /// 备注（可选）
     #[serde(default)]
     pub memo: String,
+    /// 在角色基础上额外授予的权限
+    #[serde(default)]
+    pub extra_perms: Vec<Perm>,
+    /// 在角色基础上明确关闭的权限
+    #[serde(default)]
+    pub deny_perms: Vec<Perm>,
 }
 
 fn default_true() -> bool {
@@ -139,6 +157,10 @@ pub struct UpdateUserReq {
     pub memo: Option<String>,
     /// 完整替换数据范围（前端提交当前 scope 的完整副本）
     pub data_scope: Option<DataScope>,
+    /// 完整替换在角色基础上额外授予的权限
+    pub extra_perms: Option<Vec<Perm>>,
+    /// 完整替换在角色基础上明确关闭的权限
+    pub deny_perms: Option<Vec<Perm>>,
 }
 
 #[derive(Deserialize)]

@@ -402,6 +402,11 @@ async fn create_user(
     if !u.is_admin() {
         u.data_scope.own_voucher_only = true;
     }
+    // 角色基础上的逐项覆盖（管理员角色忽略，避免把自己锁在门外）
+    if !u.is_admin() {
+        u.extra_perms = req.extra_perms;
+        u.deny_perms = req.deny_perms;
+    }
     let id = users::insert(&db, &u)?;
     db.log(user.username(), "安全", "新建用户", &format!("创建账号「{username}」（{}）", req.role.label()))?;
     Ok(Json(json!({"id": id})))
@@ -445,6 +450,12 @@ async fn update_user(
     }
     if let Some(s) = req.data_scope {
         u.data_scope = s;
+    }
+    if let Some(p) = req.extra_perms {
+        u.extra_perms = p;
+    }
+    if let Some(p) = req.deny_perms {
+        u.deny_perms = p;
     }
     users::update(&db, &u)?;
     db.log(user.username(), "安全", "修改用户", &format!("更新「{username}」的信息"))?;

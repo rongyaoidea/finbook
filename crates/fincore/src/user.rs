@@ -309,8 +309,10 @@ pub struct User {
     pub password_hash: String,
     pub role: Role,
     pub disabled: bool,
-    /// 额外权限（在角色基础上追加或例外）
+    /// 额外权限（在角色基础上追加）
     pub extra_perms: Vec<Perm>,
+    /// 禁止的权限（在角色基础上例外关闭，逐项覆盖角色预设）
+    pub deny_perms: Vec<Perm>,
     pub memo: String,
     /// 上次修改口令时间
     pub pwd_changed_at: String,
@@ -340,6 +342,7 @@ impl User {
             role,
             disabled: false,
             extra_perms: Vec::new(),
+            deny_perms: Vec::new(),
             memo: String::new(),
             pwd_changed_at: String::new(),
             must_change_pwd: false,
@@ -361,6 +364,14 @@ impl User {
 
     pub fn can(&self, p: Perm) -> bool {
         if self.disabled {
+            return false;
+        }
+        // 系统管理员始终拥有全部权限，不接受逐项关闭（避免把自己锁在门外）
+        if self.role == Role::Admin {
+            return true;
+        }
+        // 逐项覆盖：角色预设 + 额外授权 − 明确关闭
+        if self.deny_perms.contains(&p) {
             return false;
         }
         self.role.perms().contains(&p) || self.extra_perms.contains(&p)
@@ -632,5 +643,30 @@ mod tests {
         let admin = User::new("admin", "管理员", Role::Admin);
         assert!(!admin.data_scope.own_voucher_only);
         assert!(admin.data_scope.is_unrestricted());
+    }
+
+    #[test]
+    fn per_perm_override_deny_and_extra() {
+        // 会计角色本身拥有 VoucherNew / Report，但没有 Backup
+        let mut acc = User::new("acc1", "会计一", Role::Accountant);
+        assert!(acc.can(Perm::VoucherNew));
+        assert!(acc.can(Perm::Report));
+        assert!(!acc.can(Perm::Backup));
+
+        // 逐项关闭：角色里有的也能关掉
+        acc.deny_perms.push(Perm::VoucherNew);
+        assert!(!acc.can(Perm::VoucherNew), "逐项关闭后角色权限失效");
+        assert!(acc.can(Perm::Report), "未关闭的权限不受影响");
+
+        // 逐项开启：角色里没有的也能加上
+        acc.extra_perms.push(Perm::Backup);
+        assert!(acc.can(Perm::Backup), "逐项开启后获得额外权限");
+
+        // 管理员始终全权，不受 deny 影响（防止把自己锁在门外）
+        let mut admin = User::new("root", "管理员", Role::Admin);
+        admin.deny_perms.push(Perm::UserManage);
+        assert!(admin.can(Perm::UserManage), "管理员不受逐项关闭限制");
+        admin.deny_perms.push(Perm::Backup);
+        assert!(admin.can(Perm::Backup));
     }
 }

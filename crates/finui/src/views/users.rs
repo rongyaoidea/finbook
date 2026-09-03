@@ -265,6 +265,69 @@ impl UsersView {
                 ui.checkbox(&mut u.disabled, "停用该用户");
                 ui.checkbox(&mut u.must_change_pwd, "下次登录强制改密");
                 ui.add_space(8.0);
+
+                // 权限逐项覆盖：角色预设基础上，每一项可改为「强制开启 / 强制关闭」
+                if u.is_admin() {
+                    ui.label(RichText::new("系统管理员默认拥有全部权限，不受逐项开关限制。").weak());
+                } else {
+                    ui.label(RichText::new("权限覆盖（角色基础上逐项开关）").weak());
+                    ui.add_space(4.0);
+                    let role_perms = u.role.perms();
+                    let extra = u.extra_perms.clone();
+                    let deny = u.deny_perms.clone();
+                    // -1=强制关闭 0=跟随角色 1=强制开启
+                    let mut changed: Option<(Perm, i8)> = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("user_perm_overrides")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("perm_overrides")
+                                .num_columns(2)
+                                .spacing([10.0, 6.0])
+                                .show(ui, |ui| {
+                                    for p in Perm::all() {
+                                        let base = role_perms.contains(p);
+                                        let force_on = extra.contains(p);
+                                        let force_off = deny.contains(p);
+                                        let cur = if force_off {
+                                            "强制关闭".to_string()
+                                        } else if force_on {
+                                            "强制开启".to_string()
+                                        } else {
+                                            format!("跟随角色{}", if base { " ✔" } else { " ✖" })
+                                        };
+                                        ui.label(format!("{}：", p.label()));
+                                        egui::ComboBox::from_id_salt(("perm_ovr", p))
+                                            .selected_text(cur)
+                                            .width(170.0)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_label(!force_off && !force_on, "跟随角色")
+                                                    .clicked()
+                                                    .then(|| changed = Some((*p, 0)));
+                                                ui.selectable_label(force_on, "强制开启")
+                                                    .clicked()
+                                                    .then(|| changed = Some((*p, 1)));
+                                                ui.selectable_label(force_off, "强制关闭")
+                                                    .clicked()
+                                                    .then(|| changed = Some((*p, -1)));
+                                            });
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    // 应用选择：跟随角色 → 清空覆盖；强制开启 → 加 extra；强制关闭 → 加 deny
+                    if let Some((p, mode)) = changed {
+                        u.extra_perms.retain(|x| *x != p);
+                        u.deny_perms.retain(|x| *x != p);
+                        match mode {
+                            1 => u.extra_perms.push(p),
+                            -1 => u.deny_perms.push(p),
+                            _ => {}
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
+
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("取消").clicked() {

@@ -243,47 +243,48 @@ async function showSetupWizard() {
 
 // 导航项配置（新增页面只改这里 + VIEWS 注册表，无需改 switch）
 // admin: true 表示仅系统管理员可见（只读视角入口）
+// group: 侧边栏分组（与桌面端 NavItem::group 保持一致）
 const NAV_ITEMS = [
-  { id: "overview", label: "账目总览", admin: true },
-  { id: "dashboard", label: "仪表盘", perm: null },
-  { id: "vouchers", label: "记账凭证", perm: "voucher_new" },
-  { id: "invoices", label: "发票管理", perm: "report" },
-  { id: "imports", label: "数据导入", perm: "voucher_new" },
-  { id: "ledger", label: "明细账", perm: "report" },
-  { id: "reports", label: "报表中心", perm: "report" },
-  { id: "multi-column", label: "多栏账", perm: "report" },
-  { id: "summary-table", label: "摘要汇总表", perm: "report" },
-  { id: "ratios", label: "财务指标", perm: "report" },
-  { id: "equity", label: "权益变动表", perm: "report" },
-  { id: "compare", label: "报表对比", perm: "report" },
-  { id: "daily", label: "科目日报表", perm: "report" },
-  { id: "reconcile", label: "期末对账", perm: "report" },
-  { id: "mrp", label: "MRP 运算", perm: "account_edit" },
-  { id: "routing", label: "工艺路线", perm: "account_edit" },
-  { id: "approval", label: "审批中心", perm: "report" },
-  { id: "notes", label: "报表附注", perm: "report" },
-  { id: "archive", label: "电子档案", perm: "report" },
-  { id: "budget-versions", label: "预算版本", perm: "report" },
-  { id: "budget-alerts", label: "预算预警", perm: "report" },
-  { id: "po-reconcile", label: "采购对账", perm: "report" },
-  { id: "so-reconcile", label: "销售对账", perm: "report" },
-  { id: "inv-aging", label: "库存账龄", perm: "report" },
-  { id: "inv-abc", label: "库存ABC", perm: "report" },
-  { id: "inv-serial", label: "序列号", perm: "account_edit" },
-  { id: "inv-unit", label: "多单位换算", perm: "account_edit" },
-  { id: "inv-assemble", label: "组装拆卸", perm: "account_edit" },
-  { id: "inv-warehouse", label: "分仓库库存", perm: "report" },
-  { id: "inv-transfer", label: "调拨报表", perm: "report" },
-  { id: "po-estimate", label: "采购暂估", perm: "account_edit" },
-  { id: "procure-quota", label: "供应商配额", perm: "account_edit" },
-  { id: "po-doc", label: "采购单据", perm: "account_edit" },
-  { id: "so-doc", label: "销售单据", perm: "account_edit" },
-  { id: "order-change-log", label: "订单变更", perm: "report" },
-  { id: "work-report", label: "工序报工", perm: "account_edit" },
-  { id: "funds", label: "资金管理", perm: "report" },
-  { id: "budget-analysis", label: "预算分析", perm: "report" },
-  { id: "cost", label: "成本核算", perm: "report" },
-  { id: "security", label: "安全中心", perm: "user_manage" },
+  { id: "overview", label: "账目总览", admin: true, group: "管理员" },
+  { id: "dashboard", label: "仪表盘", perm: null, group: "开始" },
+  { id: "vouchers", label: "记账凭证", perm: "voucher_new", group: "凭证" },
+  { id: "imports", label: "数据导入", perm: "voucher_new", group: "凭证" },
+  { id: "invoices", label: "发票管理", perm: "report", group: "凭证" },
+  { id: "ledger", label: "明细账", perm: "report", group: "账簿报表" },
+  { id: "reports", label: "报表中心", perm: "report", group: "账簿报表" },
+  { id: "multi-column", label: "多栏账", perm: "report", group: "账簿报表" },
+  { id: "summary-table", label: "摘要汇总表", perm: "report", group: "账簿报表" },
+  { id: "ratios", label: "财务指标", perm: "report", group: "账簿报表" },
+  { id: "equity", label: "权益变动表", perm: "report", group: "账簿报表" },
+  { id: "compare", label: "报表对比", perm: "report", group: "账簿报表" },
+  { id: "daily", label: "科目日报表", perm: "report", group: "账簿报表" },
+  { id: "notes", label: "报表附注", perm: "report", group: "账簿报表" },
+  { id: "reconcile", label: "期末对账", perm: "report", group: "期末" },
+  { id: "mrp", label: "MRP 运算", perm: "account_edit", group: "生产制造" },
+  { id: "routing", label: "工艺路线", perm: "account_edit", group: "生产制造" },
+  { id: "work-report", label: "工序报工", perm: "account_edit", group: "生产制造" },
+  { id: "funds", label: "资金管理", perm: "report", group: "资金" },
+  { id: "budget-versions", label: "预算版本", perm: "report", group: "管理会计" },
+  { id: "budget-alerts", label: "预算预警", perm: "report", group: "管理会计" },
+  { id: "budget-analysis", label: "预算分析", perm: "report", group: "管理会计" },
+  { id: "cost", label: "成本核算", perm: "report", group: "管理会计" },
+  { id: "po-doc", label: "采购单据", perm: "account_edit", group: "采购" },
+  { id: "po-reconcile", label: "采购对账", perm: "report", group: "采购" },
+  { id: "po-estimate", label: "采购暂估", perm: "account_edit", group: "采购" },
+  { id: "procure-quota", label: "供应商配额", perm: "account_edit", group: "采购" },
+  { id: "so-doc", label: "销售单据", perm: "account_edit", group: "销售" },
+  { id: "so-reconcile", label: "销售对账", perm: "report", group: "销售" },
+  { id: "order-change-log", label: "订单变更", perm: "report", group: "销售" },
+  { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
+  { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
+  { id: "inv-serial", label: "序列号", perm: "account_edit", group: "库存" },
+  { id: "inv-unit", label: "多单位换算", perm: "account_edit", group: "库存" },
+  { id: "inv-assemble", label: "组装拆卸", perm: "account_edit", group: "库存" },
+  { id: "inv-warehouse", label: "分仓库库存", perm: "report", group: "库存" },
+  { id: "inv-transfer", label: "调拨报表", perm: "report", group: "库存" },
+  { id: "approval", label: "审批中心", perm: "report", group: "系统" },
+  { id: "archive", label: "电子档案", perm: "report", group: "系统" },
+  { id: "security", label: "安全中心", perm: "user_manage", group: "系统" },
 ];
 
 // 视图注册表：id → 渲染函数（函数声明已提升，可在顶层引用）
@@ -350,11 +351,19 @@ function renderShell() {
         <button class="btn ghost sm" id="logout">退出登录</button>
       </div>
       <div class="sidebar" id="sidebar">
-        ${session.user.is_admin ? `<div class="group">管理员 · 只读总览</div>` : ""}
-        ${nav.map((n) => {
-          if (n.admin && !session.user.is_admin) return "";
-          return `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`;
-        }).join("")}
+        ${(() => {
+          const visible = nav.filter((n) => !(n.admin && !session.user.is_admin));
+          let lastGroup = "";
+          let html = "";
+          for (const n of visible) {
+            if (n.group && n.group !== lastGroup) {
+              html += `<div class="group">${esc(n.group)}</div>`;
+              lastGroup = n.group;
+            }
+            html += `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`;
+          }
+          return html;
+        })()}
       </div>
       <div class="side-mask" id="side-mask"></div>
       <div class="main" id="main"></div>
@@ -1403,17 +1412,50 @@ async function openNewUser() {
     <div class="field"><label>初始口令（至少 6 位）</label><input id="nu-p" type="password" /></div>
     <div class="field"><label>备注</label><input id="nu-memo" /></div>
     <div class="field"><label><input type="checkbox" id="nu-must" checked /> 首次登录强制改密</label></div>
-    <div class="panel"><div class="muted" style="margin-bottom:6px">该角色将拥有以下权限：</div><div id="nu-perms"></div></div>
+    <div id="nu-perm-box">${permMatrixHtml(roles, { role: "accountant", extra_perms: [], deny_perms: [] })}</div>
     <div class="foot"><button class="btn" id="nu-save">创建</button><button class="btn ghost" id="nu-cancel">取消</button></div>`);
-  const renderPerms = () => { const r = roles.find((x) => x.role === $("#nu-r", mask).value); $("#nu-perms", mask).innerHTML = r ? rolePermsHtml(r.perms) : ""; };
-  $("#nu-r", mask).addEventListener("change", renderPerms);
-  renderPerms();
+  // 切换角色时重新生成矩阵（跟随角色的默认勾选随角色变化）
+  const refreshMatrix = () => {
+    $("#nu-perm-box", mask).innerHTML = permMatrixHtml(roles, { role: $("#nu-r", mask).value, extra_perms: [], deny_perms: [] });
+  };
+  $("#nu-r", mask).addEventListener("change", refreshMatrix);
   $("#nu-cancel", mask).onclick = closeModal;
   $("#nu-save", mask).onclick = async () => {
-    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value, memo: $("#nu-memo", mask).value.trim(), must_change_pwd: $("#nu-must", mask).checked };
+    const extra = [], deny = [];
+    $all("[data-perm]", mask).forEach((sel) => {
+      if (sel.value === "on") extra.push(sel.dataset.perm);
+      else if (sel.value === "off") deny.push(sel.dataset.perm);
+    });
+    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value, memo: $("#nu-memo", mask).value.trim(), must_change_pwd: $("#nu-must", mask).checked, extra_perms: extra, deny_perms: deny };
     if (!body.username || body.password.length < 6) { toast("账号必填且口令至少 6 位", "err"); return; }
     try { await api("/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已创建用户", "ok"); closeModal(); loadUsers(); } catch (e) { toast(e.message, "err"); }
   };
+}
+
+// 用户编辑弹窗：角色预设基础上的逐项权限开关矩阵
+function permMatrixHtml(roles, u) {
+  // 全部权限清单（取所有角色权限的并集）
+  const allPerms = [];
+  const seen = new Set();
+  (roles || []).forEach((r) => (r.perms || []).forEach((p) => { if (!seen.has(p.code)) { seen.add(p.code); allPerms.push(p); } }));
+  const extraSet = new Set(u.extra_perms || []);
+  const denySet = new Set(u.deny_perms || []);
+  const roleCodes = new Set((roles.find((x) => x.role === u.role) || {}).perms || [].map((p) => p.code));
+  const stateOf = (code) => (denySet.has(code) ? "off" : extraSet.has(code) ? "on" : "role");
+  const rows = allPerms.map((p) => {
+    const base = roleCodes.has(p.code) ? "（角色默认 ✔）" : "（角色默认 ✖）";
+    const cur = stateOf(p.code);
+    return `<tr><td>${esc(p.label)}</td><td><select data-perm="${esc(p.code)}">
+      <option value="role" ${cur === "role" ? "selected" : ""}>跟随角色 ${base}</option>
+      <option value="on" ${cur === "on" ? "selected" : ""}>强制开启</option>
+      <option value="off" ${cur === "off" ? "selected" : ""}>强制关闭</option>
+    </select></td></tr>`;
+  }).join("");
+  return `<div class="panel">
+    <div class="muted" style="margin-bottom:6px">权限明细（在角色预设基础上逐项覆盖）</div>
+    <table class="grid"><thead><tr><th>功能权限</th><th style="width:240px">授权方式</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+  </div>`;
 }
 
 async function openEditUser(u) {
@@ -1435,14 +1477,19 @@ async function openEditUser(u) {
       <div class="field"><label><input type="checkbox" id="eu-own-v" ${ds.own_voucher_only ? "checked" : ""} /> 仅看本人填制的凭证</label></div>
       <div class="field"><label><input type="checkbox" id="eu-own-d" ${ds.own_doc_only ? "checked" : ""} /> 仅看本人经手的业务单据</label></div>
     </div>
-    <div class="panel"><div class="muted" style="margin-bottom:6px">该角色将拥有以下权限：</div><div id="eu-perms"></div></div>
+    ${u.is_admin ? `<div class="panel muted">系统管理员默认拥有全部权限，不受逐项开关限制。</div>` : permMatrixHtml(roles, u)}
     <div class="foot"><button class="btn" id="eu-save">保存</button><button class="btn ghost" id="eu-cancel">取消</button></div>`);
-  const renderPerms = () => { const r = roles.find((x) => x.role === $("#eu-r", mask).value); $("#eu-perms", mask).innerHTML = r ? rolePermsHtml(r.perms) : ""; };
-  $("#eu-r", mask).addEventListener("change", renderPerms);
-  renderPerms();
   $("#eu-cancel", mask).onclick = closeModal;
   $("#eu-save", mask).onclick = async () => {
     const deptsVal = $("#eu-depts", mask).value.split(",").map((s) => s.trim()).filter(Boolean);
+    const extra = [], deny = [];
+    if (!u.is_admin) {
+      $all("[data-perm]", mask).forEach((sel) => {
+        const code = sel.dataset.perm;
+        if (sel.value === "on") extra.push(code);
+        else if (sel.value === "off") deny.push(code);
+      });
+    }
     const body = {
       display_name: $("#eu-n", mask).value.trim(),
       role: $("#eu-r", mask).value,
@@ -1450,6 +1497,8 @@ async function openEditUser(u) {
       must_change_pwd: $("#eu-must", mask).checked,
       disabled: $("#eu-dis", mask).checked,
       data_scope: { depts: deptsVal, account_from: $("#eu-acct-from", mask).value.trim(), account_to: $("#eu-acct-to", mask).value.trim(), own_voucher_only: $("#eu-own-v", mask).checked, own_doc_only: $("#eu-own-d", mask).checked },
+      extra_perms: extra,
+      deny_perms: deny,
     };
     try { await api(`/users/${encodeURIComponent(u.username)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存", "ok"); closeModal(); loadUsers(); } catch (e) { toast(e.message, "err"); }
   };

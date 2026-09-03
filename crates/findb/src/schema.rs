@@ -23,7 +23,8 @@ use crate::DbError;
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
-pub const SCHEMA_VERSION: i64 = 16;
+/// v17：用户权限逐项覆盖（user.deny_perms_json）
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -1132,8 +1133,12 @@ const MIGRATE_V8: &[(&str, &str, &str)] = &[
     ("stock_move", "batch_no", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// v16 → v17：用户权限逐项覆盖（deny_perms_json）
+const MIGRATE_V17: &[(&str, &str, &str)] = &[
+    ("user", "deny_perms_json", "TEXT NOT NULL DEFAULT '[]'"),
+];
+
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
-/// SQLite ALTER 改不了约束，需重建表。bom_substitute / bom_change_log 为 DDL 新表。
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "bom", "version")? {
         return Ok(());
@@ -1214,6 +1219,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
         migrate_generic(conn, MIGRATE_V8)?;
         migrate_v9(conn)?;
         migrate_v10(conn)?;
+        migrate_generic(conn, MIGRATE_V17)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
             rusqlite::params![SCHEMA_VERSION.to_string()],

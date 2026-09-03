@@ -694,11 +694,11 @@ impl SettleView {
         });
 
         ui.add_space(10.0);
-        self.show_bad_debt(ui, &lines, &buckets);
+        self.show_bad_debt(ctx, ui, &lines, &buckets);
     }
 
     /// 坏账准备测算：比例可改，结果只用于参考
-    fn show_bad_debt(&mut self, ui: &mut Ui, lines: &[AgingLine], buckets: &[AgingBucket]) {
+    fn show_bad_debt(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui, lines: &[AgingLine], buckets: &[AgingBucket]) {
         widgets::card(ui, "坏账准备测算", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, r) in self.rates.iter_mut().enumerate() {
@@ -718,8 +718,22 @@ impl SettleView {
                 .collect();
             let prov = aging::bad_debt_provision(lines, &rates);
             widgets::kv(ui, "应计提坏账准备", &prov.fmt_money());
+            ui.add_space(6.0);
+            if ui.button("正式计提坏账准备").clicked() && ctx.can(Perm::VoucherNew) {
+                let period = self.upto(ctx);
+                let date = chrono::Local::now().date_naive();
+                match findb::settle::bad_debt_provision_voucher(ctx.db(), period, date, &ctx.user().username) {
+                    Ok(Some(id)) => {
+                        ctx.info(format!("已生成坏账准备凭证 #{id}"));
+                        ctx.log("往来", "计提坏账准备", &format!("凭证 #{id}"));
+                        self.dirty = true;
+                    }
+                    Ok(None) => ctx.info("无可计提的坏账准备"),
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
             ui.label(
-                RichText::new("测算结果仅供参考，正式计提请到凭证里手工录入。").weak(),
+                RichText::new("按账龄区间比例测算；点击「正式计提」自动生成「借 资产减值损失 / 贷 坏账准备」凭证。").weak(),
             );
         });
     }

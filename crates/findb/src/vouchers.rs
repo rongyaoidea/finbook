@@ -647,6 +647,82 @@ pub fn find_gaps(db: &Db, period: Period, word: &str) -> DbResult<Vec<i32>> {
     Ok(gaps)
 }
 
+/// 红字冲销一张凭证：生成借贷互换、摘要加「冲销」前缀的反向凭证并落库。
+///
+/// 原凭证保留不动（符合审计要求），冲销凭证落在 `period`（通常为当前期），
+/// 状态为「未记账」，由用户核对后手动记账。
+pub fn reverse(
+    db: &Db,
+    id: i64,
+    who: &str,
+    period: Period,
+    date: NaiveDate,
+) -> DbResult<i64> {
+    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    if v.status == VoucherStatus::Void {
+        return Err(FinError::state("已作废凭证无需冲销").into());
+    }
+    if v.entries.iter().filter(|e| !e.is_blank()).count() == 0 {
+        return Err(FinError::state("凭证无有效分录，无法冲销").into());
+    }
+    let mut r = fincore::engine::reverse_voucher(&v);
+    r.period = period;
+    r.date = date;
+    r.no = next_no(db, period, &v.word)?;
+    r.status = VoucherStatus::Draft;
+    r.prepared_by = who.to_string();
+    r.posted_by = None;
+    r.audited_by = None;
+    r.cashier = None;
+    r.source = VoucherSource::Manual;
+    r.memo = format!("红字冲销 {}-{:04}（{}）", v.word, v.no, v.date.format("%Y-%m-%d"));
+    let nid = save(db, &mut r)?;
+    db.log(
+        who,
+        "凭证",
+        "红字冲销",
+        &format!("{}-{:04} → 冲销凭证 {}-{:04}", v.word, v.no, v.word, r.no),
+    )?;
+    Ok(nid)
+}
+
+/// 把某期间内同凭证字的凭证号重排为连续（按 日期 + 原凭证号 升序）。
+///
+/// 用于删除后消除断号。返回重排的凭证张数。
+pub fn renumber(db: &Db, period: Period, word: &str) -> DbResult<usize> {
+    let rows: Vec<(i64, NaiveDate, i32)> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT id,date,no FROM voucher WHERE period=?1 AND word=?2 ORDER BY date,no")?;
+        let rows = stmt
+            .query_map(rusqlite::params![period.ymm(), word], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, ds, no)| {
+                let d = NaiveDate::parse_from_str(&ds, "%Y-%m-%d")
+                    .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).expect("基准日期必然合法"));
+                (id, d, no)
+            })
+            .collect()
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let tx = db.conn().unchecked_transaction()?;
+    let mut stmt = tx.prepare("UPDATE voucher SET no=?2 WHERE id=?1")?;
+    let mut n = 0i32;
+    for (id, _d, _no) in &rows {
+        n += 1;
+        stmt.execute(rusqlite::params![id, n])?;
+    }
+    drop(stmt);
+    tx.commit()?;
+    db.log("系统", "凭证", "重排凭证号", &format!("{}-{} 共 {} 张", period.label(), word, rows.len()))?;
+    Ok(rows.len())
+}
+
 /// 按科目汇总某期间的分录（用于多栏账、现金流量表等）
 ///
 /// 聚合在 Rust 侧用 `Decimal` 完成：SQLite 没有十进制类型，`SUM(CAST(x AS REAL))`
@@ -770,6 +846,49 @@ mod tests {
             got.entries.iter().map(|e| e.line).collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn reverse_generates_mirror_voucher() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = sample(p, 5, 1);
+        v.status = VoucherStatus::Posted;
+        v.posted_by = Some("张三".into());
+        let id = save(&db, &mut v).unwrap();
+
+        let rid = reverse(&db, id, "李四", p, NaiveDate::from_ymd_opt(2026, 1, 6).unwrap()).unwrap();
+        let r = get(&db, rid).unwrap().unwrap();
+        // 原凭证不动
+        let orig = get(&db, id).unwrap().unwrap();
+        assert_eq!(orig.status, VoucherStatus::Posted);
+        // 冲销凭证：借贷互换、未记账、摘要带「冲销」前缀
+        assert_eq!(r.status, VoucherStatus::Draft);
+        assert_eq!(r.entries.len(), 2);
+        assert_eq!(r.entries[0].credit, Money::parse("1000").unwrap()); // 原借方 → 冲销贷方
+        assert!(r.entries.iter().all(|e| e.summary.starts_with("冲销")));
+        assert!(r.balanced());
+        assert_eq!(r.no, 2, "冲销凭证应取下一个凭证号");
+    }
+
+    #[test]
+    fn renumber_compacts_gaps() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v1 = sample(p, 5, 1);
+        save(&db, &mut v1).unwrap();
+        let mut v2 = sample(p, 6, 2);
+        save(&db, &mut v2).unwrap();
+        let mut v4 = sample(p, 7, 4);
+        save(&db, &mut v4).unwrap(); // 断号 3
+
+        assert_eq!(find_gaps(&db, p, "记").unwrap(), vec![3]);
+        let n = renumber(&db, p, "记").unwrap();
+        assert_eq!(n, 3);
+        assert!(find_gaps(&db, p, "记").unwrap().is_empty());
+        // 按日期顺序重排后，各张编号 1..=3
+        let rows = list(&db, &VoucherQuery::period(p)).unwrap();
+        assert_eq!(rows.iter().map(|v| v.no).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]

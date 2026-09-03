@@ -276,6 +276,8 @@ const NAV_ITEMS = [
   { id: "inv-transfer", label: "调拨报表", perm: "report" },
   { id: "po-estimate", label: "采购暂估", perm: "account_edit" },
   { id: "procure-quota", label: "供应商配额", perm: "account_edit" },
+  { id: "po-doc", label: "采购单据", perm: "account_edit" },
+  { id: "so-doc", label: "销售单据", perm: "account_edit" },
   { id: "order-change-log", label: "订单变更", perm: "report" },
   { id: "work-report", label: "工序报工", perm: "account_edit" },
   { id: "security", label: "安全中心", perm: "user_manage" },
@@ -315,6 +317,8 @@ const VIEWS = {
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
   "procure-quota": viewProcureQuota,
+  "po-doc": viewPoDoc,
+  "so-doc": viewSoDoc,
   "order-change-log": viewOrderChangeLog,
   "work-report": viewWorkReport,
   "security": viewSecurity,
@@ -706,6 +710,7 @@ async function viewVouchers(main) {
         <option value="posted">已记账</option><option value="void">已作废</option>
       </select>
       <button class="btn ghost sm" id="v-refresh">查询</button>
+      ${can("voucher_edit") ? `<button class="btn ghost sm" id="v-renumber">重排断号</button>` : ""}
       <span class="spacer"></span>
       <span class="muted">期间：${esc(state.current || "")}</span>
     </div>
@@ -715,6 +720,13 @@ async function viewVouchers(main) {
   if (can("voucher_new")) $("#new-v").addEventListener("click", () => openVoucherEditor(null));
   $("#v-refresh").addEventListener("click", () => loadVouchers());
   $("#v-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadVouchers(); });
+  if ($("#v-renumber")) $("#v-renumber").addEventListener("click", async () => {
+    if (!(await confirmDialog(`将当前期间「记」字凭证的凭证号重排为连续？`, true))) return;
+    try {
+      const r = await api("/vouchers/renumber", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), word: "记" }) });
+      toast(`已重排 ${r.renumbered} 张凭证`, "ok"); loadVouchers();
+    } catch (e) { toast(e.message, "err"); }
+  });
   await ensureAccounts();
   loadVouchers();
 }
@@ -775,6 +787,7 @@ async function openVoucherEditor(id) {
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
       ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
+      ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
       ${can("voucher_delete") && (status === "draft" || status === "audited") ? `<button class="btn danger" id="v-del">删除</button>` : ""}
       <button class="btn ghost" id="v-close">关闭</button>
     </div>
@@ -830,6 +843,7 @@ async function openVoucherEditor(id) {
   if (editable) $("#v-save", mask).onclick = save;
   if ($("#v-post", mask)) $("#v-post", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/post`, { method: "POST" }); toast("已记账", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: today() }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   $("#v-close", mask).onclick = closeModal;
 }
@@ -1173,7 +1187,8 @@ async function viewReports(main) {
       <label>至 <input id="r-to" value="${esc(state.current || "")}" style="width:90px" /></label>
       <button class="btn sm" id="r-go">生成科目余额表</button>
       <span class="spacer"></span>
-      ${can("export") ? `<button class="btn ghost sm" id="r-export">导出 CSV</button>` : `<span class="tag warn" title="无导出权限">无导出权限，仅可打印</span>`}
+      ${can("export") ? `<button class="btn ghost sm" id="r-export">导出 CSV</button>
+      <button class="btn ghost sm" id="r-pdf">导出 PDF</button>` : `<span class="tag warn" title="无导出权限">无导出权限，仅可打印</span>`}
       <button class="btn ghost sm" id="r-print">打印预览</button>
     </div>
     <div class="panel"><table class="grid" id="r-table"><thead><tr>
@@ -1181,7 +1196,10 @@ async function viewReports(main) {
     </tr></thead><tbody><tr><td colspan="9" class="muted">点击「生成科目余额表」</td></tr></tbody></table></div>`;
   $("#r-go").addEventListener("click", loadTrial);
   $("#r-print").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.open(`/api/reports/trial-balance/print?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`, "_blank"); });
-  if (can("export")) $("#r-export").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.location = `/api/reports/trial-balance/export?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`; });
+  if (can("export")) {
+    $("#r-export").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.location = `/api/reports/trial-balance/export?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`; });
+    $("#r-pdf").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.location = `/api/reports/trial-balance/pdf?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`; });
+  }
 }
 async function loadTrial() {
   const f = $("#r-from").value, t = $("#r-to").value;
@@ -2031,6 +2049,135 @@ async function viewProcureQuota(main) {
       $("#pq-result").textContent = r.remaining == null ? "该供应商/物料未设置配额" : `剩余配额：${fmt(String(r.remaining))}`;
     } catch (e) { toast(e.message, "err"); }
   });
+}
+
+async function viewPoDoc(main) {
+  const period = encodeURIComponent(state.current || "");
+  const table = (rows) => rows.length
+    ? `<table class="grid"><thead><tr><th>单号</th><th>存货</th><th>数量</th><th>状态</th><th>请购人</th><th>备注</th><th></th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td>${esc(r.status)}</td><td>${esc(r.requester)}</td><td>${esc(r.memo)}</td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-req-approve="${r.id}">审批</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="muted">暂无请购单</div>`;
+  const poTrack = (rows) => rows.length
+    ? `<table class="grid"><thead><tr><th>订单号</th><th>供应商</th><th>订单数量</th><th>到货数量</th><th>执行率</th></tr></thead>
+      <tbody>${rows.map((t) => `<tr><td>${esc(t.no)}</td><td>${esc(t.supplier_name)}</td><td class="num">${esc(t.ordered_qty)}</td><td class="num">${esc(t.received_qty)}</td><td class="num">${esc(t.rate)}%</td></tr>`).join("")}</tbody></table>`
+    : `<div class="muted">暂无采购订单</div>`;
+
+  main.innerHTML = `<h2>采购单据</h2>
+    <div class="toolbar">
+      <label>存货 <input id="pd-item" style="width:130px" /></label>
+      <label>数量 <input id="pd-qty" style="width:80px" /></label>
+      <label>备注 <input id="pd-memo" style="width:140px" /></label>
+      <button class="btn primary" id="pd-save">保存请购单</button>
+    </div>
+    <div class="toolbar">
+      <label>采购订单ID <input id="pd-poid" style="width:80px" /></label>
+      <label>数量/金额 <input id="pd-amt" style="width:100px" /></label>
+      <label>备注 <input id="pd-memo2" style="width:120px" /></label>
+      <button class="btn" id="pd-receipt">到货</button>
+      <button class="btn" id="pd-return">退货</button>
+      <button class="btn" id="pd-pay">付款</button>
+    </div>
+    <div class="panel" style="margin-top:12px"><h4>请购单</h4><div id="pd-list">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><h4>采购订单执行跟踪</h4><div id="pd-track">加载中…</div></div>`;
+
+  const load = async () => {
+    try {
+      const r = await api(`/procure/req?period=${period}`);
+      $("#pd-list").innerHTML = table(r.rows || []);
+      $all("[data-req-approve]").forEach((b) => b.onclick = async () => {
+        try { await api(`/procure/req/${b.dataset.reqApprove}/approve`, { method: "POST" }); toast("已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#pd-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+    try {
+      const t = await api("/procure/track");
+      $("#pd-track").innerHTML = poTrack(t.rows || []);
+    } catch (e) { $("#pd-track").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#pd-save").addEventListener("click", async () => {
+    try {
+      await postJson("/procure/req", { id: 0, period: ymm(state.current || ""), date: today(), item_code: $("#pd-item").value.trim(), item_name: $("#pd-item").value.trim(), qty: $("#pd-qty").value.trim() || "0", status: "draft", requester: "", memo: $("#pd-memo").value.trim() });
+      toast("已保存请购单", "ok"); $("#pd-qty").value = ""; $("#pd-memo").value = ""; load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  const poid = () => parseInt($("#pd-poid").value.trim(), 10) || 0;
+  const amt = () => $("#pd-amt").value.trim();
+  const memo = () => $("#pd-memo2").value.trim();
+  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast("已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  load();
+}
+
+async function viewSoDoc(main) {
+  const period = encodeURIComponent(state.current || "");
+  const table = (rows) => rows.length
+    ? `<table class="grid"><thead><tr><th>单号</th><th>客户</th><th>存货</th><th>数量</th><th>单价</th><th>状态</th><th></th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.customer_name)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td class="num">${esc(r.unit_price)}</td><td>${esc(r.status)}</td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-quo-approve="${r.id}">审批</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="muted">暂无报价单</div>`;
+  const soTrack = (rows) => rows.length
+    ? `<table class="grid"><thead><tr><th>订单号</th><th>客户</th><th>订单数量</th><th>发货数量</th><th>执行率</th></tr></thead>
+      <tbody>${rows.map((t) => `<tr><td>${esc(t.no)}</td><td>${esc(t.customer_name)}</td><td class="num">${esc(t.ordered_qty)}</td><td class="num">${esc(t.shipped_qty)}</td><td class="num">${esc(t.rate)}%</td></tr>`).join("")}</tbody></table>`
+    : `<div class="muted">暂无销售订单</div>`;
+
+  main.innerHTML = `<h2>销售单据</h2>
+    <div class="toolbar">
+      <label>客户 <input id="sd-cust" style="width:110px" /></label>
+      <label>存货 <input id="sd-item" style="width:130px" /></label>
+      <label>数量 <input id="sd-qty" style="width:70px" /></label>
+      <label>单价 <input id="sd-price" style="width:80px" /></label>
+      <button class="btn primary" id="sd-save">保存报价单</button>
+    </div>
+    <div class="toolbar">
+      <label>销售订单ID <input id="sd-soid" style="width:80px" /></label>
+      <label>数量/金额 <input id="sd-amt" style="width:100px" /></label>
+      <label>备注 <input id="sd-memo" style="width:120px" /></label>
+      <button class="btn" id="sd-ship">发货</button>
+      <button class="btn" id="sd-return">退货</button>
+      <button class="btn" id="sd-pay">收款</button>
+      <span class="spacer"></span>
+      <label>客户 <input id="sd-credit-cust" style="width:110px" /></label>
+      <button class="btn" id="sd-credit">信用检查</button>
+    </div>
+    <div id="sd-credit-result" class="muted" style="margin-top:6px"></div>
+    <div class="panel" style="margin-top:12px"><h4>报价单</h4><div id="sd-list">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><h4>销售订单执行跟踪</h4><div id="sd-track">加载中…</div></div>`;
+
+  const load = async () => {
+    try {
+      const r = await api(`/sales/quote?period=${period}`);
+      $("#sd-list").innerHTML = table(r.rows || []);
+      $all("[data-quo-approve]").forEach((b) => b.onclick = async () => {
+        try { await api(`/sales/quote/${b.dataset.quoApprove}/approve`, { method: "POST" }); toast("已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#sd-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+    try {
+      const t = await api("/sales/track");
+      $("#sd-track").innerHTML = soTrack(t.rows || []);
+    } catch (e) { $("#sd-track").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#sd-save").addEventListener("click", async () => {
+    try {
+      await postJson("/sales/quote", { id: 0, period: ymm(state.current || ""), date: today(), customer_code: $("#sd-cust").value.trim(), customer_name: $("#sd-cust").value.trim(), item_code: $("#sd-item").value.trim(), item_name: $("#sd-item").value.trim(), qty: $("#sd-qty").value.trim() || "0", unit_price: $("#sd-price").value.trim() || "0", status: "draft", prepared_by: "", memo: "" });
+      toast("已保存报价单", "ok"); $("#sd-qty").value=""; $("#sd-price").value=""; load();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  const soid = () => parseInt($("#sd-soid").value.trim(), 10) || 0;
+  const amt = () => $("#sd-amt").value.trim();
+  const memo = () => $("#sd-memo").value.trim();
+  $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-return").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/return", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast("已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-credit").addEventListener("click", async () => {
+    const c = $("#sd-credit-cust").value.trim();
+    if (!c) { toast("请填写客户", "err"); return; }
+    try {
+      const r = await api(`/sales/credit?customer=${encodeURIComponent(c)}`);
+      $("#sd-credit-result").innerHTML = r.over
+        ? `<span class="tag err">超额度</span> 占用 ${esc(r.receivable)} / 额度 ${esc(r.limit)}`
+        : `<span class="tag ok">未超额度</span> 占用 ${esc(r.receivable)} / 额度 ${esc(r.limit || "未设")}`;
+    } catch (e) { toast(e.message, "err"); }
+  });
+  load();
 }
 
 async function viewOrderChangeLog(main) {

@@ -553,6 +553,20 @@ impl VoucherEdit {
                     self.reload_after(ctx);
                 }
             }
+            if ui.button("红字冲销").clicked() && self.id > 0 && self.status != VoucherStatus::Void {
+                if ctx.can(Perm::VoucherNew) {
+                    let period = ctx.period();
+                    let date = chrono::Local::now().date_naive();
+                    match findb::vouchers::reverse(ctx.db(), self.id, &ctx.user().username, period, date) {
+                        Ok(nid) => {
+                            ctx.info(format!("已生成冲销凭证 #{nid}"));
+                            ctx.log("凭证", "红字冲销", &format!("凭证 #{nid}"));
+                            self.dirty = true;
+                        }
+                        Err(e) => ctx.error(e.to_string()),
+                    }
+                }
+            }
             ui.separator();
             if ui.button("上一张").clicked() {
                 self.step(ctx, -1);

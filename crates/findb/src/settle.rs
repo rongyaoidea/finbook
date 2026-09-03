@@ -523,6 +523,61 @@ pub fn aging(
     Ok(fincore::engine::aging::analyze(&items, as_of, buckets)?)
 }
 
+/// 计提坏账准备：按应收（1122/1221）账龄与默认坏账比例计算应提额，
+/// 生成「借 资产减值损失(6701) / 贷 坏账准备(1231)」凭证（辅助核算保留往来对象）。
+/// 无可提额（账龄为 0 或比例全 0）时返回 `Ok(None)`。
+pub fn bad_debt_provision_voucher(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    who: &str,
+) -> DbResult<Option<i64>> {
+    use fincore::engine::aging::{bad_debt_provision, buckets_by_year, default_bad_debt_rates};
+    let buckets = buckets_by_year();
+    let rates = default_bad_debt_rates();
+
+    let mut lines = Vec::new();
+    for acct in ["1122", "1221"] {
+        lines.extend(aging(db, acct, period, date, &buckets)?);
+    }
+    let total = bad_debt_provision(&lines, &rates);
+    if total.is_zero() {
+        return Ok(None);
+    }
+
+    let no = crate::vouchers::next_no(db, period, "记")?;
+    let mut v = fincore::Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = fincore::voucher::VoucherSource::Business;
+    v.memo = "计提坏账准备".to_string();
+    v.push_entry(fincore::voucher::Entry {
+        debit: total,
+        ..fincore::voucher::Entry::new(1, "6701", "计提坏账准备")
+    });
+    let mut line_no = 2;
+    for l in &lines {
+        let prov: Money = l
+            .amounts
+            .iter()
+            .zip(rates.iter())
+            .map(|(a, r)| (*a * *r).round2())
+            .sum();
+        if prov.is_zero() {
+            continue;
+        }
+        let aux = fincore::voucher::AuxRef::from_key(&l.key);
+        v.push_entry(fincore::voucher::Entry {
+            credit: prov,
+            aux,
+            ..fincore::voucher::Entry::new(line_no, "1231", "计提坏账准备")
+        });
+        line_no += 1;
+    }
+    v.renumber();
+    let id = crate::vouchers::save(db, &mut v)?;
+    Ok(Some(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +705,34 @@ mod tests {
         assert_eq!(lines[0].amounts[0], Money::parse("1000").unwrap()); // 11 天
         // 2025-06-01 → 2026-03-31 约 303 天，落在 181-365 档
         assert_eq!(lines[0].amounts[4], Money::parse("2000").unwrap());
+    }
+
+    #[test]
+    fn bad_debt_provision_generates_voucher() {
+        let db = tmpdb("baddebt");
+        let p = Period::new(2026, 3).unwrap();
+        // 一笔 3 年以上的老应收 10000，一笔 1 年以内 2000
+        ar_voucher(&db, p, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(), 1, "C01", "2000", true, "600101");
+        ar_voucher(&db, p, NaiveDate::from_ymd_opt(2023, 1, 5).unwrap(), 2, "C01", "10000", true, "600101");
+
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let id = bad_debt_provision_voucher(&db, p, as_of, "u1").unwrap().expect("应生成坏账准备凭证");
+        let v = crate::vouchers::get(&db, id).unwrap().unwrap();
+        // 借 资产减值损失 / 贷 坏账准备，借贷平衡
+        assert!(v.balanced());
+        assert!(v.entries.iter().any(|e| e.account_code == "6701"));
+        assert!(v.entries.iter().any(|e| e.account_code == "1231"));
+        // 3-4 年老账 10000 × 30% + 1 年内新账 2000 × 5% = 3000 + 100 = 3100
+        let credit: Money = v.entries.iter().filter(|e| e.account_code == "1231").map(|e| e.credit).sum();
+        assert_eq!(credit, Money::parse("3100").unwrap());
+        assert_eq!(v.source, fincore::voucher::VoucherSource::Business);
+    }
+
+    #[test]
+    fn bad_debt_provision_skip_when_none() {
+        let db = tmpdb("baddebt0");
+        let p = Period::new(2026, 3).unwrap();
+        let r = bad_debt_provision_voucher(&db, p, NaiveDate::from_ymd_opt(2026, 3, 31).unwrap(), "u1").unwrap();
+        assert!(r.is_none(), "无应收时不应生成凭证");
     }
 }

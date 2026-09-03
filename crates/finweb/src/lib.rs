@@ -6,4 +6,5 @@
 
 pub mod dto;
 pub mod handlers;
+pub mod pdf;
 pub mod state;

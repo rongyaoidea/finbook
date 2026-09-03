@@ -206,6 +206,20 @@ impl VoucherList {
                 }
             }
             ui.separator();
+            if ui.button("重排断号").clicked() && ctx.can(Perm::VoucherEdit) {
+                let p = ctx.period();
+                let word = "记";
+                match findb::vouchers::renumber(ctx.db(), p, word) {
+                    Ok(0) => ctx.info("当期无凭证，无需重排"),
+                    Ok(n) => {
+                        ctx.info(format!("已重排 {n} 张凭证号"));
+                        ctx.log("凭证", "重排断号", &format!("{}-{} 共 {n} 张", p.label(), word));
+                        self.dirty = true;
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
+            ui.separator();
             if ui.button("全选本页").clicked() {
                 for v in self.paging.slice(&self.rows) {
                     self.sel.insert(v.id);

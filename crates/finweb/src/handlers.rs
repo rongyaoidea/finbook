@@ -65,7 +65,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
+        .route("/api/vouchers/:id/reverse", post(voucher_reverse))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
+        .route("/api/vouchers/renumber", post(voucher_renumber))
         // 发票管理
         .route("/api/invoices", get(list_invoices).post(create_invoice))
         .route("/api/invoices/summary", get(invoice_summary))
@@ -87,6 +89,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route(
             "/api/reports/trial-balance/export",
             get(export_trial_balance),
+        )
+        .route(
+            "/api/reports/trial-balance/pdf",
+            get(export_trial_balance_pdf),
         )
         // 高级功能：多栏账 / 摘要汇总表 / 财务指标
         .route("/api/reports/multi-column", get(get_multi_column))
@@ -116,8 +122,27 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/procure/quota", get(get_quota).post(set_quota))
         .route("/api/sales/reconcile", get(get_so_reconcile))
         .route("/api/order/change-log", get(get_change_log))
+        // 采购/销售全生命周期：请购 / 报价 / 到货 / 发货 / 付款 / 收款 / 退货 / 信用
+        .route("/api/procure/req", get(list_purchase_req).post(save_purchase_req))
+        .route("/api/procure/req/:id/approve", post(approve_purchase_req))
+        .route("/api/procure/receipt", post(add_po_receipt))
+        .route("/api/procure/payment", post(add_po_payment))
+        .route("/api/procure/return", post(add_po_return))
+        .route("/api/procure/price", get(get_price_history))
+        .route("/api/procure/track", get(get_po_track))
+        .route("/api/procure/stats", get(get_purchase_stats))
+        .route("/api/sales/quote", get(list_quotation).post(save_quotation))
+        .route("/api/sales/quote/:id/approve", post(approve_quotation))
+        .route("/api/sales/shipment", post(add_so_shipment))
+        .route("/api/sales/payment", post(add_so_payment))
+        .route("/api/sales/return", post(add_so_return))
+        .route("/api/sales/credit", get(get_credit_check))
+        .route("/api/sales/track", get(get_so_track))
+        .route("/api/sales/stats", get(get_sales_stats))
         // 预算预警
         .route("/api/budget/alerts", get(get_budget_alerts))
+        // 坏账准备计提
+        .route("/api/settle/bad-debt/provision", post(bad_debt_provision_endpoint))
         // 工艺路线 / 报工 / MRP
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
@@ -903,6 +928,73 @@ async fn voucher_unpost(
     Ok(Json(json!({"ok": true, "action": "unposted"})))
 }
 
+/// 红字冲销请求：冲销凭证落到的期间与日期
+#[derive(Deserialize, Default)]
+struct ReverseVoucherReq {
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+}
+
+async fn voucher_reverse(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ReverseVoucherReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权冲销该凭证"));
+    }
+    let period = if req.period > 0 {
+        parse_period(&req.period.to_string()).unwrap_or_else(|| current_period(&state, &user))
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let nid = vouchers::reverse(&db, id, user.username(), period, date)?;
+    Ok(Json(json!({"id": nid})))
+}
+
+/// 断号重排请求：period + word
+#[derive(Deserialize, Default)]
+struct RenumberVoucherReq {
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub word: String,
+}
+
+async fn voucher_renumber(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<RenumberVoucherReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        parse_period(&req.period.to_string()).unwrap_or_else(|| current_period(&state, &user))
+    } else {
+        current_period(&state, &user)
+    };
+    let word = if req.word.trim().is_empty() {
+        "记".to_string()
+    } else {
+        req.word.trim().to_string()
+    };
+    let n = vouchers::renumber(&db, period, &word)?;
+    Ok(Json(json!({"ok": true, "renumbered": n})))
+}
+
 async fn voucher_delete(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -1223,6 +1315,10 @@ async fn get_ledger(
         .unwrap_or(false);
     let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
+    // 数据范围：非全量权限用户只能查看自己范围内的科目
+    if !user.user.can_see_account(&code) {
+        return Err(AppError::forbidden("无权查看该科目"));
+    }
     let lq = LedgerQuery {
         code,
         include_children,
@@ -1251,7 +1347,7 @@ fn trial_balance_data(
         .get("to")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(state, user));
-    let bq = BalanceQuery::range(from, to);
+    let bq = BalanceQuery::range(from, to).with_data_scope(&user.user.data_scope);
     let snap = BalanceSnapshot::load(&db, &bq)?;
     let chart = accounts::chart(&db)?;
     let rows = snap.account_table(&chart, &bq);
@@ -1314,6 +1410,32 @@ async fn export_trial_balance(
             ),
         ],
         body,
+    )
+        .into_response())
+}
+
+/// 科目余额表导出 PDF（仅管理员与财务主管）
+async fn export_trial_balance_pdf(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let (rows, totals) = trial_balance_data(&state, &user, &q)?;
+    let from = q.get("from").cloned().unwrap_or_default();
+    let to = q.get("to").cloned().unwrap_or_default();
+    let company = state.company_name();
+    let bytes = crate::pdf::trial_balance_pdf(&company, &from, &to, &rows, &totals)
+        .map_err(AppError::bad_request)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/pdf"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"trial_balance.pdf\"",
+            ),
+        ],
+        bytes,
     )
         .into_response())
 }
@@ -1464,6 +1586,10 @@ async fn get_multi_column(
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
     let db = state.db_for(&user.book_key)?;
+    // 数据范围：主科目与各栏目科目均须在可见范围内
+    if !user.user.can_see_account(&main) || cols.iter().any(|c| !user.user.can_see_account(c)) {
+        return Err(AppError::forbidden("无权查看该科目"));
+    }
     let rows = advanced::multi_column_table(&db, &main, &cols, from, to)?;
     Ok(Json(serde_json::json!({ "main": main, "cols": cols, "rows": rows })))
 }
@@ -1557,6 +1683,10 @@ async fn get_account_daily(
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
     let db = state.db_for(&user.book_key)?;
+    // 数据范围：仅可见科目
+    if !user.user.can_see_account(&code) {
+        return Err(AppError::forbidden("无权查看该科目"));
+    }
     let rows = findb::reports::account_daily_report(&db, &code, from, to)?;
     Ok(Json(serde_json::json!({ "code": code, "rows": rows })))
 }
@@ -1947,6 +2077,314 @@ async fn get_change_log(
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
+// ---- 采购/销售全生命周期：请购 / 报价 / 到货 / 发货 / 付款 / 收款 / 退货 / 信用 ----
+
+async fn list_purchase_req(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let rows = findb::procurement::pr_list(&db, period)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn save_purchase_req(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(mut req): Json<findb::procurement::PurchaseReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.no.is_empty() {
+        req.no = findb::procurement::pr_next_no(&db, req.period)?;
+    }
+    if req.requester.is_empty() {
+        req.requester = user.user.display_name.clone();
+    }
+    let id = findb::procurement::pr_save(&db, &mut req)?;
+    Ok(Json(serde_json::json!({ "id": id, "no": req.no })))
+}
+
+async fn approve_purchase_req(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::procurement::pr_approve(&db, id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ReceiptReq {
+    pub po_id: i64,
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+    pub qty: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn add_po_receipt(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ReceiptReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::procurement::po_receipt_add(&db, &findb::procurement::PoReceipt {
+        id: 0, po_id: req.po_id, period, date, qty: parse_money(&req.qty), memo: req.memo,
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn add_po_return(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ReceiptReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money(&req.qty), &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+#[derive(Deserialize)]
+struct PaymentReq {
+    pub po_id: i64,
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+    pub amount: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn add_po_payment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<PaymentReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::procurement::po_payment_add(&db, &findb::procurement::PoPayment {
+        id: 0, po_id: req.po_id, period, date, amount: parse_money(&req.amount), memo: req.memo,
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn get_price_history(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let item = q.get("item").cloned().unwrap_or_default();
+    let rows = findb::procurement::price_history(&db, &item)?;
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(s, p, d)| serde_json::json!({ "supplier": s, "unit_price": p.fmt_money(), "date": d }))
+        .collect();
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_po_track(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::procurement::po_execution_track(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_purchase_stats(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::procurement::purchase_stats(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn list_quotation(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let rows = findb::sales::quo_list(&db, period)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn save_quotation(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(mut req): Json<findb::sales::Quotation>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.no.is_empty() {
+        req.no = findb::sales::quo_next_no(&db, req.period)?;
+    }
+    if req.prepared_by.is_empty() {
+        req.prepared_by = user.user.display_name.clone();
+    }
+    let id = findb::sales::quo_save(&db, &mut req)?;
+    Ok(Json(serde_json::json!({ "id": id, "no": req.no })))
+}
+
+async fn approve_quotation(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::sales::quo_approve(&db, id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ShipmentReq {
+    pub so_id: i64,
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+    pub qty: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn add_so_shipment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ShipmentReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money(&req.qty), &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn add_so_return(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ShipmentReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money(&req.qty), &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+#[derive(Deserialize)]
+struct SoPaymentReq {
+    pub so_id: i64,
+    #[serde(default)]
+    pub period: i32,
+    #[serde(default)]
+    pub date: String,
+    pub amount: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn add_so_payment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SoPaymentReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
+    };
+    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money(&req.amount), &req.memo)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn get_credit_check(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let customer = q.get("customer").cloned().unwrap_or_default();
+    let (receivable, limit, over) = findb::sales::credit_check(&db, &customer, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({
+        "receivable": receivable.fmt_money(),
+        "limit": limit.fmt_money(),
+        "over": over,
+    })))
+}
+
+async fn get_so_track(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::sales::so_execution_track(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn get_sales_stats(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::sales::sales_stats(&db, current_period(&state, &user))?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
 // ---- 预算预警 ----
 
 async fn get_budget_alerts(
@@ -1961,6 +2399,24 @@ async fn get_budget_alerts(
     let threshold = q.get("threshold").and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
     let rows = findb::mgmt::budget_alerts(&db, period, from, threshold)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+/// 坏账准备计提：按应收账龄生成「借 资产减值损失 / 贷 坏账准备」凭证
+async fn bad_debt_provision_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = chrono::Local::now().date_naive();
+    match findb::settle::bad_debt_provision_voucher(&db, period, date, user.username())? {
+        Some(id) => {
+            db.log(user.username(), "往来", "计提坏账准备", &format!("凭证 #{id}"))?;
+            Ok(Json(json!({"ok": true, "voucher_id": id})))
+        }
+        None => Ok(Json(json!({"ok": true, "voucher_id": 0, "message": "无可计提的坏账准备"}))),
+    }
 }
 
 // ---- 工艺路线 / 报工 ----

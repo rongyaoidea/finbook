@@ -177,6 +177,21 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/archives/:id", get(get_archive))
         .route("/api/archives/:id/verify", get(verify_archive))
         .route("/api/health", get(|| async { "ok" }))
+        // 资金：票据 / 融资 / 资金日报 / 资金预测
+        .route("/api/funds/bills", get(list_bills).post(save_bill))
+        .route("/api/funds/bills/:id/status", post(bill_transition))
+        .route("/api/funds/bills/:id/delete", post(delete_bill))
+        .route("/api/funds/loans", get(list_loans).post(save_loan))
+        .route("/api/funds/loans/:id/settle", post(loan_settle))
+        .route("/api/funds/loans/:id/delete", post(delete_loan))
+        .route("/api/funds/daily", get(get_funds_daily))
+        .route("/api/funds/forecast", get(get_funds_forecast))
+        // 预算分析
+        .route("/api/budget/analysis", get(get_budget_analysis))
+        // 成本：计价配置 + 期末结价
+        .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
+        .route("/api/cost/configs/:item/delete", post(clear_cost_method))
+        .route("/api/cost/period-end", get(run_period_end_cost))
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
         .with_state(state)
@@ -2994,4 +3009,293 @@ async fn verify_archive(
         .ok_or_else(|| AppError::NotFound("档案不存在".to_string()))?;
     let ok = advanced::archive_verify(&a);
     Ok(Json(serde_json::json!({ "ok": ok, "content_hash": a.content_hash })))
+}
+
+// ---------------------------------------------------------------------------
+// 资金：票据 / 融资 / 资金日报 / 资金预测
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BillReq {
+    #[serde(default)]
+    pub id: i64,
+    pub kind: String,
+    pub no: String,
+    pub period: i32,
+    pub issue_date: String,
+    pub due_date: String,
+    #[serde(default)]
+    pub counterpart: String,
+    #[serde(default)]
+    pub bank: String,
+    #[serde(default)]
+    pub amount: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+#[derive(Deserialize)]
+struct BillTransitionReq {
+    pub status: String,
+    pub date: String,
+}
+
+async fn list_bills(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q.get("kind").map(|s| s.as_str());
+    let rows = findb::funds::bill_list(&db, kind)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn save_bill(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BillReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let parse_date = |s: &str| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))
+    };
+    let mut b = findb::funds::Bill {
+        id: req.id,
+        kind: req.kind,
+        no: req.no,
+        period: Period::from_ymm(req.period),
+        issue_date: parse_date(&req.issue_date)?,
+        due_date: parse_date(&req.due_date)?,
+        counterpart: req.counterpart,
+        bank: req.bank,
+        amount: parse_money(&req.amount),
+        status: req.status,
+        handled_date: None,
+        memo: req.memo,
+        created_by: user.username().to_string(),
+        created_at: String::new(),
+    };
+    let id = findb::funds::bill_save(&db, &mut b)?;
+    db.log(user.username(), "资金", "保存票据", &format!("#{id} {}", b.no))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn bill_transition(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<BillTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+        .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?;
+    let to = findb::funds::BillStatus::parse(&req.status);
+    findb::funds::bill_transition(&db, id, to, date)?;
+    db.log(user.username(), "资金", "票据流转", &format!("#{id} → {}", to.label()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_bill(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::bill_delete(&db, id)?;
+    db.log(user.username(), "资金", "删除票据", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LoanReq {
+    #[serde(default)]
+    pub id: i64,
+    pub kind: String,
+    pub no: String,
+    #[serde(default)]
+    pub bank: String,
+    #[serde(default)]
+    pub principal: String,
+    #[serde(default)]
+    pub rate_pct: String,
+    pub start_date: String,
+    pub end_date: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub memo: String,
+}
+
+async fn list_loans(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q.get("kind").map(|s| s.as_str());
+    let rows = findb::funds::loan_list(&db, kind)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn save_loan(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<LoanReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let parse_date = |s: &str| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))
+    };
+    let mut l = findb::funds::Loan {
+        id: req.id,
+        kind: req.kind,
+        no: req.no,
+        bank: req.bank,
+        principal: parse_money(&req.principal),
+        rate_pct: parse_money(&req.rate_pct),
+        start_date: parse_date(&req.start_date)?,
+        end_date: parse_date(&req.end_date)?,
+        status: req.status,
+        memo: req.memo,
+        created_by: user.username().to_string(),
+        created_at: String::new(),
+    };
+    let id = findb::funds::loan_save(&db, &mut l)?;
+    db.log(user.username(), "资金", "保存融资", &format!("#{id} {}", l.no))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn loan_settle(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::loan_settle(&db, id)?;
+    db.log(user.username(), "资金", "结清融资", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_loan(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::loan_delete(&db, id)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_funds_daily(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let rows = findb::funds::funds_daily(&db, period)?;
+    Ok(Json(serde_json::json!({ "period": period.label(), "rows": rows })))
+}
+
+async fn get_funds_forecast(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let fc = findb::funds::funds_forecast(&db, period)?;
+    Ok(Json(serde_json::json!({ "period": period.label(), "forecast": fc })))
+}
+
+// ---------------------------------------------------------------------------
+// 预算分析
+// ---------------------------------------------------------------------------
+
+async fn get_budget_analysis(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let year = q.get("year").and_then(|s| s.parse::<i32>().ok()).unwrap_or_else(|| current_period(&state, &user).year());
+    let version = q.get("version").cloned().unwrap_or_default();
+    let upto = q.get("upto").and_then(|s| parse_period(s));
+    let rows = findb::mgmt::budget_analysis(&db, year, &version, upto)?;
+    let summary = findb::mgmt::budget_analysis_summary(&db, year, &version)?;
+    Ok(Json(serde_json::json!({ "year": year, "rows": rows, "summary": summary })))
+}
+
+// ---------------------------------------------------------------------------
+// 成本：计价配置 + 期末结价
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CostMethodReq {
+    pub item: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub standard_cost: String,
+}
+
+async fn list_cost_configs(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::business::cost_configs(&db)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
+async fn save_cost_method(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CostMethodReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let sc = parse_money(&req.standard_cost);
+    findb::business::item_cost_method_set(&db, &req.item, Some(&req.method), sc)?;
+    db.log(user.username(), "成本", "设置计价方式", &format!("{} → {}", req.item, req.method))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn clear_cost_method(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(item): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::business::item_cost_method_clear(&db, &item)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn run_period_end_cost(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::PeriodClose)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
+    let apply = q.get("apply").map(|s| s == "1" || s == "true").unwrap_or(false);
+    let rows = findb::business::period_end_cost(&db, period, apply)?;
+    Ok(Json(serde_json::json!({ "period": period.label(), "rows": rows, "apply": apply })))
 }

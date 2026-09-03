@@ -266,6 +266,69 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
     let mut out = Vec::new();
     for item in items {
         let rows = stock_list_item(db, &item, period)?;
+        // 全月一次平均：期末统一计价（期初 + 本期入库 → 一个单价）
+        if method == CostMethod::MonthAverage {
+            let (opening, this_period): (Vec<_>, Vec<_>) = rows
+                .iter()
+                .filter(|r| r.kind != StockKind::Adjust)
+                .partition(|r| r.period.ymm() < period.ymm());
+            let mut st = StockState::new();
+            let opening_moves: Vec<StockMoveIn> = opening
+                .iter()
+                .map(|r| StockMoveIn {
+                    qty: r.qty,
+                    price: if r.price.is_zero() { None } else { Some(r.price) },
+                })
+                .collect();
+            let _ = fincore::engine::costing::run(&opening_moves, CostMethod::MovingAverage)?;
+            let opening_state = st.clone();
+            let period_moves: Vec<StockMoveIn> = this_period
+                .iter()
+                .map(|r| StockMoveIn {
+                    qty: r.qty,
+                    price: if r.price.is_zero() { None } else { Some(r.price) },
+                })
+                .collect();
+            let (_, end_st) =
+                fincore::engine::costing::run_month_average(&opening_state, &period_moves)?;
+            let in_qty: Money = this_period.iter().filter(|r| r.qty.is_positive()).map(|r| r.qty).sum();
+            let in_amount: Money = this_period
+                .iter()
+                .filter(|r| r.qty.is_positive())
+                .map(|r| if r.amount.is_zero() { (r.qty * r.price).round2() } else { r.amount })
+                .sum();
+            let out_qty: Money = this_period.iter().filter(|r| r.qty.is_negative()).map(|r| r.qty.abs()).sum();
+            // 期初结存金额（含历史调整）
+            let opening_adj: Money = rows
+                .iter()
+                .filter(|r| r.kind == StockKind::Adjust && r.period.ymm() < period.ymm())
+                .map(|r| r.amount)
+                .sum();
+            let end_amount = end_st.amount + opening_adj;
+            // 全月一次单价 = (期初金额 + 本期入库) / (期初数量 + 本期入库)，不提前舍入
+            let unit2 = {
+                let denom = opening_state.qty + in_qty;
+                if denom.is_zero() {
+                    Money::ZERO
+                } else {
+                    ((opening_state.amount + in_amount) / denom).round_dp(6)
+                }
+            };
+            // 出库成本按统一单价（口径与 run_month_average 一致）
+            let out_amount = (out_qty * unit2).round2();
+            out.push(StockSummary {
+                item: item.clone(),
+                in_qty,
+                in_amount,
+                out_qty,
+                out_amount,
+                end_qty: end_st.qty,
+                end_amount,
+                unit_cost: unit2.round2(),
+            });
+            continue;
+        }
+
         let mut st = StockState::new();
         let mut s = StockSummary {
             item: item.clone(),
@@ -351,6 +414,176 @@ pub fn stock_cost_voucher(
         )?;
     }
     Ok(Some(id))
+}
+
+// ===========================================================================
+// 存货计价配置 + 期末结价
+// ===========================================================================
+
+/// 读取某存货的计价方式（未配置时默认移动加权平均）
+pub fn item_cost_method(db: &Db, item: &str) -> DbResult<CostMethod> {
+    let m: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT method FROM item_cost_method WHERE item=?1",
+            rusqlite::params![item],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(CostMethod::parse(m.as_deref().unwrap_or("moving_average")))
+}
+
+/// 读取某存货的标准成本单价（未配置为 0）
+pub fn item_standard_cost(db: &Db, item: &str) -> DbResult<Money> {
+    let v: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT standard_cost FROM item_cost_method WHERE item=?1",
+            rusqlite::params![item],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(Money::parse_or_zero(v.as_deref().unwrap_or("0")))
+}
+
+/// 保存某存货的计价方式（method 为空表示恢复默认）
+pub fn item_cost_method_set(
+    db: &Db,
+    item: &str,
+    method: Option<&str>,
+    standard_cost: Money,
+) -> DbResult<()> {
+    let code = method.unwrap_or("moving_average");
+    db.conn().execute(
+        "INSERT INTO item_cost_method(item,method,standard_cost) VALUES(?1,?2,?3)
+         ON CONFLICT(item) DO UPDATE SET method=excluded.method, standard_cost=excluded.standard_cost",
+        rusqlite::params![item, code, standard_cost.to_string()],
+    )?;
+    Ok(())
+}
+
+/// 删除某存货的计价配置（恢复默认）
+pub fn item_cost_method_clear(db: &Db, item: &str) -> DbResult<()> {
+    db.conn()
+        .execute("DELETE FROM item_cost_method WHERE item=?1", rusqlite::params![item])?;
+    Ok(())
+}
+
+/// 列出所有已配置计价方式的存货
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CostConfigRow {
+    pub item: String,
+    pub method: String,
+    pub method_label: String,
+    pub standard_cost: Money,
+}
+
+pub fn cost_configs(db: &Db) -> DbResult<Vec<CostConfigRow>> {
+    let mut st = db
+        .conn()
+        .prepare("SELECT item, method, standard_cost FROM item_cost_method ORDER BY item")?;
+    let rows = st
+        .query_map([], |r| {
+            let m: String = r.get(1)?;
+            Ok(CostConfigRow {
+                item: r.get(0)?,
+                method: m.clone(),
+                method_label: CostMethod::parse(&m).label().to_string(),
+                standard_cost: Money::parse_or_zero(&r.get::<_, String>(2)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 期末结价：按各存货配置的计价方式计算期末结存成本，
+/// 并生成"成本调整"流水（差额入账，保持数量不变）。
+///
+/// 返回每个存货的调整明细。全月一次平均在这里统一重算出库成本，
+/// 再与流水上已记成本比较，把差额作为调整。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PeriodEndCostRow {
+    pub item: String,
+    pub method: String,
+    /// 结存数量
+    pub end_qty: Money,
+    /// 按计价方式算出的期末结存金额
+    pub end_amount: Money,
+    /// 单价
+    pub unit_cost: Money,
+    /// 需要调整的金额（正=调增，负=调减，0=无需调整）
+    pub adjust: Money,
+}
+
+/// 期末结价。`period` 为本期，方法按各存货配置读取；
+/// `apply` 为 true 时把调整写入 stock_move（kind=adjust）。
+pub fn period_end_cost(db: &Db, period: Period, apply: bool) -> DbResult<Vec<PeriodEndCostRow>> {
+    let mut items = stock_items(db)?;
+    items.sort();
+    let mut out = Vec::new();
+    for item in items {
+        let method = item_cost_method(db, &item)?;
+        // 期初结存（上一期期末）
+        let prev = period.prev();
+        let prev_state = stock_state(db, &item, prev, method)?;
+        // 本期流水（含期末计价）
+        let rows = stock_list_item(db, &item, period)?;
+        let moves: Vec<StockMoveIn> = rows
+            .iter()
+            .filter(|r| r.kind != StockKind::Adjust)
+            .map(|r| StockMoveIn {
+                qty: r.qty,
+                price: if r.price.is_zero() { None } else { Some(r.price) },
+            })
+            .collect();
+        let (_, end_st) = if method == CostMethod::MonthAverage {
+            fincore::engine::costing::run_month_average(&prev_state, &moves)?
+        } else {
+            let mut st = prev_state.clone();
+            for mv in &moves {
+                st.apply(mv, method)?;
+            }
+            (Vec::new(), st)
+        };
+        // 本期已入账的成本调整
+        let adj: Money = rows
+            .iter()
+            .filter(|r| r.kind == StockKind::Adjust)
+            .map(|r| r.amount)
+            .sum();
+        let end_amount = end_st.amount + adj;
+        let unit_cost = end_st.unit_cost();
+        // 调整差额：把"按计价方式应有的结存"与"流水累计的结存"对齐。
+        // 流水口径：期初 + 本期入库 − 本期出库（出库按流水价）
+        let flow_end: Money = {
+            let mut st = prev_state.clone();
+            for mv in &moves {
+                st.apply(mv, method)?;
+            }
+            st.amount + adj
+        };
+        let adjust = (end_amount - flow_end).round2();
+        if apply && !adjust.is_zero() {
+            stock_adjust(
+                db,
+                period,
+                period.last_day(),
+                &item,
+                "",
+                adjust,
+                "期末结价调整",
+            )?;
+        }
+        out.push(PeriodEndCostRow {
+            item,
+            method: method.code().to_string(),
+            end_qty: end_st.qty,
+            end_amount,
+            unit_cost,
+            adjust,
+        });
+    }
+    Ok(out)
 }
 
 // ===========================================================================
@@ -1332,5 +1565,47 @@ mod tests {
         assert!(claim_delete(&db, id).is_err());
         // 重复生成要拦
         assert!(claim_voucher(&db, id, "100201", "u").is_err());
+    }
+
+    #[test]
+    fn cost_config_and_period_end_pricing() {
+        let db = tmpdb("costcfg");
+        let p = Period::new(2026, 1).unwrap();
+        // 未配置默认移动加权
+        assert_eq!(item_cost_method(&db, "P001").unwrap(), CostMethod::MovingAverage);
+        // 配置为全月一次平均 + 标准成本
+        item_cost_method_set(&db, "P001", Some("month_average"), m("10")).unwrap();
+        assert_eq!(item_cost_method(&db, "P001").unwrap(), CostMethod::MonthAverage);
+        assert_eq!(item_standard_cost(&db, "P001").unwrap(), m("10"));
+        let cfg = cost_configs(&db).unwrap();
+        assert_eq!(cfg.len(), 1);
+        assert_eq!(cfg[0].method_label, "全月一次加权平均");
+        // 恢复默认
+        item_cost_method_clear(&db, "P001").unwrap();
+        assert_eq!(item_cost_method(&db, "P001").unwrap(), CostMethod::MovingAverage);
+    }
+
+    #[test]
+    fn month_average_summary_and_pricing() {
+        let db = tmpdb("ma");
+        let p = Period::new(2026, 1).unwrap();
+        // 1 月：入 100@10、入 50@12、出 80
+        stock_insert(&db, &mv(p, d(2026, 1, 5), StockKind::Purchase, "100", "10")).unwrap();
+        stock_insert(&db, &mv(p, d(2026, 1, 10), StockKind::Purchase, "50", "12")).unwrap();
+        stock_insert(&db, &mv(p, d(2026, 1, 20), StockKind::Sale, "-80", "0")).unwrap();
+
+        // 全月一次：单价 = (0 + 1000 + 600) / 150 = 10.6667；出库 80 × 10.6667 = 853.33
+        let sum = stock_summary(&db, p, CostMethod::MonthAverage).unwrap();
+        assert_eq!(sum.len(), 1);
+        assert_eq!(sum[0].out_qty, m("80"));
+        assert_eq!(sum[0].out_amount, m("853.33"));
+        assert_eq!(sum[0].end_qty, m("70"));
+        assert_eq!(sum[0].end_amount, m("746.67"));
+
+        // 期末结价：不 apply 时 adjust 应为 0（流水成本与计价一致）
+        let rows = period_end_cost(&db, p, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].end_qty, m("70"));
+        assert_eq!(rows[0].adjust, m("0"));
     }
 }

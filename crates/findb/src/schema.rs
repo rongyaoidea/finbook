@@ -22,7 +22,8 @@ use crate::DbError;
 /// v5：账号设备绑定（user.device_id / device_name）
 /// v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
-pub const SCHEMA_VERSION: i64 = 15;
+/// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -939,6 +940,53 @@ CREATE TABLE IF NOT EXISTS order_change_log (
     changed_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ocl ON order_change_log(order_type, order_id);
+
+-- ===========================================================================
+-- v16：资金（票据 / 融资）+ 存货计价配置
+-- ===========================================================================
+
+-- 票据（应收票据 / 应付票据）
+CREATE TABLE IF NOT EXISTS bill (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL DEFAULT 'receivable', -- receivable=应收 / payable=应付
+    no          TEXT NOT NULL DEFAULT '',
+    period      INTEGER NOT NULL,
+    issue_date  TEXT NOT NULL,             -- 出票日
+    due_date    TEXT NOT NULL,             -- 到期日
+    counterpart TEXT NOT NULL DEFAULT '',  -- 对方单位
+    bank        TEXT NOT NULL DEFAULT '',  -- 承兑银行
+    amount      TEXT NOT NULL DEFAULT '0', -- 票面金额
+    status      TEXT NOT NULL DEFAULT 'in_hand', -- in_hand/endorsed/discounted/matured/paid
+    handled_date TEXT,                     -- 背书/贴现/兑付日期
+    memo        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bill_kind ON bill(kind, status);
+
+-- 融资（借款台账）
+CREATE TABLE IF NOT EXISTS loan (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL DEFAULT 'borrow', -- borrow=借款 / lend=放款
+    no          TEXT NOT NULL DEFAULT '',
+    bank        TEXT NOT NULL DEFAULT '',  -- 对方金融机构 / 单位
+    principal   TEXT NOT NULL DEFAULT '0', -- 本金
+    rate_pct    TEXT NOT NULL DEFAULT '0', -- 年利率（%）
+    start_date  TEXT NOT NULL,             -- 起息日
+    end_date    TEXT NOT NULL,             -- 到期日
+    status      TEXT NOT NULL DEFAULT 'active', -- active / settled
+    memo        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_loan_kind ON loan(kind, status);
+
+-- 存货计价方式配置（按存货档案 code）
+CREATE TABLE IF NOT EXISTS item_cost_method (
+    item          TEXT PRIMARY KEY,
+    method        TEXT NOT NULL DEFAULT 'moving_average', -- moving_average/fifo/specific/standard/month_average
+    standard_cost TEXT NOT NULL DEFAULT '0'
+);
 
 "#;
 

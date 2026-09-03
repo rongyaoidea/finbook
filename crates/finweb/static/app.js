@@ -280,6 +280,9 @@ const NAV_ITEMS = [
   { id: "so-doc", label: "销售单据", perm: "account_edit" },
   { id: "order-change-log", label: "订单变更", perm: "report" },
   { id: "work-report", label: "工序报工", perm: "account_edit" },
+  { id: "funds", label: "资金管理", perm: "report" },
+  { id: "budget-analysis", label: "预算分析", perm: "report" },
+  { id: "cost", label: "成本核算", perm: "report" },
   { id: "security", label: "安全中心", perm: "user_manage" },
 ];
 
@@ -321,6 +324,9 @@ const VIEWS = {
   "so-doc": viewSoDoc,
   "order-change-log": viewOrderChangeLog,
   "work-report": viewWorkReport,
+  "funds": viewFunds,
+  "budget-analysis": viewBudgetAnalysis,
+  "cost": viewCost,
   "security": viewSecurity,
 };
 
@@ -2347,6 +2353,336 @@ async function viewOrderChangeLog(main) {
         : `<div class="muted">无变更记录</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
+}
+
+// ===========================================================================
+// 资金管理：资金日报 / 票据 / 融资 / 资金预测
+// ===========================================================================
+async function viewFunds(main) {
+  main.innerHTML = `<h2>资金管理</h2>
+    <div class="toolbar">
+      <button class="btn sm ${state.fundsTab === "daily" ? "primary" : "ghost"}" id="ft-daily">资金日报</button>
+      <button class="btn sm ${state.fundsTab === "bill" ? "primary" : "ghost"}" id="ft-bill">票据</button>
+      <button class="btn sm ${state.fundsTab === "loan" ? "primary" : "ghost"}" id="ft-loan">融资</button>
+      <button class="btn sm ${state.fundsTab === "forecast" ? "primary" : "ghost"}" id="ft-forecast">资金预测</button>
+    </div>
+    <div id="funds-body" class="muted">加载中…</div>`;
+  const tab = state.fundsTab || "daily";
+  const switchTab = (t) => { state.fundsTab = t; viewFunds(main); };
+  $("#ft-daily").onclick = () => switchTab("daily");
+  $("#ft-bill").onclick = () => switchTab("bill");
+  $("#ft-loan").onclick = () => switchTab("loan");
+  $("#ft-forecast").onclick = () => switchTab("forecast");
+
+  const body = $("#funds-body");
+  if (tab === "daily") {
+    body.className = "";
+    try {
+      const r = await api("/funds/daily");
+      const rows = r.rows || [];
+      body.innerHTML = rows.length
+        ? `<div class="muted" style="margin-bottom:8px">期间：${esc(r.period)}</div><table class="grid"><thead><tr>
+            <th>科目</th><th>科目名称</th><th class="num">期初</th><th class="num">收入</th><th class="num">支出</th><th class="num">期末</th>
+          </tr></thead><tbody>${rows.map((x) => `<tr>
+            <td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td>
+            <td class="num">${fmt(x.begin)}</td><td class="num">${fmt(x.income)}</td>
+            <td class="num">${fmt(x.expense)}</td><td class="num"><b>${fmt(x.end)}</b></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">本期无现金/银行科目数据</div>`;
+    } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  } else if (tab === "bill") {
+    renderBills(body);
+  } else if (tab === "loan") {
+    renderLoans(body);
+  } else {
+    body.className = "";
+    try {
+      const r = await api("/funds/forecast");
+      const f = r.forecast || {};
+      body.innerHTML = `<div class="cards">
+        ${["现金/银行结存", "在库应收票据", "应付票据", "放款可收回", "借款需偿还", "预计资金头寸"].map((t, i) => {
+          const k = ["cash_balance", "receivable_bills", "payable_bills", "lend", "borrow", "position"][i];
+          const v = f[k] || "0";
+          return `<div class="card"><div class="k">${t}</div><div class="v">${fmt(v)}</div></div>`;
+        }).join("")}
+      </div>`;
+    } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+async function renderBills(body) {
+  body.className = "";
+  const toolbar = `<div class="toolbar">
+      <button class="btn sm" id="bill-new">新增票据</button>
+      <label>类型 <select id="bill-kind"><option value="">全部</option><option value="receivable">应收</option><option value="payable">应付</option></select></label>
+    </div><div id="bill-list" class="muted">加载中…</div>`;
+  body.innerHTML = toolbar;
+  $("#bill-new").onclick = () => openBillEditor(null);
+  $("#bill-kind").onchange = loadBills;
+  await loadBills();
+  async function loadBills() {
+    const kind = $("#bill-kind").value;
+    try {
+      const r = await api(`/funds/bills?kind=${encodeURIComponent(kind)}`);
+      const rows = r.rows || [];
+      const stMap = { in_hand: ["在库", "ok"], endorsed: ["已背书", "warn"], discounted: ["已贴现", "warn"], matured: ["已到期", "err"], settled: ["已兑付", "ok"] };
+      $("#bill-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>类型</th><th>票据号</th><th>出票日</th><th>到期日</th><th>对方单位</th><th>承兑银行</th><th class="num">金额</th><th>状态</th><th></th></tr></thead>
+          <tbody>${rows.map((b) => {
+            const s = stMap[b.status] || [b.status, ""];
+            return `<tr><td>${b.kind === "receivable" ? "应收" : "应付"}</td><td>${esc(b.no)}</td>
+              <td>${esc(b.issue_date)}</td><td>${esc(b.due_date)}</td><td>${esc(b.counterpart || "—")}</td>
+              <td>${esc(b.bank || "—")}</td><td class="num">${fmt(b.amount)}</td>
+              <td><span class="tag ${s[1]}">${esc(s[0])}</span></td>
+              <td class="row-actions">
+                <button class="btn ghost sm" data-bill="${b.id}">打开</button>
+                ${b.status === "in_hand" ? `<button class="btn ghost sm" data-bill-act="${b.id}" data-to="endorsed">背书</button>
+                <button class="btn ghost sm" data-bill-act="${b.id}" data-to="discounted">贴现</button>
+                <button class="btn ghost sm" data-bill-act="${b.id}" data-to="settled">兑付</button>` : ""}
+              </td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无票据</div>`;
+      $all("[data-bill]").forEach((b) => b.onclick = () => openBillEditor(parseInt(b.dataset.bill, 10)));
+      $all("[data-bill-act]").forEach((b) => b.onclick = async () => {
+        try { await api(`/funds/bills/${b.dataset.billAct}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: b.dataset.to, date: today() }) }); toast("已更新", "ok"); loadBills(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#bill-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+async function openBillEditor(id) {
+  let b = { id: 0, kind: "receivable", no: "", issue_date: today(), due_date: today(), counterpart: "", bank: "", amount: "0", status: "in_hand", memo: "" };
+  if (id) { try { const r = await api("/funds/bills"); b = (r.rows || []).find((x) => x.id === id) || b; } catch (e) { toast(e.message, "err"); return; } }
+  const mask = modal(`
+    <h3>${id ? "编辑票据" : "新增票据"}</h3>
+    <div class="field"><label>类型</label><select id="b-kind">
+      <option value="receivable" ${b.kind === "receivable" ? "selected" : ""}>应收票据</option>
+      <option value="payable" ${b.kind === "payable" ? "selected" : ""}>应付票据</option></select></div>
+    <div class="field"><label>票据号</label><input id="b-no" value="${esc(b.no)}" /></div>
+    <div class="field"><label>出票日</label><input id="b-issue" type="date" value="${esc(b.issue_date)}" /></div>
+    <div class="field"><label>到期日</label><input id="b-due" type="date" value="${esc(b.due_date)}" /></div>
+    <div class="field"><label>对方单位</label><input id="b-cp" value="${esc(b.counterpart)}" /></div>
+    <div class="field"><label>承兑银行</label><input id="b-bank" value="${esc(b.bank)}" /></div>
+    <div class="field"><label>金额</label><input id="b-amt" value="${esc(b.amount)}" /></div>
+    <div class="field"><label>备注</label><input id="b-memo" value="${esc(b.memo)}" /></div>
+    <div class="foot"><button class="btn" id="b-save">保存</button>${id ? `<button class="btn danger ghost" id="b-del">删除</button>` : ""}<button class="btn ghost" id="b-cancel">取消</button></div>`);
+  $("#b-cancel", mask).onclick = closeModal;
+  $("#b-save", mask).onclick = async () => {
+    const body2 = {
+      id: b.id, kind: $("#b-kind", mask).value, no: $("#b-no", mask).value.trim(),
+      period: ymm(state.current || ""), issue_date: $("#b-issue", mask).value,
+      due_date: $("#b-due", mask).value, counterpart: $("#b-cp", mask).value.trim(),
+      bank: $("#b-bank", mask).value.trim(), amount: $("#b-amt", mask).value.trim(),
+      status: "in_hand", memo: $("#b-memo", mask).value.trim(),
+    };
+    if (!body2.no || !body2.issue_date || !body2.due_date) { toast("票据号与日期必填", "err"); return; }
+    try { await api("/funds/bills", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body2) }); toast("已保存", "ok"); closeModal(); renderBills($("#funds-body")); } catch (e) { toast(e.message, "err"); }
+  };
+  if (id) $("#b-del", mask).onclick = async () => { if (!(await confirmDialog("删除该票据？", true))) return; try { await api(`/funds/bills/${id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); renderBills($("#funds-body")); } catch (e) { toast(e.message, "err"); } };
+}
+
+async function renderLoans(body) {
+  body.className = "";
+  body.innerHTML = `<div class="toolbar"><button class="btn sm" id="loan-new">新增融资</button>
+      <label>类型 <select id="loan-kind"><option value="">全部</option><option value="borrow">借款</option><option value="lend">放款</option></select></label>
+    </div><div id="loan-list" class="muted">加载中…</div>`;
+  $("#loan-new").onclick = () => openLoanEditor(null);
+  $("#loan-kind").onchange = loadLoans;
+  await loadLoans();
+  async function loadLoans() {
+    const kind = $("#loan-kind").value;
+    try {
+      const r = await api(`/funds/loans?kind=${encodeURIComponent(kind)}`);
+      const rows = r.rows || [];
+      $("#loan-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>类型</th><th>编号</th><th>机构</th><th class="num">本金</th><th class="num">年利率%</th><th>起息日</th><th>到期日</th><th>状态</th><th></th></tr></thead>
+          <tbody>${rows.map((l) => `<tr>
+            <td>${l.kind === "borrow" ? "借款" : "放款"}</td><td>${esc(l.no)}</td><td>${esc(l.bank || "—")}</td>
+            <td class="num">${fmt(l.principal)}</td><td class="num">${fmt(l.rate_pct)}</td>
+            <td>${esc(l.start_date)}</td><td>${esc(l.end_date)}</td>
+            <td><span class="tag ${l.status === "active" ? "warn" : "ok"}">${l.status === "active" ? "存续" : "已结清"}</span></td>
+            <td class="row-actions">
+              <button class="btn ghost sm" data-loan="${l.id}">打开</button>
+              ${l.status === "active" ? `<button class="btn ghost sm" data-loan-settle="${l.id}">结清</button>` : ""}
+            </td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无融资记录</div>`;
+      $all("[data-loan]").forEach((b) => b.onclick = () => openLoanEditor(parseInt(b.dataset.loan, 10)));
+      $all("[data-loan-settle]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("结清该笔融资？", true))) return;
+        try { await api(`/funds/loans/${b.dataset.loanSettle}/settle`, { method: "POST" }); toast("已结清", "ok"); loadLoans(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#loan-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+async function openLoanEditor(id) {
+  let l = { id: 0, kind: "borrow", no: "", bank: "", principal: "0", rate_pct: "0", start_date: today(), end_date: today(), status: "active", memo: "" };
+  if (id) { try { const r = await api("/funds/loans"); l = (r.rows || []).find((x) => x.id === id) || l; } catch (e) { toast(e.message, "err"); return; } }
+  const mask = modal(`
+    <h3>${id ? "编辑融资" : "新增融资"}</h3>
+    <div class="field"><label>类型</label><select id="l-kind">
+      <option value="borrow" ${l.kind === "borrow" ? "selected" : ""}>借款</option>
+      <option value="lend" ${l.kind === "lend" ? "selected" : ""}>放款</option></select></div>
+    <div class="field"><label>编号</label><input id="l-no" value="${esc(l.no)}" /></div>
+    <div class="field"><label>机构</label><input id="l-bank" value="${esc(l.bank)}" /></div>
+    <div class="field"><label>本金</label><input id="l-pr" value="${esc(l.principal)}" /></div>
+    <div class="field"><label>年利率(%)</label><input id="l-rate" value="${esc(l.rate_pct)}" /></div>
+    <div class="field"><label>起息日</label><input id="l-start" type="date" value="${esc(l.start_date)}" /></div>
+    <div class="field"><label>到期日</label><input id="l-end" type="date" value="${esc(l.end_date)}" /></div>
+    <div class="field"><label>备注</label><input id="l-memo" value="${esc(l.memo)}" /></div>
+    <div class="foot"><button class="btn" id="l-save">保存</button>${id ? `<button class="btn danger ghost" id="l-del">删除</button>` : ""}<button class="btn ghost" id="l-cancel">取消</button></div>`);
+  $("#l-cancel", mask).onclick = closeModal;
+  $("#l-save", mask).onclick = async () => {
+    const body2 = {
+      id: l.id, kind: $("#l-kind", mask).value, no: $("#l-no", mask).value.trim(),
+      bank: $("#l-bank", mask).value.trim(), principal: $("#l-pr", mask).value.trim(),
+      rate_pct: $("#l-rate", mask).value.trim(), start_date: $("#l-start", mask).value,
+      end_date: $("#l-end", mask).value, status: "active", memo: $("#l-memo", mask).value.trim(),
+    };
+    if (!body2.no || !body2.start_date || !body2.end_date) { toast("编号与日期必填", "err"); return; }
+    try { await api("/funds/loans", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body2) }); toast("已保存", "ok"); closeModal(); renderLoans($("#funds-body")); } catch (e) { toast(e.message, "err"); }
+  };
+  if (id) $("#l-del", mask).onclick = async () => { if (!(await confirmDialog("删除该笔融资？", true))) return; try { await api(`/funds/loans/${id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); renderLoans($("#funds-body")); } catch (e) { toast(e.message, "err"); } };
+}
+
+// ===========================================================================
+// 预算分析：年度逐月预算 vs 实际（含部门维度）
+// ===========================================================================
+async function viewBudgetAnalysis(main) {
+  main.innerHTML = `<h2>预算分析</h2>
+    <div class="toolbar">
+      <label>年度 <input id="ana-year" value="${new Date().getFullYear()}" style="width:70px" /></label>
+      <label>版本 <input id="ana-ver" value="" placeholder="留空=当前" style="width:110px" /></label>
+      <button class="btn primary" id="ana-run">查询</button>
+      <button class="btn ghost sm" id="ana-sum">仅汇总</button>
+    </div>
+    <div id="ana-body" class="muted">选择年度后查询</div>`;
+  const run = async (summaryOnly) => {
+    const year = $("#ana-year").value.trim() || String(new Date().getFullYear());
+    const ver = $("#ana-ver").value.trim();
+    try {
+      const r = await api(`/budget/analysis?year=${encodeURIComponent(year)}&version=${encodeURIComponent(ver)}`);
+      const rows = r.rows || [], sums = r.summary || [];
+      if (summaryOnly || !rows.length) {
+        $("#ana-body").innerHTML = sums.length
+          ? `<div class="muted" style="margin-bottom:8px">年度汇总（科目 × 部门）</div><table class="grid"><thead><tr>
+              <th>科目</th><th>部门</th><th class="num">预算</th><th class="num">实际</th><th class="num">执行率</th></tr></thead>
+            <tbody>${sums.map((x) => `<tr><td>${esc(x.account_code)} ${esc(x.account_name)}</td><td>${esc(x.dept || "—")}</td>
+              <td class="num">${fmt(x.budget)}</td><td class="num">${fmt(x.actual)}</td><td class="num">${x.rate}%</td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">该年度无预算数据</div>`;
+      } else {
+        // 按月透视：行=科目×部门，列=月份
+        const months = Array.from(new Set(rows.map((x) => x.period))).sort();
+        const groups = {};
+        rows.forEach((x) => { const k = `${x.account_code}|${x.account_name}|${x.dept}`; (groups[k] = groups[k] || []).push(x); });
+        $("#ana-body").innerHTML = `<div class="muted" style="margin-bottom:8px">逐月预算 vs 实际（预算/实际/执行率%）</div><div class="panel" style="overflow-x:auto"><table class="grid"><thead><tr>
+            <th>科目 / 部门</th>${months.map((mo) => `<th colspan="3" class="num">${esc(String(mo).slice(4, 6))}月</th>`).join("")}</tr>
+          <tr><th></th>${months.map(() => `<th class="num">预算</th><th class="num">实际</th><th class="num">率</th>`).join("")}</tr></thead>
+          <tbody>${Object.entries(groups).map(([k, items]) => {
+            const m = {};
+            items.forEach((i) => m[i.period] = i);
+            return `<tr><td>${esc(k.split("|").slice(0, 2).join(" "))}${k.split("|")[2] ? `<div class="muted" style="font-size:11px">${esc(k.split("|")[2])}</div>` : ""}</td>
+              ${months.map((mo) => { const i = m[mo]; return i ? `<td class="num">${fmt(i.budget)}</td><td class="num">${fmt(i.actual)}</td><td class="num">${i.rate}%</td>` : `<td class="num">—</td><td class="num">—</td><td class="num">—</td>`; }).join("")}</tr>`;
+          }).join("")}</tbody></table></div>`;
+      }
+    } catch (e) { $("#ana-body").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#ana-run").addEventListener("click", () => run(false));
+  $("#ana-sum").addEventListener("click", () => run(true));
+}
+
+// ===========================================================================
+// 成本核算：计价方式配置 + 期末结价
+// ===========================================================================
+async function viewCost(main) {
+  main.innerHTML = `<h2>成本核算</h2>
+    <div class="toolbar">
+      <button class="btn sm ${state.costTab === "config" ? "primary" : "ghost"}" id="ct-config">计价方式</button>
+      <button class="btn sm ${state.costTab === "close" ? "primary" : "ghost"}" id="ct-close">期末结价</button>
+    </div>
+    <div id="cost-body" class="muted">加载中…</div>`;
+  const tab = state.costTab || "config";
+  $("#ct-config").onclick = () => { state.costTab = "config"; viewCost(main); };
+  $("#ct-close").onclick = () => { state.costTab = "close"; viewCost(main); };
+  const body = $("#cost-body");
+  if (tab === "config") {
+    body.className = "";
+    body.innerHTML = `<div class="toolbar"><button class="btn sm" id="cost-new">新增配置</button></div><div id="cost-list" class="muted">加载中…</div>`;
+    $("#cost-new").onclick = () => openCostConfig(null);
+    await loadCostConfigs();
+    async function loadCostConfigs() {
+      try {
+        const r = await api("/cost/configs");
+        const rows = r.rows || [];
+        $("#cost-list").innerHTML = rows.length
+          ? `<table class="grid"><thead><tr><th>存货</th><th>计价方式</th><th class="num">标准成本</th><th></th></tr></thead>
+            <tbody>${rows.map((x) => `<tr><td>${esc(x.item)}</td><td>${esc(x.method_label)}</td>
+              <td class="num">${fmt(x.standard_cost)}</td>
+              <td class="row-actions"><button class="btn ghost sm" data-cfg="${esc(x.item)}">编辑</button>
+              <button class="btn ghost sm" data-cfg-del="${esc(x.item)}">清除</button></td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">尚未配置存货计价方式（默认移动加权平均）</div>`;
+        $all("[data-cfg]").forEach((b) => b.onclick = () => openCostConfig(b.dataset.cfg));
+        $all("[data-cfg-del]").forEach((b) => b.onclick = async () => {
+          if (!(await confirmDialog(`清除 ${b.dataset.cfgDel} 的计价配置（恢复默认）？`, true))) return;
+          try { await api(`/cost/configs/${encodeURIComponent(b.dataset.cfgDel)}/delete`, { method: "POST" }); toast("已清除", "ok"); loadCostConfigs(); } catch (e) { toast(e.message, "err"); }
+        });
+      } catch (e) { $("#cost-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    }
+  } else {
+    body.className = "";
+    body.innerHTML = `<div class="toolbar">
+        <label>期间 <input id="ce-period" value="${esc(state.current)}" style="width:90px" /></label>
+        <button class="btn" id="ce-preview">试算（不落账）</button>
+        <button class="btn primary" id="ce-apply">期末结价（写入调整）</button>
+      </div><div id="ce-list" class="muted">选择期间后试算</div>`;
+    const run = async (apply) => {
+      const p = $("#ce-period").value.trim();
+      try {
+        const r = await api(`/cost/period-end?period=${encodeURIComponent(p)}&apply=${apply}`);
+        const rows = r.rows || [];
+        const sumAdj = rows.reduce((a, x) => a + moneyNum(x.adjust), 0);
+        $("#ce-list").innerHTML = rows.length
+          ? `<div class="muted" style="margin-bottom:8px">期间 ${esc(r.period)}${apply ? "（已写入成本调整）" : "（试算）"} · 调整合计 ${moneyFmt(sumAdj)}</div>
+            <table class="grid"><thead><tr><th>存货</th><th>计价方式</th><th class="num">结存数量</th><th class="num">结存金额</th><th class="num">单价</th><th class="num">调整额</th></tr></thead>
+            <tbody>${rows.map((x) => `<tr><td>${esc(x.item)}</td><td>${esc(x.method)}</td>
+              <td class="num">${fmt(x.end_qty)}</td><td class="num">${fmt(x.end_amount)}</td>
+              <td class="num">${fmt(x.unit_cost)}</td>
+              <td class="num" style="color:${moneyNum(x.adjust) < 0 ? "var(--err)" : "var(--ok)"}">${fmt(x.adjust)}</td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">该期间无存货流水</div>`;
+      } catch (e) { $("#ce-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    };
+    $("#ce-preview").addEventListener("click", () => run(false));
+    $("#ce-apply").addEventListener("click", async () => { if (!(await confirmDialog("期末结价会写入成本调整流水（不影响数量），确认执行？", true))) return; run(true); });
+  }
+}
+
+async function openCostConfig(item) {
+  const mask = modal(`
+    <h3>计价方式配置</h3>
+    <div class="field"><label>存货编码</label><input id="c-item" value="${esc(item || "")}" ${item ? "disabled" : ""} /></div>
+    <div class="field"><label>计价方式</label><select id="c-method">
+      <option value="moving_average">移动加权平均</option>
+      <option value="month_average">全月一次加权平均</option>
+      <option value="fifo">先进先出</option>
+      <option value="specific">个别计价</option>
+      <option value="standard">标准成本</option></select></div>
+    <div class="field"><label>标准成本单价</label><input id="c-std" value="0" /></div>
+    <div class="foot"><button class="btn" id="c-save">保存</button><button class="btn ghost" id="c-cancel">取消</button></div>`);
+  if (item) {
+    try {
+      const r = await api("/cost/configs");
+      const cfg = (r.rows || []).find((x) => x.item === item);
+      if (cfg) { $("#c-method", mask).value = cfg.method; $("#c-std", mask).value = cfg.standard_cost; }
+    } catch (e) {}
+  }
+  $("#c-cancel", mask).onclick = closeModal;
+  $("#c-save", mask).onclick = async () => {
+    const it = item || $("#c-item", mask).value.trim();
+    if (!it) { toast("存货编码必填", "err"); return; }
+    try {
+      await api("/cost/configs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ item: it, method: $("#c-method", mask).value, standard_cost: $("#c-std", mask).value.trim() || "0" }) });
+      toast("已保存", "ok"); closeModal(); viewCost($("#main"));
+    } catch (e) { toast(e.message, "err"); }
+  };
 }
 
 // 启动：先尝试恢复已有会话（cookie 仍有效则直接进入应用，不再无条件显示登录页）

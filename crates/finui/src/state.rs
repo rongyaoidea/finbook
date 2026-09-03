@@ -54,6 +54,12 @@ pub enum NavItem {
     Budget,
     /// 多维损益
     DimProfit,
+    /// 资金管理（现金/银行日记账、票据、融资、资金预测）
+    Funds,
+    /// 预算分析（年度逐月 vs 实际，含部门维度）
+    BudgetAnalysis,
+    /// 成本核算（计价方式配置、期末结价）
+    Cost,
     /// 自定义报表
     CustomReport,
     /// 多栏账
@@ -115,6 +121,9 @@ impl NavItem {
             NavItem::Claims => "费用报销".to_string(),
             NavItem::Budget => "预算管理".to_string(),
             NavItem::DimProfit => "多维损益".to_string(),
+            NavItem::Funds => "资金管理".to_string(),
+            NavItem::BudgetAnalysis => "预算分析".to_string(),
+            NavItem::Cost => "成本核算".to_string(),
             NavItem::CustomReport => "自定义报表".to_string(),
             NavItem::MultiColumn => "多栏账".to_string(),
             NavItem::SummaryTable => "摘要汇总表".to_string(),
@@ -157,7 +166,11 @@ impl NavItem {
             NavItem::Inventory | NavItem::InventoryDeep | NavItem::ScmDeep | NavItem::Payroll
             | NavItem::Claims | NavItem::Manufacturing => "业务",
             NavItem::Approval | NavItem::Archive => "系统",
-            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit => "管理会计",
+            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit | NavItem::BudgetAnalysis => {
+                "管理会计"
+            }
+            NavItem::Funds => "业务",
+            NavItem::Cost => "业务",
             NavItem::Users | NavItem::Security | NavItem::Options | NavItem::Backup
             | NavItem::Logs | NavItem::Help | NavItem::About => "系统",
         }
@@ -177,9 +190,9 @@ impl NavItem {
             NavItem::BankRec | NavItem::Settle | NavItem::Payroll | NavItem::Claims => {
                 Some(Perm::VoucherNew)
             }
-            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit | NavItem::CustomReport => {
-                Some(Perm::Report)
-            }
+            NavItem::Budget | NavItem::BudgetAlerts | NavItem::DimProfit | NavItem::CustomReport
+            | NavItem::BudgetAnalysis => Some(Perm::Report),
+            NavItem::Funds | NavItem::Cost => Some(Perm::Report),
             NavItem::MultiColumn | NavItem::SummaryTable | NavItem::Ratios | NavItem::ReportNotes
             | NavItem::Archive => Some(Perm::Report),
             NavItem::Manufacturing => Some(Perm::AccountEdit),
@@ -239,7 +252,10 @@ impl NavItem {
             NavItem::Archive,
             NavItem::Budget,
             NavItem::BudgetAlerts,
+            NavItem::BudgetAnalysis,
             NavItem::DimProfit,
+            NavItem::Funds,
+            NavItem::Cost,
             NavItem::Users,
             NavItem::Security,
             NavItem::Options,

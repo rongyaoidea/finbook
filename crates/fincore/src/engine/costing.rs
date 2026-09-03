@@ -28,6 +28,8 @@ pub enum CostMethod {
     Specific,
     /// 标准成本（出库按预设标准成本，差异另行处理）
     Standard,
+    /// 全月一次加权平均（期末按"期初+本期入库"加权，一次统一计算出库成本）
+    MonthAverage,
 }
 
 impl CostMethod {
@@ -37,6 +39,7 @@ impl CostMethod {
             CostMethod::Fifo => "先进先出",
             CostMethod::Specific => "个别计价",
             CostMethod::Standard => "标准成本",
+            CostMethod::MonthAverage => "全月一次加权平均",
         }
     }
     pub fn code(&self) -> &'static str {
@@ -45,6 +48,7 @@ impl CostMethod {
             CostMethod::Fifo => "fifo",
             CostMethod::Specific => "specific",
             CostMethod::Standard => "standard",
+            CostMethod::MonthAverage => "month_average",
         }
     }
     pub fn parse(s: &str) -> Self {
@@ -52,6 +56,7 @@ impl CostMethod {
             "fifo" => CostMethod::Fifo,
             "specific" | "individual" => CostMethod::Specific,
             "standard" => CostMethod::Standard,
+            "month_average" | "monthly_average" => CostMethod::MonthAverage,
             _ => CostMethod::MovingAverage,
         }
     }
@@ -60,6 +65,7 @@ impl CostMethod {
         CostMethod::Fifo,
         CostMethod::Specific,
         CostMethod::Standard,
+        CostMethod::MonthAverage,
     ];
 }
 
@@ -218,8 +224,9 @@ impl StockState {
         }
 
         let cost = match method {
-            CostMethod::MovingAverage => {
-                // 结存为零时用 last_price（先出库后入库的场景）
+            CostMethod::MovingAverage | CostMethod::MonthAverage => {
+                // 全月一次平均的"逐笔重放"与移动加权同口径；
+                // 真正的月末统一计价由 run_month_average 在期末一次性完成。
                 let unit = if self.qty.is_zero() {
                     self.last_price
                 } else {
@@ -301,6 +308,54 @@ pub fn run(
     let mut out = Vec::with_capacity(moves.len());
     for mv in moves {
         out.push(st.apply(mv, method)?);
+    }
+    Ok((out, st))
+}
+
+/// 全月一次加权平均：期末统一计算出库成本。
+///
+/// 单价 = (期初金额 + 本期全部入库金额) / (期初数量 + 本期全部入库数量)，
+/// 本期所有出库都用同一个单价。`opening` 为期初结存（跨期重放得到），
+/// `moves` 是本期出入库流水（按日期升序）。
+///
+/// 返回每条本期流水的出库成本（入库为 None）与期末结存。
+pub fn run_month_average(
+    opening: &StockState,
+    moves: &[Move],
+) -> Result<(Vec<Option<Money>>, StockState), FinError> {
+    let mut st = opening.clone();
+    // 汇总本期入库
+    let mut in_qty = Money::ZERO;
+    let mut in_amount = Money::ZERO;
+    for mv in moves {
+        if mv.qty.is_positive() {
+            let price = mv.price.unwrap_or(st.unit_cost());
+            in_qty += mv.qty;
+            in_amount += (mv.qty * price).round2();
+        }
+    }
+    // 全月一次单价
+    let denom = opening.qty + in_qty;
+    let unit = if denom.is_zero() {
+        st.unit_cost()
+    } else {
+        ((opening.amount + in_amount) / denom).round_dp(QTY_DP + 2)
+    };
+    let mut out = Vec::with_capacity(moves.len());
+    for mv in moves {
+        if mv.qty.is_positive() {
+            let price = mv.price.unwrap_or(unit);
+            st.apply(&Move { qty: mv.qty, price: Some(price) }, CostMethod::MovingAverage)?;
+            out.push(None);
+        } else {
+            let want = (-mv.qty).round_dp(QTY_DP);
+            let cost = (want * unit).round2();
+            st.consume_lots(want);
+            st.qty = (st.qty - want).round_dp(QTY_DP);
+            st.amount -= cost;
+            st.normalize_if_empty();
+            out.push(Some(cost));
+        }
     }
     Ok((out, st))
 }
@@ -426,5 +481,35 @@ mod tests {
         assert_eq!(delta, m("20"));
         assert_eq!(st.qty, q("10"));
         assert_eq!(st.unit_cost(), m("10"));
+    }
+
+    #[test]
+    fn month_average_uniform_unit_cost() {
+        // 期初 100@10=1000；本月入 100@12=1200；
+        // 全月一次单价 = (1000+1200)/(100+100) = 11
+        let opening = StockState {
+            qty: q("100"),
+            amount: m("1000"),
+            lots: vec![Lot { qty: q("100"), unit_cost: m("10") }],
+            last_price: m("10"),
+            standard_cost: Money::ZERO,
+        };
+        let moves = vec![
+            Move { qty: q("100"), price: Some(m("12")) }, // 入
+            Move { qty: q("-80"), price: None },          // 出 80@11 = 880
+        ];
+        let (costs, st) = run_month_average(&opening, &moves).unwrap();
+        assert_eq!(costs[0], None);
+        assert_eq!(costs[1], Some(m("880")));
+        assert_eq!(st.qty, q("120"));
+        // 结存金额 = 1000 + 1200 - 880 = 1320
+        assert_eq!(st.amount, m("1320"));
+        assert_eq!(st.unit_cost(), m("11"));
+    }
+
+    #[test]
+    fn method_roundtrip_includes_month_average() {
+        assert_eq!(CostMethod::parse("month_average"), CostMethod::MonthAverage);
+        assert_eq!(CostMethod::MonthAverage.label(), "全月一次加权平均");
     }
 }

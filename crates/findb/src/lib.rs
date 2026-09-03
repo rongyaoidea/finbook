@@ -18,6 +18,7 @@ pub mod auxs;
 pub mod balances;
 pub mod bank;
 pub mod business;
+pub mod funds;
 pub mod imports;
 pub mod inventory2;
 pub mod invoices;

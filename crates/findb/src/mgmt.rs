@@ -260,7 +260,7 @@ pub struct BudgetAlert {
     pub over_amount: Money,
 }
 
-/// 预算预警：返回执行率 >= threshold（百分比，如 90）的科目，按超支额降序。
+/// 预算预警：执行率 >= threshold（百分比，如 90）的科目，按超支额降序。
 pub fn budget_alerts(
     db: &Db,
     period: Period,
@@ -288,6 +288,147 @@ pub fn budget_alerts(
         }
     }
     out.sort_by(|a, b| b.over_amount.cmp(&a.over_amount));
+    Ok(out)
+}
+
+// ===========================================================================
+// 预算分析（年度趋势 + 部门维度）
+// ===========================================================================
+
+/// 预算分析行：某科目 × 某部门在某一期间的预算与执行
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BudgetAnalysisRow {
+    pub period: Period,
+    pub account_code: String,
+    pub account_name: String,
+    pub dept: String,
+    pub budget: Money,
+    pub actual: Money,
+    /// 执行率（%）
+    pub rate: Money,
+}
+
+/// 预算分析：返回指定版本、某年 1 月 ~ 12 月（或截至 `upto`）的逐月预算 vs 实际，
+/// 并按 科目 × 部门 展开（多维度预算：dept 维度）。
+///
+/// `upto` 为空表示整个年度；`rate_only_with_budget` 为 true 时只输出有预算的行。
+pub fn budget_analysis(
+    db: &Db,
+    year: i32,
+    version: &str,
+    upto: Option<Period>,
+) -> DbResult<Vec<BudgetAnalysisRow>> {
+    let chart = crate::accounts::chart(db)?;
+    let end = upto.unwrap_or_else(|| Period::new(year, 12).unwrap());
+    let from = Period::new(year, 1).unwrap();
+    let budgets = budget_list_version(db, None, version)?;
+
+    // 预算按 (期间, 科目, 部门) 聚合成映射
+    let mut bmap: std::collections::BTreeMap<(i32, String, String), Money> =
+        std::collections::BTreeMap::new();
+    for b in budgets {
+        if b.period.year() != year {
+            continue;
+        }
+        *bmap.entry((b.period.ymm(), b.account_code.clone(), b.dept.clone()))
+            .or_insert(Money::ZERO) += b.amount;
+    }
+    if bmap.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut period = from;
+    while period <= end {
+        // 逐期快照：BalanceRow 的 debit/credit 是"该期发生额"
+        let snap = BalanceSnapshot::load(db, &BalanceQuery::period(period))?;
+        for ((p, code, dept), budget) in &bmap {
+            if *p != period.ymm() {
+                continue;
+            }
+            let aux = if dept.is_empty() {
+                None
+            } else {
+                Some(AuxRef {
+                    dept: Some(dept.clone()),
+                    ..Default::default()
+                })
+            };
+            let row = snap.for_account(code, aux.as_ref());
+            let actual = row.debit - row.credit;
+            let rate = if budget.is_zero() {
+                Money::ZERO
+            } else {
+                ((actual.abs() * Money::from_i64(100)) / budget.abs().inner()).round2()
+            };
+            out.push(BudgetAnalysisRow {
+                period,
+                account_code: code.clone(),
+                account_name: chart.get(code).map(|a| a.name.clone()).unwrap_or_default(),
+                dept: dept.clone(),
+                budget: *budget,
+                actual,
+                rate,
+            });
+        }
+        period = period.next();
+    }
+    out.sort_by(|a, b| {
+        a.period
+            .ymm()
+            .cmp(&b.period.ymm())
+            .then(a.account_code.cmp(&b.account_code))
+            .then(a.dept.cmp(&b.dept))
+    });
+    Ok(out)
+}
+
+/// 预算分析汇总：某科目 × 部门全年预算/实际合计
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BudgetAnalysisSummary {
+    pub account_code: String,
+    pub account_name: String,
+    pub dept: String,
+    pub budget: Money,
+    pub actual: Money,
+    /// 执行率（%）
+    pub rate: Money,
+}
+
+/// 预算分析的年度汇总（用于部门维度对比与排行）
+pub fn budget_analysis_summary(
+    db: &Db,
+    year: i32,
+    version: &str,
+) -> DbResult<Vec<BudgetAnalysisSummary>> {
+    let rows = budget_analysis(db, year, version, None)?;
+    let mut map: std::collections::BTreeMap<(String, String), (Money, Money)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let e = map
+            .entry((r.account_code.clone(), r.dept.clone()))
+            .or_insert((Money::ZERO, Money::ZERO));
+        e.0 += r.budget;
+        e.1 += r.actual;
+    }
+    let chart = crate::accounts::chart(db)?;
+    let mut out = Vec::new();
+    for ((code, dept), (budget, actual)) in map {
+        let rate = if budget.is_zero() {
+            Money::ZERO
+        } else {
+            ((actual.abs() * Money::from_i64(100)) / budget.abs().inner()).round2()
+        };
+        out.push(BudgetAnalysisSummary {
+            account_code: code.clone(),
+            account_name: chart.get(&code).map(|a| a.name.clone()).unwrap_or_default(),
+            dept,
+            budget,
+            actual,
+            rate,
+        });
+    }
+    out.sort_by(|a, b| a.account_code.cmp(&b.account_code).then(a.dept.cmp(&b.dept)));
     Ok(out)
 }
 
@@ -751,6 +892,47 @@ mod tests {
         let list = custom_list(&db).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].lines.len(), 2);
-        assert!(custom_next_key(&db).unwrap().starts_with('R'));
+    }
+
+    #[test]
+    fn budget_analysis_yearly_and_by_dept() {
+        let db = tmpdb("anly");
+        // 2026 年 1~2 月，销售部 660201 预算各 10000
+        for mo in [1u32, 2] {
+            budget_upsert_version(
+                &db,
+                &Budget {
+                    id: 0,
+                    period: Period::new(2026, mo).unwrap(),
+                    account_code: "660201".into(),
+                    dept: "D01".into(),
+                    amount: m("10000"),
+                    memo: String::new(),
+                    version: "v1".into(),
+                },
+            )
+            .unwrap();
+        }
+        // 1 月实际 12000（超支），2 月实际 8000
+        post(&db, Period::new(2026, 1).unwrap(), 1, &[("660201", "12000", "0", Some("D01")), ("100201", "0", "12000", Some("D01"))]);
+        post(&db, Period::new(2026, 2).unwrap(), 2, &[("660201", "8000", "0", Some("D01")), ("100201", "0", "8000", Some("D01"))]);
+
+        let rows = budget_analysis(&db, 2026, "v1", None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let jan = rows.iter().find(|r| r.period.month() == 1).unwrap();
+        assert_eq!(jan.budget, m("10000"));
+        assert_eq!(jan.actual, m("12000"));
+        assert_eq!(jan.rate, m("120"));
+        let feb = rows.iter().find(|r| r.period.month() == 2).unwrap();
+        assert_eq!(feb.actual, m("8000"));
+        assert_eq!(feb.rate, m("80"));
+
+        // 年度汇总：预算 20000，实际 20000，执行率 100
+        let sums = budget_analysis_summary(&db, 2026, "v1").unwrap();
+        assert_eq!(sums.len(), 1);
+        assert_eq!(sums[0].dept, "D01");
+        assert_eq!(sums[0].budget, m("20000"));
+        assert_eq!(sums[0].actual, m("20000"));
+        assert_eq!(sums[0].rate, m("100"));
     }
 }

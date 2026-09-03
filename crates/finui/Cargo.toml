@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 egui = "0.31"
-egui_extras = "0.31"
+egui_extras = { version = "0.31", features = ["chrono", "serde"] }
 eframe = { version = "0.31", features = ["persistence"] }
 rfd = "0.15"
 csv = "1.3"

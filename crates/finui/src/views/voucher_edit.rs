@@ -7,7 +7,7 @@
 
 use chrono::NaiveDate;
 use egui::{Align, Color32, Layout, RichText, Ui};
-use egui_extras::{Column, TableBuilder};
+use egui_extras::{Column, DatePickerButton, TableBuilder};
 use fincore::engine::{validate_voucher, ValidateCtx};
 use fincore::report::cashflow::CashFlowItem;
 use fincore::{
@@ -591,8 +591,24 @@ impl VoucherEdit {
         // ---------------- 凭证头 ----------------
         ui.horizontal(|ui| {
             ui.label("日期");
-            let w = if readonly { 100.0 } else { 100.0 };
-            ui.add_sized([w, 22.0], egui::TextEdit::singleline(&mut self.date));
+            ui.add_sized(
+                [100.0, 22.0],
+                egui::TextEdit::singleline(&mut self.date).hint_text("YYYY-MM-DD"),
+            );
+            if !readonly {
+                // 日历选择器：点击弹出日历，选中后回写日期字符串；仍可手动输入
+                let mut d = NaiveDate::parse_from_str(self.date.trim(), "%Y-%m-%d")
+                    .unwrap_or_else(|_| chrono::Local::now().date_naive());
+                if ui
+                    .add(DatePickerButton::new(&mut d).id_salt("vch_date"))
+                    .changed()
+                {
+                    self.date = d.format("%Y-%m-%d").to_string();
+                }
+                if ui.button("今天").clicked() {
+                    self.date = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+                }
+            }
             ui.label("凭证字");
             if readonly || self.words.is_empty() {
                 ui.add_sized(

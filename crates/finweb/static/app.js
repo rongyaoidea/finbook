@@ -772,7 +772,7 @@ async function openVoucherEditor(id) {
   const mask = modal(`
     <h3>记账凭证 ${esc(voucher_no)}</h3>
     <div class="toolbar">
-      <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} /></label>
+      <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} />${editable ? `<button class="btn ghost sm" id="v-today">今天</button>` : ""}</label>
       <label>字 <input id="v-word" value="${esc(v.word)}" style="width:60px" ${editable ? "" : "disabled"} /></label>
       <label>号 <input id="v-no" type="number" value="${v.no}" style="width:70px" ${editable ? "" : "disabled"} /></label>
       <label>附单据 <input id="v-att" type="number" value="${v.attachments}" style="width:60px" ${editable ? "" : "disabled"} /></label>
@@ -819,6 +819,7 @@ async function openVoucherEditor(id) {
   }
   renderRows();
   if (editable) $("#v-add", mask).onclick = () => { v.entries.push({ line: v.entries.length + 1, account_code: "", summary: "", debit: "0", credit: "0" }); renderRows(); };
+  if (editable && $("#v-today", mask)) $("#v-today", mask).onclick = () => { $("#v-date", mask).value = today(); };
 
   const save = async () => {
     const dateVal = $("#v-date", mask).value;

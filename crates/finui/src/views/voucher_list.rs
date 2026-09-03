@@ -196,7 +196,11 @@ impl VoucherList {
                     let who = ctx.user().username.clone();
                     let r = findb::vouchers::post_many(ctx.db(), &ids, &who);
                     if let Some((n, errs)) = ctx.handle(r) {
-                        ctx.info(format!("已记账 {n} 张"));
+                        if errs.is_empty() {
+                            ctx.info(format!("已记账 {n} 张"));
+                        } else {
+                            ctx.error(format!("已记账 {n} 张，失败 {} 张", errs.len()));
+                        }
                         for e in errs.iter().take(5) {
                             ctx.error(e.clone());
                         }

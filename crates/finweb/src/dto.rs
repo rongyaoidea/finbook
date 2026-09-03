@@ -1,6 +1,6 @@
 //! 请求 / 响应数据结构（与前端 JSON 契约）
 
-use fincore::user::{Perm, Role, User};
+use fincore::user::{DataScope, Perm, Role, User};
 use fincore::Voucher;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,16 @@ pub struct PublicUser {
     pub disabled: bool,
     /// 该用户拥有的权限（snake_case 名称）
     pub perms: Vec<String>,
+    /// 下次登录是否强制改密
+    pub must_change_pwd: bool,
+    /// 锁定截止时刻（`%Y-%m-%d %H:%M:%S`），None 表示未锁定
+    pub locked_until: Option<String>,
+    /// 上次登录时间（空串表示从未登录）
+    pub last_login_at: String,
+    /// 备注
+    pub memo: String,
+    /// 数据权限范围
+    pub data_scope: DataScope,
 }
 
 impl PublicUser {
@@ -39,6 +49,11 @@ impl PublicUser {
             device_name: u.device_name.clone(),
             disabled: u.disabled,
             perms,
+            must_change_pwd: u.must_change_pwd,
+            locked_until: u.locked_until.clone(),
+            last_login_at: u.last_login_at.clone(),
+            memo: u.memo.clone(),
+            data_scope: u.data_scope.clone(),
         }
     }
 }
@@ -106,6 +121,9 @@ pub struct CreateUserReq {
     /// 是否强制首次登录改密（默认 true，测试场景可设为 false）
     #[serde(default = "default_true")]
     pub must_change_pwd: bool,
+    /// 备注（可选）
+    #[serde(default)]
+    pub memo: String,
 }
 
 fn default_true() -> bool {
@@ -118,6 +136,9 @@ pub struct UpdateUserReq {
     pub role: Option<Role>,
     pub disabled: Option<bool>,
     pub must_change_pwd: Option<bool>,
+    pub memo: Option<String>,
+    /// 完整替换数据范围（前端提交当前 scope 的完整副本）
+    pub data_scope: Option<DataScope>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +149,12 @@ pub struct ResetPwdReq {
 #[derive(Deserialize)]
 pub struct PeriodReq {
     pub ymm: i32,
+}
+
+#[derive(Deserialize)]
+pub struct BatchPostReq {
+    /// 要批量记账的凭证 id 列表
+    pub ids: Vec<i64>,
 }
 
 /// 凭证分录（前端提交的最小字段）

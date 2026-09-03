@@ -608,6 +608,17 @@ impl VoucherEdit {
                 if ui.button("今天").clicked() {
                     self.date = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
                 }
+                // 跨期提示：所选日期与当前期间不一致时提前告知，保存将按日期归入对应期间
+                if let Ok(d) = NaiveDate::parse_from_str(self.date.trim(), "%Y-%m-%d") {
+                    let p = Period::from_date(d);
+                    if p != ctx.period() {
+                        ui.label(
+                            RichText::new(format!("该日期属于 {} 期，保存后归入该期间", p.label()))
+                                .color(palette::WARN)
+                                .small(),
+                        );
+                    }
+                }
             }
             ui.label("凭证字");
             if readonly || self.words.is_empty() {

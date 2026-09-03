@@ -174,7 +174,11 @@ a:hover { color: var(--primary-d); }
 .topbar .logo {
   font-weight: 800; font-size: 16px; letter-spacing: -.03em;
   color: var(--primary);
+  cursor: pointer;            /* 点击回到仪表盘 */
+  user-select: none;
+  padding: 4px 2px;
 }
+.topbar .who { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
 .topbar .grow { flex: 1; }
 .topbar select, .topbar input {
   padding: 6px 9px; border: 1px solid var(--z-200); border-radius: 8px;
@@ -183,7 +187,16 @@ a:hover { color: var(--primary-d); }
 .topbar select:focus, .topbar input:focus {
   outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-t);
 }
-.topbar .who { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+/* 汉堡按钮：桌面隐藏，窄屏显示 */
+.hamburger {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 36px; height: 36px; padding: 0; font-size: 18px; line-height: 1;
+  border: 1px solid var(--z-200); border-radius: 8px;
+  background: var(--z-50); color: var(--text); cursor: pointer;
+}
+/* 抽屉遮罩：桌面隐藏，窄屏打开菜单时显示 */
+.side-mask { display: none; }
 
 /* Sidebar：深色 + 微妙纹理 */
 .sidebar {
@@ -261,6 +274,10 @@ table.grid th {
   text-transform: uppercase; letter-spacing: .04em;
   border-bottom: 1px solid var(--z-200);
 }
+table.grid th.sortable { cursor: pointer; user-select: none; }
+table.grid th.sortable:hover { color: var(--brand); }
+table.grid th.sort-asc::after { content: " ▲"; font-size: 10px; }
+table.grid th.sort-desc::after { content: " ▼"; font-size: 10px; }
 table.grid tbody tr { transition: background .1s; }
 table.grid tbody tr:hover { background: #f8fafc; }
 table.grid tbody tr:last-child td { border-bottom: none; }
@@ -386,22 +403,47 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 ::-webkit-scrollbar-thumb { background: var(--z-300); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--z-400); }
 ::selection { background: var(--primary-t); }
-/* ── P2-7 响应式：窄屏折叠 sidebar、表格横向滚动 ─────────────── */
+/* ── P2-7 响应式：窄屏抽屉菜单、表格横向滚动 ─────────────── */
 .panel { overflow-x: auto; }
 table.grid { min-width: 100%; }
+/* 平板 / 窄屏（≤900px）：侧栏改为滑出抽屉，主区全宽 */
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; }
+  .hamburger { display: inline-flex; }
   .sidebar {
-    position: static;
-    flex-direction: row; flex-wrap: wrap;
-    gap: 4px; padding: 8px;
+    position: fixed;
+    top: 50px; left: 0; bottom: 0;   /* 从 topbar 下方滑出 */
+    width: 240px; max-width: 80vw;
+    flex-direction: column; flex-wrap: nowrap;
+    padding: 8px 0 12px;
+    transform: translateX(-100%);
+    transition: transform .22s ease;
+    z-index: 60;
+    box-shadow: var(--shadow-lg);
   }
-  .nav-item { white-space: nowrap; }
+  .sidebar .nav-item { white-space: nowrap; }
+  body.menu-open .sidebar { transform: translateX(0); }
+  body.menu-open .side-mask {
+    display: block;
+    position: fixed; inset: 0;
+    background: rgba(15, 23, 42, .45);
+    z-index: 50;
+  }
+  .main { padding: 14px 14px 24px; }
 }
+/* 手机（≤600px）：topbar 换行、卡片单列、工具栏纵向 */
 @media (max-width: 600px) {
-  .topbar { flex-wrap: wrap; gap: 6px; }
+  .app { grid-template-rows: auto 1fr; }  /* topbar 换行时不压住主区 */
+  .topbar { flex-wrap: wrap; gap: 8px; padding: 8px 12px; min-height: 50px; }
+  .topbar .who { display: none; }   /* 用户名让位给操作按钮 */
   .cards { grid-template-columns: 1fr; }
   .toolbar { flex-wrap: wrap; }
+  .toolbar label { min-width: 100%; }
+  .toolbar input, .toolbar select { max-width: 100%; }
+  .btn.sm { padding: 6px 10px; }
+  .login-card { width: 100%; max-width: 92vw; padding: 24px 20px; }
+  .modal { padding: 18px 16px; }
+  .modal.wide { width: 100%; }
 }
 
 /* ── P2-7 暗色模式：复用调色板变量覆写 ──────────────────────── */

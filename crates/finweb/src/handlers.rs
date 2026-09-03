@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use axum::routing::{get, post, put};
@@ -51,6 +51,11 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/api/users/:username/reset-device",
             post(reset_user_device),
         )
+        .route(
+            "/api/users/:username/unlock",
+            post(unlock_user),
+        )
+        .route("/api/roles", get(list_roles))
         // 账套参数 / 仪表盘 / 期间
         .route("/api/options", get(get_options).put(put_options))
         .route("/api/dashboard", get(get_dashboard))
@@ -62,6 +67,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/accounts/fill-defaults", post(fill_default_accounts))
         .route("/api/vouchers/next-no", get(next_voucher_no))
         .route("/api/vouchers", get(list_vouchers).post(save_voucher))
+        .route("/api/vouchers/batch-post", post(voucher_batch_post))
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
@@ -171,7 +177,27 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/archives/:id", get(get_archive))
         .route("/api/archives/:id/verify", get(verify_archive))
         .route("/api/health", get(|| async { "ok" }))
+        // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
+        .route("/", get(serve_index))
         .with_state(state)
+}
+
+/// 返回 SPA 首页，并把 `{{V}}` 占位符替换为当前资源版本号。
+/// 版本号由静态文件 mtime 计算，任何前端改动都会使 URL 变化 → 浏览器缓存自动失效。
+async fn serve_index(State(state): State<Arc<WebState>>) -> Response {
+    use axum::response::Html;
+    let path = state.static_dir.join("index.html");
+    let html = match std::fs::read_to_string(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("index.html 读取失败：{e}"),
+            )
+                .into_response()
+        }
+    };
+    Html(html.replace("{{V}}", &state.assets_ver)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +381,7 @@ async fn create_user(
     u.set_password(&req.password);
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     u.must_change_pwd = req.must_change_pwd;
+    u.memo = req.memo;
     // 普通账户默认只能看自己填制的凭证（防越权翻看他人/全盘数据）；
     // 管理员不受此限制，可看到所有账套数据
     if !u.is_admin() {
@@ -398,6 +425,12 @@ async fn update_user(
     if let Some(m) = req.must_change_pwd {
         u.must_change_pwd = m;
     }
+    if let Some(m) = req.memo {
+        u.memo = m;
+    }
+    if let Some(s) = req.data_scope {
+        u.data_scope = s;
+    }
     users::update(&db, &u)?;
     db.log(user.username(), "安全", "修改用户", &format!("更新「{username}」的信息"))?;
     Ok(Json(json!({"ok": true})))
@@ -433,6 +466,41 @@ async fn reset_user_device(
     state.sessions.remove_by_username(&username);
     db.log(user.username(), "安全", "重置设备绑定", &format!("重置「{username}」的设备绑定"))?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn unlock_user(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(username): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::UserManage)?;
+    let db = state.db_for(&user.book_key)?;
+    security::unlock_user(&db, &username)?;
+    db.log(user.username(), "安全", "解锁用户", &format!("解锁「{username}」"))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 角色 → 权限矩阵（供前端在新建/改角色时实时预览）
+async fn list_roles(user: CurrentUser) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::UserManage)?;
+    let roles: Vec<serde_json::Value> = Role::all()
+        .iter()
+        .map(|r| {
+            let perms: Vec<serde_json::Value> = r
+                .perms()
+                .iter()
+                .map(|p| {
+                    let code = serde_json::to_value(*p)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    json!({ "code": code, "label": p.label() })
+                })
+                .collect();
+            json!({ "role": serde_json::to_value(*r).ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default(), "label": r.label(), "perms": perms })
+        })
+        .collect();
+    Ok(Json(json!(roles)))
 }
 
 async fn delete_user(
@@ -912,6 +980,18 @@ async fn voucher_post(
     }
     vouchers::post(&db, id, user.username())?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn voucher_batch_post(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BatchPostReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherPost)?;
+    let db = state.db_for(&user.book_key)?;
+    let (n, errs) = vouchers::post_many(&db, &req.ids, user.username())?;
+    db.log(user.username(), "凭证", "批量记账", &format!("{n} 张"))?;
+    Ok(Json(json!({ "ok": n, "errors": errs })))
 }
 
 async fn voucher_unpost(

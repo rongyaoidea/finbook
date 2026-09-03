@@ -37,6 +37,8 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
         "".to_string(),
         "test".to_string(),
         opts.start_period.ymm(),
+        std::path::PathBuf::new(),
+        "test".to_string(),
     );
     (state, book_path, dir)
 }
@@ -317,6 +319,8 @@ async fn books_listed_and_login_with_book_key() {
         "".to_string(),
         "test".to_string(),
         opts.start_period.ymm(),
+        std::path::PathBuf::new(),
+        "test".to_string(),
     );
 
     // 账套列表应返回两个

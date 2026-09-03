@@ -335,29 +335,39 @@ function renderShell() {
   app.innerHTML = `
     <div class="app">
       <div class="topbar">
-        <span class="logo">FinBook</span>
-        <span class="muted">${esc(u.display_name)}（${esc(u.role_label)}）</span>
+        <button class="hamburger" id="menu-btn" aria-label="打开菜单">☰</button>
+        <span class="logo" id="logo-home" title="回到仪表盘">FinBook</span>
+        <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
         <button class="btn ghost sm" id="logout">退出登录</button>
       </div>
-      <div class="sidebar">
+      <div class="sidebar" id="sidebar">
         ${session.user.is_admin ? `<div class="group">管理员 · 只读总览</div>` : ""}
         ${nav.map((n) => {
           if (n.admin && !session.user.is_admin) return "";
           return `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`;
         }).join("")}
       </div>
+      <div class="side-mask" id="side-mask"></div>
       <div class="main" id="main"></div>
     </div>`;
 
+  function closeMenu() { document.body.classList.remove("menu-open"); }
+  function toggleMenu() { document.body.classList.toggle("menu-open"); }
+
+  // 点击 logo 回到仪表盘（不再是无行为的死元素）
+  $("#logo-home").addEventListener("click", () => { state.view = "dashboard"; closeMenu(); renderMain(); });
+  $("#menu-btn").addEventListener("click", toggleMenu);
+  $("#side-mask").addEventListener("click", closeMenu);
   // 事件委托：nav-item 只在 sidebar 容器上绑一次
   $(".sidebar").addEventListener("click", (e) => {
     const btn = e.target.closest(".nav-item");
     if (!btn) return;
     state.view = btn.dataset.view;
     $all(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === state.view));
+    closeMenu();
     renderMain();
   });
   $("#period-sel").addEventListener("change", async (e) => {
@@ -711,15 +721,19 @@ async function viewVouchers(main) {
       </select>
       <button class="btn ghost sm" id="v-refresh">查询</button>
       ${can("voucher_edit") ? `<button class="btn ghost sm" id="v-renumber">重排断号</button>` : ""}
+      ${can("voucher_post") ? `<button class="btn ghost sm" id="v-batch">批量记账</button>` : ""}
       <span class="spacer"></span>
       <span class="muted">期间：${esc(state.current || "")}</span>
     </div>
     <div class="panel"><table class="grid" id="v-table"><thead><tr>
+      ${can("voucher_post") ? `<th style="width:26px"><input type="checkbox" id="v-all" title="全选未记账" /></th>` : ""}
       <th>期间</th><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>状态</th><th>制单</th><th></th>
-    </tr></thead><tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody></table></div>`;
+    </tr></thead><tbody><tr><td colspan="${can("voucher_post") ? 10 : 9}" class="muted">加载中…</td></tr></tbody></table></div>`;
   if (can("voucher_new")) $("#new-v").addEventListener("click", () => openVoucherEditor(null));
   $("#v-refresh").addEventListener("click", () => loadVouchers());
   $("#v-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadVouchers(); });
+  if ($("#v-all")) $("#v-all").addEventListener("change", (e) => { $all(".v-sel").forEach((c) => c.checked = e.target.checked); });
+  if ($("#v-batch")) $("#v-batch").addEventListener("click", batchPost);
   if ($("#v-renumber")) $("#v-renumber").addEventListener("click", async () => {
     if (!(await confirmDialog(`将当前期间「记」字凭证的凭证号重排为连续？`, true))) return;
     try {
@@ -739,12 +753,14 @@ async function loadVouchers() {
   if (q) url += `&q=${encodeURIComponent(q)}`;
   if (st) url += `&status=${st}`;
   let rows;
-  try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="9" style="color:var(--err)">${esc(e.message)}</td></tr>`; return; }
+  try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="${can("voucher_post") ? 10 : 9}" style="color:var(--err)">${esc(e.message)} <button class="btn ghost sm" id="v-retry">重试</button></td></tr>`; const rb = $("#v-retry", tb); if (rb) rb.addEventListener("click", loadVouchers); return; }
   if (!rows.length) { tb.innerHTML = `<tr><td colspan="9" class="muted">暂无凭证</td></tr>`; return; }
   const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
   tb.innerHTML = rows.map((v) => {
     const s = stMap[v.status] || [v.status_label, ""];
+    const selectable = can("voucher_post") && (v.status === "draft" || v.status === "audited");
     return `<tr>
+      ${can("voucher_post") ? `<td>${selectable ? `<input type="checkbox" class="v-sel" data-id="${v.id}" />` : ""}</td>` : ""}
       <td>${esc(v.period)}</td><td>${esc(v.date)}</td><td>${esc(v.voucher_no)}</td>
       <td>${esc(v.summary)}</td><td class="num">${esc(v.debit_total)}</td><td class="num">${esc(v.credit_total)}</td>
       <td><span class="tag ${s[1]}">${esc(s[0])}</span></td><td>${esc(v.prepared_by)}</td>
@@ -752,6 +768,19 @@ async function loadVouchers() {
     </tr>`;
   }).join("");
   $all("[data-edit]").forEach((b) => b.addEventListener("click", () => openVoucherEditor(parseInt(b.dataset.edit, 10))));
+}
+
+async function batchPost() {
+  const ids = $all(".v-sel:checked").map((c) => parseInt(c.dataset.id, 10));
+  if (!ids.length) { toast("请先勾选未记账的凭证", "err"); return; }
+  try {
+    const r = await api("/vouchers/batch-post", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+    const errs = r.errors || [];
+    if (r.ok > 0 && errs.length === 0) { toast(`已记账 ${r.ok} 张`, "ok"); }
+    else if (r.ok > 0) { toast(`已记账 ${r.ok} 张，失败 ${errs.length} 张`, "warn"); errs.slice(0, 5).forEach((e) => toast(e, "err")); }
+    else { toast(`记账失败：${errs[0] || "未知原因"}`, "err"); }
+    loadVouchers();
+  } catch (e) { toast(e.message, "err"); }
 }
 
 async function openVoucherEditor(id) {
@@ -773,6 +802,7 @@ async function openVoucherEditor(id) {
     <h3>记账凭证 ${esc(voucher_no)}</h3>
     <div class="toolbar">
       <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} />${editable ? `<button class="btn ghost sm" id="v-today">今天</button>` : ""}</label>
+      <span id="v-date-hint" class="muted" style="font-size:12px"></span>
       <label>字 <input id="v-word" value="${esc(v.word)}" style="width:60px" ${editable ? "" : "disabled"} /></label>
       <label>号 <input id="v-no" type="number" value="${v.no}" style="width:70px" ${editable ? "" : "disabled"} /></label>
       <label>附单据 <input id="v-att" type="number" value="${v.attachments}" style="width:60px" ${editable ? "" : "disabled"} /></label>
@@ -819,7 +849,19 @@ async function openVoucherEditor(id) {
   }
   renderRows();
   if (editable) $("#v-add", mask).onclick = () => { v.entries.push({ line: v.entries.length + 1, account_code: "", summary: "", debit: "0", credit: "0" }); renderRows(); };
-  if (editable && $("#v-today", mask)) $("#v-today", mask).onclick = () => { $("#v-date", mask).value = today(); };
+  if (editable && $("#v-today", mask)) $("#v-today", mask).onclick = () => { $("#v-date", mask).value = today(); updateDateHint(); };
+  // 跨期提示：所选日期与当前期间不一致时提前告知（保存时会按日期归入对应期间）
+  function updateDateHint() {
+    const el = $("#v-date-hint", mask);
+    if (!el) return;
+    const dv = $("#v-date", mask).value;
+    if (dv && state.current && ymm(dv.slice(0, 7)) !== ymm(state.current)) {
+      el.textContent = `该日期属于 ${dv.slice(0, 7)} 期，保存后将归入该期间`;
+    } else {
+      el.textContent = "";
+    }
+  }
+  if (editable) $("#v-date", mask).addEventListener("change", updateDateHint);
 
   const save = async () => {
     const dateVal = $("#v-date", mask).value;
@@ -1237,69 +1279,173 @@ async function loadTrial() {
 // 安全中心（用户管理）
 // ===========================================================================
 async function viewSecurity(main) {
+  const roles = await loadRoles();
   main.innerHTML = `
     <h2>安全中心</h2>
     <div class="panel">
       <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
         <button class="btn sm" id="me-pwd">修改我的口令</button>
         ${can("user_manage") ? `<button class="btn sm" id="new-user">新建用户</button>` : ""}
+        ${can("user_manage") ? `<span class="spacer"></span>
+          <label>搜索 <input id="u-kw" style="width:150px" placeholder="账号 / 姓名" /></label>
+          <label>角色 <select id="u-role"><option value="">全部</option>${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></label>` : ""}
       </div>
     </div>
     ${can("user_manage") ? `<div class="panel"><table class="grid" id="u-table"><thead><tr>
-      <th>账号</th><th>姓名</th><th>角色</th><th>绑定设备</th><th>状态</th><th></th>
-    </tr></thead><tbody><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table></div>` : `<div class="panel muted">您没有用户管理权限，仅可修改自己的口令。</div>`}`;
+      <th data-sort="username" class="sortable" title="点击排序">账号</th><th>姓名</th><th>角色</th>
+      <th data-sort="last_login_at" class="sortable" title="点击排序">最近登录</th><th>锁定</th><th>强制改密</th><th>绑定设备</th><th>状态</th><th></th>
+    </tr></thead><tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody></table></div>` : `<div class="panel muted">您没有用户管理权限，仅可修改自己的口令。</div>`}`;
   $("#me-pwd").addEventListener("click", () => openChangePwd(false));
-  if (can("user_manage")) { $("#new-user").addEventListener("click", openNewUser); loadUsers(); }
+  if (can("user_manage")) {
+    $("#new-user").addEventListener("click", openNewUser);
+    $("#u-kw").addEventListener("input", loadUsers);
+    $("#u-role").addEventListener("change", loadUsers);
+    $all(".sortable", main).forEach((th) => th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      // 排序字段与方向：再次点击同列翻转；切换列时重置为升序
+      window._usersSort = { key, asc: window._usersSort && window._usersSort.key === key ? !window._usersSort.asc : true };
+      $all(".sortable", main).forEach((h) => h.classList.remove("sort-asc", "sort-desc"));
+      th.classList.add(window._usersSort.asc ? "sort-asc" : "sort-desc");
+      loadUsers();
+    }));
+    loadUsers();
+  }
 }
+
+// 角色 → 权限矩阵（/api/roles），缓存一次
+let rolesCache = null;
+async function loadRoles() {
+  if (rolesCache) return rolesCache;
+  try { rolesCache = await api("/roles"); } catch (e) { rolesCache = []; }
+  return rolesCache;
+}
+function rolePermsHtml(perms) {
+  if (!perms || !perms.length) return `<span class="muted">无权限</span>`;
+  return perms.map((p) => `<span class="tag">${esc(p.label)}</span>`).join(" ");
+}
+
 async function loadUsers() {
   const tb = $("#u-table tbody");
+  const kw = ($("#u-kw") ? $("#u-kw").value : "").trim().toLowerCase();
+  const roleF = $("#u-role") ? $("#u-role").value : "";
   let users;
-  try { users = await api("/users"); } catch (e) { tb.innerHTML = `<tr><td colspan="6" style="color:var(--err)">${esc(e.message)}</td></tr>`; return; }
-  if (!users.length) { tb.innerHTML = `<tr><td colspan="6" class="muted">暂无用户</td></tr>`; return; }
+  try { users = await api("/users"); } catch (e) { tb.innerHTML = `<tr><td colspan="9" style="color:var(--err)">${esc(e.message)} <button class="btn ghost sm" id="u-retry">重试</button></td></tr>`; const rb = $("#u-retry", tb); if (rb) rb.addEventListener("click", loadUsers); return; }
+  users = users.filter((u) => {
+    if (kw && !((u.username || "").toLowerCase().includes(kw) || (u.display_name || "").toLowerCase().includes(kw))) return false;
+    if (roleF && u.role !== roleF) return false;
+    return true;
+  });
+  // 列排序（账号 / 最近登录）
+  const sort = window._usersSort;
+  if (sort) {
+    const dir = sort.asc ? 1 : -1;
+    users.sort((a, b) => {
+      const av = sort.key === "username" ? (a.username || "") : (a.last_login_at || "");
+      const bv = sort.key === "username" ? (b.username || "") : (b.last_login_at || "");
+      return av < bv ? -dir : av > bv ? dir : 0;
+    });
+  }
+  if (!users.length) { tb.innerHTML = `<tr><td colspan="9" class="muted">暂无匹配用户</td></tr>`; return; }
+  // 缓存当前页用户，供「编辑」弹窗按用户名取完整对象
+  window._usersCache = users;
   tb.innerHTML = users.map((u) => {
     // role_label 由后端提供（Role::label），避免前端硬编码与角色扩展脱节
     const roleLabel = u.role_label || u.role;
     const dev = u.device_name ? `<span class="tag">${esc(u.device_name)}</span>` : `<span class="muted">未绑定</span>`;
     const dis = u.disabled ? `<span class="tag err">已停用</span>` : `<span class="tag ok">启用</span>`;
+    const lock = u.locked_until ? `<span class="tag warn">已锁定</span>` : `<span class="muted">—</span>`;
+    const must = u.must_change_pwd ? `<span class="tag warn">是</span>` : `<span class="muted">否</span>`;
+    const last = u.last_login_at ? esc(u.last_login_at) : `<span class="muted">从未登录</span>`;
     const me = u.username === session.user.username;
     return `<tr>
-      <td>${esc(u.username)}</td><td>${esc(u.display_name)}</td><td>${esc(roleLabel)}</td>
+      <td>${esc(u.username)}${u.memo ? `<div class="muted" style="font-size:11px">${esc(u.memo)}</div>` : ""}</td>
+      <td>${esc(u.display_name)}</td><td>${esc(roleLabel)}</td>
+      <td>${last}</td><td>${lock}</td><td>${must}</td>
       <td>${dev}</td><td>${dis}</td>
       <td class="row-actions">
+        <button class="btn ghost sm" data-edit="${esc(u.username)}">编辑</button>
         <button class="btn ghost sm" data-reset-pwd="${esc(u.username)}">重置口令</button>
         <button class="btn ghost sm" data-reset-dev="${esc(u.username)}">重置设备</button>
+        ${u.locked_until ? `<button class="btn ghost sm" data-unlock="${esc(u.username)}">解锁</button>` : ""}
         ${me ? "" : `<button class="btn ghost sm" data-toggle="${esc(u.username)}" data-next="${u.disabled ? "0" : "1"}">${u.disabled ? "启用" : "停用"}</button>
         <button class="btn danger sm" data-del="${esc(u.username)}">删除</button>`}
       </td>
     </tr>`;
   }).join("");
+  $all("[data-edit]").forEach((b) => b.onclick = () => { const u = (window._usersCache || []).find((x) => x.username === b.dataset.edit); if (u) openEditUser(u); });
   $all("[data-reset-pwd]").forEach((b) => b.onclick = () => openAdminResetPwd(b.dataset.resetPwd));
   $all("[data-toggle]").forEach((b) => b.onclick = async () => {
     const dis = b.dataset.next === "1";
     if (dis && !(await confirmDialog(`停用 ${b.dataset.toggle}？其全部会话将被立即下线。`, true))) return;
     try {
       await api(`/users/${encodeURIComponent(b.dataset.toggle)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ disabled: dis }) });
-      toast(dis ? "已停用" : "已启用", "ok"); loadUsers();
+      toast(dis ? "已停用，该账号全部会话已下线" : "已启用", "ok"); loadUsers();
     } catch (e) { toast(e.message, "err"); }
   });
-  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`重置 ${b.dataset.resetDev} 的设备绑定？该账号可在新设备重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
-  $all("[data-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`删除用户 ${b.dataset.del}？`, true))) return; try { await api(`/users/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`重置 ${b.dataset.resetDev} 的设备绑定？该账号可在新设备重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定，其会话已下线", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-unlock]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`解锁 ${b.dataset.unlock}？解锁后可重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.unlock)}/unlock`, { method: "POST" }); toast("已解锁", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`删除用户 ${b.dataset.del}？删除后该账号无法登录（历史操作日志保留）。`, true))) return; try { await api(`/users/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
 }
 
-function openNewUser() {
-  const roles = [["admin", "系统管理员"], ["supervisor", "财务主管"], ["accountant", "会计"], ["cashier", "出纳"], ["auditor", "审核人"], ["viewer", "只读"]];
+async function openNewUser() {
+  const roles = await loadRoles();
   const mask = modal(`
     <h3>新建用户</h3>
     <div class="field"><label>账号</label><input id="nu-u" /></div>
     <div class="field"><label>姓名</label><input id="nu-n" /></div>
-    <div class="field"><label>角色</label><select id="nu-r">${roles.map((r) => `<option value="${r[0]}">${r[1]}</option>`).join("")}</select></div>
+    <div class="field"><label>角色</label><select id="nu-r">${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></div>
     <div class="field"><label>初始口令（至少 6 位）</label><input id="nu-p" type="password" /></div>
+    <div class="field"><label>备注</label><input id="nu-memo" /></div>
+    <div class="field"><label><input type="checkbox" id="nu-must" checked /> 首次登录强制改密</label></div>
+    <div class="panel"><div class="muted" style="margin-bottom:6px">该角色将拥有以下权限：</div><div id="nu-perms"></div></div>
     <div class="foot"><button class="btn" id="nu-save">创建</button><button class="btn ghost" id="nu-cancel">取消</button></div>`);
+  const renderPerms = () => { const r = roles.find((x) => x.role === $("#nu-r", mask).value); $("#nu-perms", mask).innerHTML = r ? rolePermsHtml(r.perms) : ""; };
+  $("#nu-r", mask).addEventListener("change", renderPerms);
+  renderPerms();
   $("#nu-cancel", mask).onclick = closeModal;
   $("#nu-save", mask).onclick = async () => {
-    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value };
+    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value, memo: $("#nu-memo", mask).value.trim(), must_change_pwd: $("#nu-must", mask).checked };
     if (!body.username || body.password.length < 6) { toast("账号必填且口令至少 6 位", "err"); return; }
     try { await api("/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已创建用户", "ok"); closeModal(); loadUsers(); } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+async function openEditUser(u) {
+  const roles = await loadRoles();
+  const ds = u.data_scope || {};
+  const depts = (ds.depts || []).join(",");
+  const me = u.username === session.user.username;
+  const mask = modal(`
+    <h3>编辑用户 · ${esc(u.username)}</h3>
+    <div class="field"><label>姓名</label><input id="eu-n" value="${esc(u.display_name)}" /></div>
+    <div class="field"><label>角色</label><select id="eu-r">${roles.map((r) => `<option value="${r.role}" ${r.role === u.role ? "selected" : ""}>${esc(r.label)}</option>`).join("")}</select></div>
+    <div class="field"><label>备注</label><input id="eu-memo" value="${esc(u.memo || "")}" /></div>
+    <div class="field"><label><input type="checkbox" id="eu-must" ${u.must_change_pwd ? "checked" : ""} /> 强制下次登录改密</label></div>
+    <div class="field"><label><input type="checkbox" id="eu-dis" ${u.disabled ? "checked" : ""} ${me ? "disabled" : ""} /> 停用该账号</label></div>
+    <div class="panel">
+      <div class="muted" style="margin-bottom:6px">数据范围（留空 / 不勾选 = 不限制）</div>
+      <div class="field"><label>可见部门（逗号分隔）</label><input id="eu-depts" value="${esc(depts)}" /></div>
+      <div class="field"><label>科目范围 从 <input id="eu-acct-from" value="${esc(ds.account_from || "")}" style="width:90px" /> 至 <input id="eu-acct-to" value="${esc(ds.account_to || "")}" style="width:90px" /></label></div>
+      <div class="field"><label><input type="checkbox" id="eu-own-v" ${ds.own_voucher_only ? "checked" : ""} /> 仅看本人填制的凭证</label></div>
+      <div class="field"><label><input type="checkbox" id="eu-own-d" ${ds.own_doc_only ? "checked" : ""} /> 仅看本人经手的业务单据</label></div>
+    </div>
+    <div class="panel"><div class="muted" style="margin-bottom:6px">该角色将拥有以下权限：</div><div id="eu-perms"></div></div>
+    <div class="foot"><button class="btn" id="eu-save">保存</button><button class="btn ghost" id="eu-cancel">取消</button></div>`);
+  const renderPerms = () => { const r = roles.find((x) => x.role === $("#eu-r", mask).value); $("#eu-perms", mask).innerHTML = r ? rolePermsHtml(r.perms) : ""; };
+  $("#eu-r", mask).addEventListener("change", renderPerms);
+  renderPerms();
+  $("#eu-cancel", mask).onclick = closeModal;
+  $("#eu-save", mask).onclick = async () => {
+    const deptsVal = $("#eu-depts", mask).value.split(",").map((s) => s.trim()).filter(Boolean);
+    const body = {
+      display_name: $("#eu-n", mask).value.trim(),
+      role: $("#eu-r", mask).value,
+      memo: $("#eu-memo", mask).value.trim(),
+      must_change_pwd: $("#eu-must", mask).checked,
+      disabled: $("#eu-dis", mask).checked,
+      data_scope: { depts: deptsVal, account_from: $("#eu-acct-from", mask).value.trim(), account_to: $("#eu-acct-to", mask).value.trim(), own_voucher_only: $("#eu-own-v", mask).checked, own_doc_only: $("#eu-own-d", mask).checked },
+    };
+    try { await api(`/users/${encodeURIComponent(u.username)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存", "ok"); closeModal(); loadUsers(); } catch (e) { toast(e.message, "err"); }
   };
 }
 function openAdminResetPwd(username) {
@@ -2203,5 +2349,13 @@ async function viewOrderChangeLog(main) {
   });
 }
 
-// 启动
-showLogin();
+// 启动：先尝试恢复已有会话（cookie 仍有效则直接进入应用，不再无条件显示登录页）
+(async function boot() {
+  try {
+    const me = await api("/me");
+    session.user = me;
+    await afterLogin();
+  } catch (e) {
+    showLogin();
+  }
+})();

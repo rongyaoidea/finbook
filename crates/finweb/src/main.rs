@@ -61,9 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         company,
         env!("CARGO_PKG_VERSION").to_string(),
         default_period,
+        static_dir(),
+        asset_version(),
     );
 
-    let app = build_app(state.clone());
+    let app = build_app(state.clone(), state.static_dir.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!(
@@ -94,10 +96,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 组装应用：API 路由 + 静态资源（前端 SPA）
-fn build_app(state: std::sync::Arc<WebState>) -> Router {
+fn build_app(state: std::sync::Arc<WebState>, static_dir: PathBuf) -> Router {
     // handlers::router 内部已带 /api 前缀，这里用 merge 而不是 nest，避免变成 /api/api/...
     let api = handlers::router(state);
-    let static_dir = static_dir();
     api.fallback_service(ServeDir::new(static_dir))
 }
 
@@ -115,4 +116,26 @@ fn static_dir() -> PathBuf {
         }
     }
     PathBuf::from("static")
+}
+
+/// 由前端静态文件的最新修改时间生成资源版本号。
+/// 任何 JS/CSS 变更都会使版本号变化 → 首页 `?v=` 随之变化 → 浏览器缓存自动失效，
+/// 避免用户长期拿到旧版前端（曾因固定 `?v=20260101` 导致行为与样式不同步）。
+fn asset_version() -> String {
+    let dir = static_dir();
+    let mut latest: u128 = 0;
+    for name in ["app.js", "style.css", "util.js"] {
+        if let Ok(meta) = std::fs::metadata(dir.join(name)) {
+            if let Ok(m) = meta.modified() {
+                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                    latest = latest.max(d.as_nanos());
+                }
+            }
+        }
+    }
+    if latest == 0 {
+        "dev".to_string()
+    } else {
+        latest.to_string()
+    }
 }

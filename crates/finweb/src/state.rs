@@ -30,6 +30,10 @@ pub struct WebState {
     pub version: String,
     /// 账套默认（启用）期间，ymm 形式，作为会话期间的初值
     pub default_period: i32,
+    /// 静态资源目录（前端 SPA 所在位置）
+    pub static_dir: PathBuf,
+    /// 前端资源版本号（由静态文件 mtime 计算，变化时浏览器缓存自动失效）
+    pub assets_ver: String,
 }
 
 impl WebState {
@@ -40,6 +44,8 @@ impl WebState {
         company: String,
         version: String,
         default_period: i32,
+        static_dir: PathBuf,
+        assets_ver: String,
     ) -> Arc<Self> {
         Arc::new(Self {
             books,
@@ -49,6 +55,8 @@ impl WebState {
             company: std::sync::RwLock::new(company),
             version,
             default_period,
+            static_dir,
+            assets_ver,
         })
     }
 

@@ -113,6 +113,24 @@ a:hover { color: var(--primary-d); }
 .banner.set { background: var(--ok-bg); border: 1px solid rgba(21,128,61,.2); color: var(--ok); }
 .banner.unset { background: var(--warn-bg); border: 1px solid rgba(180,83,9,.2); color: var(--warn); }
 
+/* 账套选择页 */
+.login-card.wide { width: 640px; max-width: 94vw; }
+.book-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow: auto; }
+.book-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: var(--bg); border: 1px solid var(--panel-border); border-radius: 10px;
+  padding: 4px 10px 4px 0; transition: border-color .15s, box-shadow .15s;
+}
+.book-item:hover { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.08); }
+.book-enter {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  background: none; border: 0; cursor: pointer; padding: 8px 12px;
+  text-align: left; color: inherit; font: inherit;
+}
+.book-item .book-name { font-weight: 600; font-size: 14px; color: var(--text); }
+.book-item .book-meta { font-size: 12px; color: var(--muted); }
+.book-del { flex: none; }
+
 .field { margin-bottom: 14px; }
 .field label {
   display: block; font-size: 12px; font-weight: 600;

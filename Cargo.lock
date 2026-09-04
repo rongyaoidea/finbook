@@ -1680,6 +1680,7 @@ dependencies = [
  "findb",
  "printpdf",
  "rand 0.8.8",
+ "rusqlite",
  "rust_decimal",
  "serde",
  "serde_json",

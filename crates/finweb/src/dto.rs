@@ -35,6 +35,80 @@ pub struct PublicUser {
     pub data_scope: DataScope,
 }
 
+/// 平台级登录返回的用户信息（不含账套内权限，需选账套后再取）
+#[derive(Clone, Serialize)]
+pub struct PlatformUser {
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub must_change_pwd: bool,
+}
+
+/// 登录响应：返回平台用户与"可进入的账套列表"
+#[derive(Serialize)]
+pub struct LoginResp {
+    pub user: PlatformUser,
+    /// 是否强制要求改密
+    pub must_change_pwd: bool,
+    /// 本次登录是否触发了初始化（新体系下恒为 false，保留字段以兼容前端）
+    pub setup: bool,
+    /// 该用户可进入的账套（管理员=全部，普通=本人创建的）
+    pub books: Vec<serde_json::Value>,
+}
+
+/// 平台账号（开通/列表用，不含敏感字段）
+#[derive(Clone, Serialize)]
+pub struct PlatformUserItem {
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub disabled: bool,
+    pub must_change_pwd: bool,
+    /// 是否已绑定登录设备（"一人一机"）
+    pub device_bound: bool,
+    pub created_at: String,
+}
+
+impl PlatformUserItem {
+    pub fn from_realm(u: &crate::realm::RealmUser) -> Self {
+        Self {
+            username: u.username.clone(),
+            display_name: u.display_name.clone(),
+            is_admin: u.is_admin,
+            disabled: u.disabled,
+            must_change_pwd: u.must_change_pwd,
+            device_bound: !u.device_id.is_empty(),
+            created_at: u.created_at.clone(),
+        }
+    }
+}
+
+/// 开通/修改平台账号请求
+#[derive(Deserialize)]
+pub struct PlatformUserReq {
+    pub username: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub password: String,
+    /// 是否平台管理员（默认 false，即普通用户）
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+/// 自建账套请求
+#[derive(Deserialize)]
+pub struct CreateBookReq {
+    /// 账套标识（文件名，不含扩展名）；为空则自动生成
+    #[serde(default)]
+    pub key: String,
+    /// 公司名（建账时写入账套参数）
+    #[serde(default)]
+    pub company: String,
+    /// 启用期间 ymm；0 表示取当前月
+    #[serde(default)]
+    pub start_period: i32,
+}
+
 impl PublicUser {
     pub fn from_user(u: &User) -> Self {
         let perm_code = |p: &Perm| {
@@ -108,13 +182,12 @@ pub struct LoginReq {
     pub book_key: String,
 }
 
-#[derive(Serialize)]
-pub struct LoginResp {
-    pub user: PublicUser,
-    /// 是否强制要求改密
-    pub must_change_pwd: bool,
-    /// 本次登录是否触发了「首次登录即管理员」初始化
-    pub setup: bool,
+/// 平台账号修改请求（管理员用，仅改展示名/停用/管理员标志，口令走 reset-password）
+#[derive(Deserialize)]
+pub struct UpdatePlatformUserReq {
+    pub display_name: Option<String>,
+    pub disabled: Option<bool>,
+    pub is_admin: Option<bool>,
 }
 
 #[derive(Deserialize)]

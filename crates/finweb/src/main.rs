@@ -1,7 +1,8 @@
 //! FinBook Web 服务端入口
 //!
-//! 在 Linux 服务器上运行，多个用户通过浏览器访问同一套账（服务端 SQLite，WAL 模式）。
-//! 首次访问且账套为空时，「首次登录即管理员」：第一个成功登录的账号会成为系统管理员。
+//! 多租户模式：全局平台身份库（realm.db）+ 多账套目录。
+//! - 平台管理员：管理普通用户账号、查看全部账套（本身不需要建账套）。
+//! - 普通用户：登录后自建账套（每个账套独立 `.fbk` 文件，彼此隔离）。
 //!
 //! 业务代码在 lib 目标（finweb::handlers / finweb::state），本文件只做启动装配。
 
@@ -11,39 +12,44 @@ use axum::Router;
 use tower_http::services::ServeDir;
 
 use fincore::user::PasswordPolicy;
-use fincore::BookOptions;
-use findb::{users, Db};
 
 use finweb::handlers;
-use finweb::state::{BookRegistry, WebState};
+use finweb::realm::RealmDb;
+use finweb::state::{BookRegistry, SessionStore, WebState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let book = std::env::var("FINBOOK_DB").unwrap_or_else(|_| "./finbook.fbk".to_string());
     let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let path = PathBuf::from(&book);
-    // 多账套目录（可选）：扫描其中所有 *.fbk 并注册；未设置则仅注册 FINBOOK_DB 单账套
-    let book_dir = std::env::var("FINBOOK_DIR").ok().map(PathBuf::from);
+    // 平台身份库（全局账号 + 账套目录）
+    let realm_path =
+        std::env::var("FINBOOK_REALM").unwrap_or_else(|_| "./data/realm.db".to_string());
+    // 用户自建账套的存放目录
+    let books_dir = std::env::var("FINBOOK_BOOKS_DIR").unwrap_or_else(|_| "./data/books".to_string());
+    let books_dir = PathBuf::from(&books_dir);
+    std::fs::create_dir_all(&books_dir)?;
 
-    // 账套不存在则自动建账（不内置管理员 → 首次登录即管理员）
-    let existed = path.exists();
-    let db = if existed {
-        Db::open(&path)?
-    } else {
-        let opts = BookOptions::default();
-        Db::create_no_admin(&path, &opts)?
-    };
+    // 兼容旧版单账套环境变量：若设置且目录里有账套文件，则注册为可选账套
+    let legacy_dir = std::env::var("FINBOOK_DIR").ok().map(PathBuf::from);
 
-    let company = db.options().company.clone();
-    let default_period = db.options().start_period.ymm();
-    let admin_set = users::admin_exists(&db)?;
-    let admin_user = users::first_admin_username(&db)?;
-    drop(db); // 释放这一连接，连接池会按需重新打开
+    // 平台身份库：打开（首次自动建表）并引导管理员
+    let realm = RealmDb::open(&realm_path)?;
+    let bootstrap = realm.ensure_bootstrap(
+        &std::env::var("FINBOOK_ADMIN_USER").unwrap_or_else(|_| "admin".to_string()),
+        &std::env::var("FINBOOK_ADMIN_PASS").unwrap_or_default(),
+        std::env::var("FINBOOK_ADMIN_MUST_CHANGE")
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(false),
+    )?;
 
-    // 账套注册表：先注册 FINBOOK_DB（单账套兼容），再扫描 FINBOOK_DIR
+    // 账套注册表：启动时把平台账套目录全量载入（key → path）
     let books = BookRegistry::new();
-    books.register(&path, 16);
-    if let Some(dir) = &book_dir {
+    for p in realm.load_all_book_paths()? {
+        if p.exists() {
+            books.register(&p, 16);
+        }
+    }
+    // 旧版单账套目录里的文件也一并注册（便于迁移；归属仍以 realm_book 为准）
+    if let Some(dir) = &legacy_dir {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -56,11 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = WebState::new(
         books,
+        SessionStore::new(),
         PasswordPolicy::default(),
-        path.clone(),
-        company,
+        realm,
+        books_dir.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
-        default_period,
+        default_period(),
         static_dir(),
         asset_version(),
     );
@@ -68,31 +75,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_app(state.clone(), state.static_dir.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
+    let book_count = state.books.list().len();
     println!(
-        "\n  FinBook Web 已启动\n  访问地址 : http://{listen}\n  账套文件 : {}\n  公司名称 : {}\n   管理员账号: {}\n",
-        path.display(),
-        state.company_name(),
-        if admin_set {
-            format!("已设定（{}）", admin_user.unwrap_or_default())
-        } else {
-            "未设定 —— 首次登录的账号将自动成为管理员".to_string()
-        }
+        "\n  FinBook Web 已启动（多租户模式）\n  访问地址   : http://{listen}\n  平台身份库 : {}\n  账套目录   : {}\n  已注册账套 : {book_count} 个\n",
+        state.realm.path().display(),
+        books_dir.display(),
     );
-    if !existed {
-        println!("  （检测到账套文件不存在，已自动创建空账套，请使用浏览器首次登录以初始化管理员）\n");
-    }
-    if book_dir.is_some() {
-        let books = state.books.list();
-        let summary = books
-            .iter()
-            .map(|(k, _)| k.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  （多账套模式：已注册 {} 个账套：{}）\n", books.len(), summary);
+    if let Some((user, pass)) = bootstrap {
+        println!("  ┌─────────────────────────────────────────────┐");
+        println!("  │ 已初始化平台管理员（请立即保存，仅显示一次）│");
+        println!("  │   账号：{user:<40}│");
+        println!("  │   口令：{pass:<40}│");
+        println!("  └─────────────────────────────────────────────┘\n");
     }
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// 默认工作期间：当前月份（ymm）
+fn default_period() -> i32 {
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    (now.year() as i32) * 100 + now.month() as i32
 }
 
 /// 组装应用：API 路由 + 静态资源（前端 SPA）

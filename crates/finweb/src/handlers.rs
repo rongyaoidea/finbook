@@ -7,23 +7,26 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
-use fincore::{AuxRef, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
+use fincore::{AuxRef, BookOptions, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
 use findb::accounts;
 use findb::advanced;
 use findb::balances::{self, BalanceSnapshot, BalanceQuery, LedgerQuery};
+use findb::Db;
 use findb::periods;
-use findb::security::{self, DeviceIdentity};
+use findb::security;
 use findb::users;
 use findb::vouchers::{self, VoucherQuery};
 use serde_json::json;
 
 use crate::dto::*;
+use crate::realm::RealmDb;
 use crate::state::{
-    period_to_str, parse_money, parse_period, clear_cookie_header, AppError, CurrentUser, WebState,
+    period_to_str, parse_money, parse_period, clear_cookie_header, AppError, CurrentUser, RealmUser,
+    WebState,
 };
 
 const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
@@ -32,11 +35,31 @@ const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/api/setup/status", get(get_setup_status))
-        .route("/api/books", get(list_books))
+        // 平台账套目录：列表（按归属过滤）+ 自建账套 + 选择当前账套
+        .route("/api/books", get(list_books).post(create_book))
+        .route("/api/books/:key/select", post(select_book))
+        .route("/api/books/:key", delete(delete_book))
         .route("/api/login", post(post_login))
         .route("/api/logout", post(post_logout))
         .route("/api/me", get(get_me))
         .route("/api/change-password", post(post_change_password))
+        // 平台账号管理（仅平台管理员，作用于全局身份库）
+        .route(
+            "/api/platform/users",
+            get(list_platform_users).post(create_platform_user),
+        )
+        .route(
+            "/api/platform/users/:username",
+            put(update_platform_user).delete(delete_platform_user),
+        )
+        .route(
+            "/api/platform/users/:username/reset-password",
+            post(reset_platform_password),
+        )
+        .route(
+            "/api/platform/users/:username/reset-device",
+            post(reset_platform_device),
+        )
         // 用户管理
         .route("/api/users", get(list_users).post(create_user))
         .route(
@@ -230,113 +253,218 @@ async fn serve_index(State(state): State<Arc<WebState>>) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<SetupStatus>, AppError> {
-    let db = state.default_db()?;
-    let admin_set = users::admin_exists(&db)?;
-    let opts = db.options();
-    // 未建账 = 尚未设定公司名称（启用期间默认值亦视为未建账）
-    let needs_setup = opts.company.trim().is_empty();
-    // 注意：不返回管理员用户名——该接口无需登录即可访问，
-    // 暴露账号名等于替攻击者完成了一半的用户名枚举。
+    // 平台管理员是否已初始化（首次启动已引导）
+    let admin_set = state.realm.count_users()? > 0;
     Ok(Json(SetupStatus {
         admin_set,
-        needs_setup,
-        company: opts.company,
+        needs_setup: false,
+        company: String::new(),
         version: state.version.clone(),
-        book: None, // 不暴露账套路径，防止目录结构泄露
+        book: None,
     }))
 }
 
-/// 账套列表（无需登录，登录页用于选择账套）
-/// 注意：不返回文件路径，防止目录结构泄露
-async fn list_books(State(state): State<Arc<WebState>>) -> Result<Json<serde_json::Value>, AppError> {
-    let keys = state.books.list();
-    let items: Vec<serde_json::Value> = keys
+/// 账套列表（需登录）：管理员返回全部，普通用户只返回自己创建的
+/// 同时返回平台身份摘要（前端在"已登录未选账套"状态下据此渲染选择页）
+async fn list_books(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let books = state.realm.list_books_for(&user.username, user.is_admin)?;
+    let items: Vec<serde_json::Value> = books
         .iter()
-        .map(|(key, _path)| {
-            // 只返回 key 和公司名，不返回文件路径
-            let company = match state.db_for(key) {
-                Ok(db) => db.options().company,
-                Err(_) => String::new(),
-            };
-            json!({ "key": key, "company": company })
-        })
+        .map(|b| json!({ "key": b.key, "company": b.company, "owner": b.owner_username }))
         .collect();
-    Ok(Json(json!({ "books": items })))
+    Ok(Json(json!({
+        "user": {
+            "username": user.username,
+            "display_name": user.display_name,
+            "is_admin": user.is_admin,
+            "must_change_pwd": user.must_change_pwd,
+        },
+        "books": items,
+    })))
 }
 
 async fn post_login(
     State(state): State<Arc<WebState>>,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, AppError> {
-    // 登录到指定账套（默认首个账套；前端登录页可选）
-    let book_key = if req.book_key.trim().is_empty() {
-        state.books.first_key()
-    } else {
-        req.book_key.clone()
-    };
-    let db = state.db_for(&book_key)?;
+    // 全局登录（认平台身份库，而非某一套账）
     let username = req.username.trim().to_string();
-    let count = users::count(&db)?;
-
-    // 首次登录即管理员：账套尚无任何用户时，直接用本次登录创建管理员账号
-    let mut setup = false;
-    if count == 0 {
-        if username.is_empty() || req.password.len() < 6 {
-            return Err(AppError::bad_request(
-                "首次使用请设置管理员账号：用户名不能为空，口令至少 6 位",
-            ));
+    let ru = state
+        .realm
+        .authenticate(&username, &req.password)?
+        .ok_or_else(|| AppError::unauthorized("用户名或口令错误"))?;
+    if ru.disabled {
+        return Err(AppError::forbidden("账户已停用，请联系管理员"));
+    }
+    // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
+    if !ru.is_admin {
+        match state.realm.bind_device(&username, &req.device_id)? {
+            Ok(()) => {}
+            Err(msg) => return Err(AppError::forbidden(msg)),
         }
-        // 并发场景：两个请求同时看到 0 用户，后落库的那个会撞唯一约束。
-        // 此时账套里已经有管理员了，走正常登录即可，而不是抛 500。
-        if let Err(e) = users::create_admin(&db, &username, &req.password, &username) {
-            if users::admin_exists(&db)? {
-                // 已被并发请求初始化，继续正常登录流程
-            } else {
-                return Err(e.into());
-            }
+    }
+    // 普通账号登录时踢掉旧会话（一人一会话）；管理员不受限，可多端并存
+    if !ru.is_admin {
+        state.sessions.remove_by_username(&username);
+    }
+    let token = state.sessions.create(
+        &username,
+        ru.is_admin,
+        &req.device_id,
+        state.default_period,
+        "", // 账套登录后由"选择账套"设定
+    );
+    // 返回该用户可进入的账套列表（管理员=全部，普通=本人创建）
+    let books = state.realm.list_books_for(&username, ru.is_admin)?;
+    let book_list: Vec<serde_json::Value> = books
+        .iter()
+        .map(|b| json!({ "key": b.key, "company": b.company, "owner": b.owner_username }))
+        .collect();
+    let resp = LoginResp {
+        user: PlatformUser {
+            username: ru.username,
+            display_name: ru.display_name,
+            is_admin: ru.is_admin,
+            must_change_pwd: ru.must_change_pwd,
+        },
+        must_change_pwd: ru.must_change_pwd,
+        setup: false,
+        books: book_list,
+    };
+    let mut r = Json(resp).into_response();
+    r.headers_mut()
+        .insert(header::SET_COOKIE, crate::state::cookie_header(&token, SESSION_SECS));
+    Ok(r)
+}
+
+/// 生成唯一账套 key（文件名，不含扩展名）
+fn make_book_key(raw: &str, owner: &str, realm: &RealmDb) -> Result<String, AppError> {
+    let now = chrono::Local::now();
+    let base = if raw.trim().is_empty() {
+        format!("{}_{:04}{:02}", owner, now.year(), now.month())
+    } else {
+        let cleaned: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let trimmed = cleaned.trim_matches('_').to_string();
+        if trimmed.is_empty() {
+            format!("{}_{:04}{:02}", owner, now.year(), now.month())
         } else {
-            setup = true;
+            trimmed
         }
+    };
+    // 唯一化：若冲突则在末尾追加序号
+    let mut key = base.clone();
+    let mut n = 1;
+    while realm.get_book(&key)?.is_some() {
+        n += 1;
+        key = format!("{base}_{n}");
     }
+    Ok(key)
+}
 
-    let dev = DeviceIdentity::new(&req.device_id, &req.device_name);
-    let res = security::login(&db, &username, &req.password, &state.policy, Some(&dev))?;
-    let must_change = matches!(res, security::LoginResult::MustChangePassword(_));
-
-    match res {
-        security::LoginResult::Ok(u) | security::LoginResult::MustChangePassword(u) => {
-            // 普通账号登录时踢掉旧会话（一人一机）；管理员不受限制，可多端并存
-            if !u.is_admin() {
-                state.sessions.remove_by_username(&u.username);
-            }
-            let token = state.sessions.create(&u.username, &req.device_id, state.default_period, &book_key);
-            let resp = LoginResp {
-                user: PublicUser::from_user(&u),
-                must_change_pwd: must_change,
-                setup,
-            };
-            let body = Json(resp).into_response();
-            let mut resp = body;
-            resp.headers_mut()
-                .insert(header::SET_COOKIE, crate::state::cookie_header(&token, SESSION_SECS));
-            Ok(resp)
-        }
-        security::LoginResult::BadPassword { remaining: _ } => Err(AppError::unauthorized(
-            "用户名或口令错误",
-        )),
-        security::LoginResult::Locked { minutes } => Err(AppError::unauthorized(format!(
-            "账户已被锁定，请 {minutes} 分钟后再试"
-        ))),
-        security::LoginResult::Disabled => {
-            Err(AppError::unauthorized("账户已停用，请联系管理员"))
-        }
-        security::LoginResult::NoSuchUser => Err(AppError::unauthorized(
-            "用户名或口令错误", // 与 BadPassword 统一响应，防止用户名枚举
-        )),
-        security::LoginResult::DeviceBound { device_name } => Err(AppError::forbidden(format!(
-            "该账号已绑定设备「{device_name}」，如需在新设备登录请联系管理员在「安全中心 → 用户管理」中重置设备绑定"
-        ))),
+/// 普通用户自建账套：创建者为该账套的所有者，并成为账套内管理员
+async fn create_book(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Json(req): Json<CreateBookReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let owner = user.username.clone();
+    let company = req.company.trim().to_string();
+    let key = make_book_key(&req.key, &owner, &state.realm)?;
+    let path = state.books_dir.join(format!("{key}.fbk"));
+    if path.exists() {
+        return Err(AppError::bad_request("账套文件已存在"));
     }
+    let mut opts = BookOptions::default();
+    if !company.is_empty() {
+        opts.company = company.clone();
+    }
+    if req.start_period > 0 {
+        opts.start_period = Period::from_ymm(req.start_period);
+    }
+    let db = Db::create_no_admin(&path, &opts)?;
+    // 种子所有者为账套内管理员（复制平台口令哈希，便于必要时直接登账套）
+    let mut u = User::new(&owner, &user.display_name, Role::Admin);
+    if let Ok(Some(ru)) = state.realm.get_user(&owner) {
+        u.password_hash = ru.password_hash;
+    }
+    users::insert(&db, &u)?;
+    drop(db);
+    // 注册进运行期账套表 + 平台账套目录
+    state.books.register(&path, 16);
+    state
+        .realm
+        .register_book(&key, &path.to_string_lossy(), &owner, &company)?;
+    Ok(Json(json!({ "key": key, "company": company })))
+}
+
+/// 选择当前账套（登录后进入某套账前调用）
+async fn select_book(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let book = state
+        .realm
+        .get_book(&key)?
+        .ok_or_else(|| AppError::not_found("账套不存在"))?;
+    // 授权三层：平台管理员 / 归属者 / 账套内已有该用户的行（被邀请成员）
+    let is_member = state
+        .db_for(&key)
+        .ok()
+        .and_then(|db| users::get(&db, &user.username).ok().flatten())
+        .is_some();
+    let allowed =
+        user.is_admin || book.owner_username == user.username || is_member;
+    if !allowed {
+        return Err(AppError::forbidden("无权访问该账套"));
+    }
+    // 进入账套时把会话当前期间同步为该账套启用期间
+    if let Ok(db) = state.db_for(&key) {
+        let ymm = db.options().start_period.ymm();
+        state.sessions.set_period(&user.token, ymm);
+        drop(db);
+    }
+    state.sessions.set_book_key(&user.token, &key);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 删除账套（平台管理员 或 账套归属者）：解除「有账套的用户无法删除」的死锁
+async fn delete_book(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let book = state
+        .realm
+        .get_book(&key)?
+        .ok_or_else(|| AppError::not_found("账套不存在"))?;
+    if !user.is_admin && book.owner_username != user.username {
+        return Err(AppError::forbidden("无权删除该账套"));
+    }
+    // 顺序要点：先摘运行期注册（否则后续请求会把已删文件重新打开成空库），
+    // 再清会话、删目录记录，最后落盘删除文件。
+    state.books.unregister(&key);
+    state.sessions.clear_book_key(&key);
+    state.realm.delete_book(&key)?;
+    let p = std::path::PathBuf::from(&book.path);
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(format!("{}-wal", p.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", p.display()));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn post_logout(State(state): State<Arc<WebState>>, jar: axum_extra::extract::cookie::CookieJar) -> Response {
@@ -349,26 +477,143 @@ async fn post_logout(State(state): State<Arc<WebState>>, jar: axum_extra::extrac
 }
 
 async fn get_me(
-    State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<PublicUser>, AppError> {
-    let db = state.db_for(&user.book_key)?;
-    let u = users::get(&db, user.username())?
-        .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
-    Ok(Json(PublicUser::from_user(&u)))
+    // 直接使用身份对账后的用户：平台管理员查看他人账套时是临时身份
+    // （不写入账套 user 表），回查数据库会 404
+    Ok(Json(PublicUser::from_user(&user.user)))
 }
 
 async fn post_change_password(
     State(state): State<Arc<WebState>>,
-    user: CurrentUser,
+    user: RealmUser,
     Json(req): Json<ChangePwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let db = state.db_for(&user.book_key)?;
-    let r = security::change_password_checked(&db, user.username(), &req.old, &req.new, &state.policy)?;
+    // 改的是平台口令（与登录身份一致）
+    let r = state.realm.change_password(&user.username, &req.old, &req.new)?;
     match r {
-        Ok(()) => Ok(Json(json!({"ok": true}))),
+        Ok(()) => {
+            // 同步到该用户自己拥有的账套内的同名用户行，保持一致
+            if let Ok(Some(ru)) = state.realm.get_user(&user.username) {
+                let _ = state
+                    .realm
+                    .sync_password_to_books(&state.books_dir, &user.username, &ru.password_hash);
+            }
+            Ok(Json(json!({"ok": true})))
+        }
         Err(msg) => Err(AppError::bad_request(msg)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 平台账号管理（仅平台管理员）
+// ---------------------------------------------------------------------------
+
+async fn list_platform_users(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+) -> Result<Json<Vec<PlatformUserItem>>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    let list = state
+        .realm
+        .list_users()?
+        .into_iter()
+        .map(|u| PlatformUserItem::from_realm(&u))
+        .collect();
+    Ok(Json(list))
+}
+
+async fn create_platform_user(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Json(req): Json<PlatformUserReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    if req.username.trim().is_empty() || req.password.len() < 6 {
+        return Err(AppError::bad_request("用户名不能为空，口令至少 6 位"));
+    }
+    // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
+    let id = state
+        .realm
+        .create_user(&req.username, &req.display_name, &req.password, req.is_admin, true)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn update_platform_user(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(username): Path<String>,
+    Json(req): Json<UpdatePlatformUserReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    if username == user.username {
+        return Err(AppError::bad_request("不能修改当前登录的账号，请使用改密功能"));
+    }
+    state
+        .realm
+        .update_user(&username, req.display_name.as_deref(), req.disabled, req.is_admin)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_platform_user(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(username): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    if username == user.username {
+        return Err(AppError::bad_request("不能删除当前登录的账号"));
+    }
+    if state.realm.count_books_of(&username)? > 0 {
+        return Err(AppError::bad_request("该用户仍拥有账套，请先删除其账套后再删除账号"));
+    }
+    state.realm.delete_user(&username)?;
+    state.sessions.remove_by_username(&username);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn reset_platform_password(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(username): Path<String>,
+    Json(req): Json<ResetPwdReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    state.realm.reset_password(&username, &req.new)?;
+    if let Ok(Some(ru)) = state.realm.get_user(&username) {
+        let _ = state
+            .realm
+            .sync_password_to_books(&state.books_dir, &username, &ru.password_hash);
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 平台层重置设备绑定（Web"一人一机"）：解绑后该账号下次登录自动绑定新设备
+async fn reset_platform_device(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Path(username): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限平台管理员"));
+    }
+    if username == user.username {
+        return Err(AppError::bad_request("不能重置当前登录账号的设备"));
+    }
+    state.realm.clear_device(&username)?;
+    // 强制重新登录：旧会话不能再沿用
+    state.sessions.remove_by_username(&username);
+    Ok(Json(json!({"ok": true})))
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +647,13 @@ async fn create_user(
     if users::get(&db, &username)?.is_some() {
         return Err(AppError::bad_request("该用户名已存在"));
     }
+    // Web 端登录只认平台身份库：账套内子账号必须对应一个已存在的平台账号，
+    // 否则开出来的账号无法登录（死账号）。
+    if state.realm.get_user(&username)?.is_none() {
+        return Err(AppError::bad_request(
+            "该账号尚未开通平台账号，请先让平台管理员在「平台账号」中开通同名账号",
+        ));
+    }
     let mut u = User::new(&username, &req.display_name, req.role);
     u.set_password(&req.password);
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
@@ -432,6 +684,12 @@ async fn update_user(
     let db = state.db_for(&user.book_key)?;
     let mut u = users::get(&db, &username)?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
+    // 账套归属者不可被停用 / 降权 / 改名，否则账套会失去主人
+    if let Some(owner) = state.realm.book_owner(&user.book_key)? {
+        if username == owner {
+            return Err(AppError::bad_request("不能修改账套归属者的账套内身份"));
+        }
+    }
     if let Some(d) = req.display_name {
         u.display_name = d;
     }
@@ -551,6 +809,12 @@ async fn delete_user(
     let db = state.db_for(&user.book_key)?;
     let u = users::get(&db, &username)?
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))?;
+    // 账套归属者不可删除（删了账套就没有主人了）
+    if let Some(owner) = state.realm.book_owner(&user.book_key)? {
+        if username == owner {
+            return Err(AppError::bad_request("不能删除账套归属者"));
+        }
+    }
     if u.is_admin() {
         let admins = users::list(&db)?.into_iter().filter(|x| x.is_admin()).count();
         if admins <= 1 {
@@ -583,8 +847,6 @@ async fn put_options(
     user.require(Perm::SysOption)?;
     let db = state.db_for(&user.book_key)?;
     db.set_options(&opts)?;
-    // 刷新公司名缓存（建账向导保存后，仪表盘立即显示新公司名）
-    state.refresh_company(&db);
     Ok(Json(json!({"ok": true})))
 }
 
@@ -608,7 +870,7 @@ async fn get_dashboard(
     let cur = current_period(&state, &user);
     let closed = periods::closed_upto(&db)?;
     Ok(Json(Dashboard {
-        company: state.company_name(),
+        company: user.company.clone(),
         start_period: period_to_str(start),
         current_period: period_to_str(cur),
         closed_upto: closed.map(period_to_str),
@@ -1457,7 +1719,7 @@ async fn print_voucher_form(
         return Err(AppError::forbidden("没有查看凭证的权限"));
     }
     let db = state.db_for(&user.book_key)?;
-    let company = state.company_name();
+    let company = user.company.clone();
     let chart = accounts::chart(&db)?;
     let aux_names = findb::auxs::full_name_map(&db)?;
 
@@ -1529,7 +1791,7 @@ async fn print_ledger_form(
         return Err(AppError::forbidden("无权查看该科目"));
     }
     let db = state.db_for(&user.book_key)?;
-    let company = state.company_name();
+    let company = user.company.clone();
     let chart = accounts::chart(&db)?;
     let from = q
         .get("from")
@@ -1698,7 +1960,7 @@ async fn print_trial_balance(
     // 打印预览：所有有「账簿报表」权限的角色都可使用（不落地文件）
     user.require(Perm::Report)?;
     let (rows, totals) = trial_balance_data(&state, &user, &q)?;
-    let html = trial_balance_html(&state, &q, &rows, &totals);
+    let html = trial_balance_html(&user.company, &q, &rows, &totals);
     Ok((
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
@@ -1739,7 +2001,7 @@ async fn export_trial_balance_pdf(
     let (rows, totals) = trial_balance_data(&state, &user, &q)?;
     let from = q.get("from").cloned().unwrap_or_default();
     let to = q.get("to").cloned().unwrap_or_default();
-    let company = state.company_name();
+    let company = user.company.clone();
     let bytes = crate::pdf::trial_balance_pdf(&company, &from, &to, &rows, &totals)
         .map_err(AppError::bad_request)?;
     Ok((
@@ -1760,7 +2022,7 @@ async fn export_trial_balance_pdf(
 // ---------------------------------------------------------------------------
 
 fn trial_balance_html(
-    state: &WebState,
+    company: &str,
     q: &HashMap<String, String>,
     rows: &[fincore::balance::BalanceRow],
     totals: &fincore::balance::TrialBalance,
@@ -1810,7 +2072,7 @@ fn trial_balance_html(
          <td class='r'>—</td></tr></tfoot></table>\
          <script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>\
          </body></html>",
-        html_escape(&state.company_name()),
+        html_escape(company),
         html_escape(&from),
         html_escape(&to),
         chrono::Local::now().format("%Y-%m-%d %H:%M"),
@@ -3629,7 +3891,7 @@ async fn print_balance_sheet(
             Box::new(fincore::report::to_begin),
         ],
     )?;
-    let html = crate::report_html::report_table_html(&t, &state.company_name(), "元");
+    let html = crate::report_html::report_table_html(&t, &user.company, "元");
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -3676,7 +3938,7 @@ async fn print_income_statement(
         to,
         vec![Box::new(fincore::report::identity), Box::new(to_ytd)],
     )?;
-    let html = crate::report_html::report_table_html(&t, &state.company_name(), "元");
+    let html = crate::report_html::report_table_html(&t, &user.company, "元");
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -3718,7 +3980,7 @@ async fn print_cash_flow(
     let (from, to) = report_range(&state, &user, &q);
     let cf = findb::reports::cash_flow_statement(&db, from, to)?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
-    let html = crate::report_html::cash_flow_html(&cf, &state.company_name(), &subtitle);
+    let html = crate::report_html::cash_flow_html(&cf, &user.company, &subtitle);
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -3732,6 +3994,6 @@ async fn print_equity_statement(
     let (from, to) = report_range(&state, &user, &q);
     let stmt = findb::reports::equity_statement(&db, from, to)?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
-    let html = crate::report_html::equity_html(&stmt, &state.company_name(), &subtitle);
+    let html = crate::report_html::equity_html(&stmt, &user.company, &subtitle);
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }

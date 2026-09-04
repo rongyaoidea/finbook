@@ -1,7 +1,8 @@
-//! Web 服务共享状态：数据库连接池、会话管理、鉴权提取器与错误类型。
+//! Web 服务共享状态：平台身份库、账套注册表、会话管理、鉴权提取器与错误类型。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,22 +11,23 @@ use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::cookie::CookieJar;
-use fincore::user::{PasswordPolicy, Perm, User};
+use fincore::user::{PasswordPolicy, Perm, Role, User};
 use findb::{users, Db, DbError};
 use rand::Rng;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromStr;
-use serde_json::json;
+
+use crate::realm::{ensure_book_admin, RealmDb, RealmUser as RealmAccount};
 
 /// 全局共享状态（以 Arc 包裹，可被多请求并发引用）
 pub struct WebState {
-    /// 账套注册表（多账套支持）
+    /// 账套注册表（多账套支持）：key → 文件路径
     pub books: BookRegistry,
     pub sessions: SessionStore,
     pub policy: PasswordPolicy,
-    /// 默认账套路径（环境变量 FINBOOK_DB 或首个注册账套）
-    pub book_path: PathBuf,
-    /// 公司名缓存（RwLock：建账后可由 refresh_company 更新）
+    /// 平台身份库（全局账号 + 账套目录）
+    pub realm: RealmDb,
+    /// 用户自建账套的存放目录
+    pub books_dir: PathBuf,
+    /// 公司名缓存（建账后可由 refresh_company 更新；多账套下更推荐用 CurrentUser.company）
     pub company: std::sync::RwLock<String>,
     pub version: String,
     /// 账套默认（启用）期间，ymm 形式，作为会话期间的初值
@@ -37,11 +39,13 @@ pub struct WebState {
 }
 
 impl WebState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         books: BookRegistry,
+        sessions: SessionStore,
         policy: PasswordPolicy,
-        book_path: PathBuf,
-        company: String,
+        realm: RealmDb,
+        books_dir: PathBuf,
         version: String,
         default_period: i32,
         static_dir: PathBuf,
@@ -49,10 +53,11 @@ impl WebState {
     ) -> Arc<Self> {
         Arc::new(Self {
             books,
-            sessions: SessionStore::new(),
+            sessions,
             policy,
-            book_path,
-            company: std::sync::RwLock::new(company),
+            realm,
+            books_dir,
+            company: std::sync::RwLock::new(String::new()),
             version,
             default_period,
             static_dir,
@@ -63,13 +68,6 @@ impl WebState {
     /// 读取公司名
     pub fn company_name(&self) -> String {
         self.company.read().map(|c| c.clone()).unwrap_or_default()
-    }
-
-    /// 从账套选项刷新公司名缓存（建账/改公司名后用）
-    pub fn refresh_company(&self, db: &Db) {
-        if let Ok(mut c) = self.company.write() {
-            *c = db.options().company;
-        }
     }
 
     /// 借出指定账套的连接（owned，多账套）
@@ -113,6 +111,11 @@ impl BookRegistry {
         g.push((key, path.to_path_buf()));
     }
 
+    /// 注销账套（删除账套时调用）：避免后续请求把已删除文件重新打开成空库
+    pub fn unregister(&self, key: &str) {
+        self.inner.lock().unwrap().retain(|(k, _)| k != key);
+    }
+
     /// 所有账套 key + 文件路径（供列表展示）
     pub fn list(&self) -> Vec<(String, PathBuf)> {
         let g = self.inner.lock().unwrap();
@@ -143,73 +146,6 @@ impl BookRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// 数据库连接池
-// ---------------------------------------------------------------------------
-
-/// 简单的连接池：账套文件用 WAL 模式，本机多连接并发写入会自动等待，
-/// 不会报 database is locked。每个请求借出一个 Db，用完后归还。
-pub struct DbPool {
-    inner: Mutex<Vec<Db>>,
-    max: usize,
-    path: PathBuf,
-}
-
-impl DbPool {
-    pub fn new(path: &Path, max: usize) -> Self {
-        Self {
-            inner: Mutex::new(Vec::new()),
-            max: max.max(1),
-            path: path.to_path_buf(),
-        }
-    }
-
-    /// 借出一个数据库连接；池空时临时新建一个。
-    pub fn get(&self) -> Result<PooledDb<'_>, DbError> {
-        let db = {
-            let mut g = self.inner.lock().unwrap();
-            g.pop()
-        };
-        let db = match db {
-            Some(d) => d,
-            None => Db::open(&self.path)?,
-        };
-        Ok(PooledDb {
-            db: Some(db),
-            pool: self,
-        })
-    }
-
-    fn checkin(&self, db: Db) {
-        let mut g = self.inner.lock().unwrap();
-        if g.len() < self.max {
-            g.push(db);
-        }
-        // 超过上限则丢弃，连接随 Db 析构关闭
-    }
-}
-
-/// 借用型连接，作用域结束自动归还池中。
-pub struct PooledDb<'a> {
-    db: Option<Db>,
-    pool: &'a DbPool,
-}
-
-impl std::ops::Deref for PooledDb<'_> {
-    type Target = Db;
-    fn deref(&self) -> &Db {
-        self.db.as_ref().unwrap()
-    }
-}
-
-impl Drop for PooledDb<'_> {
-    fn drop(&mut self) {
-        if let Some(db) = self.db.take() {
-            self.pool.checkin(db);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 会话管理
 // ---------------------------------------------------------------------------
 
@@ -220,6 +156,8 @@ pub struct SessionStore {
 #[derive(Clone)]
 pub struct SessionInfo {
     pub username: String,
+    /// 平台管理员标志（决定能否看全部账套）
+    pub is_admin: bool,
     /// 登录时的设备指纹（用于逐请求复核"一人一机"策略）
     pub device_id: String,
     pub last_active: i64,
@@ -249,16 +187,23 @@ impl SessionStore {
             .collect()
     }
 
-    pub fn create(&self, username: &str, device_id: &str, period_ymm: i32, book_key: &str) -> String {
+    pub fn create(
+        &self,
+        username: &str,
+        is_admin: bool,
+        device_id: &str,
+        period_ymm: i32,
+        book_key: &str,
+    ) -> String {
         let token = Self::new_token();
         let now = now_secs();
         let mut g = self.inner.lock().unwrap();
-        // 顺手清理过期会话，避免长期运行时会话表无限增长
         g.retain(|_, i| now - i.last_active < SESSION_MAX_SECS);
         g.insert(
             token.clone(),
             SessionInfo {
                 username: username.to_string(),
+                is_admin,
                 device_id: device_id.to_string(),
                 last_active: now,
                 period_ymm,
@@ -295,8 +240,26 @@ impl SessionStore {
         }
     }
 
+    /// 切换当前账套（登录后选账套时调用）
+    pub fn set_book_key(&self, token: &str, key: &str) {
+        if let Some(i) = self.inner.lock().unwrap().get_mut(token) {
+            i.book_key = key.to_string();
+        }
+    }
+
     pub fn remove(&self, token: &str) {
         self.inner.lock().unwrap().remove(token);
+    }
+
+    /// 账套被删除后，把仍停留在该账套的会话退回"未选账套"状态，
+    /// 否则用户会卡在 404「账套不存在」而无法自行回到选择页。
+    pub fn clear_book_key(&self, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        for info in g.values_mut() {
+            if info.book_key == key {
+                info.book_key.clear();
+            }
+        }
     }
 
     /// 清掉某个用户的全部会话（重置设备绑定 / 删除 / 停用账号时调用），
@@ -310,13 +273,73 @@ impl SessionStore {
 // 鉴权提取器
 // ---------------------------------------------------------------------------
 
-/// 当前登录用户（从会话 Cookie 解析，并每次请求回读数据库取最新权限）
+/// 平台级登录用户（不绑定具体账套）：用于登录、账套列表、建账、平台用户管理等。
+pub struct RealmUser {
+    pub username: String,
+    pub is_admin: bool,
+    pub display_name: String,
+    pub must_change_pwd: bool,
+    pub token: String,
+    pub device_id: String,
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<WebState>> for RealmUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<WebState>,
+    ) -> Result<Self, Self::Rejection> {
+        let jar = CookieJar::from_headers(&parts.headers);
+        let token = jar
+            .get("finbook_sid")
+            .map(|c| c.value().to_string())
+            .ok_or_else(|| AppError::unauthorized("未登录或会话已失效"))?;
+        let info = state
+            .sessions
+            .get(&token, state.policy.idle_minutes)
+            .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
+        let ru = state
+            .realm
+            .get_user(&info.username)?
+            .ok_or_else(|| AppError::unauthorized("账号已不存在，请重新登录"))?;
+        if ru.disabled {
+            state.sessions.remove(&token);
+            return Err(AppError::forbidden("账号已被停用，请联系管理员"));
+        }
+        // 强制改密拦截：必须改密的用户只能访问改密和退出接口
+        // （不删除会话——否则改密请求自身也会被挡在门外，用户被迫重新登录）
+        if ru.must_change_pwd {
+            let path = parts.uri.path();
+            let is_allowed = path == "/api/change-password"
+                || path == "/api/logout"
+                || path == "/api/login";
+            if !is_allowed {
+                return Err(AppError::unauthorized("你的口令已过期或需首次设置，请先修改口令"));
+            }
+        }
+        state.sessions.touch(&token);
+        Ok(RealmUser {
+            username: ru.username,
+            is_admin: ru.is_admin,
+            display_name: ru.display_name,
+            must_change_pwd: ru.must_change_pwd,
+            token,
+            device_id: info.device_id,
+        })
+    }
+}
+
+/// 当前账套内用户（从会话 + 账套归属授权 + 身份对账得来）
 pub struct CurrentUser {
     pub user: User,
     /// 会话令牌（服务端内部使用，不向外暴露）
     pub token: String,
     /// 当前账套 key（多账套）
     pub book_key: String,
+    /// 当前账套的公司名（多账套下每套不同）
+    pub company: String,
 }
 
 impl CurrentUser {
@@ -356,39 +379,81 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             .sessions
             .get(&token, state.policy.idle_minutes)
             .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
-        // 回读数据库：管理员刚改的权限/停用状态立即生效，无需用户重登
-        let db = state.db_for(&info.book_key)?;
-        let user = users::get(&db, &info.username)?
+
+        // 1) 平台账号存在且未停用
+        let ru: RealmAccount = state
+            .realm
+            .get_user(&info.username)?
             .ok_or_else(|| AppError::unauthorized("账号已不存在，请重新登录"))?;
+        if ru.disabled {
+            state.sessions.remove(&token);
+            return Err(AppError::forbidden("账号已被停用，请联系管理员"));
+        }
+
+        // 2) 账套归属授权：平台管理员可看全部；归属者可进；账套内已有该用户行 = 被邀请的成员
+        let book_key = info.book_key.clone();
+        if book_key.is_empty() {
+            return Err(AppError::unauthorized("请先选择账套"));
+        }
+        let book = state
+            .realm
+            .get_book(&book_key)?
+            .ok_or_else(|| AppError::not_found("账套不存在或已被删除"))?;
+        let db = state.db_for(&book_key)?;
+        let in_book = users::get(&db, &ru.username)?;
+        let allowed = info.is_admin || book.owner_username == info.username || in_book.is_some();
+        if !allowed {
+            return Err(AppError::forbidden("无权访问该账套"));
+        }
+
+        // 3) 身份对账
+        let user = match in_book {
+            // 账套内已有该用户行：沿用其账套内角色 / 权限 / 数据范围，不擅自升级
+            Some(u) => u,
+            None => {
+                if info.is_admin && book.owner_username != info.username {
+                    // 平台管理员查看他人账套：构造临时账套管理员身份，不写入该账套 user 表，
+                    // 避免在他人账套留下账号记录；操作仍按管理员用户名记入审计与凭证。
+                    let mut u = User::new(&ru.username, &ru.display_name, Role::Admin);
+                    u.password_hash = ru.password_hash.clone();
+                    u
+                } else {
+                    // 归属者：本就是自己的账套，缺失时补种一行（落库）
+                    ensure_book_admin(&db, &ru)?;
+                    users::get(&db, &ru.username)?
+                        .ok_or_else(|| AppError::unauthorized("账套内账号缺失，请重新进入账套"))?
+                }
+            }
+        };
         if user.disabled {
             state.sessions.remove(&token);
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
         }
-        // "一人一机"逐请求复核：管理员豁免；普通账号一旦绑定了新设备，
-        // 旧设备上的会话立即失效（管理员重置绑定后旧会话不能继续用）
+        // "一人一机"逐请求复核：管理员豁免；普通账号一旦绑定了新设备，旧设备会话立即失效
         if !user.is_admin() && !user.device_id.is_empty() && user.device_id != info.device_id {
             state.sessions.remove(&token);
             return Err(AppError::unauthorized(
                 "该账号已在其他设备登录，本设备会话已被下线",
             ));
         }
-        // 强制改密拦截：必须改密的用户只能访问改密和退出接口（登录接口本身不受限）
+        // 强制改密拦截（不删除会话，仅拒绝非改密/退出请求）
         if user.must_change_pwd {
             let path = parts.uri.path();
             let is_allowed = path == "/api/change-password"
                 || path == "/api/logout"
                 || path == "/api/login";
             if !is_allowed {
-                state.sessions.remove(&token);
                 return Err(AppError::unauthorized("你的口令已过期或需首次设置，请先修改口令"));
             }
         }
+        let company = db.options().company;
         drop(db);
         state.sessions.touch(&token);
         Ok(CurrentUser {
             user,
             token,
-            book_key: info.book_key.clone(),
+            book_key,
+            company,
         })
     }
 }
@@ -427,6 +492,9 @@ impl AppError {
     pub fn bad_request(m: impl Into<String>) -> Self {
         AppError::BadRequest(m.into())
     }
+    pub fn not_found(m: impl Into<String>) -> Self {
+        AppError::NotFound(m.into())
+    }
 }
 
 impl IntoResponse for AppError {
@@ -438,7 +506,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("数据库错误：{e}")),
         };
-        (status, axum::Json(json!({ "error": msg }))).into_response()
+        (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
     }
 }
 
@@ -455,9 +523,6 @@ pub fn now_secs() -> i64 {
 
 /// 构造 Set-Cookie 头值
 pub fn cookie_header(token: &str, max_age_secs: i64) -> HeaderValue {
-    // Secure 标志由 FINWEB_SECURE_COOKIE 环境变量控制：
-    // - 未设置（默认 false）：不加 Secure，HTTP/HTTPS 均可工作
-    // - 显式设为 true：加 Secure，要求 HTTPS 传输（生产推荐）
     let secure = std::env::var("FINWEB_SECURE_COOKIE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -493,7 +558,7 @@ pub fn parse_period(s: &str) -> Option<fincore::Period> {
 
 /// 解析金额字符串（默认 0）
 pub fn parse_money(s: &str) -> fincore::Money {
-    match Decimal::from_str(s.trim()) {
+    match rust_decimal::Decimal::from_str(s.trim()) {
         Ok(d) => fincore::Money::new(d),
         Err(_) => fincore::Money::ZERO,
     }

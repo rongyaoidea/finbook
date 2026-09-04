@@ -2,7 +2,7 @@
 const API = "/api";
 
 let session = { user: null };
-let state = { view: "dashboard", periods: [], current: null, accounts: null, users: null };
+let state = { view: "dashboard", periods: [], current: null, accounts: null, users: null, bookKey: "" };
 
 // ---------- 工具 ----------
 // esc / fmt / fmtMoney / ymm 抽到 util.js（无 DOM 依赖，可单测），此处经全局复用。
@@ -108,36 +108,17 @@ function deviceName() { return (navigator.platform || "Web") + " · " + navigato
 function can(p) { return session.user && session.user.perms.indexOf(p) >= 0; }
 
 // ===========================================================================
-// 登录
+// 登录（平台级：登录后再选择/新建账套）
 // ===========================================================================
 async function showLogin() {
-  let status = { admin_set: false };
-  try { status = await api("/setup/status"); } catch (e) {}
-  // 账套列表（多账套时登录页可选）
-  let bookOpts = "";
-  try {
-    const b = await api("/books");
-    const list = (b && b.books) || [];
-    if (list.length > 1) {
-      bookOpts = `<div class="field"><label>账套 / 公司</label>
-        <select id="login-book">${list.map((x) => `<option value="${esc(x.key)}">${esc(x.company || x.key)}</option>`).join("")}</select>
-      </div>`;
-    } else if (list.length === 1) {
-      bookOpts = `<input type="hidden" id="login-book" value="${esc(list[0].key)}" />`;
-    }
-  } catch (e) {}
   const app = document.getElementById("app");
-  const banner = status.admin_set
-    ? `<div class="banner set">✅ <b>管理员账号已设定</b>。请输入账号口令登录。</div>`
-    : `<div class="banner unset">🔧 <b>管理员账号未设定</b> —— 首次成功登录的账号将自动成为系统管理员，请设置您的管理员账号与口令。</div>`;
   app.innerHTML = `
     <div class="login-wrap">
       <div class="login-card">
         <h1>FinBook 财务管理系统</h1>
-        <div class="sub">${esc(status.company || "Web 版")}</div>
-        ${banner}
+        <div class="sub">多用户 · 多账套</div>
+        <div class="banner set">请输入平台账号登录。登录后可选择或新建自己的账套。</div>
         <form id="login-form">
-          ${bookOpts}
           <div class="field"><label>账号</label><input id="u" autocomplete="username" required /></div>
           <div class="field"><label>口令</label><input id="p" type="password" autocomplete="current-password" required /></div>
           <button class="btn block" type="submit">登录</button>
@@ -149,22 +130,143 @@ async function showLogin() {
     e.preventDefault();
     const username = $("#u").value.trim();
     const password = $("#p").value;
-    const sel = $("#login-book");
-    const book_key = sel ? sel.value : "";
     try {
       const r = await api("/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password, device_id: deviceId(), device_name: deviceName(), book_key }),
+        body: JSON.stringify({ username, password, device_id: deviceId(), device_name: deviceName(), book_key: "" }),
       });
       session.user = r.user;
-      toast(r.setup ? `已创建管理员账号「${esc(username)}」` : `欢迎，${esc(r.user.display_name)}`, "ok");
-      await afterLogin();
-      if (r.must_change_pwd) openChangePwd(true);
+      session.platformAdmin = !!r.user.is_admin;
+      if (r.must_change_pwd) {
+        openChangePwd(true, () => showBookPicker());
+      } else {
+        toast(`欢迎，${esc(r.user.display_name)}`, "ok");
+        showBookPicker({ user: r.user, books: r.books });
+      }
     } catch (err) {
       $("#login-err").textContent = err.message;
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// 账套选择 / 新建（登录成功后、进入账套前）
+// ---------------------------------------------------------------------------
+
+async function loadMyBooks() {
+  const r = await api("/books");
+  return { user: r.user || null, books: (r && r.books) || [] };
+}
+
+async function showBookPicker(pre, force) {
+  let data = pre || null;
+  if (!data) {
+    try { data = await loadMyBooks(); } catch (e) { return; }
+  }
+  // force：从账套内退回选择页时，用平台身份覆盖账套内身份
+  if (data.user && (!session.user || force)) session.user = data.user;
+  if (data.user) session.platformAdmin = !!data.user.is_admin;
+  const books = data.books || [];
+  const app = document.getElementById("app");
+  const u = session.user || {};
+  const isPlatformAdmin = !!session.platformAdmin;
+  app.innerHTML = `
+    <div class="login-wrap">
+      <div class="login-card wide">
+        <h1>选择账套</h1>
+        <div class="sub">${esc(u.display_name || "")}${isPlatformAdmin ? "（平台管理员）" : ""}</div>
+        <div class="muted" style="margin:6px 0 14px">普通用户可在自己创建的账套中记账；平台管理员可进入全部账套查看。选择账套进入，或新建一套。</div>
+        <div id="book-list" class="book-list">${books.length ? books.map((b) => `
+          <div class="book-item">
+            <button class="book-enter" data-key="${esc(b.key)}" data-company="${esc(b.company || b.key)}">
+              <span class="book-name">${esc(b.company || b.key)}</span>
+              <span class="book-meta">${isPlatformAdmin ? `归属：${esc(b.owner)} · ` : ""}${esc(b.key)}</span>
+            </button>
+            ${(isPlatformAdmin || b.owner === u.username) ? `<button class="btn sm ghost book-del" data-del="${esc(b.key)}" title="删除该账套（数据不可恢复）">删除</button>` : ""}
+          </div>`).join("") : `<div class="muted" style="padding:18px 0">还没有账套，点击下方「新建账套」开始记账。</div>`}</div>
+        <div style="display:flex;gap:10px;margin-top:16px">
+          <button class="btn primary" id="new-book">＋ 新建账套</button>
+          <span class="grow"></span>
+          <button class="btn ghost" id="picker-logout">退出登录</button>
+        </div>
+      </div>
+    </div>`;
+  $all(".book-enter").forEach((el) => {
+    el.addEventListener("click", () => enterBook(el.dataset.key, el.dataset.company));
+  });
+  $all(".book-del").forEach((el) => {
+    el.addEventListener("click", () => deleteBook(el.dataset.del, el.dataset.del));
+  });
+  $("#new-book").addEventListener("click", openCreateBook);
+  $("#picker-logout").addEventListener("click", async () => {
+    try { await api("/logout", { method: "POST" }); } catch (e) {}
+    session.user = null;
+    showLogin();
+  });
+}
+
+async function enterBook(key, name) {
+  try {
+    await api(`/books/${encodeURIComponent(key)}/select`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    state.bookKey = key;
+    const me = await api("/me");
+    session.user = me;
+    shellBuilt = false; // 身份从平台层切换为账套层，顶栏与侧边栏需重建
+    state.view = "dashboard";
+    toast(`已进入账套「${esc(name || key)}」`, "ok");
+    await afterLogin();
+  } catch (e) {
+    toast(e.message, "err");
+    if (String(e.message).indexOf("登录") >= 0 || String(e.message).indexOf("停用") >= 0) showLogin();
+    else if (session.user) showBookPicker();
+  }
+}
+
+/// 删除账套（平台管理员 或 账套归属者）；删除后回到账套选择页
+async function deleteBook(key, name) {
+  if (!(await confirmDialog(`确定删除账套「${name || key}」？该账套内的全部凭证、科目与设置将被永久删除，不可恢复。`, true))) return;
+  try {
+    await api(`/books/${encodeURIComponent(key)}`, { method: "DELETE" });
+    toast("账套已删除", "ok");
+    if (key === state.bookKey) {
+      // 删掉的正是当前所在账套：退回选择页并用平台身份重建
+      state.bookKey = "";
+      shellBuilt = false;
+      await showBookPicker(null, true);
+    } else {
+      await showBookPicker();
+    }
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function openCreateBook() {
+  const now = new Date();
+  const mask = modal(`
+    <h3>新建账套</h3>
+    <p class="muted" style="margin:0 0 14px;line-height:1.6">
+      每个账套都是独立隔离的一套账。创建者自动成为该账套的管理员，可再为同事开通账套内子账号。
+    </p>
+    <div class="field"><label>公司名称</label><input id="cb-company" placeholder="例如：某某贸易有限公司" /></div>
+    <div class="field"><label>启用期间（YYYY-MM）</label><input id="cb-start" value="${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}" /></div>
+    <div class="field"><label>账套标识（可选，留空自动生成）</label><input id="cb-key" placeholder="字母/数字/下划线" /></div>
+    <div class="foot"><button class="btn" id="cb-cancel">取消</button><button class="btn primary" id="cb-save">创建</button></div>`);
+  $("#cb-cancel", mask).onclick = closeModal;
+  $("#cb-save", mask).onclick = async () => {
+    const company = $("#cb-company", mask).value.trim();
+    if (!company) { toast("请输入公司名称", "err"); return; }
+    const ym = $("#cb-start", mask).value.trim().replace(/[^0-9]/g, "");
+    let start_period = 0;
+    if (ym.length === 6) start_period = parseInt(ym, 10);
+    else if (/^\d{4}$/.test(ym)) start_period = parseInt(ym, 10) * 100 + 1;
+    if (start_period <= 0) { toast("启用期间格式应为 YYYY-MM", "err"); return; }
+    try {
+      const r = await api("/books", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: $("#cb-key", mask).value.trim(), company, start_period }) });
+      closeModal();
+      toast(`账套「${esc(company)}」创建成功`, "ok");
+      await enterBook(r.key, company);
+    } catch (e) { toast(e.message, "err"); }
+  };
 }
 
 async function afterLogin() {
@@ -246,6 +348,8 @@ async function showSetupWizard() {
 // group: 侧边栏分组（与桌面端 NavItem::group 保持一致）
 const NAV_ITEMS = [
   { id: "overview", label: "账目总览", admin: true, group: "管理员" },
+  { id: "platform-users", label: "平台账号", platform: true, group: "平台管理" },
+  { id: "platform-books", label: "全部账套", platform: true, group: "平台管理" },
   { id: "dashboard", label: "仪表盘", perm: null, group: "开始" },
   { id: "vouchers", label: "记账凭证", perm: "voucher_new", group: "凭证" },
   { id: "imports", label: "数据导入", perm: "voucher_new", group: "凭证" },
@@ -293,6 +397,8 @@ const NAV_ITEMS = [
 // 视图注册表：id → 渲染函数（函数声明已提升，可在顶层引用）
 const VIEWS = {
   "overview": viewOverview,
+  "platform-users": viewPlatformUsers,
+  "platform-books": viewPlatformBooks,
   "dashboard": viewDashboard,
   "vouchers": viewVouchers,
   "invoices": viewInvoices,
@@ -343,8 +449,7 @@ let shellBuilt = false;
 function renderShell() {
   const u = session.user;
   const app = document.getElementById("app");
-  const nav = NAV_ITEMS.filter((n) => !n.perm || can(n.perm));
-  const periodOpts = state.periods.map((p) => `<option value="${p}" ${p === state.current ? "selected" : ""}>${p}</option>`).join("");
+  const nav = NAV_ITEMS.filter((n) => !n.perm || can(n.perm));  const periodOpts = state.periods.map((p) => `<option value="${p}" ${p === state.current ? "selected" : ""}>${p}</option>`).join("");
   app.innerHTML = `
     <div class="app">
       <div class="topbar">
@@ -353,12 +458,14 @@ function renderShell() {
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
+        <button class="btn ghost sm" id="switch-book">切换账套</button>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
         <button class="btn ghost sm" id="logout">退出登录</button>
       </div>
       <div class="sidebar" id="sidebar">
         ${(() => {
-          const visible = nav.filter((n) => !(n.admin && !session.user.is_admin));
+          const pa = !!session.platformAdmin;
+          const visible = nav.filter((n) => !(n.admin && !session.user.is_admin) && !(n.platform && !pa));
           let lastGroup = "";
           let html = "";
           for (const n of visible) {
@@ -397,12 +504,19 @@ function renderShell() {
     renderMain();
   });
   $("#logout").addEventListener("click", logout);
+  $("#switch-book").addEventListener("click", async () => {
+    shellBuilt = false;
+    state.bookKey = "";
+    await showBookPicker();
+  });
   $("#change-pwd").addEventListener("click", () => openChangePwd(false));
   shellBuilt = true;
 }
 
 function render() {
+  // session.user 有 perms = 已进入账套（PublicUser）；只有平台身份（PlatformUser）时停在账套选择页
   if (!session.user) { shellBuilt = false; showLogin(); return; }
+  if (!session.user.perms) { shellBuilt = false; showBookPicker(); return; }
   if (!shellBuilt) renderShell();
   renderMain();
 }
@@ -416,6 +530,7 @@ function renderMain() {
 async function logout() {
   try { await api("/logout", { method: "POST" }); } catch (e) {}
   session.user = null;
+  session.platformAdmin = false;
   render();
 }
 
@@ -1541,8 +1656,9 @@ async function loadUsers() {
 async function openNewUser() {
   const roles = await loadRoles();
   const mask = modal(`
-    <h3>新建用户</h3>
-    <div class="field"><label>账号</label><input id="nu-u" /></div>
+    <h3>新建用户（账套内成员）</h3>
+    <div class="banner set" style="margin-bottom:12px">此账号用于本账套内的角色分工。对方需已拥有<b>平台账号</b>（同名）才能登录本账套；没有的请先让平台管理员在「平台账号」中开通。</div>
+    <div class="field"><label>账号（须与平台账号同名）</label><input id="nu-u" /></div>
     <div class="field"><label>姓名</label><input id="nu-n" /></div>
     <div class="field"><label>角色</label><select id="nu-r">${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></div>
     <div class="field"><label>初始口令（至少 6 位）</label><input id="nu-p" type="password" /></div>
@@ -1654,20 +1770,146 @@ function openAdminResetPwd(username) {
     try { await api(`/users/${encodeURIComponent(username)}/reset-password`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new: np }) }); toast("已重置口令", "ok"); closeModal(); } catch (e) { toast(e.message, "err"); }
   };
 }
-function openChangePwd(forced) {
+// ===========================================================================
+// 平台管理（仅平台管理员，作用于全局身份库，与账套内子账号无关）
+// ===========================================================================
+async function viewPlatformUsers(main) {
+  main.innerHTML = `<h2>平台账号</h2>
+    <div class="toolbar">
+      <button class="btn primary" id="pu-add">＋ 开通账号</button>
+      <span class="muted">平台账号用于登录 Web 系统；普通用户登录后自行创建与维护账套。</span>
+    </div>
+    <div id="pu-list" class="muted">加载中…</div>`;
+  async function load() {
+    try {
+      const rows = await api("/platform/users");
+      $("#pu-list").innerHTML = rows.length ? `<table class="grid"><thead><tr>
+        <th>账号</th><th>展示名</th><th>类型</th><th>状态</th><th>设备</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr>
+          <td>${esc(x.username)}</td><td>${esc(x.display_name)}</td>
+          <td>${x.is_admin ? "平台管理员" : "普通用户"}</td>
+          <td>${x.disabled ? `<span style="color:var(--err)">已停用</span>` : "正常"}</td>
+          <td>${x.device_bound ? "已绑定" : "未绑定"}</td>
+          <td class="muted">${esc(x.created_at)}</td>
+          <td>
+            <button class="btn sm" data-act="edit" data-u="${esc(x.username)}">编辑</button>
+            <button class="btn sm" data-act="reset" data-u="${esc(x.username)}">重置口令</button>
+            <button class="btn sm" data-act="dev" data-u="${esc(x.username)}">重置设备</button>
+            <button class="btn sm ghost" data-act="del" data-u="${esc(x.username)}">删除</button>
+          </td></tr>`).join("")}</tbody></table>` : `<div class="muted">暂无账号</div>`;
+    } catch (e) { $("#pu-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+  $("#pu-add").addEventListener("click", () => {
+    const mask = modal(`
+      <h3>开通平台账号</h3>
+      <div class="field"><label>账号（登录名）</label><input id="nc-u" autocomplete="off" /></div>
+      <div class="field"><label>展示名</label><input id="nc-d" /></div>
+      <div class="field"><label>初始口令（至少 6 位，首次登录会要求改密）</label><input id="nc-p" type="text" /></div>
+      <div class="field"><label><input type="checkbox" id="nc-a" /> 设为平台管理员</label></div>
+      <div class="foot"><button class="btn" id="nc-cancel">取消</button><button class="btn primary" id="nc-save">创建</button></div>`);
+    $("#nc-cancel", mask).onclick = closeModal;
+    $("#nc-save", mask).onclick = async () => {
+      const username = $("#nc-u", mask).value.trim();
+      const password = $("#nc-p", mask).value;
+      if (!username) { toast("请输入账号", "err"); return; }
+      if (password.length < 6) { toast("口令至少 6 位", "err"); return; }
+      try {
+        await api("/platform/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, display_name: $("#nc-d", mask).value.trim(), password, is_admin: $("#nc-a", mask).checked }) });
+        toast(`账号「${esc(username)}」已开通`, "ok");
+        closeModal(); load();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  });
+  $("#pu-list").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const u = btn.dataset.u, act = btn.dataset.act;
+    if (act === "reset") {
+      const mask = modal(`
+        <h3>重置口令：${esc(u)}</h3>
+        <div class="field"><label>新口令（至少 6 位）</label><input id="rp-n" type="text" /></div>
+        <div class="foot"><button class="btn" id="rp-cancel">取消</button><button class="btn primary" id="rp-save">重置</button></div>`);
+      $("#rp-cancel", mask).onclick = closeModal;
+      $("#rp-save", mask).onclick = async () => {
+        const np = $("#rp-n", mask).value;
+        if (np.length < 6) { toast("口令至少 6 位", "err"); return; }
+        try {
+          await api(`/platform/users/${encodeURIComponent(u)}/reset-password`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new: np }) });
+          toast("口令已重置", "ok"); closeModal();
+        } catch (err) { toast(err.message, "err"); }
+      };
+    } else if (act === "edit") {
+      let info = null;
+      try { info = (await api("/platform/users")).find((x) => x.username === u); } catch (err) {}
+      const mask = modal(`
+        <h3>编辑账号：${esc(u)}</h3>
+        <div class="field"><label>展示名</label><input id="eu-d" value="${esc(info ? info.display_name : "")}" /></div>
+        <div class="field"><label><input type="checkbox" id="eu-a" ${info && info.is_admin ? "checked" : ""} /> 平台管理员</label></div>
+        <div class="field"><label><input type="checkbox" id="eu-x" ${info && info.disabled ? "checked" : ""} /> 停用该账号</label></div>
+        <div class="foot"><button class="btn" id="eu-cancel">取消</button><button class="btn primary" id="eu-save">保存</button></div>`);
+      $("#eu-cancel", mask).onclick = closeModal;
+      $("#eu-save", mask).onclick = async () => {
+        try {
+          await api(`/platform/users/${encodeURIComponent(u)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ display_name: $("#eu-d", mask).value.trim(), is_admin: $("#eu-a", mask).checked, disabled: $("#eu-x", mask).checked }) });
+          toast("已保存", "ok"); closeModal(); load();
+        } catch (err) { toast(err.message, "err"); }
+      };
+    } else if (act === "dev") {
+      if (!(await confirmDialog(`重置「${u}」的设备绑定？该账号将被强制下线，下次登录自动绑定新设备。`, true))) return;
+      try { await api(`/platform/users/${encodeURIComponent(u)}/reset-device`, { method: "POST" }); toast("设备绑定已重置", "ok"); load(); } catch (err) { toast(err.message, "err"); }
+    } else if (act === "del") {
+      if (!(await confirmDialog(`确定删除账号「${u}」？该操作不可恢复（其创建的账套需先删除）。`, true))) return;
+      try { await api(`/platform/users/${encodeURIComponent(u)}`, { method: "DELETE" }); toast("已删除", "ok"); load(); } catch (err) { toast(err.message, "err"); }
+    }
+  });
+  await load();
+}
+
+async function viewPlatformBooks(main) {
+  main.innerHTML = `<h2>全部账套</h2>
+    <div class="muted" style="margin-bottom:10px">平台管理员可进入任意账套查看：以临时管理员身份进入，不在该账套留下账号记录，操作会记入账套审计日志。</div>
+    <div id="pb-list" class="muted">加载中…</div>`;
+  async function load() {
+    try {
+      const data = await loadMyBooks();
+      const books = data.books || [];
+      $("#pb-list").innerHTML = books.length ? `<table class="grid"><thead><tr>
+        <th>账套标识</th><th>公司名称</th><th>归属用户</th><th>操作</th></tr></thead>
+        <tbody>${books.map((b) => `<tr>
+          <td>${esc(b.key)}</td><td>${esc(b.company || "（未命名）")}</td><td>${esc(b.owner)}</td>
+          <td><button class="btn sm" data-key="${esc(b.key)}" data-company="${esc(b.company || b.key)}">进入</button>
+          <button class="btn sm ghost" data-del="${esc(b.key)}" data-name="${esc(b.company || b.key)}">删除</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">系统中还没有账套。普通用户登录后可自行创建。</div>`;
+    } catch (e) { $("#pb-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+  $("#pb-list").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-key]");
+    if (btn) { enterBook(btn.dataset.key, btn.dataset.company); return; }
+    const del = e.target.closest("button[data-del]");
+    if (del) deleteBook(del.dataset.del, del.dataset.name);
+  });
+  await load();
+}
+
+function openChangePwd(forced, onDone) {
   const mask = modal(`
-    <h3>${forced ? "首次登录：请设置您的管理员口令" : "修改口令"}</h3>
-    ${forced ? `<div class="banner unset" style="margin-bottom:12px">为安全起见，建议设置一个强度较高的口令。</div>` : ""}
+    <h3>${forced ? "首次登录 / 口令已重置：请设置新口令" : "修改口令"}</h3>
+    ${forced ? `<div class="banner unset" style="margin-bottom:12px">为安全起见，请先设置一个强度较高的新口令。</div>` : ""}
     <div class="field"><label>原口令</label><input id="cp-o" type="password" ${forced ? "placeholder='首次登录可留空'" : ""} /></div>
     <div class="field"><label>新口令（至少 6 位）</label><input id="cp-n" type="password" /></div>
     <div class="field"><label>确认新口令</label><input id="cp-c" type="password" /></div>
-    <div class="foot"><button class="btn" id="cp-save">保存</button><button class="btn ghost" id="cp-cancel">取消</button></div>`);
+    <div class="foot"><button class="btn" id="cp-save">保存</button>${forced ? "" : `<button class="btn ghost" id="cp-cancel">取消</button>`}</div>`);
   if (!forced) $("#cp-cancel", mask).onclick = closeModal;
   $("#cp-save", mask).onclick = async () => {
     const oldp = $("#cp-o", mask).value, np = $("#cp-n", mask).value, cp = $("#cp-c", mask).value;
     if (np.length < 6) { toast("新口令至少 6 位", "err"); return; }
     if (np !== cp) { toast("两次输入不一致", "err"); return; }
-    try { await api("/change-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ old: oldp, new: np }) }); toast("口令已更新", "ok"); closeModal(); } catch (e) { toast(e.message, "err"); }
+    try {
+      await api("/change-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ old: oldp, new: np }) });
+      toast("口令已更新", "ok");
+      closeModal();
+      if (typeof onDone === "function") onDone();
+    } catch (e) { toast(e.message, "err"); }
   };
 }
 
@@ -2908,13 +3150,21 @@ async function openCostConfig(item) {
   };
 }
 
-// 启动：先尝试恢复已有会话（cookie 仍有效则直接进入应用，不再无条件显示登录页）
+// 启动：先尝试恢复已有会话。
+// - /me 成功：已进入某账套，直接进应用
+// - /me 失败但 /books 成功：已登录平台但未选账套 → 账套选择页
+// - 都失败：显示登录页
 (async function boot() {
   try {
     const me = await api("/me");
     session.user = me;
     await afterLogin();
-  } catch (e) {
-    showLogin();
+  } catch (e1) {
+    try {
+      const b = await api("/books");
+      showBookPicker(b);
+    } catch (e2) {
+      showLogin();
+    }
   }
 })();

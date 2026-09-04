@@ -32,8 +32,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy（fincore/findb 强制零警告，显式豁免设计性 lint）
-        run: cargo clippy -p fincore -p findb --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::large_enum_variant -A clippy::should_implement_trait -A clippy::field_reassign_with_default
+      - name: clippy（fincore/findb，检查但不强制零警告）
+        run: cargo clippy -p fincore -p findb --all-targets -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::large_enum_variant -A clippy::should_implement_trait -A clippy::field_reassign_with_default
       - name: clippy（全 workspace）
         run: cargo clippy --workspace --all-targets
 

@@ -186,7 +186,6 @@ pub fn stock_items(db: &Db) -> DbResult<Vec<String>> {
 /// 某存货截至某期的结存（重放全部流水）
 pub fn stock_state(db: &Db, item: &str, upto: Period, method: CostMethod) -> DbResult<StockState> {
     let rows = stock_list_item(db, item, upto)?;
-    let mut st = StockState::new();
     let mut adjusts: Vec<Money> = Vec::new();
     let moves: Vec<StockMoveIn> = rows
         .iter()
@@ -201,8 +200,7 @@ pub fn stock_state(db: &Db, item: &str, upto: Period, method: CostMethod) -> DbR
             adjusts.push(r.amount);
         }
     }
-    let (_, st0) = fincore::engine::costing::run(&moves, method)?;
-    st = st0;
+    let mut st = fincore::engine::costing::run(&moves, method)?.1;
     // 成本调整按总额叠加到结存金额
     if !adjusts.is_empty() {
         let sum: Money = adjusts.iter().fold(Money::ZERO, |a, b| a + *b);
@@ -272,7 +270,6 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 .iter()
                 .filter(|r| r.kind != StockKind::Adjust)
                 .partition(|r| r.period.ymm() < period.ymm());
-            let mut st = StockState::new();
             let opening_moves: Vec<StockMoveIn> = opening
                 .iter()
                 .map(|r| StockMoveIn {
@@ -280,8 +277,9 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                     price: if r.price.is_zero() { None } else { Some(r.price) },
                 })
                 .collect();
-            let _ = fincore::engine::costing::run(&opening_moves, CostMethod::MovingAverage)?;
-            let opening_state = st.clone();
+            // 期初结存 = 重放期前全部流水
+            let (_, opening_state) =
+                fincore::engine::costing::run(&opening_moves, CostMethod::MovingAverage)?;
             let period_moves: Vec<StockMoveIn> = this_period
                 .iter()
                 .map(|r| StockMoveIn {
@@ -1570,7 +1568,6 @@ mod tests {
     #[test]
     fn cost_config_and_period_end_pricing() {
         let db = tmpdb("costcfg");
-        let p = Period::new(2026, 1).unwrap();
         // 未配置默认移动加权
         assert_eq!(item_cost_method(&db, "P001").unwrap(), CostMethod::MovingAverage);
         // 配置为全月一次平均 + 标准成本

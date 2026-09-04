@@ -493,7 +493,8 @@ pub fn is_legacy_hash(stored: &str) -> bool {
     !stored.starts_with("$argon2")
 }
 
-/// 旧版 `salt$sha256(password)`。仅保留作兼容（argon2 失败时的兜底与升级迁移测试用）。
+/// 旧版 `salt$sha256(password)`。仅测试用：验证旧哈希的升级迁移路径。
+#[cfg(test)]
 fn legacy_hash_password(plain: &str) -> String {
     let salt = random_hex(16);
     let hash = sha256_hex(&format!("{salt}{plain}"));
@@ -512,7 +513,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     r == 0
 }
 
-/// 简易随机十六进制（单机软件，不用于密码学强度场景）
+/// 简易随机十六进制（仅测试用：生成旧版哈希的盐）
+#[cfg(test)]
 fn random_hex(n: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()

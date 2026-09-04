@@ -87,6 +87,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
+        .route("/api/ledger/print-form", get(print_ledger_form))
+        .route("/api/vouchers/print-form", get(print_voucher_form))
         .route("/api/reports/trial-balance", get(get_trial_balance))
         .route(
             "/api/reports/trial-balance/print",
@@ -1443,6 +1445,205 @@ async fn get_ledger(
     };
     let rows = balances::ledger(&db, &chart, &lq)?;
     Ok(Json(rows))
+}
+
+async fn print_voucher_form(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    if !can_view_vouchers(&user) {
+        return Err(AppError::forbidden("没有查看凭证的权限"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let company = state.company_name();
+    let chart = accounts::chart(&db)?;
+    let aux_names = findb::auxs::full_name_map(&db)?;
+
+    let mut query = VoucherQuery::default().with_data_scope(&user.user);
+    query.asc = true;
+    let from = q
+        .get("from")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let to = q
+        .get("to")
+        .and_then(|s| parse_period(s))
+        .unwrap_or(from);
+    query.from = Some(from);
+    query.to = Some(to);
+    query.limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .or(Some(500));
+    let mut list = vouchers::list(&db, &query)?;
+    vouchers::fill_entries(&db, &mut list)?;
+    list.retain(|v| user.user.can_see_voucher(v));
+    if list.is_empty() {
+        return Err(AppError::bad_request("没有可打印的凭证"));
+    }
+
+    let aux_label = |aux: &fincore::AuxRef| {
+        let mut parts = Vec::new();
+        for k in fincore::account::AuxKind::ALL {
+            if *k == fincore::account::AuxKind::CashFlow {
+                continue;
+            }
+            if let Some(v) = aux.get(*k) {
+                let name = aux_names
+                    .get(&format!("{}:{}", k.code(), v))
+                    .cloned()
+                    .unwrap_or_default();
+                parts.push(if name.is_empty() {
+                    v.to_string()
+                } else {
+                    name
+                });
+            }
+        }
+        parts.join("/")
+    };
+    let prints = findb::printform::vouchers_to_print(&list, &chart, &aux_label);
+    let html = findb::printform::voucher_form_html(
+        &company,
+        &format!("{}~{}", period_to_str(from), period_to_str(to)),
+        &prints,
+        true,
+    );
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+/// 账簿套打（明细账 / 总账 / 日记账）HTML
+async fn print_ledger_form(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let code = q.get("code").cloned().unwrap_or_default();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少科目编码参数 code"));
+    }
+    if !user.user.can_see_account(&code) {
+        return Err(AppError::forbidden("无权查看该科目"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let company = state.company_name();
+    let chart = accounts::chart(&db)?;
+    let from = q
+        .get("from")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let to = q
+        .get("to")
+        .and_then(|s| parse_period(s))
+        .unwrap_or(from);
+    let ktype = q.get("type").map(String::as_str).unwrap_or("detail");
+    let include_children = q
+        .get("include_children")
+        .map(|s| s == "1" || s == "true")
+        .unwrap_or(true);
+    let posted_only = q
+        .get("posted_only")
+        .map(|s| s == "1" || s == "true")
+        .unwrap_or(true);
+    let lq = LedgerQuery {
+        code: code.clone(),
+        include_children,
+        aux: None,
+        from,
+        to,
+        posted_only,
+    };
+    let acct = chart
+        .get(&code)
+        .map(|a| format!("{} {}", code, a.name))
+        .unwrap_or(code.clone());
+
+    // 期初余额方向
+    let snap = BalanceSnapshot::load(&db, &BalanceQuery::range(from, from))?;
+    let (bd, bamt) = fincore::signed_to_dir_amount(snap.for_account(&code, None).begin);
+    let begin_dir = if bamt.is_zero() {
+        "平".to_string()
+    } else {
+        bd.label().to_string()
+    };
+
+    let (title, rows) = match ktype {
+        "general" => {
+            let list = balances::general_ledger(&db, &lq)?;
+            let rows = list
+                .into_iter()
+                .map(|r| findb::printform::LedgerPrintRow {
+                    date: r.period.code(),
+                    voucher_no: String::new(),
+                    summary: r.summary,
+                    debit: r.debit,
+                    credit: r.credit,
+                    dir: if r.balance.is_zero() {
+                        "平".to_string()
+                    } else {
+                        r.dir.label().to_string()
+                    },
+                    balance: r.balance,
+                })
+                .collect::<Vec<_>>();
+            ("总账".to_string(), rows)
+        }
+        "journal" => {
+            let list = balances::journal(&db, &chart, &lq)?;
+            let rows = list
+                .into_iter()
+                .map(|r| findb::printform::LedgerPrintRow {
+                    date: r.date.format("%Y-%m-%d").to_string(),
+                    voucher_no: r.voucher_no,
+                    summary: r.summary,
+                    debit: r.debit,
+                    credit: r.credit,
+                    dir: if r.balance.is_zero() {
+                        "平".to_string()
+                    } else {
+                        r.dir.label().to_string()
+                    },
+                    balance: r.balance,
+                })
+                .collect::<Vec<_>>();
+            ("日记账".to_string(), rows)
+        }
+        _ => {
+            let list = balances::ledger(&db, &chart, &lq)?;
+            let rows = list
+                .into_iter()
+                .map(|r| findb::printform::LedgerPrintRow {
+                    date: r.date.format("%Y-%m-%d").to_string(),
+                    voucher_no: r.voucher_no,
+                    summary: r.summary,
+                    debit: r.debit,
+                    credit: r.credit,
+                    dir: if r.balance.is_zero() {
+                        "平".to_string()
+                    } else {
+                        r.dir.label().to_string()
+                    },
+                    balance: r.balance,
+                })
+                .collect::<Vec<_>>();
+            ("明细账".to_string(), rows)
+        }
+    };
+
+    let ledger = findb::printform::LedgerPrint {
+        title,
+        account_name: acct,
+        period_label: format!("{}~{}", period_to_str(from), period_to_str(to)),
+        begin_dir,
+        begin_balance: bamt,
+        rows,
+        page_from_1: true,
+    };
+    let html = findb::printform::ledger_form_html(&company, &ledger);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
 /// 计算科目余额表（供 JSON / 打印 / 导出复用）

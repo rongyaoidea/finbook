@@ -253,6 +253,16 @@ impl VoucherList {
             }
         });
 
+        // 凭证套打：按会计档案版式整张打印（不落地数据文件，Report 权限即可）
+        if ctx.user().can(Perm::Report) {
+            widgets::toolbar(ui, |ui| {
+                ui.label(RichText::new("套打").strong());
+                if ui.button("凭证套打").clicked() {
+                    self.print_taoda(ctx);
+                }
+            });
+        }
+
         // ---------------- 列表 ----------------
         let page_rows = self.paging.slice(&self.rows);
         let shown: Vec<Voucher> = page_rows.to_vec();
@@ -341,6 +351,29 @@ impl VoucherList {
         });
 
         act
+    }
+
+    fn print_taoda(&mut self, ctx: &mut AppCtx<'_>) {
+        if self.rows.is_empty() {
+            ctx.error("没有可打印的凭证");
+            return;
+        }
+        let company = ctx.db().options().company.clone();
+        let chart = ctx.chart().clone();
+        let aux_names = &ctx.st.aux_names;
+        let aux_label = |aux: &fincore::AuxRef| crate::views::voucher_edit::aux_text(aux, aux_names);
+        let prints = findb::printform::vouchers_to_print(&self.rows, &chart, &aux_label);
+        if prints.is_empty() {
+            ctx.error("没有未作废的凭证可打印");
+            return;
+        }
+        let period_label = format!("{}~{}", self.from, self.to);
+        let html = findb::printform::voucher_form_html(&company, &period_label, &prints, true);
+        let title = format!("凭证套打_{}_{}", self.from, self.to);
+        match crate::views::export::print_html_content(&title, &html) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
+        }
     }
 
     fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {

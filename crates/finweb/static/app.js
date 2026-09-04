@@ -743,6 +743,7 @@ async function viewVouchers(main) {
       <button class="btn ghost sm" id="v-refresh">查询</button>
       ${can("voucher_edit") ? `<button class="btn ghost sm" id="v-renumber">重排断号</button>` : ""}
       ${can("voucher_post") ? `<button class="btn ghost sm" id="v-batch">批量记账</button>` : ""}
+      ${can("report") ? `<button class="btn ghost sm" id="v-printform">凭证套打</button>` : ""}
       <span class="spacer"></span>
       <span class="muted">期间：${esc(state.current || "")}</span>
     </div>
@@ -755,6 +756,9 @@ async function viewVouchers(main) {
   $("#v-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadVouchers(); });
   if ($("#v-all")) $("#v-all").addEventListener("change", (e) => { $all(".v-sel").forEach((c) => c.checked = e.target.checked); });
   if ($("#v-batch")) $("#v-batch").addEventListener("click", batchPost);
+  if ($("#v-printform")) $("#v-printform").addEventListener("click", () => {
+    window.open(`/api/vouchers/print-form?period=${encodeURIComponent(state.current || "")}`, "_blank");
+  });
   if ($("#v-renumber")) $("#v-renumber").addEventListener("click", async () => {
     if (!(await confirmDialog(`将当前期间「记」字凭证的凭证号重排为连续？`, true))) return;
     try {
@@ -1220,12 +1224,19 @@ async function viewLedger(main) {
       <label><input type="checkbox" id="l-posted" /> 仅已记账</label>
       <button class="btn sm" id="l-go">查询</button>
       <button class="btn ghost sm" id="l-print">打印预览</button>
+      <button class="btn ghost sm" id="l-printform">账簿套打</button>
     </div>
     <div class="panel"><table class="grid" id="l-table"><thead><tr>
       <th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th>
     </tr></thead><tbody><tr><td colspan="7" class="muted">请输入科目后查询</td></tr></tbody></table></div>`;
   $("#l-go").addEventListener("click", loadLedger);
   $("#l-print").addEventListener("click", () => { const el = $("#l-table").querySelector("table"); printPreview("明细账", el); });
+  $("#l-printform").addEventListener("click", () => {
+    const code = $("#l-code").value.trim();
+    if (!code) { toast("请先输入科目编码", "err"); return; }
+    const q = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}&type=detail`;
+    window.open(`/api/ledger/print-form?${q}`, "_blank");
+  });
 }
 async function loadLedger() {
   const code = $("#l-code").value.trim();

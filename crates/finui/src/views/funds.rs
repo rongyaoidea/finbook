@@ -519,12 +519,15 @@ impl BudgetAnalysisView {
 // ===========================================================================
 
 pub struct CostView {
-    pub tab: u8, // 0=计价配置 1=期末结价
+    pub tab: u8, // 0=计价配置 1=期末结价 2=制造成本
     pub period_text: String,
     pub configs: Vec<findb::business::CostConfigRow>,
     pub close_rows: Vec<findb::business::PeriodEndCostRow>,
     pub dirty: bool,
     pub key: String,
+    // 制造成本
+    pub oh_amount: String,
+    pub oh_base: String,
 }
 
 impl Default for CostView {
@@ -536,6 +539,8 @@ impl Default for CostView {
             close_rows: Vec::new(),
             dirty: true,
             key: String::new(),
+            oh_amount: String::new(),
+            oh_base: "cost".to_string(),
         }
     }
 }
@@ -553,7 +558,7 @@ impl CostView {
             ui.label(RichText::new("存货计价方式配置 · 期末结价").weak());
         });
         widgets::toolbar(ui, |ui| {
-            for (i, label) in ["计价方式", "期末结价"].iter().enumerate() {
+            for (i, label) in ["计价方式", "期末结价", "制造成本"].iter().enumerate() {
                 if ui.selectable_label(self.tab == i as u8, *label).clicked() {
                     self.tab = i as u8;
                     self.dirty = true;
@@ -567,8 +572,111 @@ impl CostView {
 
         match self.tab {
             0 => self.show_configs(ctx, ui),
-            _ => self.show_period_end(ctx, ui),
+            1 => self.show_period_end(ctx, ui),
+            _ => self.show_manufacturing(ctx, ui),
         }
+    }
+
+    fn show_manufacturing(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let p = Period::parse(&self.period_text).unwrap_or_else(|_| ctx.period());
+        widgets::toolbar(ui, |ui| {
+            ui.label("期间");
+            let r = ui.add_sized([84.0, 22.0], egui::TextEdit::singleline(&mut self.period_text));
+            if r.changed() {
+                self.dirty = true;
+            }
+            ui.separator();
+            ui.label("分摊费用");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.oh_amount));
+            for (code, label) in [("cost", "按成本占比"), ("labor", "按直接人工"), ("qty", "按计划产量")] {
+                if ui.selectable_label(self.oh_base == code, label).clicked() {
+                    self.oh_base = code.to_string();
+                }
+            }
+            if ui.button("分摊并落地").clicked() {
+                let amt = Money::parse_or_zero(&self.oh_amount);
+                let base = findb::manufacturing::OverheadBase::parse(&self.oh_base);
+                match findb::manufacturing::overhead_allocate_with(ctx.db(), p, amt, base, true) {
+                    Ok(alloc) => {
+                        ctx.log("成本", "制造费用分摊", &format!("{} 笔", alloc.len()));
+                        ctx.info(format!("已分摊 {} 笔制造费用", alloc.len()));
+                        self.dirty = true;
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
+        });
+
+        // 在制品成本
+        let wip = findb::manufacturing::wip_cost(ctx.db(), p).unwrap_or_default();
+        widgets::card(ui, "在制品成本", |ui| {
+            let cols = [
+                widgets::TCol::new("订单号", 140.0).fixed(),
+                widgets::TCol::new("产品", 150.0),
+                widgets::TCol::new("材料", 90.0).right(),
+                widgets::TCol::new("人工", 90.0).right(),
+                widgets::TCol::new("制造费", 90.0).right(),
+                widgets::TCol::new("合计", 110.0).right(),
+            ];
+            widgets::grid(ui, "cost_wip", &cols, wip.len(), 22.0, |i, c, ui| {
+                let r = &wip[i];
+                match c {
+                    0 => { ui.label(RichText::new(&r.no).monospace()); }
+                    1 => { ui.label(&r.item_name); }
+                    2 => { widgets::amount_label(ui, r.material); }
+                    3 => { widgets::amount_label(ui, r.labor); }
+                    4 => { widgets::amount_label(ui, r.overhead); }
+                    5 => { widgets::amount_label(ui, r.total); }
+                    _ => {}
+                }
+            });
+        });
+
+        // 成本差异分析
+        let var = findb::manufacturing::cost_variance_report(ctx.db(), p).unwrap_or_default();
+        widgets::card(ui, "成本差异分析", |ui| {
+            let cols = [
+                widgets::TCol::new("订单号", 140.0).fixed(),
+                widgets::TCol::new("产品", 140.0),
+                widgets::TCol::new("实际成本", 100.0).right(),
+                widgets::TCol::new("标准成本", 100.0).right(),
+                widgets::TCol::new("差异", 100.0).right(),
+                widgets::TCol::new("差异%", 70.0).right(),
+            ];
+            widgets::grid(ui, "cost_var", &cols, var.len(), 22.0, |i, c, ui| {
+                let r = &var[i];
+                match c {
+                    0 => { ui.label(RichText::new(&r.no).monospace()); }
+                    1 => { ui.label(&r.item_name); }
+                    2 => { widgets::amount_label(ui, r.actual); }
+                    3 => { widgets::amount_label(ui, r.standard); }
+                    4 => { ui.label(r.variance.fmt_plain()); }
+                    5 => { ui.label(format!("{:.1}%", r.variance_pct)); }
+                    _ => {}
+                }
+            });
+        });
+
+        // 成本预测
+        let fc = findb::manufacturing::cost_forecast_report(ctx.db(), p).unwrap_or_default();
+        widgets::card(ui, "成本预测（BOM 参考）", |ui| {
+            let cols = [
+                widgets::TCol::new("订单号", 140.0).fixed(),
+                widgets::TCol::new("产品", 140.0),
+                widgets::TCol::new("计划量", 100.0).right(),
+                widgets::TCol::new("预测成本", 120.0).right(),
+            ];
+            widgets::grid(ui, "cost_fc", &cols, fc.len(), 22.0, |i, c, ui| {
+                let r = &fc[i];
+                match c {
+                    0 => { ui.label(RichText::new(&r.no).monospace()); }
+                    1 => { ui.label(&r.item_name); }
+                    2 => { widgets::amount_label(ui, r.planned_qty); }
+                    3 => { widgets::amount_label(ui, r.forecast); }
+                    _ => {}
+                }
+            });
+        });
     }
 
     fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {

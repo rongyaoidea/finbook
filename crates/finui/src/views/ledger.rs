@@ -3,7 +3,9 @@
 use egui::{RichText, Ui};
 use findb::balances::{BalanceQuery, LedgerQuery};
 use findb::reports::DailyRow;
-use fincore::{signed_to_dir_amount, GeneralLedgerRow, JournalRow, LedgerRow, Money, Period};
+use fincore::{
+    signed_to_dir_amount, GeneralLedgerRow, JournalRow, LedgerRow, Money, Perm, Period,
+};
 
 use crate::state::AppCtx;
 use crate::widgets::{self, AccountPickerState, Paging};
@@ -196,6 +198,16 @@ impl LedgerView {
                 self.export(ctx, mode);
             }
         });
+
+        // 账簿套打：按会计档案三栏账版式打印，不落地数据文件（Report 权限即可）
+        if ctx.user().can(Perm::Report) {
+            widgets::toolbar(ui, |ui| {
+                ui.label(RichText::new("套打").strong());
+                if ui.button("账簿套打").clicked() {
+                    self.print_taoda(ctx);
+                }
+            });
+        }
 
         ui.horizontal(|ui| {
             let (d, amt) = signed_to_dir_amount(self.begin);
@@ -408,6 +420,104 @@ impl LedgerView {
                 .strong(),
             );
         });
+    }
+
+    fn print_taoda(&mut self, ctx: &mut AppCtx<'_>) {
+        use findb::printform::{LedgerPrint, LedgerPrintRow};
+        let company = ctx.db().options().company.clone();
+        let acct = ctx
+            .chart()
+            .get(&self.code)
+            .map(|a| format!("{} {}", self.code, a.name))
+            .unwrap_or(self.code.clone());
+        let tab_name = match self.tab {
+            Tab::Detail => "明细账",
+            Tab::General => "总账",
+            Tab::Journal => "日记账",
+            Tab::Daily => "科目日报表",
+        };
+        // 期初余额方向
+        let (bd, bamt) = signed_to_dir_amount(self.begin);
+        let begin_dir = if bamt.is_zero() { "平".to_string() } else { bd.label().to_string() };
+
+        let (title, rows): (String, Vec<LedgerPrintRow>) = match self.tab {
+            Tab::Detail => (
+                "明细账".to_string(),
+                self.detail
+                    .iter()
+                    .map(|r| LedgerPrintRow {
+                        date: r.date.format("%Y-%m-%d").to_string(),
+                        voucher_no: r.voucher_no.clone(),
+                        summary: r.summary.clone(),
+                        debit: r.debit,
+                        credit: r.credit,
+                        dir: if r.balance.is_zero() {
+                            "平".to_string()
+                        } else {
+                            r.dir.label().to_string()
+                        },
+                        balance: r.balance,
+                    })
+                    .collect(),
+            ),
+            Tab::General => (
+                "总账".to_string(),
+                self.general
+                    .iter()
+                    .map(|r| LedgerPrintRow {
+                        date: r.period.code(),
+                        voucher_no: String::new(),
+                        summary: r.summary.clone(),
+                        debit: r.debit,
+                        credit: r.credit,
+                        dir: if r.balance.is_zero() {
+                            "平".to_string()
+                        } else {
+                            r.dir.label().to_string()
+                        },
+                        balance: r.balance,
+                    })
+                    .collect(),
+            ),
+            Tab::Journal => (
+                "日记账".to_string(),
+                self.journal
+                    .iter()
+                    .map(|r| LedgerPrintRow {
+                        date: r.date.format("%Y-%m-%d").to_string(),
+                        voucher_no: r.voucher_no.clone(),
+                        summary: r.summary.clone(),
+                        debit: r.debit,
+                        credit: r.credit,
+                        dir: if r.balance.is_zero() {
+                            "平".to_string()
+                        } else {
+                            r.dir.label().to_string()
+                        },
+                        balance: r.balance,
+                    })
+                    .collect(),
+            ),
+            Tab::Daily => {
+                ctx.error("科目日报表暂不支持套打，请切换为明细账/总账/日记账");
+                return;
+            }
+        };
+        let ledger = LedgerPrint {
+            title,
+            account_name: acct,
+            period_label: format!("{}~{}", self.from, self.to),
+            begin_dir,
+            begin_balance: bamt,
+            rows,
+            page_from_1: true,
+        };
+        let html = findb::printform::ledger_form_html(&company, &ledger);
+        let name = format!("{tab_name}_{}_{}", self.code, self.from);
+        match crate::views::export::print_html_content(&name, &html) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
+        }
     }
 
     fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {

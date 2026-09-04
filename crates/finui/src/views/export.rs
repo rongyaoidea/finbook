@@ -213,6 +213,12 @@ pub fn print_sheet(sheet: &Sheet, title: &str) -> Result<String, String> {
     if sheet.is_empty() {
         return Err("没有可打印的数据".to_string());
     }
+    print_html_content(title, &sheet_to_html(sheet, title))
+}
+
+/// 把一个现成的打印 HTML 写入零时文件并用系统默认浏览器打开（自动唤起打印）。
+/// 供「凭证套打」「账簿套打」复用，保证会计档案版式统一。
+pub fn print_html_content(title: &str, html: &str) -> Result<String, String> {
     let dir = std::env::temp_dir().join("finbook_print");
     let _ = std::fs::create_dir_all(&dir);
     let safe = title
@@ -220,7 +226,6 @@ pub fn print_sheet(sheet: &Sheet, title: &str) -> Result<String, String> {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect::<String>();
     let path = dir.join(format!("{safe}.html"));
-    let html = sheet_to_html(sheet, title);
     std::fs::write(&path, html).map_err(|e| format!("生成打印页失败：{e}"))?;
     open_path(&path).map_err(|e| format!("打开打印预览失败：{e}"))?;
     Ok("已打开打印预览，请按 Ctrl/Cmd+P 打印（数据未以文件形式导出）".to_string())

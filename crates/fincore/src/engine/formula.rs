@@ -74,20 +74,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, FinError> {
                     out.push(Tok::Minus);
                     prev_was_value = false;
                 } else {
-                    i += 1;
-                    let start = i;
-                    while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                        i += 1;
-                    }
-                    if start == i {
-                        return Err(FinError::msg("减号后缺少数字"));
-                    }
-                    let s: String = chars[start..i].iter().collect();
-                    let mut n = Money::parse(&s)?;
-                    n = n.negated();
-                    out.push(Tok::Num(n));
+                    // 一元负号统一交给语法层 factor() 处理，可作用于数字、括号、函数，
+                    // 例如 -5、-(a+b)、-FS("6001",,"贷")
+                    out.push(Tok::Minus);
                     prev_was_value = true;
-                    continue;
                 }
                 i += 1;
             }

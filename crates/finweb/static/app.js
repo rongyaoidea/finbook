@@ -1565,7 +1565,10 @@ function permMatrixHtml(roles, u) {
   (roles || []).forEach((r) => (r.perms || []).forEach((p) => { if (!seen.has(p.code)) { seen.add(p.code); allPerms.push(p); } }));
   const extraSet = new Set(u.extra_perms || []);
   const denySet = new Set(u.deny_perms || []);
-  const roleCodes = new Set((roles.find((x) => x.role === u.role) || {}).perms || [].map((p) => p.code));
+  // 角色预设权限：按 code 收集（perms 是 {code,label} 对象数组，需映射为 code，
+  // 否则 new Set 存的是对象、.has(p.code) 永远为 false，导致"角色默认"全部显示为 ✖）
+  const rolePerms = (roles.find((x) => x.role === u.role) || {}).perms || [];
+  const roleCodes = new Set(rolePerms.map((p) => p.code));
   const stateOf = (code) => (denySet.has(code) ? "off" : extraSet.has(code) ? "on" : "role");
   const rows = allPerms.map((p) => {
     const base = roleCodes.has(p.code) ? "（角色默认 ✔）" : "（角色默认 ✖）";

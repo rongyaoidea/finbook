@@ -424,7 +424,11 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
 }
 
 /// 删除凭证（连同分录，外键 ON DELETE CASCADE）
+///
+/// 先清理该凭证的所有附件（含磁盘 `.attachments/` 中的大文件），
+/// 再删除凭证行；否则外存附件会随级联删除而成为孤儿文件。
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
+    crate::attach::delete_for_voucher(db, id)?;
     db.conn()
         .execute("DELETE FROM voucher WHERE id=?1", rusqlite::params![id])?;
     Ok(())

@@ -255,10 +255,13 @@ pub fn auto_match(
 
     let mut res = MatchResult::default();
     let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // 本轮内已勾对成功的流水：stmts 里的 matched() 反映的是「进入本函数时」的状态，
+    // link() 只写库不更新内存，若不单独记录，后续轮次会重复勾对同一笔流水并覆盖首次结果。
+    let mut done_stmt: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // 第一轮：结算号精确匹配
     for s in &stmts {
-        if s.matched() {
+        if s.matched() || done_stmt.contains(&s.id) {
             continue;
         }
         if s.settle_no.trim().is_empty() {
@@ -276,6 +279,7 @@ pub fn auto_match(
             .collect();
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
+            done_stmt.insert(s.id);
             link(db, s.id, cands[0].entry_id, who)?;
             res.by_no += 1;
         } else if cands.len() > 1 {
@@ -285,7 +289,7 @@ pub fn auto_match(
 
     // 第二轮：金额 + 方向 + 日期容差
     for s in &stmts {
-        if s.matched() {
+        if s.matched() || done_stmt.contains(&s.id) {
             continue;
         }
         let cands: Vec<&BookEntry> = books
@@ -299,6 +303,7 @@ pub fn auto_match(
             .collect();
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
+            done_stmt.insert(s.id);
             link(db, s.id, cands[0].entry_id, who)?;
             res.by_amount_date += 1;
         } else if cands.len() > 1 {
@@ -308,7 +313,7 @@ pub fn auto_match(
 
     // 第三轮：只看金额 + 方向（日期不限）
     for s in &stmts {
-        if s.matched() {
+        if s.matched() || done_stmt.contains(&s.id) {
             continue;
         }
         let cands: Vec<&BookEntry> = books
@@ -319,6 +324,7 @@ pub fn auto_match(
             .collect();
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
+            done_stmt.insert(s.id);
             link(db, s.id, cands[0].entry_id, who)?;
             res.by_amount += 1;
         } else if cands.len() > 1 {

@@ -187,7 +187,8 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
         }
         DepMethod::DoubleDeclining => {
             // 前 n-24 期按净值双倍摊销，最后 24 期改直线
-            let switch = (n - 24).max(1);
+            // 当使用期 ≤24 个月时 switch=0，整个使用期内都走直线，符合"最后两年改直线"的准则
+            let switch = (n - 24).max(0);
             if i <= switch {
                 let net = input.original - accum;
                 let rate = Money::from_i64(2) / Money::from_i64(n as i64);

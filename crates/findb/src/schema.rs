@@ -1198,34 +1198,50 @@ fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
     // busy_timeout 让并发写入时等待而不是立刻报 database is locked。
+    // 注意：PRAGMA 不能在事务内执行，必须先单独完成。
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA busy_timeout = 5000;
          PRAGMA synchronous = NORMAL;",
     )?;
-    conn.execute_batch(DDL)?;
-    let v: i64 = version(conn);
-    if v < 2 {
-        migrate_v2(conn)?;
+    // DDL + 全部迁移放进一个事务：任一环节失败整体回滚。
+    // 否则 migrate_v7/v9/v10 的「建新表 → DROP TABLE → 改名」中途崩溃会把账套表搞丢。
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let res = (|| -> Result<(), DbError> {
+        conn.execute_batch(DDL)?;
+        let v: i64 = version(conn);
+        if v < 2 {
+            migrate_v2(conn)?;
+        }
+        if v < 3 {
+            migrate_v3(conn)?;
+        }
+        if v < SCHEMA_VERSION {
+            migrate_generic(conn, MIGRATE_V5)?;
+            migrate_generic(conn, MIGRATE_V6)?;
+            migrate_v7(conn)?;
+            migrate_generic(conn, MIGRATE_V8)?;
+            migrate_v9(conn)?;
+            migrate_v10(conn)?;
+            migrate_generic(conn, MIGRATE_V17)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
+                rusqlite::params![SCHEMA_VERSION.to_string()],
+            )?;
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
-    if v < 3 {
-        migrate_v3(conn)?;
-    }
-    if v < SCHEMA_VERSION {
-        migrate_generic(conn, MIGRATE_V5)?;
-        migrate_generic(conn, MIGRATE_V6)?;
-        migrate_v7(conn)?;
-        migrate_generic(conn, MIGRATE_V8)?;
-        migrate_v9(conn)?;
-        migrate_v10(conn)?;
-        migrate_generic(conn, MIGRATE_V17)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
-            rusqlite::params![SCHEMA_VERSION.to_string()],
-        )?;
-    }
-    Ok(())
 }
 
 /// v1 → v2：给既有表补列

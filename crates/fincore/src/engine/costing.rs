@@ -117,16 +117,46 @@ impl StockState {
 
     /// 成本调整：在数量不变的前提下把结存金额调整为指定值，
     /// 差额即成本调整额（正=调增，负=调减）。返回调整金额。
+    ///
+    /// 调整额按每批所占金额的比例分摊到各 FIFO 批次，保持各批次的
+    /// **相对单价不变**（口径不漂移）；舍入尾差由最后一非零批次吸收，
+    /// 保证批次金额之和恒等于结存金额。
     pub fn adjust_amount(&mut self, new_amount: Money) -> Result<Money, FinError> {
         let delta = new_amount - self.amount;
         self.amount = new_amount;
-        // 同步按比例刷新批次成本，保持 FIFO 口径不漂移
-        if !self.qty.is_zero() {
-            let unit = (new_amount / self.qty).round_dp(QTY_DP + 2);
-            for lot in &mut self.lots {
-                lot.unit_cost = unit;
+        if !self.qty.is_zero() && !self.lots.is_empty() {
+            let old_total: Money = self
+                .lots
+                .iter()
+                .map(|l| (l.qty * l.unit_cost).round2())
+                .sum();
+            if !old_total.is_zero() {
+                // 最后一个非零数量批次作为尾差吸收者
+                let mut residual_idx = None;
+                for (i, l) in self.lots.iter().enumerate() {
+                    if !l.qty.is_zero() {
+                        residual_idx = Some(i);
+                    }
+                }
+                let mut remaining = delta;
+                for (i, lot) in self.lots.iter_mut().enumerate() {
+                    if lot.qty.is_zero() {
+                        continue;
+                    }
+                    let share = if Some(i) == residual_idx {
+                        remaining
+                    } else {
+                        let ratio = (lot.qty * lot.unit_cost).round2() / old_total;
+                        let s = (delta * ratio).round2();
+                        remaining -= s;
+                        s
+                    };
+                    lot.unit_cost += share / lot.qty;
+                }
             }
-            self.last_price = unit;
+            self.last_price = (new_amount / self.qty).round_dp(QTY_DP + 2);
+        } else if !self.qty.is_zero() {
+            self.last_price = (new_amount / self.qty).round_dp(QTY_DP + 2);
         }
         Ok(delta.round2())
     }

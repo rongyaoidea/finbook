@@ -155,7 +155,8 @@ impl Money {
     /// 指定小数位 + 千分位
     pub fn fmt_dp(self, dp: u32) -> String {
         let d = self.0.round_dp(dp);
-        let neg = d.is_sign_negative();
+        // 四舍五入后若量化为 0（如 -0.004 → -0.00），不应显示负号
+        let neg = d.is_sign_negative() && !d.is_zero();
         let s = d.abs().to_string();
         let (ip, fp) = match s.split_once('.') {
             Some((a, b)) => (a, b),

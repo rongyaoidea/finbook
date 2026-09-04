@@ -72,8 +72,8 @@ struct VoucherLine {
     code: String,
     debit: Money,
     credit: Money,
-    /// 辅助核算（客户编码，可选）
-    customer: Option<String>,
+    /// 辅助核算（客户/银行等，CSV 里按列约定提取）
+    aux: fincore::AuxRef,
 }
 
 /// 按模板从 CSV 行提取期初余额行
@@ -131,15 +131,23 @@ fn extract_begin_line(tmpl: ImportTemplate, f: &[String]) -> Option<BeginLine> {
     }
 }
 
+/// 取 CSV 第 `i` 列（0 起），空串返回 None
+fn opt_field(f: &[String], i: usize) -> Option<String> {
+    f.get(i).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// 按模板从 CSV 行提取凭证行
 fn extract_voucher_line(tmpl: ImportTemplate, f: &[String]) -> Option<VoucherLine> {
     if f.len() < 4 {
         return None;
     }
     let date = parse_date(&f[0])?;
+    let mut aux = fincore::AuxRef::default();
     match tmpl {
         ImportTemplate::Generic => {
-            // 日期, 凭证字, 摘要, 科目编码, 借方, 贷方[, 客户]
+            // 日期, 凭证字, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]
+            aux.customer = opt_field(f, 6);
+            aux.bank = opt_field(f, 7);
             Some(VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
@@ -148,11 +156,13 @@ fn extract_voucher_line(tmpl: ImportTemplate, f: &[String]) -> Option<VoucherLin
                 code: f.get(3).unwrap_or(&String::new()).trim().to_string(),
                 debit: parse_money(f.get(4).unwrap_or(&String::new())),
                 credit: parse_money(f.get(5).unwrap_or(&String::new())),
-                customer: f.get(6).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                aux,
             })
         }
         ImportTemplate::Kingdee => {
-            // 日期, 凭证字, 凭证号, 摘要, 科目编码, 科目名称, 借方, 贷方
+            // 日期, 凭证字, 凭证号, 摘要, 科目编码, 科目名称, 借方, 贷方[, 客户, 银行]
+            aux.customer = opt_field(f, 8);
+            aux.bank = opt_field(f, 9);
             Some(VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
@@ -161,11 +171,13 @@ fn extract_voucher_line(tmpl: ImportTemplate, f: &[String]) -> Option<VoucherLin
                 code: f.get(4).unwrap_or(&String::new()).trim().to_string(),
                 debit: parse_money(f.get(6).unwrap_or(&String::new())),
                 credit: parse_money(f.get(7).unwrap_or(&String::new())),
-                customer: None,
+                aux,
             })
         }
         ImportTemplate::Yonyou => {
-            // 日期, 凭证字号, 摘要, 科目编码, 借方, 贷方
+            // 日期, 凭证字号, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]
+            aux.customer = opt_field(f, 6);
+            aux.bank = opt_field(f, 7);
             Some(VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
@@ -174,7 +186,7 @@ fn extract_voucher_line(tmpl: ImportTemplate, f: &[String]) -> Option<VoucherLin
                 code: f.get(3).unwrap_or(&String::new()).trim().to_string(),
                 debit: parse_money(f.get(4).unwrap_or(&String::new())),
                 credit: parse_money(f.get(5).unwrap_or(&String::new())),
-                customer: None,
+                aux,
             })
         }
     }
@@ -540,14 +552,15 @@ fn import_begin_rows(
 
 /// 导入凭证（CSV 文本）
 ///
-/// - 通用列：`日期, 凭证字, 摘要, 科目编码, 借方, 贷方[, 客户编码]`
-/// - 金蝶列：`日期, 凭证字, 凭证号, 摘要, 科目编码, 科目名称, 借方, 贷方`
-/// - 用友列：`日期, 凭证字号, 摘要, 科目编码, 借方, 贷方`
+/// - 通用列：`日期, 凭证字, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]`
+/// - 金蝶列：`日期, 凭证字, 凭证号, 摘要, 科目编码, 科目名称, 借方, 贷方[, 客户, 银行]`
+/// - 用友列：`日期, 凭证字号, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]`
 ///
 /// - 凭证字省略时按"记"
 /// - 同一期间内凭证号自动连续分配（按出现顺序）
 /// - 借方/贷方必有一方非零；一行分录借贷必须平衡的凭证由校验把关
-/// - 支持辅助核算简写列（通用模板第 7 列：客户编码）
+/// - 辅助核算可选列：后面追加的客户/银行编码会按行分配到分录；带辅助核算的
+///   科目若未提供辅助列则由科目表按默认值补齐
 /// - `mapping`：源科目 → 目标科目映射（用户在前端选择），缺失科目按映射替换
 pub fn import_vouchers(
     db: &Db,
@@ -648,9 +661,12 @@ fn import_vouchers_rows(
         let mut entry = Entry::new(v.entries.len() as i32 + 1, account_code, line.summary);
         entry.debit = line.debit;
         entry.credit = line.credit;
-        // 可选客户辅助核算
-        if let Some(cust) = &line.customer {
-            entry.aux.customer = Some(cust.clone());
+        // 辅助核算（客户/银行等，CSV 里带了的直接填入）
+        if line.aux.customer.is_some() {
+            entry.aux.customer = line.aux.customer.clone();
+        }
+        if line.aux.bank.is_some() {
+            entry.aux.bank = line.aux.bank.clone();
         }
         // 未填的必填辅助核算按科目表补齐（如银行科目必须填银行账户）
         fill_required(db, &mut entry);
@@ -807,6 +823,29 @@ mod tests {
         let all = vouchers::list(&db, &vouchers::VoucherQuery::period(p)).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|v| v.entries.is_empty() || v.entries.len() >= 2));
+    }
+
+    #[test]
+    fn voucher_line_extracts_aux() {
+        use fincore::AuxKind;
+        // 通用：日期,凭证字,摘要,科目,借,贷[,客户,银行]
+        let f = split_csv("2026-01-05,记,收货款,100201,0,1000,C01,B01");
+        let line = extract_voucher_line(ImportTemplate::Generic, &f).unwrap();
+        assert_eq!(line.aux.get(AuxKind::Customer).map(|s| s.as_str()), Some("C01"));
+        assert_eq!(line.aux.get(AuxKind::Bank).map(|s| s.as_str()), Some("B01"));
+        // 金蝶：日期,凭证字,凭证号,摘要,科目,科目名,借,贷[,客户,银行]
+        let f = split_csv("2026-01-05,记,1,收货款,100201,银行存款,0,1000,C01,B01");
+        let line = extract_voucher_line(ImportTemplate::Kingdee, &f).unwrap();
+        assert_eq!(line.aux.get(AuxKind::Customer).map(|s| s.as_str()), Some("C01"));
+        assert_eq!(line.aux.get(AuxKind::Bank).map(|s| s.as_str()), Some("B01"));
+        // 用友：日期,凭证字号,摘要,科目,借,贷[,客户,银行]
+        let f = split_csv("2026-01-05,记,收货款,100201,0,1000,C01,B01");
+        let line = extract_voucher_line(ImportTemplate::Yonyou, &f).unwrap();
+        assert_eq!(line.aux.get(AuxKind::Customer).map(|s| s.as_str()), Some("C01"));
+        assert_eq!(line.aux.get(AuxKind::Bank).map(|s| s.as_str()), Some("B01"));
+        // 无辅助列时保持空
+        let line = extract_voucher_line(ImportTemplate::Generic, &split_csv("2026-01-05,记,收货款,100201,0,1000")).unwrap();
+        assert!(line.aux.is_empty());
     }
 
     #[test]

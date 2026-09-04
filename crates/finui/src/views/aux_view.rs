@@ -124,7 +124,10 @@ impl AuxView {
                         RichText::new("启用").color(palette::OK)
                     });
                 }
-                4 => { ui.label(RichText::new(&e.memo).weak()); }
+                4 => {
+                    let ext = e.summary();
+                    ui.label(RichText::new(if ext.is_empty() { e.memo.clone() } else { ext }).weak());
+                }
                 5 => {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
@@ -181,6 +184,30 @@ impl AuxView {
                         ui.label("名称：");
                         ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut e.name));
                         ui.end_row();
+                        if e.kind == AuxKind::Bank {
+                            let mut bn = e
+                                .prop(fincore::auxiliary::prop::BANK_NAME)
+                                .cloned()
+                                .unwrap_or_default();
+                            ui.label("开户行：");
+                            ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut bn));
+                            e.set_prop(
+                                fincore::auxiliary::prop::BANK_NAME,
+                                bn.trim().to_string(),
+                            );
+                            ui.end_row();
+                            let mut ba = e
+                                .prop(fincore::auxiliary::prop::BANK_ACCOUNT)
+                                .cloned()
+                                .unwrap_or_default();
+                            ui.label("账号：");
+                            ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut ba));
+                            e.set_prop(
+                                fincore::auxiliary::prop::BANK_ACCOUNT,
+                                ba.trim().to_string(),
+                            );
+                            ui.end_row();
+                        }
                         ui.label("上级编码：");
                         let mut p = e.parent_code.clone().unwrap_or_default();
                         ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut p));

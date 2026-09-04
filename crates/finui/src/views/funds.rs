@@ -52,6 +52,10 @@ impl FundsView {
                     self.dirty = true;
                 }
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                self.export(ctx, mode);
+            }
         });
 
         match self.tab {
@@ -59,6 +63,82 @@ impl FundsView {
             1 => self.show_bills(ctx, ui),
             2 => self.show_loans(ctx, ui),
             _ => self.show_forecast(ctx, ui),
+        }
+    }
+
+    fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
+        let (name, sh) = match self.tab {
+            0 => {
+                let rows = findb::funds::funds_daily(ctx.db(), ctx.period()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "资金日报",
+                    vec!["科目".to_string(), "科目名称".to_string(), "期初".to_string(), "收入".to_string(), "支出".to_string(), "期末结存".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![r.account_code.clone(), r.account_name.clone(), r.begin.fmt_plain(), r.income.fmt_plain(), r.expense.fmt_plain(), r.end.fmt_plain()]);
+                }
+                ("资金日报", sh)
+            }
+            1 => {
+                let kind = if self.bill_kind.is_empty() { None } else { Some(self.bill_kind.as_str()) };
+                let rows = findb::funds::bill_list(ctx.db(), kind).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "票据",
+                    vec!["类型".to_string(), "票据号".to_string(), "出票日".to_string(), "到期日".to_string(), "对方单位".to_string(), "金额".to_string(), "状态".to_string()],
+                );
+                for b in rows {
+                    sh.push(vec![
+                        if b.kind == "receivable" { "应收".to_string() } else { "应付".to_string() },
+                        b.no.clone(),
+                        b.issue_date.format("%Y-%m-%d").to_string(),
+                        b.due_date.format("%Y-%m-%d").to_string(),
+                        b.counterpart.clone(),
+                        b.amount.fmt_plain(),
+                        findb::funds::BillStatus::parse(&b.status).label().to_string(),
+                    ]);
+                }
+                ("票据", sh)
+            }
+            2 => {
+                let kind = if self.loan_kind.is_empty() { None } else { Some(self.loan_kind.as_str()) };
+                let rows = findb::funds::loan_list(ctx.db(), kind).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "融资",
+                    vec!["类型".to_string(), "编号".to_string(), "机构".to_string(), "本金".to_string(), "年利率%".to_string(), "起息日".to_string(), "到期日".to_string(), "状态".to_string()],
+                );
+                for l in rows {
+                    sh.push(vec![
+                        if l.kind == "borrow" { "借款".to_string() } else { "放款".to_string() },
+                        l.no.clone(),
+                        l.bank.clone(),
+                        l.principal.fmt_plain(),
+                        l.rate_pct.fmt_qty(),
+                        l.start_date.format("%Y-%m-%d").to_string(),
+                        l.end_date.format("%Y-%m-%d").to_string(),
+                        if l.status == "active" { "存续".to_string() } else { "已结清".to_string() },
+                    ]);
+                }
+                ("融资", sh)
+            }
+            _ => {
+                let fc = findb::funds::funds_forecast(ctx.db(), ctx.period()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "资金预测",
+                    vec!["项目".to_string(), "金额".to_string()],
+                );
+                sh.push(vec!["现金/银行结存".to_string(), fc.cash_balance.fmt_plain()]);
+                sh.push(vec!["在库应收票据".to_string(), fc.receivable_bills.fmt_plain()]);
+                sh.push(vec!["应付票据".to_string(), fc.payable_bills.fmt_plain()]);
+                sh.push(vec!["放款可收回".to_string(), fc.lend.fmt_plain()]);
+                sh.push(vec!["借款需偿还".to_string(), fc.borrow.fmt_plain()]);
+                sh.push(vec!["预计资金头寸".to_string(), fc.position.fmt_plain()]);
+                ("资金预测", sh)
+            }
+        };
+        let title = format!("{name}（{}）", ctx.period().label());
+        match crate::views::export::run_export(&sh, name, &title, mode) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
         }
     }
 
@@ -353,6 +433,29 @@ impl BudgetAnalysisView {
             if ui.button("查询").clicked() {
                 self.dirty = true;
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                let year: i32 = self.year_text.trim().parse().unwrap_or_else(|_| ctx.period().year());
+                let rows = findb::mgmt::budget_analysis_summary(ctx.db(), year, &self.version).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "预算分析",
+                    vec!["科目".to_string(), "部门".to_string(), "预算".to_string(), "实际".to_string(), "执行率%".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![
+                        format!("{} {}", r.account_code, r.account_name),
+                        if r.dept.is_empty() { "—".to_string() } else { r.dept.clone() },
+                        r.budget.fmt_plain(),
+                        r.actual.fmt_plain(),
+                        r.rate.fmt_qty(),
+                    ]);
+                }
+                let title = format!("预算分析（{} 年度）", year);
+                match crate::views::export::run_export(&sh, "预算分析", &title, mode) {
+                    Ok(m) => ctx.info(m),
+                    Err(e) => ctx.error(e),
+                }
+            }
         });
 
         let year: i32 = self.year_text.trim().parse().unwrap_or_else(|_| ctx.period().year());
@@ -456,11 +559,48 @@ impl CostView {
                     self.dirty = true;
                 }
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                self.export(ctx, mode);
+            }
         });
 
         match self.tab {
             0 => self.show_configs(ctx, ui),
             _ => self.show_period_end(ctx, ui),
+        }
+    }
+
+    fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
+        let (name, sh) = match self.tab {
+            0 => {
+                let rows = findb::business::cost_configs(ctx.db()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "计价方式配置",
+                    vec!["存货".to_string(), "计价方式".to_string(), "标准成本".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![r.item.clone(), r.method_label.clone(), r.standard_cost.fmt_plain()]);
+                }
+                ("计价方式配置", sh)
+            }
+            _ => {
+                let p = Period::parse(&self.period_text).unwrap_or_else(|_| ctx.period());
+                let rows = findb::business::period_end_cost(ctx.db(), p, false).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "期末结价",
+                    vec!["存货".to_string(), "计价方式".to_string(), "结存数量".to_string(), "结存金额".to_string(), "单价".to_string(), "调整额".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![r.item.clone(), r.method.clone(), r.end_qty.fmt_qty(), r.end_amount.fmt_plain(), r.unit_cost.fmt_plain(), r.adjust.fmt_plain()]);
+                }
+                ("期末结价", sh)
+            }
+        };
+        let title = format!("{name}（{}）", ctx.period().label());
+        match crate::views::export::run_export(&sh, name, &title, mode) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
         }
     }
 

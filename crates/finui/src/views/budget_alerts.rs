@@ -97,6 +97,27 @@ impl BudgetAlertsView {
             if ui.button("查询").clicked() {
                 self.dirty = true;
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                let mut sh = crate::views::export::Sheet::new(
+                    "预算预警",
+                    vec!["科目".to_string(), "部门".to_string(), "预算数".to_string(), "实际数".to_string(), "执行率(%)".to_string(), "超支额".to_string()],
+                );
+                for a in &self.rows {
+                    sh.push(vec![
+                        format!("{} {}", a.account_code, a.account_name),
+                        if a.dept.is_empty() { "—".to_string() } else { a.dept.clone() },
+                        a.budget.fmt_plain(),
+                        a.actual.fmt_plain(),
+                        a.rate.fmt_qty(),
+                        a.over_amount.fmt_plain(),
+                    ]);
+                }
+                match crate::views::export::run_export(&sh, "预算预警", "预算预警", mode) {
+                    Ok(m) => ctx.info(m),
+                    Err(e) => ctx.error(e),
+                }
+            }
         });
 
         if !self.err.is_empty() {

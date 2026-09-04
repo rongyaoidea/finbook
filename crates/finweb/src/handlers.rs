@@ -104,8 +104,16 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/reports/multi-column", get(get_multi_column))
         .route("/api/reports/summary-table", get(get_summary_table))
         .route("/api/reports/ratios", get(get_fin_ratios))
+        // 财务核心：三大报表（资产负债表/利润表/现金流量表）
+        .route("/api/reports/balance-sheet", get(get_balance_sheet))
+        .route("/api/reports/balance-sheet/print", get(print_balance_sheet))
+        .route("/api/reports/income-statement", get(get_income_statement))
+        .route("/api/reports/income-statement/print", get(print_income_statement))
+        .route("/api/reports/cash-flow", get(get_cash_flow))
+        .route("/api/reports/cash-flow/print", get(print_cash_flow))
         // 财务核心：所有者权益变动表 / 报表对比 / 科目日报表 / 期末对账
         .route("/api/reports/equity", get(get_equity_statement))
+        .route("/api/reports/equity/print", get(print_equity_statement))
         .route("/api/reports/compare", get(get_report_compare))
         .route("/api/reports/daily", get(get_account_daily))
         .route("/api/reports/reconcile", get(get_period_reconcile))
@@ -3309,4 +3317,220 @@ async fn run_period_end_cost(
     let apply = q.get("apply").map(|s| s == "1" || s == "true").unwrap_or(false);
     let rows = findb::business::period_end_cost(&db, period, apply)?;
     Ok(Json(serde_json::json!({ "period": period.label(), "rows": rows, "apply": apply })))
+}
+
+// ---------------------------------------------------------------------------
+// 三大报表：资产负债表 / 利润表 / 现金流量表（JSON + 打印预览）
+// ---------------------------------------------------------------------------
+
+/// 从 query 解析 起/止期间（默认当前期间）
+fn report_range(state: &WebState, user: &CurrentUser, q: &HashMap<String, String>) -> (Period, Period) {
+    let cur = current_period(state, user);
+    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
+        fincore::Period::new(cur.year(), 1).unwrap_or(cur)
+    });
+    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(cur);
+    (from, to)
+}
+
+/// 加载报表定义（优先账套内自定义，否则内置模板）
+fn report_def(db: &findb::Db, key: &str, fallback: fincore::report::ReportDef) -> fincore::report::ReportDef {
+    findb::reports::get_def(db, key)
+        .ok()
+        .flatten()
+        .unwrap_or(fallback)
+}
+
+/// 资产负债表 / 利润表共用渲染：返回 ReportTable
+fn statement_table(
+    db: &findb::Db,
+    user: &CurrentUser,
+    key: &str,
+    from: Period,
+    to: Period,
+    kind_maps: Vec<Box<dyn Fn(fincore::report::AmountKind) -> fincore::report::AmountKind>>,
+) -> Result<fincore::report::ReportTable, AppError> {
+    let def = match key {
+        "balance_sheet" => report_def(db, key, fincore::report::balance_sheet::balance_sheet_def()),
+        _ => report_def(db, key, fincore::report::income::income_statement_def()),
+    };
+    let mut bq = BalanceQuery::range(from, to);
+    bq = bq.with_data_scope(&user.user.data_scope);
+    let snap = BalanceSnapshot::load(db, &bq)?;
+    let company = db.options().company;
+    let subtitle = format!("{} 至 {}", from.label(), to.label());
+    Ok(fincore::report::render(&def, &snap, &company, &subtitle, kind_maps))
+}
+
+/// ReportTable → JSON（行/值/样式）
+fn table_json(t: &fincore::report::ReportTable) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = t
+        .rows
+        .iter()
+        .map(|r| {
+            json!({
+                "no": r.no,
+                "name": r.name,
+                "indent": r.indent,
+                "style": format!("{:?}", r.style).to_lowercase(),
+                "values": r.values.iter().map(|v| v.fmt_money()).collect::<Vec<_>>(),
+                "negative": r.show_negative_red,
+            })
+        })
+        .collect();
+    json!({
+        "title": t.title,
+        "subtitle": t.subtitle,
+        "company": t.company,
+        "columns": t.columns,
+        "rows": rows,
+    })
+}
+
+async fn get_balance_sheet(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let t = statement_table(
+        &db,
+        &user,
+        "balance_sheet",
+        from,
+        to,
+        vec![
+            Box::new(fincore::report::identity),
+            Box::new(fincore::report::to_begin),
+        ],
+    )?;
+    Ok(Json(json!({ "from": period_to_str(from), "to": period_to_str(to), "table": table_json(&t) })))
+}
+
+async fn print_balance_sheet(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let t = statement_table(
+        &db,
+        &user,
+        "balance_sheet",
+        from,
+        to,
+        vec![
+            Box::new(fincore::report::identity),
+            Box::new(fincore::report::to_begin),
+        ],
+    )?;
+    let html = crate::report_html::report_table_html(&t, &state.company_name(), "元");
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+fn to_ytd(k: fincore::report::AmountKind) -> fincore::report::AmountKind {
+    match k {
+        fincore::report::AmountKind::PeriodDebit => fincore::report::AmountKind::YearDebit,
+        fincore::report::AmountKind::PeriodCredit => fincore::report::AmountKind::YearCredit,
+        other => other,
+    }
+}
+
+async fn get_income_statement(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let t = statement_table(
+        &db,
+        &user,
+        "income_statement",
+        from,
+        to,
+        vec![Box::new(fincore::report::identity), Box::new(to_ytd)],
+    )?;
+    Ok(Json(json!({ "from": period_to_str(from), "to": period_to_str(to), "table": table_json(&t) })))
+}
+
+async fn print_income_statement(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let t = statement_table(
+        &db,
+        &user,
+        "income_statement",
+        from,
+        to,
+        vec![Box::new(fincore::report::identity), Box::new(to_ytd)],
+    )?;
+    let html = crate::report_html::report_table_html(&t, &state.company_name(), "元");
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+async fn get_cash_flow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let cf = findb::reports::cash_flow_statement(&db, from, to)?;
+    let line = |l: &fincore::report::cashflow::CashFlowLine| {
+        json!({ "code": l.code, "name": l.name, "inflow": l.inflow.fmt_money(), "outflow": l.outflow.fmt_money(), "net": l.net.fmt_money() })
+    };
+    Ok(Json(json!({
+        "from": period_to_str(from), "to": period_to_str(to),
+        "operating": cf.operating.iter().map(line).collect::<Vec<_>>(),
+        "operating_net": cf.operating_net.fmt_money(),
+        "investing": cf.investing.iter().map(line).collect::<Vec<_>>(),
+        "investing_net": cf.investing_net.fmt_money(),
+        "financing": cf.financing.iter().map(line).collect::<Vec<_>>(),
+        "financing_net": cf.financing_net.fmt_money(),
+        "net_increase": cf.net_increase.fmt_money(),
+        "begin_cash": cf.begin_cash.fmt_money(),
+        "end_cash": cf.end_cash.fmt_money(),
+        "unassigned": cf.unassigned.fmt_money(),
+        "ties": cf.ties(),
+    })))
+}
+
+async fn print_cash_flow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let cf = findb::reports::cash_flow_statement(&db, from, to)?;
+    let subtitle = format!("{} 至 {}", from.label(), to.label());
+    let html = crate::report_html::cash_flow_html(&cf, &state.company_name(), &subtitle);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+async fn print_equity_statement(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let stmt = findb::reports::equity_statement(&db, from, to)?;
+    let subtitle = format!("{} 至 {}", from.label(), to.label());
+    let html = crate::report_html::equity_html(&stmt, &state.company_name(), &subtitle);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }

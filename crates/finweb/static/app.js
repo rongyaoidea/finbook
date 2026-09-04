@@ -252,6 +252,9 @@ const NAV_ITEMS = [
   { id: "invoices", label: "发票管理", perm: "report", group: "凭证" },
   { id: "ledger", label: "明细账", perm: "report", group: "账簿报表" },
   { id: "reports", label: "报表中心", perm: "report", group: "账簿报表" },
+  { id: "balance-sheet", label: "资产负债表", perm: "report", group: "账簿报表" },
+  { id: "income-statement", label: "利润表", perm: "report", group: "账簿报表" },
+  { id: "cash-flow", label: "现金流量表", perm: "report", group: "账簿报表" },
   { id: "multi-column", label: "多栏账", perm: "report", group: "账簿报表" },
   { id: "summary-table", label: "摘要汇总表", perm: "report", group: "账簿报表" },
   { id: "ratios", label: "财务指标", perm: "report", group: "账簿报表" },
@@ -296,6 +299,9 @@ const VIEWS = {
   "imports": viewImports,
   "ledger": viewLedger,
   "reports": viewReports,
+  "balance-sheet": viewBalanceSheet,
+  "income-statement": viewIncomeStatement,
+  "cash-flow": viewCashFlow,
   "multi-column": viewMultiColumn,
   "summary-table": viewSummaryTable,
   "ratios": viewRatios,
@@ -1213,11 +1219,13 @@ async function viewLedger(main) {
       <label><input type="checkbox" id="l-children" checked /> 含下级</label>
       <label><input type="checkbox" id="l-posted" /> 仅已记账</label>
       <button class="btn sm" id="l-go">查询</button>
+      <button class="btn ghost sm" id="l-print">打印预览</button>
     </div>
     <div class="panel"><table class="grid" id="l-table"><thead><tr>
       <th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th>
     </tr></thead><tbody><tr><td colspan="7" class="muted">请输入科目后查询</td></tr></tbody></table></div>`;
   $("#l-go").addEventListener("click", loadLedger);
+  $("#l-print").addEventListener("click", () => { const el = $("#l-table").querySelector("table"); printPreview("明细账", el); });
 }
 async function loadLedger() {
   const code = $("#l-code").value.trim();
@@ -1288,6 +1296,123 @@ async function loadTrial() {
       <td class="num">${esc(t.ytd_debit || "—")}</td><td class="num">${esc(t.ytd_credit || "—")}</td>
     </tr>`;
   }
+}
+
+// ===========================================================================
+// 通用打印预览：把页面里的表格渲染成可打印 HTML（新窗口，自动弹打印）
+// 数据只走内存，不落地文件；任何有 <table> 结果的报表页都能复用。
+// ===========================================================================
+function printPreview(title, tableEl) {
+  if (!tableEl || !tableEl.outerHTML) { toast("没有可打印的数据", "err"); return; }
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${esc(title)}</title>
+    <style>body{font-family:-apple-system,'Microsoft YaHei',sans-serif;color:#222;margin:16px;}
+    h2{text-align:center;margin:8px 0;}
+    .meta{display:flex;justify-content:space-between;color:#666;font-size:13px;margin-bottom:4px;}
+    table{border-collapse:collapse;width:100%;font-size:13px;}
+    th,td{border:1px solid #bbb;padding:4px 8px;}
+    th{background:#f0f3f7;}td.r,td.num{text-align:right;}
+    @media print{body{font-size:12px;margin:0;}}</style></head>
+    <body><h2>${esc(title)}</h2>
+    <div class="meta"><span>${esc(session.user ? session.user.display_name : "")}</span><span>打印时间：${esc(today())}</span></div>
+    ${tableEl.outerHTML}
+    <script>window.onload=function(){setTimeout(function(){window.print();},300);};</scr${"ipt"}>
+    </body></html>`;
+  const w = window.open("", "_blank");
+  if (!w) { toast("浏览器拦截了打印窗口，请允许弹出窗口", "err"); return; }
+  w.document.write(html);
+  w.document.close();
+}
+
+// ===========================================================================
+// 三大报表：资产负债表 / 利润表 / 现金流量表
+// ===========================================================================
+function statementTableHtml(t) {
+  // t = { title, subtitle, company, columns, rows:[{no,name,indent,style,values,negative}] }
+  const head = `<th>行次</th><th>项目</th>${(t.columns || []).map((c) => `<th class="num">${esc(c)}</th>`).join("")}`;
+  const body = (t.rows || []).map((r) => {
+    const indent = "　".repeat(r.indent || 0);
+    const bold = r.style === "total" ? " style='font-weight:700;background:#fafafa'" : r.style === "subtotal" ? " style='font-weight:600'" : r.style === "header" ? " style='font-weight:600;background:#f5f7fa'" : "";
+    const cells = (r.values || []).map((v) => `<td class="num"${r.negative && moneyNum(v) < 0 ? " style='color:var(--err)'" : ""}>${esc(v)}</td>`).join("");
+    return `<tr${bold}><td class="muted">${esc(r.no)}</td><td>${indent}${esc(r.name)}</td>${cells}</tr>`;
+  }).join("");
+  return `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+async function viewBalanceSheet(main) {
+  main.innerHTML = `<h2>资产负债表</h2>
+    <div class="toolbar">
+      <label>从 <input id="bs-from" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="bs-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="bs-run">查询</button>
+      <button class="btn ghost sm" id="bs-print">打印预览</button>
+    </div>
+    <div id="bs-result" class="muted">填写期间后点击查询</div>`;
+  const load = async () => {
+    const f = $("#bs-from").value.trim(), t = $("#bs-to").value.trim();
+    try {
+      const r = await api(`/reports/balance-sheet?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`);
+      $("#bs-result").innerHTML = `<div class="muted" style="margin-bottom:8px">${esc(r.table.subtitle)}</div>${statementTableHtml(r.table)}`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#bs-run").addEventListener("click", load);
+  $("#bs-print").addEventListener("click", () => { const f = $("#bs-from").value, t = $("#bs-to").value; window.open(`/api/reports/balance-sheet/print?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`, "_blank"); });
+  load();
+}
+
+async function viewIncomeStatement(main) {
+  main.innerHTML = `<h2>利润表</h2>
+    <div class="toolbar">
+      <label>从 <input id="is-from" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="is-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="is-run">查询</button>
+      <button class="btn ghost sm" id="is-print">打印预览</button>
+    </div>
+    <div id="is-result" class="muted">填写期间后点击查询</div>`;
+  const load = async () => {
+    const f = $("#is-from").value.trim(), t = $("#is-to").value.trim();
+    try {
+      const r = await api(`/reports/income-statement?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`);
+      $("#is-result").innerHTML = `<div class="muted" style="margin-bottom:8px">${esc(r.table.subtitle)}</div>${statementTableHtml(r.table)}`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#is-run").addEventListener("click", load);
+  $("#is-print").addEventListener("click", () => { const f = $("#is-from").value, t = $("#is-to").value; window.open(`/api/reports/income-statement/print?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`, "_blank"); });
+  load();
+}
+
+async function viewCashFlow(main) {
+  main.innerHTML = `<h2>现金流量表</h2>
+    <div class="toolbar">
+      <label>从 <input id="cf-from" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="cf-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <button class="btn primary" id="cf-run">查询</button>
+      <button class="btn ghost sm" id="cf-print">打印预览</button>
+    </div>
+    <div id="cf-result" class="muted">填写期间后点击查询</div>`;
+  const lineHtml = (l) => `<tr><td class="muted">${esc(l.code)}</td><td>${esc(l.name)}</td><td class="num">${esc(l.net)}</td></tr>`;
+  const section = (title, lines, net) => `<tr style="background:#f5f7fa;font-weight:600"><td colspan="3">${esc(title)}</td></tr>
+    ${lines.map(lineHtml).join("")}
+    <tr style="font-weight:600"><td colspan="2">${esc(title)}小计</td><td class="num">${esc(net)}</td></tr>`;
+  const load = async () => {
+    const f = $("#cf-from").value.trim(), t = $("#cf-to").value.trim();
+    try {
+      const r = await api(`/reports/cash-flow?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`);
+      const head = `<th>项目编码</th><th>项目</th><th class="num">金额</th>`;
+      const tail = `<tr style="font-weight:700;background:#fafafa"><td colspan="2">现金及现金等价物净增加额</td><td class="num">${esc(r.net_increase)}</td></tr>
+        <tr><td colspan="2">加：期初现金及现金等价物余额</td><td class="num">${esc(r.begin_cash)}</td></tr>
+        <tr style="font-weight:700;background:#fafafa"><td colspan="2">期末现金及现金等价物余额</td><td class="num">${esc(r.end_cash)}</td></tr>
+        <tr><td colspan="3" class="muted">${r.ties ? "✔ 净增加额与货币资金变动勾稽一致" : "✖ 勾稽不符"}</td></tr>`;
+      $("#cf-result").innerHTML = `<div class="muted" style="margin-bottom:8px">${esc(r.from)} 至 ${esc(r.to)}</div>
+        <table class="grid"><thead><tr>${head}</tr></thead><tbody>
+        ${section("经营活动产生的现金流量", r.operating, r.operating_net)}
+        ${section("投资活动产生的现金流量", r.investing, r.investing_net)}
+        ${section("筹资活动产生的现金流量", r.financing, r.financing_net)}
+        ${tail}</tbody></table>`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#cf-run").addEventListener("click", load);
+  $("#cf-print").addEventListener("click", () => { const f = $("#cf-from").value, t = $("#cf-to").value; window.open(`/api/reports/cash-flow/print?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`, "_blank"); });
+  load();
 }
 
 // ===========================================================================
@@ -1542,9 +1667,11 @@ async function viewMultiColumn(main) {
       <label>栏目(逗号分隔) <input id="mc-cols" value="660201,660202,660203" style="width:220px" /></label>
       <label>期间 <input id="mc-period" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="mc-run">查询</button>
+      <button class="btn ghost sm" id="mc-run-print">打印预览</button>
     </div>
     <div id="mc-result" class="muted">填写条件后点击查询</div>`;
   $("#mc-run").addEventListener("click", async () => {
+  $("#mc-run-print").addEventListener("click", () => { const el = $("#mc-result").querySelector("table"); printPreview("多栏账", el); });
     const mainCode = $("#mc-main").value.trim();
     const cols = $("#mc-cols").value.split(",").map((s) => s.trim()).filter(Boolean);
     const p = $("#mc-period").value.trim();
@@ -1569,9 +1696,11 @@ async function viewSummaryTable(main) {
     <div class="toolbar">
       <label>期间 <input id="st-period" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="st-run">查询</button>
+      <button class="btn ghost sm" id="st-run-print">打印预览</button>
     </div>
     <div id="st-result" class="muted">填写期间后点击查询</div>`;
   $("#st-run").addEventListener("click", async () => {
+  $("#st-run-print").addEventListener("click", () => { const el = $("#st-result").querySelector("table"); printPreview("摘要汇总表", el); });
     const p = $("#st-period").value.trim();
     try {
       const r = await api(`/reports/summary-table?from=${encodeURIComponent(p)}&to=${encodeURIComponent(p)}`);
@@ -1590,9 +1719,11 @@ async function viewRatios(main) {
     <div class="toolbar">
       <label>期间 <input id="rt-period" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="rt-run">查询</button>
+      <button class="btn ghost sm" id="rt-run-print">打印预览</button>
     </div>
     <div id="rt-result" class="muted">填写期间后点击查询</div>`;
   $("#rt-run").addEventListener("click", async () => {
+  $("#rt-run-print").addEventListener("click", () => { const el = $("#rt-result").querySelector("table"); printPreview("财务指标分析", el); });
     const p = $("#rt-period").value.trim();
     try {
       const r = await api(`/reports/ratios?period=${encodeURIComponent(p)}`);
@@ -1863,9 +1994,11 @@ async function viewWorkReport(main) {
 async function viewEquity(main) {
   main.innerHTML = `<h2>所有者权益变动表</h2>
     <div class="toolbar"><label>期间 <input id="eq-period" value="${esc(state.current)}" style="width:90px" /></label>
-    <button class="btn primary" id="eq-run">查询</button></div>
+    <button class="btn primary" id="eq-run">查询</button>
+      <button class="btn ghost sm" id="eq-run-print">打印预览</button></div>
     <div id="eq-result" class="muted">填写期间后点击查询</div>`;
   $("#eq-run").addEventListener("click", async () => {
+  $("#eq-run-print").addEventListener("click", () => { const el = $("#eq-result").querySelector("table"); printPreview("所有者权益变动表", el); });
     const p = $("#eq-period").value.trim();
     try {
       const r = await api(`/reports/equity?period=${encodeURIComponent(p)}`);
@@ -1887,11 +2020,13 @@ async function viewCompare(main) {
       <label>报表 <select id="cp-key"><option value="balance_sheet">资产负债表</option><option value="income_statement">利润表</option></select></label>
       <label>当前期 <input id="cp-cur" value="${esc(state.current)}" style="width:90px" /></label>
       <label>对比期 <input id="cp-prev" style="width:90px" /></label>
-      <button class="btn primary" id="cp-run">对比</button></div>
+      <button class="btn primary" id="cp-run">对比</button>
+      <button class="btn ghost sm" id="cp-run-print">打印预览</button></div>
     <div id="cp-result" class="muted">填写期间后点击对比</div>`;
   const p = $("#cp-cur").value.trim();
   try { $("#cp-prev").value = prevPeriod(p); } catch (e) {}
   $("#cp-run").addEventListener("click", async () => {
+  $("#cp-run-print").addEventListener("click", () => { const el = $("#cp-result").querySelector("table"); printPreview("报表对比分析", el); });
     const key = $("#cp-key").value, cur = $("#cp-cur").value.trim(), prev = $("#cp-prev").value.trim();
     try {
       const r = await api(`/reports/compare?key=${encodeURIComponent(key)}&period=${encodeURIComponent(cur)}&prev=${encodeURIComponent(prev)}`);
@@ -1915,9 +2050,11 @@ async function viewDaily(main) {
     <div class="toolbar">
       <label>科目 <input id="dl-code" placeholder="1001" style="width:90px" /></label>
       <label>期间 <input id="dl-from" value="${esc(state.current)}" style="width:90px" /></label>
-      <button class="btn primary" id="dl-run">查询</button></div>
+      <button class="btn primary" id="dl-run">查询</button>
+      <button class="btn ghost sm" id="dl-run-print">打印预览</button></div>
     <div id="dl-result" class="muted">填写科目与期间后点击查询</div>`;
   $("#dl-run").addEventListener("click", async () => {
+  $("#dl-run-print").addEventListener("click", () => { const el = $("#dl-result").querySelector("table"); printPreview("科目日报表", el); });
     const code = $("#dl-code").value.trim();
     if (!code) { toast("请输入科目编码", "err"); return; }
     const from = $("#dl-from").value.trim();
@@ -1936,9 +2073,11 @@ async function viewDaily(main) {
 async function viewReconcile(main) {
   main.innerHTML = `<h2>期末对账</h2>
     <div class="toolbar"><label>期间 <input id="rc-period" value="${esc(state.current)}" style="width:90px" /></label>
-    <button class="btn primary" id="rc-run">对账</button></div>
+    <button class="btn primary" id="rc-run">对账</button>
+      <button class="btn ghost sm" id="rc-run-print">打印预览</button></div>
     <div id="rc-result" class="muted">填写期间后点击对账</div>`;
   $("#rc-run").addEventListener("click", async () => {
+  $("#rc-run-print").addEventListener("click", () => { const el = $("#rc-result").querySelector("table"); printPreview("期末对账", el); });
     const p = $("#rc-period").value.trim();
     try {
       const r = await api(`/reports/reconcile?period=${encodeURIComponent(p)}`);
@@ -1956,9 +2095,11 @@ async function viewBudgetAlerts(main) {
     <div class="toolbar">
       <label>期间 <input id="ba-period" value="${esc(state.current)}" style="width:90px" /></label>
       <label>阈值(%) <input id="ba-thr" value="90" style="width:60px" /></label>
-      <button class="btn primary" id="ba-run">查询</button></div>
+      <button class="btn primary" id="ba-run">查询</button>
+      <button class="btn ghost sm" id="ba-run-print">打印预览</button></div>
     <div id="ba-result" class="muted">填写期间后点击查询</div>`;
   $("#ba-run").addEventListener("click", async () => {
+  $("#ba-run-print").addEventListener("click", () => { const el = $("#ba-result").querySelector("table"); printPreview("预算预警", el); });
     const p = $("#ba-period").value.trim(), thr = $("#ba-thr").value.trim() || "90";
     try {
       const r = await api(`/budget/alerts?period=${encodeURIComponent(p)}&threshold=${encodeURIComponent(thr)}`);
@@ -1975,7 +2116,10 @@ async function viewBudgetAlerts(main) {
 // 采购对账
 // ===========================================================================
 async function viewPoReconcile(main) {
-  main.innerHTML = `<h2>采购对账</h2><div id="pr-result" class="muted">加载中…</div>`;
+    main.innerHTML = `<h2>采购对账</h2>
+    <div class="toolbar"><button class="btn ghost sm" id="pr-result-print">打印预览</button></div>
+    <div id="pr-result" class="muted">加载中…</div>`;
+  $("#pr-result-print").addEventListener("click", () => { const el = $("#pr-result").querySelector("table"); printPreview("采购对账", el); });
   try {
     const r = await api("/procure/reconcile");
     const rows = r.rows || [];
@@ -1988,7 +2132,10 @@ async function viewPoReconcile(main) {
 // 销售对账
 // ===========================================================================
 async function viewSoReconcile(main) {
-  main.innerHTML = `<h2>销售对账</h2><div id="sr-result" class="muted">加载中…</div>`;
+    main.innerHTML = `<h2>销售对账</h2>
+    <div class="toolbar"><button class="btn ghost sm" id="sr-result-print">打印预览</button></div>
+    <div id="sr-result" class="muted">加载中…</div>`;
+  $("#sr-result-print").addEventListener("click", () => { const el = $("#sr-result").querySelector("table"); printPreview("销售对账", el); });
   try {
     const r = await api("/sales/reconcile");
     const rows = r.rows || [];
@@ -2001,7 +2148,10 @@ async function viewSoReconcile(main) {
 // 库存账龄
 // ===========================================================================
 async function viewInvAging(main) {
-  main.innerHTML = `<h2>库存账龄分析</h2><div id="ia-result" class="muted">加载中…</div>`;
+    main.innerHTML = `<h2>库存账龄分析</h2>
+    <div class="toolbar"><button class="btn ghost sm" id="ia-result-print">打印预览</button></div>
+    <div id="ia-result" class="muted">加载中…</div>`;
+  $("#ia-result-print").addEventListener("click", () => { const el = $("#ia-result").querySelector("table"); printPreview("库存账龄分析", el); });
   try {
     const r = await api("/inventory/aging");
     const rows = r.rows || [];
@@ -2014,7 +2164,10 @@ async function viewInvAging(main) {
 // 库存 ABC
 // ===========================================================================
 async function viewInvAbc(main) {
-  main.innerHTML = `<h2>库存 ABC 分析</h2><div id="ib-result" class="muted">加载中…</div>`;
+  main.innerHTML = `<h2>库存 ABC 分析</h2>
+    <div class="toolbar"><button class="btn ghost sm" id="ib-result-print">打印预览</button></div>
+    <div id="ib-result" class="muted">加载中…</div>`;
+  $("#ib-result-print").addEventListener("click", () => { const el = $("#ib-result").querySelector("table"); printPreview("库存ABC分析", el); });
   try {
     const r = await api("/inventory/abc");
     const rows = r.rows || [];
@@ -2151,9 +2304,11 @@ async function viewInvWarehouse(main) {
     <div class="toolbar">
       <label>存货 <input id="iw-item" style="width:160px" /></label>
       <button class="btn primary" id="iw-load">查询</button>
+      <button class="btn ghost sm" id="iw-load-print">打印预览</button>
     </div>
     <div id="iw-result" class="muted">填写存货后点击查询</div>`;
   $("#iw-load").addEventListener("click", async () => {
+  $("#iw-load-print").addEventListener("click", () => { const el = $("#iw-result").querySelector("table"); printPreview("分仓库库存", el); });
     const item = $("#iw-item").value.trim();
     if (!item) { toast("请填写存货", "err"); return; }
     try {
@@ -2168,7 +2323,10 @@ async function viewInvWarehouse(main) {
 }
 
 async function viewInvTransfer(main) {
-  main.innerHTML = `<h2>调拨报表</h2><div id="it-result" class="muted">加载中…</div>`;
+    main.innerHTML = `<h2>调拨报表</h2>
+    <div class="toolbar"><button class="btn ghost sm" id="it-result-print">打印预览</button></div>
+    <div id="it-result" class="muted">加载中…</div>`;
+  $("#it-result-print").addEventListener("click", () => { const el = $("#it-result").querySelector("table"); printPreview("调拨报表", el); });
   try {
     const r = await api("/inventory/transfer");
     const rows = r.rows || [];
@@ -2602,6 +2760,7 @@ async function viewBudgetAnalysis(main) {
       <label>年度 <input id="ana-year" value="${new Date().getFullYear()}" style="width:70px" /></label>
       <label>版本 <input id="ana-ver" value="" placeholder="留空=当前" style="width:110px" /></label>
       <button class="btn primary" id="ana-run">查询</button>
+      <button class="btn ghost sm" id="ana-run-print">打印预览</button>
       <button class="btn ghost sm" id="ana-sum">仅汇总</button>
     </div>
     <div id="ana-body" class="muted">选择年度后查询</div>`;
@@ -2637,6 +2796,7 @@ async function viewBudgetAnalysis(main) {
   };
   $("#ana-run").addEventListener("click", () => run(false));
   $("#ana-sum").addEventListener("click", () => run(true));
+  $("#ana-run-print").addEventListener("click", () => { const el = $("#ana-body").querySelector("table"); printPreview("预算分析", el); });
 }
 
 // ===========================================================================

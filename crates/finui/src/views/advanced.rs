@@ -71,6 +71,10 @@ impl MultiColumnView {
             let r = ui.add_sized([84.0, 22.0], egui::TextEdit::singleline(&mut self.period_text));
             if r.changed() { self.dirty = true; }
             if ui.button("刷新").clicked() { self.dirty = true; }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                self.export(ctx, mode);
+            }
         });
         ui.add_space(4.0);
         ui.label(RichText::new("以主科目发生额为主线，按凭证把对方发生额拆到各栏目；金额带符号（借正贷负）。").weak());
@@ -100,6 +104,30 @@ impl MultiColumnView {
                 _ => { widgets::amount_label(ui, r.balance); }
             }
         });
+    }
+
+    fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
+        let cols = self.cols();
+        let mut headers = vec!["日期".to_string(), "凭证号".to_string(), "摘要".to_string(), "发生额".to_string()];
+        headers.extend(cols.iter().cloned());
+        headers.push("余额".to_string());
+        let mut sh = crate::views::export::Sheet::new("多栏账", headers);
+        for r in &self.rows {
+            let mut row = vec![
+                r.date.clone(),
+                r.voucher_no.clone(),
+                r.summary.clone(),
+                r.amount.fmt_plain(),
+            ];
+            row.extend(r.cols.iter().map(|v| v.fmt_plain()));
+            row.push(r.balance.fmt_plain());
+            sh.push(row);
+        }
+        let title = format!("多栏账（{}-{}）", self.main, self.period_text);
+        match crate::views::export::run_export(&sh, "多栏账", &title, mode) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
+        }
     }
 }
 
@@ -145,6 +173,10 @@ impl SummaryTableView {
             let r = ui.add_sized([84.0, 22.0], egui::TextEdit::singleline(&mut self.period_text));
             if r.changed() { self.dirty = true; }
             if ui.button("刷新").clicked() { self.dirty = true; }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                self.export(ctx, mode);
+            }
         });
         ui.add_space(6.0);
         let rows = self.rows.clone();
@@ -164,6 +196,26 @@ impl SummaryTableView {
                 _ => {}
             }
         });
+    }
+
+    fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
+        let mut sh = crate::views::export::Sheet::new(
+            "摘要汇总表",
+            vec!["摘要".to_string(), "凭证张数".to_string(), "借方发生额".to_string(), "贷方发生额".to_string()],
+        );
+        for r in &self.rows {
+            sh.push(vec![
+                r.summary.clone(),
+                r.voucher_count.to_string(),
+                r.debit.fmt_plain(),
+                r.credit.fmt_plain(),
+            ]);
+        }
+        let title = format!("摘要汇总表（{}）", self.period_text);
+        match crate::views::export::run_export(&sh, "摘要汇总表", &title, mode) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
+        }
     }
 }
 
@@ -210,6 +262,10 @@ impl RatiosView {
             let r = ui.add_sized([84.0, 22.0], egui::TextEdit::singleline(&mut self.period_text));
             if r.changed() { self.dirty = true; }
             if ui.button("刷新").clicked() { self.dirty = true; }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                self.export(ctx, mode);
+            }
         });
         ui.add_space(6.0);
         let rows = self.rows.clone();
@@ -227,6 +283,21 @@ impl RatiosView {
                 _ => {}
             }
         });
+    }
+
+    fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
+        let mut sh = crate::views::export::Sheet::new(
+            "财务指标分析",
+            vec!["指标".to_string(), "数值".to_string(), "计算公式".to_string()],
+        );
+        for r in &self.rows {
+            sh.push(vec![r.name.clone(), r.display.clone(), r.formula.clone()]);
+        }
+        let title = format!("财务指标分析（{}）", self.period_text);
+        match crate::views::export::run_export(&sh, "财务指标分析", &title, mode) {
+            Ok(m) => ctx.info(m),
+            Err(e) => ctx.error(e),
+        }
     }
 }
 

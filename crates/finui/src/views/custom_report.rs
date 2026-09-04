@@ -223,6 +223,25 @@ impl CustomReportView {
             if ui.button("删除").clicked() {
                 want_del = true;
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                if let Some(c) = &self.cur {
+                    let mut sh = crate::views::export::Sheet::new(
+                        &c.name,
+                        c.columns.iter().cloned().collect(),
+                    );
+                    for row in &self.values {
+                        sh.push(row.iter().map(|v| v.fmt_plain()).collect());
+                    }
+                    let title = format!("{}（{}）", c.name, self.period(ctx).label());
+                    match crate::views::export::run_export(&sh, &c.name, &title, mode) {
+                        Ok(m) => ctx.info(m),
+                        Err(e) => ctx.error(e),
+                    }
+                } else {
+                    ctx.error("请先选择一张报表");
+                }
+            }
         });
 
         if want_rename {

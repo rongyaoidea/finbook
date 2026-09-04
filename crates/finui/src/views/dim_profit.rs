@@ -166,6 +166,28 @@ impl DimProfitView {
             if ui.button("刷新").clicked() {
                 self.dirty = true;
             }
+            ui.separator();
+            if let Some(mode) = crate::views::export::export_print_controls(ui, ctx) {
+                let mut sh = crate::views::export::Sheet::new(
+                    "多维损益",
+                    vec!["维度".to_string(), "收入".to_string(), "成本".to_string(), "费用".to_string(), "税金".to_string(), "利润".to_string()],
+                );
+                for r in &self.rows {
+                    sh.push(vec![
+                        r.name.clone(),
+                        r.revenue.fmt_plain(),
+                        r.cost.fmt_plain(),
+                        r.expense.fmt_plain(),
+                        r.tax.fmt_plain(),
+                        r.profit.fmt_plain(),
+                    ]);
+                }
+                let title = format!("多维损益（{} · {}）", p.label(), self.dim.label());
+                match crate::views::export::run_export(&sh, "多维损益", &title, mode) {
+                    Ok(m) => ctx.info(m),
+                    Err(e) => ctx.error(e),
+                }
+            }
         });
 
         ui.add_space(4.0);

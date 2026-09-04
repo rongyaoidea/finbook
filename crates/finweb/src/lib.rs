@@ -7,4 +7,5 @@
 pub mod dto;
 pub mod handlers;
 pub mod pdf;
+pub mod report_html;
 pub mod state;

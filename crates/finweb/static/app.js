@@ -3222,7 +3222,7 @@ function renderAccounts(main, rows) {
       <input id="acct-kw" placeholder="编码 / 名称" value="${esc(kw)}" style="width:160px" />
       <button class="btn" id="acct-search">查询</button>
       <div class="spacer"></div>
-      ${can("voucher_new") ? `<button class="btn ghost" id="acct-fill">填充默认科目</button>` : ""}
+      ${session.platformAdmin ? `<button class="btn ghost" id="acct-fill">填充默认科目</button>` : ""}
       ${can("account_edit") ? `<button class="btn primary" id="acct-new">新增科目</button>` : ""}
     </div>
     <div class="panel" style="padding:0;overflow:auto;max-height:70vh">
@@ -3700,12 +3700,23 @@ async function viewTemplates(main) {
       </div>`;
     $all("[data-gen]", body).forEach((b) => b.addEventListener("click", async () => {
       const t = rows.find((x) => x.id === parseInt(b.dataset.gen, 10));
-      if (t) await genVoucherFromTemplate(t);
+      if (t) { await generateTemplateVoucher(t, period); refresh(); }
     }));
   }
 }
 
-// 由模板打开凭证编辑器（空金额分录预填为 0，可在编辑器内补全）
+// 按模板直接生成凭证并回写 last_period（走后端 generate，用于「本期到期」闭环）
+async function generateTemplateVoucher(t, period) {
+  if (!t.entries.length) { toast("模板没有分录", "err"); return null; }
+  if (!(await confirmDialog(`按模板「${t.name}」生成 ${period} 的记账凭证？金额为空的科目将按 0 记账。`))) return null;
+  try {
+    const r = await api(`/templates/${t.id}/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(period), date: "" }) });
+    toast(`已生成凭证 #${r.id}`, "ok");
+    return r;
+  } catch (e) { toast(e.message, "err"); return null; }
+}
+
+// 由模板打开凭证编辑器（空金额分录预填为 0，可在编辑器内补全）——用于手工调用场景
 async function genVoucherFromTemplate(t) {
   if (!t.entries.length) { toast("模板没有分录", "err"); return; }
   const unPriced = t.entries.filter((e) => !String(e.amount || "").trim());
@@ -3828,7 +3839,8 @@ async function viewPayroll(main) {
   $("#py-tab-voucher").onclick = () => switchTab("voucher");
   $("#py-prev").onclick = () => switchPeriod(prevPeriod(period));
   $("#py-next").onclick = () => switchPeriod(nextPeriod(period));
-  $("#py-refresh").onclick = () => viewPayroll(main);
+  $("#py-refresh").onclick = () => switchPeriod($("#py-period").value.trim() || period);
+  $("#py-period").addEventListener("keydown", (e) => { if (e.key === "Enter") switchPeriod($("#py-period").value.trim() || period); });
 
   const ymm6 = ymm(period);
   let rows = [], employees = [];
@@ -3966,11 +3978,14 @@ async function viewPayroll(main) {
 function openPayrollEditor(main, row, period, employees) {
   const isEdit = !!row;
   const r = row || { employee: "", dept: "", gross: "", social: "", housing: "", deduction: "", additional: "", social_co: "", housing_co: "", memo: "" };
-  const empOpts = employees.map((e) => `<option value="${esc(e.code)}" ${r.employee === e.code ? "selected" : ""}>${esc(e.code)} ${esc(e.name)}</option>`).join("");
+  const empKnown = r.employee && employees.some((e) => e.code === r.employee);
+  // 只渲染一份选项：已知员工在列表里（编辑时）不再额外加裸编码项，避免重复
+  const empOpts = employees.map((e) => `<option value="${esc(e.code)}" ${r.employee === e.code ? "selected" : ""}>${esc(e.code)} ${esc(e.name)}</option>`).join("")
+    + (r.employee && !empKnown ? `<option value="${esc(r.employee)}" selected>${esc(r.employee)}（档案外）</option>` : "");
   const mask = modal(`
     <h3>${isEdit ? `编辑工资行（${esc(empNameIn(employees, r.employee) || r.employee)}）` : "新增工资行"} · ${esc(period)}</h3>
     <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
-      <div><label>员工 *</label>${employees.length ? `<select id="pw-emp"><option value="${esc(r.employee)}" ${r.employee && !employees.some((e) => e.code === r.employee) ? "selected" : ""}>${esc(r.employee || "选择…")}</option>${empOpts}</select>` : `<input id="pw-emp" value="${esc(r.employee)}" placeholder="职员编码" />`}</div>
+      <div><label>员工 *</label>${employees.length ? `<select id="pw-emp"><option value="">选择职员…</option>${empOpts}</select>` : `<input id="pw-emp" value="${esc(r.employee)}" placeholder="职员编码" />`}</div>
       <div><label>部门</label><input id="pw-dept" value="${esc(r.dept)}" style="width:110px" /></div>
     </div>
     <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">

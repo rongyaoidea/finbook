@@ -1211,8 +1211,8 @@ async fn templates_and_aux_lifecycle() {
     let tpl = serde_json::json!({
         "id": 0, "name": "月度计提房租", "memo": "每月房租",
         "entries": [
-            { "summary": "计提房租", "account_code": "6602", "dir": "debit", "amount": "5000", "aux": {} },
-            { "summary": "计提房租", "account_code": "2202", "dir": "credit", "amount": "5000", "aux": {} }
+            { "summary": "计提房租", "account_code": "660201", "dir": "debit", "amount": "5000", "aux": {} },
+            { "summary": "计提房租", "account_code": "221101", "dir": "credit", "amount": "5000", "aux": {} }
         ],
         "freq": "monthly", "start_period": 202601, "end_period": null,
         "last_period": null, "active": true
@@ -1233,6 +1233,31 @@ async fn templates_and_aux_lifecycle() {
         .unwrap();
     let s = body_string(resp).await;
     assert!(s.contains("月度计提房租"), "本期到期应包含模板：{s}");
+
+    // 生成凭证 → 回写 last_period，本期到期列表不再包含
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/templates/{id}/generate"),
+            &sid,
+            serde_json::json!({ "period": 202601, "date": "2026-01-31" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "模板生成凭证应成功");
+    let s = body_string(resp).await;
+    let vid: i64 = serde_json::from_str::<serde_json::Value>(&s).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert!(vid > 0, "应返回凭证 id：{s}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/templates/due?period=202601", &sid))
+        .await
+        .unwrap();
+    let s = body_string(resp).await;
+    assert!(
+        !s.contains("月度计提房租"),
+        "生成后本期到期列表应移除该模板（last_period 已推进）：{s}"
+    );
 
     // 修改
     let mut tpl2 = tpl.clone();

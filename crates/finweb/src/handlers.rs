@@ -236,6 +236,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/templates", get(list_templates).post(create_template))
         .route("/api/templates/due", get(due_templates))
         .route("/api/templates/:id", put(update_template).delete(delete_template))
+        .route("/api/templates/:id/generate", post(generate_template))
         .route("/api/aux", get(list_aux).post(create_aux))
         .route("/api/aux/:id", put(update_aux).delete(delete_aux))
         .route("/api/payroll", get(list_payroll).post(save_payroll))
@@ -4185,6 +4186,20 @@ struct BackupRestoreReq {
     file: String,
 }
 
+/// 强制把 WAL 合并回主文件（TRUNCATE），使文件级复制（`fs::copy`）拿到一致快照。
+///
+/// 数据库为 WAL 模式，最新提交可能滞留在 `-wal` 文件中；若不先 checkpoint 直接复制
+/// 主文件，备份会缺最新数据，恢复后丢账。checkpoint 后主文件即完整、`-wal` 被清空。
+fn checkpoint_wal(db: &findb::Db) -> Result<(), AppError> {
+    let _row: (i64, i64, i64) = db
+        .conn()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(findb::DbError::from)?;
+    Ok(())
+}
+
 async fn list_backups(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -4222,15 +4237,13 @@ async fn create_backup(
     }
     let dir = state.books_dir.join("backups");
     let _ = std::fs::create_dir_all(&dir);
+    // 先 checkpoint 把 WAL 合并回主文件，再复制主文件即可得到完整一致快照
+    let db = state.db_for(&user.book_key)?;
+    checkpoint_wal(&db)?;
+    drop(db);
     let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let dst_name = format!("{}_{}.fbk", stamp, key);
     std::fs::copy(&src, dir.join(&dst_name))?;
-    for ext in ["-wal", "-shm"] {
-        let w = state.books_dir.join(format!("{key}.fbk{ext}"));
-        if w.exists() {
-            let _ = std::fs::copy(&w, dir.join(format!("{}_{}.fbk{ext}", stamp, key)));
-        }
-    }
     let db = state.db_for(&user.book_key)?;
     db.log(user.username(), "系统", "备份账套", &format!("备份 {dst_name}"))?;
     Ok(Json(json!({"ok": true, "name": dst_name})))
@@ -4253,8 +4266,11 @@ async fn restore_backup(
         return Err(AppError::not_found("备份文件不存在"));
     }
     let dst = state.books_dir.join(format!("{key}.fbk"));
-    // 恢复前先自动备份一次，避免覆盖无法回退
+    // 恢复前先 checkpoint 当前账套并自动备份一次，避免覆盖无法回退
     let _ = std::fs::create_dir_all(state.books_dir.join("backups"));
+    let db = state.db_for(&user.book_key)?;
+    checkpoint_wal(&db)?;
+    drop(db);
     let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let auto_name = format!("auto_{}_{}.fbk", stamp, key);
     let _ = std::fs::copy(&dst, state.books_dir.join("backups").join(&auto_name));
@@ -4319,6 +4335,41 @@ async fn delete_template(
     template::delete(&db, id)?;
     db.log(user.username(), "凭证模板", "删除模板", &id.to_string())?;
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct TemplateGenerateReq {
+    /// 期间 ymm，如 202601，缺省当前期间
+    #[serde(default)]
+    period: Option<i32>,
+    /// 凭证日期，缺省期间末日
+    #[serde(default)]
+    date: String,
+}
+
+/// 由模板直接生成凭证并回写 last_period（周期性模板据此推进「本期到期」判断）
+async fn generate_template(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<TemplateGenerateReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let t = template::get(&db, id)?.ok_or_else(|| AppError::not_found("模板不存在"))?;
+    let period = req
+        .period
+        .filter(|ym| *ym > 0)
+        .map(Period::from_ymm)
+        .unwrap_or_else(|| current_period(&state, &user));
+    let date = req_date(&req.date, period.last_day())?;
+    let word = "记";
+    let no = vouchers::next_no(&db, period, word)?;
+    let mut v = t.to_voucher(period, date, word, no as i64, user.username())?;
+    let vid = vouchers::save(&db, &mut v)?;
+    template::mark_generated(&db, id, period)?;
+    db.log(user.username(), "凭证模板", "生成凭证", &format!("{} → 凭证 #{vid}", t.name))?;
+    Ok(Json(json!({ "id": vid })))
 }
 
 async fn due_templates(

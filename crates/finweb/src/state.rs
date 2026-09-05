@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -23,6 +23,8 @@ pub struct WebState {
     pub books: BookRegistry,
     pub sessions: SessionStore,
     pub policy: PasswordPolicy,
+    /// 登录限流（账号维度）
+    pub login_limiter: LoginLimiter,
     /// 平台身份库（全局账号 + 账套目录）
     pub realm: RealmDb,
     /// 用户自建账套的存放目录
@@ -55,6 +57,7 @@ impl WebState {
             books,
             sessions,
             policy,
+            login_limiter: LoginLimiter::new(),
             realm,
             books_dir,
             company: std::sync::RwLock::new(String::new()),
@@ -142,6 +145,60 @@ impl BookRegistry {
             .map(|(_, p)| p.clone())
             .ok_or_else(|| DbError::Fin(fincore::FinError::msg(format!("账套不存在：{key}"))))?;
         Db::open(&path).map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 登录限流（账号维度滑动窗口）
+// ---------------------------------------------------------------------------
+
+/// 登录失败限流窗口（15 分钟）
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// 窗口内允许的最大失败次数，超过则拒绝后续尝试直至窗口滑出
+const LOGIN_MAX_FAILURES: usize = 10;
+
+/// 登录限流：按账号做滑动窗口计数。
+///
+/// 单机内存实现——本服务为单机部署，进程重启即清零；对 WireGuard 等私有组网场景
+/// 主要作纵深防御（防授权设备被攻破后的账号爆破、防内部误操作），不追求跨实例一致性。
+pub struct LoginLimiter {
+    inner: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl LoginLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 检查该账号当前是否允许再尝试登录；返回 `Err(剩余等待秒数)` 表示已被限流。
+    pub fn check(&self, key: &str) -> Result<(), u64> {
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let v = g.entry(key.to_string()).or_default();
+        v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+        if v.len() >= LOGIN_MAX_FAILURES {
+            // 窗口滑出到最早一次失败时，允许再次尝试
+            let wait = LOGIN_WINDOW.saturating_sub(now.duration_since(v[0]));
+            return Err(wait.as_secs().max(1));
+        }
+        Ok(())
+    }
+
+    /// 记录一次失败尝试
+    pub fn record_failure(&self, key: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .push(Instant::now());
+    }
+
+    /// 登录成功后清零该账号的失败记录
+    pub fn clear(&self, key: &str) {
+        self.inner.lock().unwrap().remove(key);
     }
 }
 
@@ -468,6 +525,8 @@ pub enum AppError {
     BadRequest(String),
     NotFound(String),
     Db(DbError),
+    /// 请求过于频繁（如登录限流），附剩余等待秒数
+    RateLimited { msg: String, retry_secs: u64 },
 }
 
 impl From<DbError> for AppError {
@@ -501,18 +560,47 @@ impl AppError {
     pub fn not_found(m: impl Into<String>) -> Self {
         AppError::NotFound(m.into())
     }
+    pub fn rate_limited(m: impl Into<String>, retry_secs: u64) -> Self {
+        AppError::RateLimited {
+            msg: m.into(),
+            retry_secs,
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
-            AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
-            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
-            AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("数据库错误：{e}")),
-        };
-        (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
+        match self {
+            AppError::Unauthorized(m) => {
+                (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "error": m }))).into_response()
+            }
+            AppError::Forbidden(m) => {
+                (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "error": m }))).into_response()
+            }
+            AppError::BadRequest(m) => {
+                (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": m }))).into_response()
+            }
+            AppError::NotFound(m) => {
+                (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "error": m }))).into_response()
+            }
+            AppError::Db(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "error": format!("数据库错误：{e}") })),
+            )
+                .into_response(),
+            AppError::RateLimited { msg, retry_secs } => {
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(serde_json::json!({ "error": msg, "retry_after": retry_secs })),
+                )
+                    .into_response();
+                if let Ok(v) = HeaderValue::from_str(&retry_secs.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, v);
+                }
+                resp
+            }
+        }
     }
 }
 

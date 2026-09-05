@@ -318,10 +318,24 @@ async fn post_login(
 ) -> Result<Response, AppError> {
     // 全局登录（认平台身份库，而非某一套账）
     let username = req.username.trim().to_string();
-    let ru = state
-        .realm
-        .authenticate(&username, &req.password)?
-        .ok_or_else(|| AppError::unauthorized("用户名或口令错误"))?;
+    // 登录限流：先查是否已被锁定，避免锁定期内继续做昂贵/可枚举的密码校验
+    if let Err(secs) = state.login_limiter.check(&username) {
+        let mins = secs.div_ceil(60).max(1);
+        return Err(AppError::rate_limited(
+            format!("尝试过于频繁，请约 {mins} 分钟后再试"),
+            secs,
+        ));
+    }
+    let ru = match state.realm.authenticate(&username, &req.password) {
+        Ok(Some(ru)) => ru,
+        Ok(None) => {
+            state.login_limiter.record_failure(&username);
+            return Err(AppError::unauthorized("用户名或口令错误"));
+        }
+        Err(e) => return Err(AppError::from(e)),
+    };
+    // 登录成功，清空该账号的失败计数
+    state.login_limiter.clear(&username);
     if ru.disabled {
         return Err(AppError::forbidden("账户已停用，请联系管理员"));
     }

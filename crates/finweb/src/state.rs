@@ -482,6 +482,12 @@ impl From<fincore::FinError> for AppError {
     }
 }
 
+impl From<std::io::Error> for AppError {
+    fn from(e: std::io::Error) -> Self {
+        AppError::BadRequest(format!("文件操作失败：{e}"))
+    }
+}
+
 impl AppError {
     pub fn unauthorized(m: impl Into<String>) -> Self {
         AppError::Unauthorized(m.into())

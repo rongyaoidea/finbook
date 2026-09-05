@@ -589,7 +589,7 @@ pub fn period_end_cost(db: &Db, period: Period, apply: bool) -> DbResult<Vec<Per
 // ===========================================================================
 
 /// 工资单行
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Payroll {
     pub id: i64,
     pub period: Period,
@@ -710,8 +710,20 @@ pub fn payroll_delete(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 按主键取一条工资行（web 删除前校验凭证占用用）
+pub fn payroll_get_by_id(db: &Db, id: i64) -> DbResult<Option<Payroll>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {PAY_COLS} FROM payroll WHERE id=?1"),
+            rusqlite::params![id],
+            map_pay,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 /// 当年截至 `period` 前一个月，该员工的累计工资数据
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct YtdPayroll {
     pub income: Money,
     pub special: Money,
@@ -824,6 +836,9 @@ pub fn payroll_generate(
 /// - 应发工资 → 贷 `wage_payable`（221101）
 /// - 企业承担社保 → 贷 `social_payable`（221103）
 /// - 企业承担公积金 → 贷 `housing_payable`（221104）
+///
+/// 借方为单一费用科目，按部门拆分「应发 + 企业社保 + 企业公积金」——
+/// 部门人工成本全额进费用；费用科目（如 6602）启用的部门辅助核算也因此始终有值。
 pub fn payroll_accrue_voucher(
     db: &Db,
     period: Period,
@@ -848,10 +863,12 @@ pub fn payroll_accrue_voucher(
     v.source = VoucherSource::Business;
     v.memo = format!("计提 {} 工资及社保", period.label());
     let mut i = 1;
-    // 借方按部门拆分应发，便于后续做部门损益
+    // 借方按部门拆分「应发 + 企业社保 + 企业公积金」，便于后续做部门损益；
+    // 同时费用科目（如 6602 管理费用）通常启用部门辅助核算且必填，
+    // 三段若各自单独出借方行，社保/公积金两行没有部门会过不了引擎校验。
     let mut by_dept: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
     for r in &rows {
-        *by_dept.entry(r.dept.clone()).or_insert(Money::ZERO) += r.gross;
+        *by_dept.entry(r.dept.clone()).or_insert(Money::ZERO) += r.gross + r.social_co + r.housing_co;
     }
     for (dept, amt) in &by_dept {
         v.push_entry(Entry {
@@ -860,21 +877,7 @@ pub fn payroll_accrue_voucher(
                 dept: if dept.is_empty() { None } else { Some(dept.clone()) },
                 ..Default::default()
             },
-            ..Entry::new(i, expense_account, "计提工资")
-        });
-        i += 1;
-    }
-    if !sco.is_zero() {
-        v.push_entry(Entry {
-            debit: sco,
-            ..Entry::new(i, expense_account, "计提社保（企业）")
-        });
-        i += 1;
-    }
-    if !hco.is_zero() {
-        v.push_entry(Entry {
-            debit: hco,
-            ..Entry::new(i, expense_account, "计提公积金（企业）")
+            ..Entry::new(i, expense_account, "计提工资及社保公积金（企业）")
         });
         i += 1;
     }
@@ -1031,7 +1034,8 @@ pub fn payroll_pay_voucher(
 // 费用报销
 // ===========================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
     Draft,
     Submitted,
@@ -1090,7 +1094,7 @@ pub struct ClaimItem {
 }
 
 /// 费用报销单
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Claim {
     pub id: i64,
     pub period: Period,

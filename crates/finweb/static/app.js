@@ -351,8 +351,14 @@ const NAV_ITEMS = [
   { id: "platform-users", label: "平台账号", platform: true, group: "平台管理" },
   { id: "platform-books", label: "全部账套", platform: true, group: "平台管理" },
   { id: "dashboard", label: "仪表盘", perm: null, group: "开始" },
+  { id: "accounts", label: "会计科目", perm: "account_edit", group: "基础资料" },
+  { id: "begin", label: "期初建账", perm: "opening", group: "基础资料" },
+  { id: "aux", label: "辅助档案", perm: "aux_edit", group: "基础资料" },
   { id: "vouchers", label: "记账凭证", perm: "voucher_new", group: "凭证" },
   { id: "imports", label: "数据导入", perm: "voucher_new", group: "凭证" },
+  { id: "templates", label: "凭证模板", perm: "voucher_new", group: "凭证" },
+  { id: "payroll", label: "工资管理", perm: "voucher_new", group: "凭证" },
+  { id: "claims", label: "费用报销", perm: "voucher_new", group: "凭证" },
   { id: "invoices", label: "发票管理", perm: "report", group: "凭证" },
   { id: "ledger", label: "明细账", perm: "report", group: "账簿报表" },
   { id: "reports", label: "报表中心", perm: "report", group: "账簿报表" },
@@ -391,6 +397,9 @@ const NAV_ITEMS = [
   { id: "inv-transfer", label: "调拨报表", perm: "report", group: "库存" },
   { id: "approval", label: "审批中心", perm: "report", group: "系统" },
   { id: "archive", label: "电子档案", perm: "report", group: "系统" },
+  { id: "options", label: "账套参数", perm: "sys_option", group: "系统" },
+  { id: "logs", label: "操作日志", perm: "audit_log", group: "系统" },
+  { id: "backup", label: "备份恢复", perm: "backup", group: "系统" },
   { id: "security", label: "安全中心", perm: "user_manage", group: "系统" },
 ];
 
@@ -441,6 +450,15 @@ const VIEWS = {
   "budget-analysis": viewBudgetAnalysis,
   "cost": viewCost,
   "security": viewSecurity,
+  "accounts": viewAccounts,
+  "begin": viewBegin,
+  "aux": viewAux,
+  "options": viewOptions,
+  "logs": viewLogs,
+  "backup": viewBackup,
+  "templates": viewTemplates,
+  "payroll": viewPayroll,
+  "claims": viewClaims,
 };
 
 let shellBuilt = false;
@@ -923,11 +941,17 @@ async function batchPost() {
   } catch (e) { toast(e.message, "err"); }
 }
 
-async function openVoucherEditor(id) {
+// seedEntries：可选，凭证模板生成凭证时预填分录 [{account_code, summary, dir, amount}]
+async function openVoucherEditor(id, seedEntries) {
   await ensureAccounts();
+  const blank = { line: 1, account_code: "", summary: "", debit: "0", credit: "0" };
   let v = {
     id: 0, period: state.current, date: today(), word: "记", no: 0, attachments: 0, memo: "",
-    entries: [{ line: 1, account_code: "", summary: "", debit: "0", credit: "0" }, { line: 2, account_code: "", summary: "", debit: "0", credit: "0" }],
+    entries: (seedEntries && seedEntries.length ? seedEntries.map((e, i) => ({
+      line: i + 1, account_code: e.account_code || "", summary: e.summary || "",
+      debit: e.dir === "credit" ? "0" : (e.amount || "0"),
+      credit: e.dir === "credit" ? (e.amount || "0") : "0",
+    })) : [Object.assign({}, blank, { line: 1 }), Object.assign({}, blank, { line: 2 })]),
   };
   let status = "draft", voucher_no = "";
   if (id) {
@@ -3148,6 +3172,1050 @@ async function openCostConfig(item) {
       toast("已保存", "ok"); closeModal(); viewCost($("#main"));
     } catch (e) { toast(e.message, "err"); }
   };
+}
+
+// ===========================================================================
+// 基础资料与系统功能（对齐桌面端 finui：科目 / 期初 / 档案 / 参数 / 日志 / 备份 / 模板）
+// ===========================================================================
+
+// 辅助核算维度（bit 与后端 AuxKind::bit() 对齐，仅用于把掩码渲染成标签）
+const AUX_KINDS = [
+  { code: "customer", label: "客户", bit: 1 },
+  { code: "supplier", label: "供应商", bit: 2 },
+  { code: "dept", label: "部门", bit: 4 },
+  { code: "employee", label: "职员", bit: 8 },
+  { code: "project", label: "项目", bit: 16 },
+  { code: "item", label: "存货", bit: 32 },
+  { code: "cashflow", label: "现金流量", bit: 64 },
+  { code: "bank", label: "银行账户", bit: 128 },
+];
+const ACCT_CATEGORIES = [
+  { code: "asset", label: "资产" }, { code: "liability", label: "负债" }, { code: "common", label: "共同" },
+  { code: "equity", label: "权益" }, { code: "cost", label: "成本" }, { code: "income", label: "收入" }, { code: "expense", label: "费用" },
+];
+const FREQ_LABELS = { manual: "手工调用", monthly: "每月生成", quarterly: "每季生成", yearly: "每年生成" };
+
+function auxMaskLabel(mask) {
+  return AUX_KINDS.filter((k) => (mask & k.bit) !== 0).map((k) => k.label).join("、") || "—";
+}
+function acctCatLabel(code) {
+  const c = ACCT_CATEGORIES.find((x) => x.code === code);
+  return c ? c.label : code;
+}
+function dirLabel(code) { return code === "credit" ? "贷" : "借"; }
+
+// ---------------- 会计科目 ----------------
+async function viewAccounts(main) {
+  main.innerHTML = `<h2>会计科目</h2><div class="muted">加载中…</div>`;
+  let rows;
+  try { rows = await api("/accounts"); } catch (e) { main.innerHTML = `<h2>会计科目</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  state.accounts = rows;
+  renderAccounts(main, rows);
+}
+
+function renderAccounts(main, rows) {
+  const kw = (state.acctKw || "").trim();
+  const shown = kw ? rows.filter((a) => a.code.includes(kw) || a.name.includes(kw)) : rows;
+  main.innerHTML = `
+    <h2>会计科目</h2>
+    <div class="toolbar">
+      <input id="acct-kw" placeholder="编码 / 名称" value="${esc(kw)}" style="width:160px" />
+      <button class="btn" id="acct-search">查询</button>
+      <div class="spacer"></div>
+      ${can("voucher_new") ? `<button class="btn ghost" id="acct-fill">填充默认科目</button>` : ""}
+      ${can("account_edit") ? `<button class="btn primary" id="acct-new">新增科目</button>` : ""}
+    </div>
+    <div class="panel" style="padding:0;overflow:auto;max-height:70vh">
+      <table class="grid">
+        <thead><tr><th>编码</th><th>名称</th><th>类别</th><th>方向</th><th>辅助核算</th><th>数量</th><th>币种</th><th>标志</th><th>状态</th><th>备注</th><th></th></tr></thead>
+        <tbody>
+          ${shown.length ? shown.map((a) => `
+            <tr>
+              <td>${esc(a.code)}</td>
+              <td>${esc(a.name)}</td>
+              <td>${esc(acctCatLabel(a.category))}</td>
+              <td>${esc(dirLabel(a.dir))}</td>
+              <td>${esc(auxMaskLabel(a.aux))}</td>
+              <td>${esc(a.unit || "—")}</td>
+              <td>${esc(a.currency || "—")}</td>
+              <td>${a.is_cash ? "现金 " : ""}${a.is_bank ? "银行" : ""}${!a.is_cash && !a.is_bank ? "—" : ""}</td>
+              <td>${a.disabled ? `<span class="tag err">停用</span>` : `<span class="tag ok">启用</span>`}</td>
+              <td>${esc(a.memo)}</td>
+              <td class="row-actions">
+                ${can("account_edit") ? `<button class="btn sm ghost" data-act="edit" data-code="${esc(a.code)}">编辑</button>` : ""}
+                ${can("account_edit") ? `<button class="btn sm ghost" data-act="del" data-code="${esc(a.code)}">删除</button>` : ""}
+              </td>
+            </tr>`).join("") : `<tr><td colspan="11" class="muted" style="text-align:center;padding:18px">无科目${kw ? "（无匹配）" : ""}，可点「填充默认科目」</td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
+  $("#acct-search").addEventListener("click", () => { state.acctKw = $("#acct-kw").value; renderAccounts(main, rows); });
+  $("#acct-kw").addEventListener("keydown", (e) => { if (e.key === "Enter") { state.acctKw = $("#acct-kw").value; renderAccounts(main, rows); } });
+  const fill = $("#acct-fill");
+  if (fill) fill.addEventListener("click", async () => {
+    if (!(await confirmDialog("按编码推断补充系统内置科目表（已有的科目不动），继续？"))) return;
+    try { const r = await api("/accounts/fill-defaults", { method: "POST" }); toast(`已补充 ${r.added || 0} 个科目`, "ok"); viewAccounts(main); }
+    catch (e) { toast(e.message, "err"); }
+  });
+  if ($("#acct-new")) $("#acct-new").addEventListener("click", () => openAccountEditor(main, null));
+  $all("[data-act]", main).forEach((b) => b.addEventListener("click", async () => {
+    const code = b.dataset.code;
+    if (b.dataset.act === "edit") {
+      const acc = rows.find((x) => x.code === code);
+      if (acc) openAccountEditor(main, acc);
+    } else if (b.dataset.act === "del") {
+      if (!(await confirmDialog(`确定删除科目 ${code}？已被凭证使用的科目无法删除。`, true))) return;
+      try { await api(`/accounts/${encodeURIComponent(code)}`, { method: "DELETE" }); toast("已删除", "ok"); viewAccounts(main); }
+      catch (e) { toast(e.message, "err"); }
+    }
+  }));
+}
+
+function openAccountEditor(main, acc) {
+  const isEdit = !!acc;
+  const a = acc || { code: "", name: "", category: "asset", dir: "debit", aux: 0, unit: null, currency: null, has_qty: false, is_cash: false, is_bank: false, cash_flow_item: null, bs_item: null, pl_item: null, disabled: false, memo: "" };
+  const mask = modal(`
+    <h3>${isEdit ? "编辑科目" : "新增科目"}</h3>
+    <div class="field"><label>科目编码 *</label><input id="ac-code" value="${esc(a.code)}" ${isEdit ? "readonly" : ""} placeholder="1001" /></div>
+    <div class="field"><label>科目名称 *</label><input id="ac-name" value="${esc(a.name)}" /></div>
+    <div class="field"><label>类别</label>
+      <select id="ac-cat">${ACCT_CATEGORIES.map((c) => `<option value="${c.code}" ${a.category === c.code ? "selected" : ""}>${c.label}</option>`).join("")}</select>
+    </div>
+    <div class="field"><label>余额方向</label>
+      <select id="ac-dir"><option value="debit" ${a.dir !== "credit" ? "selected" : ""}>借</option><option value="credit" ${a.dir === "credit" ? "selected" : ""}>贷</option></select>
+    </div>
+    <div class="field"><label>辅助核算维度</label>
+      <div style="display:flex;flex-wrap:wrap;gap:8px 16px">
+        ${AUX_KINDS.map((k) => `<label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="ac-aux" value="${k.code}" ${(a.aux & k.bit) ? "checked" : ""} />${k.label}</label>`).join("")}
+      </div>
+    </div>
+    <div class="field"><label>数量单位（留空不核算数量）</label><input id="ac-unit" value="${esc(a.unit || "")}" placeholder="件 / 吨" /></div>
+    <div class="field"><label>外币币种（留空只核算人民币）</label><input id="ac-cur" value="${esc(a.currency || "")}" placeholder="USD" /></div>
+    <div class="field"><label>备注</label><input id="ac-memo" value="${esc(a.memo)}" /></div>
+    <div class="field" style="display:flex;gap:20px">
+      <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="ac-cash" ${a.is_cash ? "checked" : ""} />现金科目</label>
+      <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="ac-bank" ${a.is_bank ? "checked" : ""} />银行科目</label>
+      <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="ac-disabled" ${a.disabled ? "checked" : ""} />停用</label>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="ac-cancel">取消</button>
+      <button class="btn primary" id="ac-save">保存</button>
+    </div>
+  `);
+  $("#ac-cancel", mask).addEventListener("click", closeModal);
+  $("#ac-save", mask).addEventListener("click", async () => {
+    const code = $("#ac-code", mask).value.trim();
+    const name = $("#ac-name", mask).value.trim();
+    if (!code || !name) { toast("编码与名称必填", "err"); return; }
+    const auxKinds = $all(".ac-aux", mask).filter((c) => c.checked).map((c) => c.value);
+    const unit = $("#ac-unit", mask).value.trim();
+    const cur = $("#ac-cur", mask).value.trim();
+    const body = {
+      account: Object.assign({}, a, {
+        code, name,
+        category: $("#ac-cat", mask).value,
+        dir: $("#ac-dir", mask).value,
+        unit: unit || null,
+        currency: cur || null,
+        has_qty: !!unit,
+        is_cash: $("#ac-cash", mask).checked,
+        is_bank: $("#ac-bank", mask).checked,
+        disabled: $("#ac-disabled", mask).checked,
+        memo: $("#ac-memo", mask).value.trim(),
+      }),
+      aux_kinds: auxKinds,
+    };
+    try {
+      if (isEdit) await api("/accounts", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      else await api("/accounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("已保存", "ok"); closeModal(); viewAccounts(main);
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ---------------- 期初建账 ----------------
+async function viewBegin(main) {
+  main.innerHTML = `<h2>期初建账</h2><div class="muted">加载中…</div>`;
+  let rows, accounts;
+  try {
+    [rows, accounts] = await Promise.all([api("/begin"), api("/accounts")]);
+  } catch (e) { main.innerHTML = `<h2>期初建账</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  state.accounts = accounts;
+  renderBegin(main, rows);
+}
+
+// rows：BeginRow 列表；year_begin 带符号（借正贷负），前端拆成 方向 + 金额 文本框
+function renderBegin(main, rows) {
+  if (!state.beginDraft) state.beginDraft = rows.map((r) => ({
+    id: r.id, account_code: r.account_code,
+    dir: String(r.year_begin).trim().startsWith("-") ? "credit" : "debit",
+    yb: fmt(String(Math.abs(parseFloat(r.year_begin) || 0))),
+    ad: fmt(r.debit_accum), ac: fmt(r.credit_accum), qty: r.qty_begin == null ? "" : fmt(r.qty_begin),
+  }));
+  const draft = state.beginDraft;
+  const num = (s) => parseFloat(String(s).replace(/,/g, "")) || 0;
+  const render = () => {
+    const nameOf = (code) => { const a = (state.accounts || []).find((x) => x.code === code); return a ? a.name : ""; };
+    const sumYbDebit = draft.filter((r) => r.dir === "debit").reduce((s, r) => s + num(r.yb), 0);
+    const sumYbCredit = draft.filter((r) => r.dir === "credit").reduce((s, r) => s + num(r.yb), 0);
+    const sumAd = draft.reduce((s, r) => s + num(r.ad), 0);
+    const sumAc = draft.reduce((s, r) => s + num(r.ac), 0);
+    const balanced = Math.abs((sumYbDebit + sumAd) - (sumYbCredit + sumAc)) < 0.005;
+    main.innerHTML = `
+      <h2>期初建账</h2>
+      <div class="toolbar">
+        <button class="btn" id="bg-add">添加科目行</button>
+        <div class="spacer"></div>
+        ${can("opening") ? `<button class="btn primary" id="bg-save">保存全部</button>` : ""}
+      </div>
+      <div class="panel" style="padding:0;overflow:auto;max-height:60vh">
+        <table class="grid">
+          <thead><tr><th>科目编码</th><th>科目名称</th><th>方向</th><th class="num">年初余额</th><th class="num">借方累计</th><th class="num">贷方累计</th><th class="num">数量</th><th></th></tr></thead>
+          <tbody>
+            ${draft.length ? draft.map((r, i) => `
+              <tr>
+                <td><input class="bg-code" data-i="${i}" value="${esc(r.account_code)}" style="width:110px" ${r.id > 0 ? "readonly" : ""} /></td>
+                <td class="muted">${esc(nameOf(r.account_code))}</td>
+                <td><select class="bg-dir" data-i="${i}"><option value="debit" ${r.dir !== "credit" ? "selected" : ""}>借</option><option value="credit" ${r.dir === "credit" ? "selected" : ""}>贷</option></select></td>
+                <td class="num"><input class="bg-yb num" data-i="${i}" value="${esc(r.yb)}" style="width:120px;text-align:right" /></td>
+                <td class="num"><input class="bg-ad num" data-i="${i}" value="${esc(r.ad)}" style="width:120px;text-align:right" /></td>
+                <td class="num"><input class="bg-ac num" data-i="${i}" value="${esc(r.ac)}" style="width:120px;text-align:right" /></td>
+                <td class="num"><input class="bg-qty num" data-i="${i}" value="${esc(r.qty)}" style="width:90px;text-align:right" /></td>
+                <td>${r.id > 0 ? `<span class="muted" style="font-size:12px">已有</span>` : `<button class="btn ghost sm" data-rm="${i}">移除</button>`}</td>
+              </tr>`).join("") : `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">暂无期初数据，点「添加科目行」开始建账</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <div class="cards" style="margin-top:14px">
+        <div class="card"><div class="k">年初借方合计</div><div class="v" style="font-size:16px">${fmt(sumYbDebit.toFixed(2))}</div></div>
+        <div class="card"><div class="k">年初贷方合计</div><div class="v" style="font-size:16px">${fmt(sumYbCredit.toFixed(2))}</div></div>
+        <div class="card"><div class="k">借方累计合计</div><div class="v" style="font-size:16px">${fmt(sumAd.toFixed(2))}</div></div>
+        <div class="card"><div class="k">贷方累计合计</div><div class="v" style="font-size:16px">${fmt(sumAc.toFixed(2))}</div></div>
+        <div class="card"><div class="k">试算平衡</div><div class="v" style="font-size:16px;color:${balanced ? "var(--ok)" : "var(--err)"}">${balanced ? "✓ 平衡" : "✗ 不平衡"}</div></div>
+      </div>`;
+    $all(".bg-code", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].account_code = inp.value.trim());
+    $all(".bg-dir", main).forEach((sel) => sel.onchange = () => draft[+sel.dataset.i].dir = sel.value);
+    $all(".bg-yb", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].yb = inp.value);
+    $all(".bg-ad", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].ad = inp.value);
+    $all(".bg-ac", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].ac = inp.value);
+    $all(".bg-qty", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].qty = inp.value);
+    $all("[data-rm]", main).forEach((b) => b.onclick = () => { draft.splice(+b.dataset.rm, 1); render(); });
+    $("#bg-add").onclick = () => { draft.push({ id: 0, account_code: "", dir: "debit", yb: "", ad: "", ac: "", qty: "" }); render(); };
+    $("#bg-save").onclick = async () => {
+      const payload = draft
+        .filter((r) => r.account_code)
+        .map((r) => ({ account_code: r.account_code, dir: r.dir, yb: r.yb.replace(/,/g, ""), ad: r.ad.replace(/,/g, ""), ac: r.ac.replace(/,/g, ""), qty: r.qty ? r.qty.replace(/,/g, "") : null }));
+      try {
+        const r = await api("/begin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        toast(`已保存 ${r.count || payload.length} 条期初`, "ok");
+        state.beginDraft = null;
+        viewBegin(main);
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  render();
+}
+
+// ---------------- 辅助核算档案 ----------------
+async function viewAux(main) {
+  const kind = state.auxKind || "customer";
+  main.innerHTML = `<h2>辅助核算档案</h2><div class="muted">加载中…</div>`;
+  let rows;
+  try { rows = await api(`/aux?kind=${encodeURIComponent(kind)}`); }
+  catch (e) { main.innerHTML = `<h2>辅助核算档案</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  renderAux(main, rows, kind);
+}
+
+function renderAux(main, rows, kind) {
+  main.innerHTML = `
+    <h2>辅助核算档案</h2>
+    <div class="toolbar">
+      ${AUX_KINDS.map((k) => `<button class="btn sm ${kind === k.code ? "primary" : "ghost"}" data-kind="${k.code}">${k.label}</button>`).join("")}
+      <div class="spacer"></div>
+      ${can("aux_edit") ? `<button class="btn primary" id="aux-new">新增${esc(AUX_KINDS.find((k) => k.code === kind).label)}</button>` : ""}
+    </div>
+    <div class="panel" style="padding:0;overflow:auto;max-height:65vh">
+      <table class="grid">
+        <thead><tr><th>编码</th><th>名称</th><th>上级编码</th><th>状态</th><th>备注</th><th></th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((e) => `
+            <tr>
+              <td>${esc(e.code)}</td><td>${esc(e.name)}</td><td>${esc(e.parent_code || "—")}</td>
+              <td>${e.disabled ? `<span class="tag err">停用</span>` : `<span class="tag ok">启用</span>`}</td>
+              <td>${esc(e.memo)}</td>
+              <td class="row-actions">
+                ${can("aux_edit") ? `<button class="btn sm ghost" data-act="edit" data-id="${e.id}">编辑</button>` : ""}
+                ${can("aux_edit") ? `<button class="btn sm ghost" data-act="del" data-id="${e.id}">删除</button>` : ""}
+              </td>
+            </tr>`).join("") : `<tr><td colspan="6" class="muted" style="text-align:center;padding:18px">暂无档案</td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
+  $all("[data-kind]", main).forEach((b) => b.addEventListener("click", () => { state.auxKind = b.dataset.kind; viewAux(main); }));
+  if ($("#aux-new")) $("#aux-new").addEventListener("click", () => openAuxEditor(main, null, kind));
+  $all("[data-act]", main).forEach((b) => b.addEventListener("click", async () => {
+    const id = parseInt(b.dataset.id, 10);
+    if (b.dataset.act === "edit") {
+      const e = rows.find((x) => x.id === id);
+      if (e) openAuxEditor(main, e, kind);
+    } else {
+      if (!(await confirmDialog("确定删除该档案？", true))) return;
+      try { await api(`/aux/${id}`, { method: "DELETE" }); toast("已删除", "ok"); viewAux(main); }
+      catch (e2) { toast(e2.message, "err"); }
+    }
+  }));
+}
+
+function openAuxEditor(main, ent, kind) {
+  const isEdit = !!ent;
+  const e = ent || { id: 0, kind, code: "", name: "", parent_code: null, disabled: false, props: {}, memo: "" };
+  const mask = modal(`
+    <h3>${isEdit ? "编辑档案" : "新增档案"}（${esc(AUX_KINDS.find((k) => k.code === kind).label)}）</h3>
+    <div class="field"><label>编码 *</label><input id="au-code" value="${esc(e.code)}" /></div>
+    <div class="field"><label>名称 *</label><input id="au-name" value="${esc(e.name)}" /></div>
+    <div class="field"><label>上级编码（分级档案用）</label><input id="au-parent" value="${esc(e.parent_code || "")}" /></div>
+    <div class="field"><label>备注</label><input id="au-memo" value="${esc(e.memo)}" /></div>
+    <div class="field"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="au-disabled" ${e.disabled ? "checked" : ""} />停用</label></div>
+    <div class="foot">
+      <button class="btn ghost" id="au-cancel">取消</button>
+      <button class="btn primary" id="au-save">保存</button>
+    </div>
+  `);
+  $("#au-cancel", mask).addEventListener("click", closeModal);
+  $("#au-save", mask).addEventListener("click", async () => {
+    const code = $("#au-code", mask).value.trim();
+    const name = $("#au-name", mask).value.trim();
+    if (!code || !name) { toast("编码与名称必填", "err"); return; }
+    const parent = $("#au-parent", mask).value.trim();
+    const body = Object.assign({}, e, {
+      kind, code, name,
+      parent_code: parent || null,
+      disabled: $("#au-disabled", mask).checked,
+      memo: $("#au-memo", mask).value.trim(),
+      props: e.props || {},
+    });
+    try {
+      if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      else await api("/aux", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("已保存", "ok"); closeModal(); viewAux(main);
+    } catch (err) { toast(err.message, "err"); }
+  });
+}
+
+// ---------------- 账套参数 ----------------
+async function viewOptions(main) {
+  main.innerHTML = `<h2>账套参数</h2><div class="muted">加载中…</div>`;
+  let o;
+  try { o = await api("/options"); } catch (e) { main.innerHTML = `<h2>账套参数</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  main.innerHTML = `
+    <h2>账套参数</h2>
+    <div class="panel" style="max-width:640px">
+      <div class="field"><label>企业名称</label><input id="op-company" value="${esc(o.company)}" /></div>
+      <div class="field"><label>纳税识别号</label><input id="op-taxno" value="${esc(o.tax_no)}" /></div>
+      <div class="field"><label>本位币</label><input id="op-currency" value="${esc(o.base_currency)}" /></div>
+      <div class="field"><label>启用期间（YYYYMM）</label><input id="op-start" value="${esc(o.start_period)}" /></div>
+      <div class="field"><label>科目编码级长（逗号分隔，如 4,2,2,2,2）</label><input id="op-scheme" value="${esc((o.code_scheme || []).join(","))}" /></div>
+      <div class="field"><label>凭证字方案（逗号分隔，如 记,收,付,转）</label><input id="op-words" value="${esc((o.voucher_words || []).join(","))}" /></div>
+      <div class="field" style="display:flex;gap:24px;flex-wrap:wrap">
+        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-qty" ${o.enable_qty ? "checked" : ""} />启用数量核算</label>
+        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-foreign" ${o.enable_foreign ? "checked" : ""} />启用外币核算</label>
+        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-cashier" ${o.require_cashier ? "checked" : ""} />凭证需出纳签字</label>
+      </div>
+      <p class="muted" style="font-size:12px">启用期间与科目级长影响科目编码校验与凭证编号，修改请谨慎；已开账后不建议改动。</p>
+      ${can("sys_option") ? `<div class="foot" style="margin-top:10px"><button class="btn primary" id="op-save">保存参数</button></div>` : `<p class="muted">无修改权限（需要 sys_option）</p>`}
+    </div>`;
+  const save = $("#op-save");
+  if (save) save.addEventListener("click", async () => {
+    const scheme = $("#op-scheme").value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0);
+    const words = $("#op-words").value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+    const start = $("#op-start").value.trim();
+    const body = Object.assign({}, o, {
+      company: $("#op-company").value.trim(),
+      tax_no: $("#op-taxno").value.trim(),
+      base_currency: $("#op-currency").value.trim() || "CNY",
+      start_period: /^\d{6}$/.test(start) ? parseInt(start, 10) : o.start_period,
+      code_scheme: scheme.length ? scheme : o.code_scheme,
+      voucher_words: words.length ? words : o.voucher_words,
+      enable_qty: $("#op-qty").checked,
+      enable_foreign: $("#op-foreign").checked,
+      require_cashier: $("#op-cashier").checked,
+    });
+    try { await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存账套参数", "ok"); }
+    catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ---------------- 操作日志 ----------------
+async function viewLogs(main) {
+  main.innerHTML = `
+    <h2>操作日志</h2>
+    <div class="toolbar">
+      <input id="log-kw" placeholder="搜索关键字（用户 / 动作 / 详情）" style="width:220px" />
+      <select id="log-limit">
+        <option value="100">最近 100 条</option>
+        <option value="200" selected>最近 200 条</option>
+        <option value="500">最近 500 条</option>
+        <option value="1000">最近 1000 条</option>
+      </select>
+      <button class="btn" id="log-query">查询</button>
+    </div>
+    <div class="panel" style="padding:0;overflow:auto;max-height:70vh">
+      <table class="grid"><thead><tr><th>时间</th><th>用户</th><th>模块</th><th>动作</th><th>详情</th></tr></thead>
+      <tbody id="log-rows"><tr><td colspan="5" class="muted" style="text-align:center;padding:18px">加载中…</td></tr></tbody></table>
+    </div>`;
+  async function load() {
+    const q = $("#log-kw").value.trim();
+    const limit = $("#log-limit").value;
+    const rows = await api(`/logs?limit=${limit}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+    $("#log-rows").innerHTML = rows.length ? rows.map((l) => `
+      <tr>
+        <td style="white-space:nowrap">${esc(l.ts)}</td>
+        <td>${esc(l.user)}</td>
+        <td><span class="tag">${esc(l.module)}</span></td>
+        <td>${esc(l.action)}</td>
+        <td class="muted">${esc(l.detail)}</td>
+      </tr>`).join("") : `<tr><td colspan="5" class="muted" style="text-align:center;padding:18px">无日志</td></tr>`;
+  }
+  $("#log-query").addEventListener("click", () => load().catch((e) => toast(e.message, "err")));
+  $("#log-kw").addEventListener("keydown", (e) => { if (e.key === "Enter") load().catch((err) => toast(err.message, "err")); });
+  try { await load(); } catch (e) { $("#log-rows").innerHTML = `<tr><td colspan="5" style="color:var(--err);text-align:center;padding:18px">${esc(e.message)}</td></tr>`; }
+}
+
+// ---------------- 备份恢复 ----------------
+async function viewBackup(main) {
+  main.innerHTML = `
+    <h2>备份恢复</h2>
+    <div class="toolbar">
+      <span class="muted">备份当前账套到服务器 backups 目录；恢复会先自动备份一次当前数据。</span>
+      <div class="spacer"></div>
+      ${can("backup") ? `<button class="btn primary" id="bk-new">立即备份</button>` : ""}
+    </div>
+    <div class="panel" style="padding:0;overflow:auto">
+      <table class="grid"><thead><tr><th>备份文件</th><th class="num">大小</th><th>时间</th><th></th></tr></thead>
+      <tbody id="bk-rows"><tr><td colspan="4" class="muted" style="text-align:center;padding:18px">加载中…</td></tr></tbody></table>
+    </div>`;
+  async function load() {
+    const d = await api("/backups");
+    const items = d.items || [];
+    $("#bk-rows").innerHTML = items.length ? items.map((b) => {
+      const kb = b.size / 1024;
+      const size = kb > 1024 ? (kb / 1024).toFixed(2) + " MB" : kb.toFixed(1) + " KB";
+      return `<tr>
+        <td>${esc(b.name)}</td>
+        <td class="num">${size}</td>
+        <td class="muted">${esc(String(b.mtime).replace(/\.\d+ /, " "))}</td>
+        <td class="row-actions">${can("backup") ? `<button class="btn sm ghost" data-restore="${esc(b.name)}">恢复</button>` : ""}</td>
+      </tr>`;
+    }).join("") : `<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">暂无备份</td></tr>`;
+    $all("[data-restore]", main).forEach((btn) => btn.addEventListener("click", async () => {
+      const name = btn.dataset.restore;
+      if (!(await confirmDialog(`确定从 ${name} 恢复账套？当前数据将先自动备份一份，但恢复后本账套将回到备份时点的状态。`, true))) return;
+      try {
+        await api("/restore", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ file: name }) });
+        toast("恢复完成", "ok"); load();
+      } catch (e) { toast(e.message, "err"); }
+    }));
+  }
+  const mk = $("#bk-new");
+  if (mk) mk.addEventListener("click", async () => {
+    try { const r = await api("/backups", { method: "POST" }); toast(`已备份：${r.name}`, "ok"); load(); }
+    catch (e) { toast(e.message, "err"); }
+  });
+  try { await load(); } catch (e) { $("#bk-rows").innerHTML = `<tr><td colspan="4" style="color:var(--err);text-align:center;padding:18px">${esc(e.message)}</td></tr>`; }
+}
+
+// ---------------- 凭证模板 ----------------
+async function viewTemplates(main) {
+  main.innerHTML = `
+    <h2>凭证模板</h2>
+    <div class="toolbar">
+      <button class="btn sm ${!state.tplTab || state.tplTab === "list" ? "primary" : "ghost"}" id="tpl-tab-list">模板列表</button>
+      <button class="btn sm ${state.tplTab === "due" ? "primary" : "ghost"}" id="tpl-tab-due">本期到期</button>
+      <div class="spacer"></div>
+      ${can("voucher_new") && (!state.tplTab || state.tplTab === "list") ? `<button class="btn primary" id="tpl-new">新增模板</button>` : ""}
+    </div>
+    <div id="tpl-body" class="muted">加载中…</div>`;
+  const body = $("#tpl-body");
+  const tab = state.tplTab || "list";
+  $("#tpl-tab-list").onclick = () => { state.tplTab = "list"; viewTemplates(main); };
+  $("#tpl-tab-due").onclick = () => { state.tplTab = "due"; viewTemplates(main); };
+  const refresh = () => viewTemplates(main);
+
+  if (tab === "list") {
+    let rows;
+    try { rows = await api("/templates"); } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; return; }
+    body.className = "";
+    body.innerHTML = `
+      <div class="panel" style="padding:0;overflow:auto">
+        <table class="grid"><thead><tr><th>名称</th><th class="num">分录数</th><th>频率</th><th>生效期间</th><th>上次生成</th><th>状态</th><th>备注</th><th></th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((t) => `
+            <tr>
+              <td><b>${esc(t.name)}</b></td>
+              <td class="num">${t.entries.length}</td>
+              <td>${esc(FREQ_LABELS[t.freq] || t.freq)}</td>
+              <td>${t.start_period || "—"} ~ ${t.end_period || "—"}</td>
+              <td>${t.last_period || "—"}</td>
+              <td>${t.active ? `<span class="tag ok">启用</span>` : `<span class="tag err">停用</span>`}</td>
+              <td class="muted">${esc(t.memo)}</td>
+              <td class="row-actions">
+                ${can("voucher_new") ? `<button class="btn sm ghost" data-act="edit" data-id="${t.id}">编辑</button>` : ""}
+                ${can("voucher_new") ? `<button class="btn sm ghost" data-act="gen" data-id="${t.id}">生成凭证</button>` : ""}
+                ${can("voucher_new") ? `<button class="btn sm ghost" data-act="del" data-id="${t.id}">删除</button>` : ""}
+              </td>
+            </tr>`).join("") : `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">暂无模板，点「新增模板」创建</td></tr>`}
+        </tbody></table>
+      </div>`;
+    $all("[data-act]", body).forEach((b) => b.addEventListener("click", async () => {
+      const id = parseInt(b.dataset.id, 10);
+      const t = rows.find((x) => x.id === id);
+      if (b.dataset.act === "edit" && t) openTemplateEditor(refresh, t);
+      else if (b.dataset.act === "gen" && t) await genVoucherFromTemplate(t);
+      else if (b.dataset.act === "del") {
+        if (!(await confirmDialog(`确定删除模板「${t.name}」？`, true))) return;
+        try { await api(`/templates/${id}`, { method: "DELETE" }); toast("已删除", "ok"); refresh(); }
+        catch (e) { toast(e.message, "err"); }
+      }
+    }));
+    if ($("#tpl-new")) $("#tpl-new").addEventListener("click", () => openTemplateEditor(refresh, null));
+  } else {
+    const period = ymm(state.current || "") || ymm(today().slice(0, 7));
+    let rows;
+    try { rows = await api(`/templates/due?period=${period}`); } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; return; }
+    body.className = "";
+    body.innerHTML = `
+      <div class="muted" style="margin-bottom:8px">期间 ${period} 内应生成的模板（按频率与生效区间判断）：</div>
+      <div class="panel" style="padding:0;overflow:auto">
+        <table class="grid"><thead><tr><th>名称</th><th>频率</th><th class="num">分录数</th><th>上次生成</th><th></th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((t) => `
+            <tr>
+              <td><b>${esc(t.name)}</b></td>
+              <td>${esc(FREQ_LABELS[t.freq] || t.freq)}</td>
+              <td class="num">${t.entries.length}</td>
+              <td>${t.last_period || "从未"}</td>
+              <td class="row-actions">${can("voucher_new") ? `<button class="btn sm primary" data-gen="${t.id}">生成凭证</button>` : ""}</td>
+            </tr>`).join("") : `<tr><td colspan="5" class="muted" style="text-align:center;padding:18px">本期无到期模板</td></tr>`}
+        </tbody></table>
+      </div>`;
+    $all("[data-gen]", body).forEach((b) => b.addEventListener("click", async () => {
+      const t = rows.find((x) => x.id === parseInt(b.dataset.gen, 10));
+      if (t) await genVoucherFromTemplate(t);
+    }));
+  }
+}
+
+// 由模板打开凭证编辑器（空金额分录预填为 0，可在编辑器内补全）
+async function genVoucherFromTemplate(t) {
+  if (!t.entries.length) { toast("模板没有分录", "err"); return; }
+  const unPriced = t.entries.filter((e) => !String(e.amount || "").trim());
+  if (unPriced.length) {
+    if (!(await confirmDialog(`模板有 ${unPriced.length} 条分录未填金额，将预填为 0，打开凭证编辑器后请补全。继续？`))) return;
+  }
+  await openVoucherEditor(null, t.entries);
+}
+
+function openTemplateEditor(refresh, t) {
+  const isEdit = !!t;
+  const tpl = t || { id: 0, name: "", memo: "", entries: [{ summary: "", account_code: "", dir: "debit", amount: "", aux: {} }], freq: "manual", start_period: null, end_period: null, last_period: null, active: true };
+  const mask = modal(`
+    <h3>${isEdit ? "编辑模板" : "新增模板"}</h3>
+    <div class="field"><label>模板名称 *</label><input id="tp-name" value="${esc(tpl.name)}" /></div>
+    <div class="field"><label>频率</label>
+      <select id="tp-freq">
+        <option value="manual" ${tpl.freq === "manual" ? "selected" : ""}>手工调用（录凭证时选用）</option>
+        <option value="monthly" ${tpl.freq === "monthly" ? "selected" : ""}>每月生成</option>
+        <option value="quarterly" ${tpl.freq === "quarterly" ? "selected" : ""}>每季生成</option>
+        <option value="yearly" ${tpl.freq === "yearly" ? "selected" : ""}>每年生成</option>
+      </select>
+    </div>
+    <div class="field" style="display:flex;gap:12px">
+      <div><label>生效起始期间（YYYYMM）</label><input id="tp-start" value="${tpl.start_period || ""}" style="width:110px" /></div>
+      <div><label>生效结束期间</label><input id="tp-end" value="${tpl.end_period || ""}" style="width:110px" /></div>
+      <div style="align-self:flex-end"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="tp-active" ${tpl.active ? "checked" : ""} />启用</label></div>
+    </div>
+    <div class="field"><label>备注</label><input id="tp-memo" value="${esc(tpl.memo)}" /></div>
+    <div class="field">
+      <label>分录（金额留空 = 生成时待填）</label>
+      <table class="grid" id="tp-entries"><thead><tr><th>摘要</th><th>科目</th><th>方向</th><th>金额</th><th></th></tr></thead><tbody></tbody></table>
+      <button class="btn ghost sm" id="tp-add" style="margin-top:6px">加分录</button>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="tp-cancel">取消</button>
+      <button class="btn primary" id="tp-save">保存</button>
+    </div>
+  `, true);
+  const tbody = $("#tp-entries tbody", mask);
+  function renderRows() {
+    tbody.innerHTML = tpl.entries.map((e, i) => `
+      <tr>
+        <td><input class="te-sum" data-i="${i}" value="${esc(e.summary)}" style="width:100%" /></td>
+        <td>${accountOptions()}</td>
+        <td><select class="te-dir" data-i="${i}"><option value="debit" ${e.dir !== "credit" ? "selected" : ""}>借</option><option value="credit" ${e.dir === "credit" ? "selected" : ""}>贷</option></select></td>
+        <td><input class="te-amt" data-i="${i}" value="${esc(e.amount)}" style="width:100px;text-align:right" /></td>
+        <td><button class="btn ghost sm" data-rm="${i}">×</button></td>
+      </tr>`).join("");
+    $all("select.acct-sel", tbody).forEach((sel, i) => { sel.value = tpl.entries[i].account_code; sel.onchange = () => tpl.entries[i].account_code = sel.value; });
+    $all(".te-sum", tbody).forEach((inp) => inp.oninput = () => tpl.entries[+inp.dataset.i].summary = inp.value);
+    $all(".te-dir", tbody).forEach((sel) => sel.onchange = () => tpl.entries[+sel.dataset.i].dir = sel.value);
+    $all(".te-amt", tbody).forEach((inp) => inp.oninput = () => tpl.entries[+inp.dataset.i].amount = inp.value.trim());
+    $all("[data-rm]", tbody).forEach((b) => b.onclick = () => { tpl.entries.splice(+b.dataset.rm, 1); renderRows(); });
+  }
+  renderRows();
+  $("#tp-add", mask).onclick = () => { tpl.entries.push({ summary: "", account_code: "", dir: "debit", amount: "", aux: {} }); renderRows(); };
+  $("#tp-cancel", mask).addEventListener("click", closeModal);
+  $("#tp-save", mask).addEventListener("click", async () => {
+    const name = $("#tp-name", mask).value.trim();
+    if (!name) { toast("模板名称必填", "err"); return; }
+    if (tpl.entries.some((e) => !e.account_code)) { toast("每条分录都要选科目", "err"); return; }
+    const start = $("#tp-start", mask).value.trim();
+    const end = $("#tp-end", mask).value.trim();
+    const body = Object.assign({}, tpl, {
+      id: isEdit ? tpl.id : 0,
+      name,
+      freq: $("#tp-freq", mask).value,
+      start_period: /^\d{6}$/.test(start) ? parseInt(start, 10) : null,
+      end_period: /^\d{6}$/.test(end) ? parseInt(end, 10) : null,
+      active: $("#tp-active", mask).checked,
+      memo: $("#tp-memo", mask).value.trim(),
+    });
+    try {
+      if (isEdit) await api(`/templates/${tpl.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      else await api("/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("已保存模板", "ok"); closeModal(); if (refresh) refresh();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ===========================================================================
+// 工资管理（对齐桌面端：工资表 / 个税明细 / 凭证生成）
+// ===========================================================================
+function nextPeriod(p) {
+  const [y, m] = String(p).split("-").map(Number);
+  const nm = m + 1 > 12 ? 1 : m + 1, ny = m + 1 > 12 ? y + 1 : y;
+  return `${ny}-${String(nm).padStart(2, "0")}`;
+}
+const CLAIM_STATUS = [
+  { code: "", label: "全部状态" },
+  { code: "draft", label: "草稿" },
+  { code: "submitted", label: "待审批" },
+  { code: "approved", label: "已批准" },
+  { code: "rejected", label: "已驳回" },
+  { code: "paid", label: "已付款" },
+];
+
+async function viewPayroll(main) {
+  const tab = state.payTab || "sheet";
+  const period = state.payPeriod || state.current || today().slice(0, 7);
+  main.innerHTML = `
+    <h2>工资管理</h2>
+    <div class="toolbar">
+      <button class="btn sm ${tab === "sheet" ? "primary" : "ghost"}" id="py-tab-sheet">工资表</button>
+      <button class="btn sm ${tab === "tax" ? "primary" : "ghost"}" id="py-tab-tax">个税明细</button>
+      <button class="btn sm ${tab === "voucher" ? "primary" : "ghost"}" id="py-tab-voucher">凭证生成</button>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" id="py-prev">◀ 上期</button>
+      <label>期间 <input id="py-period" value="${esc(period)}" style="width:90px" /></label>
+      <button class="btn ghost sm" id="py-next">下期 ▶</button>
+      <button class="btn" id="py-refresh">刷新</button>
+    </div>
+    <div id="py-body" class="muted">加载中…</div>`;
+  const body = $("#py-body");
+  const switchTab = (t) => { state.payTab = t; viewPayroll(main); };
+  const switchPeriod = (p) => { state.payPeriod = p; viewPayroll(main); };
+  $("#py-tab-sheet").onclick = () => switchTab("sheet");
+  $("#py-tab-tax").onclick = () => switchTab("tax");
+  $("#py-tab-voucher").onclick = () => switchTab("voucher");
+  $("#py-prev").onclick = () => switchPeriod(prevPeriod(period));
+  $("#py-next").onclick = () => switchPeriod(nextPeriod(period));
+  $("#py-refresh").onclick = () => viewPayroll(main);
+
+  const ymm6 = ymm(period);
+  let rows = [], employees = [];
+  try {
+    [rows, employees] = await Promise.all([
+      api(`/payroll?period=${ymm6}`),
+      api("/aux?kind=employee").catch(() => []),
+    ]);
+  } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  const empName = (code) => { const e = employees.find((x) => x.code === code); return e ? e.name : ""; };
+  const voucherLink = (id) => (id ? `<a href="#" data-voucher="${id}">凭证 #${id}</a>` : "—");
+
+  if (tab === "sheet") {
+    body.className = "";
+    const total = (k) => rows.reduce((s, r) => s + (parseFloat(r[k]) || 0), 0);
+    body.innerHTML = `
+      <div class="toolbar">
+        <span class="muted">共 ${rows.length} 人 · 个税与实发由后端按累计预扣预缴法自动计算</span>
+        <div class="spacer"></div>
+        ${can("voucher_new") ? `<button class="btn primary" id="py-new">新增工资行</button>` : ""}
+      </div>
+      <div class="panel" style="padding:0;overflow:auto;max-height:58vh">
+        <table class="grid">
+          <thead><tr><th>员工</th><th>部门</th><th class="num">应发</th><th class="num">社保(个人)</th><th class="num">公积金(个人)</th><th class="num">其他扣除</th><th class="num">专项附加</th><th class="num">计税基数</th><th class="num">个税</th><th class="num">实发</th><th class="num">单位社保</th><th class="num">单位公积金</th><th>凭证</th><th></th></tr></thead>
+          <tbody>
+            ${rows.length ? rows.map((r) => `
+              <tr>
+                <td title="${esc(r.employee)}">${esc(empName(r.employee) || r.employee)}</td>
+                <td>${esc(r.dept) || "—"}</td>
+                <td class="num">${fmt(r.gross)}</td><td class="num">${fmt(r.social)}</td>
+                <td class="num">${fmt(r.housing)}</td><td class="num">${fmt(r.deduction)}</td>
+                <td class="num">${fmt(r.additional)}</td><td class="num">${fmt(r.tax_base)}</td>
+                <td class="num">${fmt(r.tax)}</td><td class="num"><b>${fmt(r.net)}</b></td>
+                <td class="num">${fmt(r.social_co)}</td><td class="num">${fmt(r.housing_co)}</td>
+                <td>${voucherLink(r.voucher_id)}</td>
+                <td class="row-actions">
+                  ${can("voucher_new") && !r.voucher_id ? `<button class="btn sm ghost" data-edit="${r.id}">改</button>` : ""}
+                  ${can("voucher_new") && !r.voucher_id ? `<button class="btn sm ghost" data-del="${r.id}">删</button>` : ""}
+                </td>
+              </tr>`).join("") : `<tr><td colspan="14" class="muted" style="text-align:center;padding:18px">${period} 无工资数据</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      ${rows.length ? `<div class="cards" style="margin-top:12px">
+        <div class="card"><div class="k">应发合计</div><div class="v" style="font-size:16px">${fmt(total("gross").toFixed(2))}</div></div>
+        <div class="card"><div class="k">个税合计</div><div class="v" style="font-size:16px">${fmt(total("tax").toFixed(2))}</div></div>
+        <div class="card"><div class="k">实发合计</div><div class="v" style="font-size:16px">${fmt(total("net").toFixed(2))}</div></div>
+        <div class="card"><div class="k">单位社保+公积金</div><div class="v" style="font-size:16px">${fmt((total("social_co") + total("housing_co")).toFixed(2))}</div></div>
+      </div>` : ""}`;
+    $all("[data-voucher]", body).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.voucher, 10)); }));
+    const newBtn = $("#py-new");
+    if (newBtn) newBtn.addEventListener("click", () => openPayrollEditor(main, null, period, employees));
+    $all("[data-edit]", body).forEach((b) => b.addEventListener("click", () => {
+      const r = rows.find((x) => x.id === parseInt(b.dataset.edit, 10));
+      if (r) openPayrollEditor(main, r, period, employees);
+    }));
+    $all("[data-del]", body).forEach((b) => b.addEventListener("click", async () => {
+      if (!(await confirmDialog("确定删除该工资行？", true))) return;
+      try { await api(`/payroll/${b.dataset.del}`, { method: "DELETE" }); toast("已删除", "ok"); viewPayroll(main); }
+      catch (e) { toast(e.message, "err"); }
+    }));
+  } else if (tab === "tax") {
+    body.className = "";
+    body.innerHTML = `
+      <div class="toolbar">
+        <label>员工 <select id="py-emp"><option value="">选择职员…</option>${employees.map((e) => `<option value="${esc(e.code)}">${esc(e.code)} ${esc(e.name)}</option>`).join("")}</select></label>
+        <button class="btn" id="py-tax-run">查询累计</button>
+      </div>
+      <div id="py-tax-box" class="muted">选择员工后查看本年至上月的累计数与本期的个税计算。</div>`;
+    $("#py-tax-run").addEventListener("click", async () => {
+      const code = $("#py-emp").value;
+      if (!code) { toast("请选择员工", "err"); return; }
+      const box = $("#py-tax-box");
+      try {
+        const cur = rows.find((r) => r.employee === code);
+        if (!cur) { box.innerHTML = `<div class="muted">${esc(empName(code) || code)} 在 ${period} 没有工资数据，请先在「工资表」录入。</div>`; return; }
+        const ytd = await api(`/payroll/ytd?period=${ymm6}&employee=${encodeURIComponent(code)}`);
+        box.innerHTML = `
+          <div class="cards" style="margin-top:12px">
+            <div class="card"><div class="k">累计收入（本年至上月）</div><div class="v" style="font-size:16px">${fmt(ytd.income)}</div></div>
+            <div class="card"><div class="k">累计专项扣除（社保+公积金）</div><div class="v" style="font-size:16px">${fmt(ytd.special)}</div></div>
+            <div class="card"><div class="k">累计专项附加扣除</div><div class="v" style="font-size:16px">${fmt(ytd.additional)}</div></div>
+            <div class="card"><div class="k">累计已预扣个税</div><div class="v" style="font-size:16px">${fmt(ytd.withheld)}</div></div>
+            <div class="card"><div class="k">已有月数</div><div class="v" style="font-size:16px">${ytd.months}</div></div>
+          </div>
+          <div class="cards" style="margin-top:12px">
+            <div class="card"><div class="k">本期应发</div><div class="v" style="font-size:16px">${fmt(cur.gross)}</div></div>
+            <div class="card"><div class="k">本期计税基数</div><div class="v" style="font-size:16px">${fmt(cur.tax_base)}</div></div>
+            <div class="card"><div class="k">本期个税</div><div class="v" style="font-size:16px">${fmt(cur.tax)}</div></div>
+            <div class="card"><div class="k">本期实发</div><div class="v" style="font-size:16px">${fmt(cur.net)}</div></div>
+          </div>`;
+      } catch (e) { box.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    });
+  } else {
+    // 凭证生成：默认科目与桌面端 finui VoucherCfg 一致
+    body.className = "";
+    body.innerHTML = `
+      <div class="panel" style="max-width:660px">
+        <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+          <div><label>凭证日期（留空 = 期间末日）</label><input id="pv-date" type="date" value="${esc(today())}" style="width:150px" /></div>
+        </div>
+        <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+          <div><label>费用科目</label><input id="pv-expense" value="6602" style="width:90px" /></div>
+          <div><label>应付工资</label><input id="pv-wage" value="221101" style="width:90px" /></div>
+          <div><label>应付社保</label><input id="pv-social" value="221103" style="width:90px" /></div>
+          <div><label>应付公积金</label><input id="pv-housing" value="221104" style="width:90px" /></div>
+          <div><label>其他应付款(个人)</label><input id="pv-personal" value="2241" style="width:90px" /></div>
+          <div><label>银行存款</label><input id="pv-bank" value="100201" style="width:90px" /></div>
+          <div><label>应交个税</label><input id="pv-tax" value="222103" style="width:90px" /></div>
+        </div>
+        <p class="muted" style="font-size:12px">计提凭证按部门拆分借方费用；社保缴纳与工资发放凭证走银行存款；同一期凭证只能生成一次，重复生成由引擎报错拦截。</p>
+        <div class="foot" style="margin-top:6px;display:flex;gap:10px">
+          ${rows.length ? `
+          <button class="btn primary" id="pv-accrue">生成计提凭证</button>
+          <button class="btn" id="pv-social">生成社保缴纳凭证</button>
+          <button class="btn" id="pv-pay">生成发放凭证</button>` : `<span class="muted">本期无工资数据，先在「工资表」录入。</span>`}
+        </div>
+        <div id="pv-result" class="muted" style="margin-top:10px"></div>
+      </div>`;
+    const q = `period=${ymm6}`;
+    const runVoucher = (url, bodyObj, label) => (async () => {
+      if (!(await confirmDialog(`确认为 ${period} 生成${label}？`))) return;
+      try {
+        const r = await api(`${url}?${q}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyObj) });
+        $("#pv-result").innerHTML = r.id ? `<span style="color:var(--ok)">已生成凭证 #${r.id}，<a href="#" id="pv-open">点击查看</a></span>` : `<span class="muted">无可生成内容（金额全为零）</span>`;
+        if (r.id) $("#pv-open").addEventListener("click", (e) => { e.preventDefault(); openVoucherEditor(r.id); });
+      } catch (e) { toast(e.message, "err"); }
+    });
+    if ($("#pv-accrue")) $("#pv-accrue").onclick = runVoucher("/payroll/accrue", { date: $("#pv-date").value, expense: $("#pv-expense").value.trim(), wage_payable: $("#pv-wage").value.trim(), social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim() }, "计提凭证");
+    if ($("#pv-social")) $("#pv-social").onclick = runVoucher("/payroll/social-pay", { date: $("#pv-date").value, social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim(), personal_payable: $("#pv-personal").value.trim(), bank_account: $("#pv-bank").value.trim() }, "社保缴纳凭证");
+    if ($("#pv-pay")) $("#pv-pay").onclick = runVoucher("/payroll/pay", { date: $("#pv-date").value, payable_account: $("#pv-wage").value.trim(), bank_account: $("#pv-bank").value.trim(), tax_account: $("#pv-tax").value.trim(), social_account: $("#pv-personal").value.trim() }, "发放凭证");
+  }
+}
+
+function openPayrollEditor(main, row, period, employees) {
+  const isEdit = !!row;
+  const r = row || { employee: "", dept: "", gross: "", social: "", housing: "", deduction: "", additional: "", social_co: "", housing_co: "", memo: "" };
+  const empOpts = employees.map((e) => `<option value="${esc(e.code)}" ${r.employee === e.code ? "selected" : ""}>${esc(e.code)} ${esc(e.name)}</option>`).join("");
+  const mask = modal(`
+    <h3>${isEdit ? `编辑工资行（${esc(empNameIn(employees, r.employee) || r.employee)}）` : "新增工资行"} · ${esc(period)}</h3>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>员工 *</label>${employees.length ? `<select id="pw-emp"><option value="${esc(r.employee)}" ${r.employee && !employees.some((e) => e.code === r.employee) ? "selected" : ""}>${esc(r.employee || "选择…")}</option>${empOpts}</select>` : `<input id="pw-emp" value="${esc(r.employee)}" placeholder="职员编码" />`}</div>
+      <div><label>部门</label><input id="pw-dept" value="${esc(r.dept)}" style="width:110px" /></div>
+    </div>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>应发工资 *</label><input id="pw-gross" value="${esc(r.gross)}" style="width:110px;text-align:right" /></div>
+      <div><label>社保(个人)</label><input id="pw-social" value="${esc(r.social)}" style="width:100px;text-align:right" /></div>
+      <div><label>公积金(个人)</label><input id="pw-housing" value="${esc(r.housing)}" style="width:100px;text-align:right" /></div>
+      <div><label>其他扣除</label><input id="pw-ded" value="${esc(r.deduction)}" style="width:100px;text-align:right" /></div>
+      <div><label>专项附加扣除</label><input id="pw-add" value="${esc(r.additional)}" style="width:110px;text-align:right" /></div>
+    </div>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>单位社保</label><input id="pw-sco" value="${esc(r.social_co)}" style="width:100px;text-align:right" /></div>
+      <div><label>单位公积金</label><input id="pw-hco" value="${esc(r.housing_co)}" style="width:100px;text-align:right" /></div>
+      <div><label>备注</label><input id="pw-memo" value="${esc(r.memo)}" style="width:220px" /></div>
+    </div>
+    <p class="muted" style="font-size:12px">个税按累计预扣预缴法自动计算，实发 = 应发 − 社保 − 公积金 − 其他扣除 − 个税。</p>
+    <div class="foot">
+      <button class="btn ghost" id="pw-cancel">取消</button>
+      <button class="btn primary" id="pw-save">计算并保存</button>
+    </div>
+  `);
+  $("#pw-cancel", mask).addEventListener("click", closeModal);
+  $("#pw-save", mask).addEventListener("click", async () => {
+    const empSel = $("#pw-emp", mask);
+    const employee = (empSel.value || "").trim();
+    if (!employee) { toast("员工必填", "err"); return; }
+    const body = {
+      employee,
+      dept: $("#pw-dept", mask).value.trim(),
+      gross: $("#pw-gross", mask).value.trim() || "0",
+      social: $("#pw-social", mask).value.trim() || "0",
+      housing: $("#pw-housing", mask).value.trim() || "0",
+      deduction: $("#pw-ded", mask).value.trim() || "0",
+      additional: $("#pw-add", mask).value.trim() || "0",
+      social_co: $("#pw-sco", mask).value.trim() || "0",
+      housing_co: $("#pw-hco", mask).value.trim() || "0",
+      memo: $("#pw-memo", mask).value.trim(),
+    };
+    try {
+      const out = await api(`/payroll?period=${ymm(period)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast(`已保存：个税 ${fmt(out.tax)}，实发 ${fmt(out.net)}`, "ok");
+      closeModal(); viewPayroll(main);
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+function empNameIn(employees, code) { const e = (employees || []).find((x) => x.code === code); return e ? e.name : ""; }
+
+// ===========================================================================
+// 费用报销（草稿 → 提交 → 审批 → 支付 → 生成凭证）
+// ===========================================================================
+async function viewClaims(main) {
+  const period = state.clmPeriod || state.current || today().slice(0, 7);
+  const status = state.clmStatus == null ? "" : state.clmStatus;
+  main.innerHTML = `
+    <h2>费用报销</h2>
+    <div class="toolbar">
+      <button class="btn ghost sm" id="cl-prev">◀ 上期</button>
+      <label>期间 <input id="cl-period" value="${esc(period)}" style="width:90px" /></label>
+      <button class="btn ghost sm" id="cl-next">下期 ▶</button>
+      <label>状态 <select id="cl-status">${CLAIM_STATUS.map((s) => `<option value="${s.code}" ${status === s.code ? "selected" : ""}>${s.label}</option>`).join("")}</select></label>
+      <button class="btn" id="cl-refresh">刷新</button>
+      <div class="spacer"></div>
+      ${can("voucher_new") ? `<button class="btn primary" id="cl-new">新增报销单</button>` : ""}
+    </div>
+    <div id="cl-body" class="muted">加载中…</div>`;
+  const switchTo = (p, s) => { state.clmPeriod = p; state.clmStatus = s; viewClaims(main); };
+  $("#cl-prev").onclick = () => switchTo(prevPeriod(period), status);
+  $("#cl-next").onclick = () => switchTo(nextPeriod(period), status);
+  $("#cl-refresh").onclick = () => switchTo($("#cl-period").value.trim() || period, $("#cl-status").value);
+  if ($("#cl-new")) $("#cl-new").addEventListener("click", () => openClaimEditor(main, null, period));
+
+  const body = $("#cl-body");
+  let rows;
+  try {
+    const q = `period=${ymm(period)}${status ? `&status=${status}` : ""}`;
+    rows = await api(`/claims?${q}`);
+  } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  body.className = "";
+  const badge = (s) => {
+    const map = { draft: ["tag", "草稿"], submitted: ["tag warn", "待审批"], approved: ["tag ok", "已批准"], rejected: ["tag err", "已驳回"], paid: ["tag ok", "已付款"] };
+    const [cls, label] = map[s] || ["tag", s];
+    return `<span class="${cls}">${label}</span>`;
+  };
+  // 状态流转动作（与桌面端 actions() 一致）
+  const actionsOf = (r) => {
+    switch (r.status) {
+      case "draft": return [["提交", "submitted"]];
+      case "submitted": return [["审批通过", "approved"], ["驳回", "rejected"]];
+      case "approved": return [["支付", "paid"]];
+      case "rejected": return [["退回草稿", "draft"]];
+      default: return [];
+    }
+  };
+  const total = rows.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+  body.innerHTML = `
+    <div class="panel" style="padding:0;overflow:auto;max-height:62vh">
+      <table class="grid">
+        <thead><tr><th>单号</th><th>日期</th><th>申请人</th><th>部门</th><th>事由</th><th class="num">金额</th><th>状态</th><th>凭证</th><th></th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((r) => `
+            <tr>
+              <td><a href="#" data-view="${r.id}"><b>${esc(r.no)}</b></a></td>
+              <td>${esc(r.biz_date)}</td>
+              <td>${esc(r.applicant)}</td>
+              <td>${esc(r.dept) || "—"}</td>
+              <td>${esc(r.reason)}</td>
+              <td class="num">${fmt(r.amount)}</td>
+              <td>${badge(r.status)}</td>
+              <td>${r.voucher_id ? `<a href="#" data-voucher="${r.voucher_id}">#${r.voucher_id}</a>` : "—"}</td>
+              <td class="row-actions">
+                ${can("voucher_new") && ["draft", "rejected"].includes(r.status) && !r.voucher_id ? `<button class="btn sm ghost" data-edit="${r.id}">改</button><button class="btn sm ghost" data-del="${r.id}">删</button>` : ""}
+                ${can("voucher_new") ? actionsOf(r).map(([label, to]) => `<button class="btn sm ghost" data-trans="${r.id}" data-to="${to}">${label}</button>`).join("") : ""}
+                ${can("voucher_new") && r.status === "paid" && !r.voucher_id ? `<button class="btn sm primary" data-vgen="${r.id}">生成凭证</button>` : ""}
+              </td>
+            </tr>`).join("") : `<tr><td colspan="9" class="muted" style="text-align:center;padding:18px">${period} 无报销单</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    ${rows.length ? `<div class="muted" style="margin-top:10px">本期报销金额合计 <b>${fmt(total.toFixed(2))}</b></div>` : ""}`;
+  const reload = () => viewClaims(main);
+  $all("[data-view]", body).forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    const r = rows.find((x) => x.id === parseInt(a.dataset.view, 10));
+    if (r) showClaimDetail(r);
+  }));
+  $all("[data-voucher]", body).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.voucher, 10)); }));
+  $all("[data-edit]", body).forEach((b) => b.addEventListener("click", () => {
+    const r = rows.find((x) => x.id === parseInt(b.dataset.edit, 10));
+    if (r) openClaimEditor(main, r, period);
+  }));
+  $all("[data-del]", body).forEach((b) => b.addEventListener("click", async () => {
+    if (!(await confirmDialog("删除后不可恢复（已生成凭证的单据需先删除凭证），确定删除？", true))) return;
+    try { await api(`/claims/${b.dataset.del}`, { method: "DELETE" }); toast("已删除", "ok"); reload(); }
+    catch (e) { toast(e.message, "err"); }
+  }));
+  $all("[data-trans]", body).forEach((b) => b.addEventListener("click", async () => {
+    const to = b.dataset.to;
+    try { await api(`/claims/${b.dataset.trans}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: to }) }); toast("状态已更新", "ok"); reload(); }
+    catch (e) { toast(e.message, "err"); }
+  }));
+  $all("[data-vgen]", body).forEach((b) => b.addEventListener("click", () => {
+    const r = rows.find((x) => x.id === parseInt(b.dataset.vgen, 10));
+    if (!r) return;
+    const mask = modal(`
+      <h3>生成报销凭证 · ${esc(r.no)}</h3>
+      <div class="field"><label>贷方支付科目（如 100201 银行存款）*</label><input id="cv-pay" value="100201" /></div>
+      <p class="muted" style="font-size:12px">借方按明细行的费用科目拆分；明细合计必须等于单据金额。</p>
+      <div class="foot">
+        <button class="btn ghost" id="cv-cancel">取消</button>
+        <button class="btn primary" id="cv-ok">生成</button>
+      </div>`);
+    $("#cv-cancel", mask).onclick = closeModal;
+    $("#cv-ok", mask).onclick = async () => {
+      const pay = $("#cv-pay", mask).value.trim();
+      if (!pay) { toast("请填写支付科目", "err"); return; }
+      try {
+        const out = await api(`/claims/${r.id}/voucher`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pay_account: pay }) });
+        toast(`已生成凭证 #${out.id}`, "ok"); closeModal(); reload();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  }));
+}
+
+function showClaimDetail(c) {
+  const stLabel = (CLAIM_STATUS.find((s) => s.code === c.status) || {}).label || c.status;
+  const mask = modal(`
+    <h3>报销单 ${esc(c.no)}</h3>
+    <div class="muted" style="line-height:1.9;font-size:13px">
+      日期：${esc(c.biz_date)} · 申请人：${esc(c.applicant)}${c.dept ? ` · 部门：${esc(c.dept)}` : ""}<br />
+      事由：${esc(c.reason)}<br />
+      金额：<b>${fmt(c.amount)}</b> · 状态：${esc(stLabel)}${c.approver ? ` · 审批人：${esc(c.approver)}${c.approved_at ? `（${esc(c.approved_at)}）` : ""}` : ""}${c.payer ? ` · 付款人：${esc(c.payer)}${c.paid_at ? `（${esc(c.paid_at)}）` : ""}` : ""}
+    </div>
+    <div class="panel" style="padding:0;margin-top:10px;overflow:auto">
+      <table class="grid"><thead><tr><th>费用科目</th><th class="num">金额</th><th>备注</th></tr></thead>
+      <tbody>${(c.items || []).map((i) => `<tr><td>${esc(i.expense_account)}</td><td class="num">${fmt(i.amount)}</td><td class="muted">${esc(i.memo)}</td></tr>`).join("") || `<tr><td colspan="3" class="muted" style="text-align:center">无明细</td></tr>`}</tbody></table>
+    </div>
+    <div class="foot"><button class="btn ghost" id="cd-close">关闭</button></div>`);
+  $("#cd-close", mask).addEventListener("click", closeModal);
+}
+
+function openClaimEditor(main, claim, period) {
+  const isEdit = !!claim;
+  const c = claim ? JSON.parse(JSON.stringify(claim)) : {
+    biz_date: today(), applicant: "", dept: "", reason: "", amount: "",
+    items: [{ expense_account: "", amount: "", memo: "" }],
+  };
+  const mask = modal(`
+    <h3>${isEdit ? `编辑报销单 ${esc(claim.no)}` : "新增报销单"} · ${esc(period)}</h3>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>业务日期 *</label><input id="cm-date" type="date" value="${esc(c.biz_date)}" style="width:150px" /></div>
+      <div><label>申请人 *</label><input id="cm-applicant" value="${esc(c.applicant)}" style="width:110px" /></div>
+      <div><label>部门</label><input id="cm-dept" value="${esc(c.dept)}" style="width:110px" /></div>
+      <div><label>单据金额 *</label><input id="cm-amount" value="${esc(c.amount)}" style="width:110px;text-align:right" /></div>
+    </div>
+    <div class="field"><label>事由 *</label><input id="cm-reason" value="${esc(c.reason)}" style="width:100%" /></div>
+    <div class="field">
+      <label>费用明细（借方科目 + 金额，合计须等于单据金额）</label>
+      <table class="grid" id="cm-items"><thead><tr><th>费用科目</th><th>金额</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+      <button class="btn ghost sm" id="cm-add" style="margin-top:6px">添加明细行</button>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" id="cm-cancel">取消</button>
+      <button class="btn primary" id="cm-save">保存草稿</button>
+    </div>
+  `, true);
+  const tbody = $("#cm-items tbody", mask);
+  function renderRows() {
+    tbody.innerHTML = c.items.map((i, k) => `
+      <tr>
+        <td>${accountOptions()}</td>
+        <td><input class="ci-amt" data-i="${k}" value="${esc(i.amount)}" style="width:110px;text-align:right" /></td>
+        <td><input class="ci-memo" data-i="${k}" value="${esc(i.memo)}" style="width:100%" /></td>
+        <td><button class="btn ghost sm" data-rm="${k}">×</button></td>
+      </tr>`).join("");
+    $all("select.acct-sel", tbody).forEach((sel, k) => { sel.value = c.items[k].expense_account; sel.onchange = () => c.items[k].expense_account = sel.value; });
+    $all(".ci-amt", tbody).forEach((inp) => inp.oninput = () => c.items[+inp.dataset.i].amount = inp.value.trim());
+    $all(".ci-memo", tbody).forEach((inp) => inp.oninput = () => c.items[+inp.dataset.i].memo = inp.value);
+    $all("[data-rm]", tbody).forEach((b) => b.onclick = () => { c.items.splice(+b.dataset.rm, 1); renderRows(); });
+  }
+  renderRows();
+  $("#cm-add", mask).onclick = () => { c.items.push({ expense_account: "", amount: "", memo: "" }); renderRows(); };
+  $("#cm-cancel", mask).addEventListener("click", closeModal);
+  $("#cm-save", mask).addEventListener("click", async () => {
+    const applicant = $("#cm-applicant", mask).value.trim();
+    const reason = $("#cm-reason", mask).value.trim();
+    if (!applicant) { toast("申请人必填", "err"); return; }
+    if (!reason) { toast("事由必填", "err"); return; }
+    if (c.items.some((i) => !i.expense_account)) { toast("每条明细都要选费用科目", "err"); return; }
+    const body = {
+      period: ymm(period),
+      biz_date: $("#cm-date", mask).value,
+      applicant, reason,
+      dept: $("#cm-dept", mask).value.trim(),
+      amount: $("#cm-amount", mask).value.trim() || "0",
+      items: c.items.map((i) => ({ expense_account: i.expense_account, amount: i.amount || "0", memo: i.memo })),
+    };
+    try {
+      if (isEdit) await api(`/claims/${claim.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      else {
+        const out = await api("/claims", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        toast(`已创建草稿 ${out.no}`, "ok");
+        closeModal(); viewClaims(main); return;
+      }
+      toast("已保存", "ok"); closeModal(); viewClaims(main);
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 
 // 启动：先尝试恢复已有会话。

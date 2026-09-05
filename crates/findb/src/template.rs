@@ -14,7 +14,8 @@ use rusqlite::OptionalExtension;
 use crate::{Db, DbResult};
 
 /// 生成频率
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Freq {
     /// 不自动生成，只在录凭证时手工调用
     #[default]
@@ -87,7 +88,7 @@ impl Default for TemplateEntry {
 }
 
 /// 凭证模板
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Template {
     pub id: i64,
     pub name: String,

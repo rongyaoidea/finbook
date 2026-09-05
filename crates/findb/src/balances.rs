@@ -468,7 +468,7 @@ fn aux_key_contains(key: &str, want: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// 期初余额行（含辅助核算）
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BeginRow {
     pub id: i64,
     pub account_code: String,

@@ -10,11 +10,12 @@ use axum::{Json, Router};
 use axum::routing::{delete, get, post, put};
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
-use fincore::{AuxRef, BookOptions, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
+use fincore::{Account, AuxEntity, AuxKind, AuxMask, AuxQuery, AuxRef, BookOptions, Direction, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
 use findb::accounts;
 use findb::advanced;
-use findb::balances::{self, BalanceSnapshot, BalanceQuery, LedgerQuery};
+use findb::{auxs, business, template};
+use findb::balances::{self, BalanceSnapshot, BalanceQuery, BeginRow, LedgerQuery};
 use findb::Db;
 use findb::periods;
 use findb::security;
@@ -225,6 +226,30 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
         .route("/api/cost/period-end", get(run_period_end_cost))
+        // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
+        .route("/api/accounts", post(create_account).put(update_account))
+        .route("/api/accounts/:code", delete(delete_account))
+        .route("/api/begin", get(list_begin).post(save_begin))
+        .route("/api/logs", get(list_logs))
+        .route("/api/backups", get(list_backups).post(create_backup))
+        .route("/api/restore", post(restore_backup))
+        .route("/api/templates", get(list_templates).post(create_template))
+        .route("/api/templates/due", get(due_templates))
+        .route("/api/templates/:id", put(update_template).delete(delete_template))
+        .route("/api/aux", get(list_aux).post(create_aux))
+        .route("/api/aux/:id", put(update_aux).delete(delete_aux))
+        .route("/api/payroll", get(list_payroll).post(save_payroll))
+        .route("/api/payroll/generate", post(generate_payroll))
+        .route("/api/payroll/ytd", get(payroll_ytd))
+        .route("/api/payroll/accrue", post(payroll_accrue))
+        .route("/api/payroll/social-pay", post(payroll_social_pay))
+        .route("/api/payroll/pay", post(payroll_pay))
+        .route("/api/payroll/:id", delete(delete_payroll))
+        .route("/api/claims", get(list_claims).post(create_claim))
+        .route("/api/claims/next-no", get(next_claim_no))
+        .route("/api/claims/:id", put(update_claim).delete(delete_claim))
+        .route("/api/claims/:id/transition", post(claim_transition))
+        .route("/api/claims/:id/voucher", post(claim_voucher))
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
         .with_state(state)
@@ -3996,4 +4021,851 @@ async fn print_equity_statement(
     let subtitle = format!("{} 至 {}", from.label(), to.label());
     let html = crate::report_html::equity_html(&stmt, &user.company, &subtitle);
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+// ===========================================================================
+// 账套内基础资料与系统功能（对齐桌面端 finui 补齐）
+// ===========================================================================
+
+// ---------------- 会计科目 ----------------
+async fn create_account(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AccountReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let mut acc = req.account;
+    acc.aux = build_aux_mask(&req.aux_kinds);
+    let db = state.db_for(&user.book_key)?;
+    if accounts::get(&db, &acc.code)?.is_some() {
+        return Err(AppError::bad_request("科目已存在"));
+    }
+    accounts::insert(&db, &acc)?;
+    db.log(user.username(), "基础资料", "新建科目", &format!("{} {}", acc.code, acc.name))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn update_account(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AccountReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let mut acc = req.account;
+    acc.aux = build_aux_mask(&req.aux_kinds);
+    let db = state.db_for(&user.book_key)?;
+    if accounts::get(&db, &acc.code)?.is_none() {
+        return Err(AppError::not_found("科目不存在"));
+    }
+    accounts::update(&db, &acc)?;
+    db.log(user.username(), "基础资料", "修改科目", &format!("{} {}", acc.code, acc.name))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_account(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if accounts::get(&db, &code)?.is_none() {
+        return Err(AppError::not_found("科目不存在"));
+    }
+    let (vouchers, entries) = accounts::usage(&db, &code)?;
+    if vouchers > 0 || entries > 0 {
+        return Err(AppError::bad_request("科目已被凭证使用，无法删除"));
+    }
+    accounts::delete(&db, &code)?;
+    db.log(user.username(), "基础资料", "删除科目", &code)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+// ---------------- 期初建账 ----------------
+#[derive(Deserialize)]
+struct BeginRowInput {
+    account_code: String,
+    #[serde(default)]
+    aux: AuxRef,
+    dir: Direction,
+    yb: String,
+    #[serde(default)]
+    ad: String,
+    #[serde(default)]
+    ac: String,
+    #[serde(default)]
+    qty: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountReq {
+    account: Account,
+    #[serde(default)]
+    aux_kinds: Vec<String>,
+}
+
+/// 前端传辅助核算维度的 kind 字符串列表（如 ["customer","project"]），
+/// 由后端统一转成 AuxMask 位掩码，避免前端依赖位序。
+fn build_aux_mask(kinds: &[String]) -> AuxMask {
+    let mut mask = AuxMask::NONE;
+    for k in kinds {
+        if let Some(kind) = AuxKind::from_code(k) {
+            mask.set(kind, true);
+        }
+    }
+    mask
+}
+
+async fn list_begin(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<Vec<BeginRow>>, AppError> {
+    user.require(Perm::Opening)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(balances::list_begin(&db)?))
+}
+
+async fn save_begin(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(rows): Json<Vec<BeginRowInput>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Opening)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut n = 0;
+    for r in rows {
+        let code = r.account_code.trim();
+        if code.is_empty() {
+            continue;
+        }
+        let yb = Money::parse_or_zero(&r.yb);
+        let year_begin = match r.dir {
+            Direction::Debit => yb,
+            Direction::Credit => -yb,
+        };
+        let br = BeginRow {
+            id: 0,
+            account_code: code.to_string(),
+            aux: r.aux,
+            year_begin,
+            debit_accum: Money::parse_or_zero(&r.ad),
+            credit_accum: Money::parse_or_zero(&r.ac),
+            qty_begin: r
+                .qty
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Money::parse_or_zero(s)),
+        };
+        balances::upsert_begin(&db, &br)?;
+        n += 1;
+    }
+    db.log(user.username(), "期初", "保存期初余额", &format!("保存 {} 条", n))?;
+    Ok(Json(json!({"ok": true, "count": n})))
+}
+
+// ---------------- 操作日志 ----------------
+async fn list_logs(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<fincore::user::AuditLog>>, AppError> {
+    user.require(Perm::AuditLog)?;
+    let db = state.db_for(&user.book_key)?;
+    let limit: i64 = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let logs = match q.get("q") {
+        Some(kw) if !kw.trim().is_empty() => db.search_logs(kw.trim(), limit)?,
+        _ => db.recent_logs(limit)?,
+    };
+    Ok(Json(logs))
+}
+
+// ---------------- 备份 / 恢复 ----------------
+#[derive(Deserialize)]
+struct BackupRestoreReq {
+    file: String,
+}
+
+async fn list_backups(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Backup)?;
+    let dir = state.books_dir.join("backups");
+    let mut items = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("fbk") {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    items.push(json!({
+                        "name": e.file_name().to_string_lossy(),
+                        "size": meta.len(),
+                        "mtime": meta.modified().map(|t| format!("{:?}", t)).unwrap_or_default(),
+                    }));
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn create_backup(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Backup)?;
+    let key = user.book_key.clone();
+    let src = state.books_dir.join(format!("{key}.fbk"));
+    if !src.exists() {
+        return Err(AppError::not_found("账套文件不存在"));
+    }
+    let dir = state.books_dir.join("backups");
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let dst_name = format!("{}_{}.fbk", stamp, key);
+    std::fs::copy(&src, dir.join(&dst_name))?;
+    for ext in ["-wal", "-shm"] {
+        let w = state.books_dir.join(format!("{key}.fbk{ext}"));
+        if w.exists() {
+            let _ = std::fs::copy(&w, dir.join(format!("{}_{}.fbk{ext}", stamp, key)));
+        }
+    }
+    let db = state.db_for(&user.book_key)?;
+    db.log(user.username(), "系统", "备份账套", &format!("备份 {dst_name}"))?;
+    Ok(Json(json!({"ok": true, "name": dst_name})))
+}
+
+async fn restore_backup(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BackupRestoreReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Backup)?;
+    let key = user.book_key.clone();
+    // 路径安全：仅允许 backups 目录下的纯文件名，禁止任何路径穿越
+    let file_name = match std::path::Path::new(&req.file).file_name().and_then(|s| s.to_str()) {
+        Some(n) if !n.contains("..") && !n.contains('/') && !n.contains('\\') => n.to_string(),
+        _ => return Err(AppError::bad_request("非法的备份文件名")),
+    };
+    let src = state.books_dir.join("backups").join(&file_name);
+    if !src.exists() {
+        return Err(AppError::not_found("备份文件不存在"));
+    }
+    let dst = state.books_dir.join(format!("{key}.fbk"));
+    // 恢复前先自动备份一次，避免覆盖无法回退
+    let _ = std::fs::create_dir_all(state.books_dir.join("backups"));
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let auto_name = format!("auto_{}_{}.fbk", stamp, key);
+    let _ = std::fs::copy(&dst, state.books_dir.join("backups").join(&auto_name));
+    std::fs::copy(&src, &dst)?;
+    for ext in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(state.books_dir.join(format!("{key}.fbk{ext}")));
+    }
+    // 重新注册账套，使后续请求以新文件重新打开
+    if let Ok(path) = std::fs::canonicalize(&dst) {
+        state.books.unregister(&key);
+        state.books.register(&path, 16);
+    }
+    let db = state.db_for(&user.book_key)?;
+    db.log(user.username(), "系统", "恢复账套", &format!("从 {file_name} 恢复"))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+// ---------------- 凭证模板 ----------------
+async fn list_templates(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<Vec<template::Template>>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(template::list(&db)?))
+}
+
+async fn create_template(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(t): Json<template::Template>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = template::insert(&db, &t)?;
+    db.log(user.username(), "凭证模板", "新建模板", &t.name)?;
+    Ok(Json(json!({"id": id})))
+}
+
+async fn update_template(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(t): Json<template::Template>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut t = t;
+    t.id = id;
+    template::update(&db, &t)?;
+    db.log(user.username(), "凭证模板", "修改模板", &t.name)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_template(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    template::delete(&db, id)?;
+    db.log(user.username(), "凭证模板", "删除模板", &id.to_string())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn due_templates(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<template::Template>>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(Period::from_ymm)
+        .unwrap_or_else(|| db.options().start_period);
+    Ok(Json(template::due_list(&db, period)?))
+}
+
+// ---------------- 辅助核算档案 ----------------
+async fn list_aux(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<AuxEntity>>, AppError> {
+    user.require(Perm::AuxEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q
+        .get("kind")
+        .and_then(|s| AuxKind::from_code(s))
+        .unwrap_or(AuxKind::Customer);
+    Ok(Json(auxs::list(&db, &AuxQuery::kind(kind))?))
+}
+
+async fn create_aux(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(e): Json<AuxEntity>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AuxEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = auxs::insert(&db, &e)?;
+    db.log(user.username(), "档案", "新建档案", &format!("{} {}", e.kind.label(), e.name))?;
+    Ok(Json(json!({"id": id})))
+}
+
+async fn update_aux(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(e): Json<AuxEntity>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AuxEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut e = e;
+    e.id = id;
+    auxs::update(&db, &e)?;
+    db.log(user.username(), "档案", "修改档案", &e.name)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_aux(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AuxEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    auxs::delete(&db, id)?;
+    db.log(user.username(), "档案", "删除档案", &id.to_string())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+// ===========================================================================
+// 工资管理（对齐桌面端 finui：工资表 / 个税明细 / 凭证生成，入口权限 VoucherNew）
+// ===========================================================================
+
+/// 从查询串取期间，缺省用当前期间
+fn query_period(state: &WebState, user: &CurrentUser, q: &HashMap<String, String>) -> Period {
+    q.get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(state, user))
+}
+
+/// 凭证生成请求里的日期，缺省用期间末日
+fn req_date(s: &str, fallback: NaiveDate) -> Result<NaiveDate, AppError> {
+    if s.trim().is_empty() {
+        return Ok(fallback);
+    }
+    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))
+}
+
+#[derive(Deserialize)]
+struct PayrollInput {
+    employee: String,
+    #[serde(default)]
+    dept: String,
+    gross: String,
+    #[serde(default)]
+    social: String,
+    #[serde(default)]
+    housing: String,
+    #[serde(default)]
+    deduction: String,
+    /// 专项附加扣除
+    #[serde(default)]
+    additional: String,
+    #[serde(default)]
+    social_co: String,
+    #[serde(default)]
+    housing_co: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_payroll(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<business::Payroll>>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    Ok(Json(business::payroll_list(&db, period)?))
+}
+
+/// 录入/修改一条工资：后端按累计预扣预缴法算个税与实发，前端无需自己算税
+async fn save_payroll(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+    Json(r): Json<PayrollInput>,
+) -> Result<Json<business::Payroll>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let employee = r.employee.trim();
+    if employee.is_empty() {
+        return Err(AppError::bad_request("员工编码必填"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let p = business::payroll_calc(
+        &db,
+        period,
+        employee,
+        r.dept.trim(),
+        parse_money(&r.gross),
+        parse_money(&r.social),
+        parse_money(&r.housing),
+        parse_money(&r.deduction),
+        parse_money(&r.additional),
+        parse_money(&r.social_co),
+        parse_money(&r.housing_co),
+        r.memo.trim(),
+    )?;
+    let id = business::payroll_upsert(&db, &p)?;
+    db.log(
+        user.username(),
+        "工资",
+        "保存工资行",
+        &format!("{} {} 应发 {} 实发 {}", period.label(), employee, p.gross, p.net),
+    )?;
+    let mut out = p;
+    out.id = id;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct GeneratePayrollReq {
+    #[serde(default)]
+    period: Option<String>,
+    rows: Vec<PayrollInput>,
+}
+
+/// 批量生成本月工资表（逐条累计预扣预缴算税后落库）
+async fn generate_payroll(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<GeneratePayrollReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = req
+        .period
+        .as_deref()
+        .and_then(parse_period)
+        .unwrap_or_else(|| current_period(&state, &user));
+    let rows: Vec<(String, String, Money, Money, Money, Money, Money, Money, Money)> = req
+        .rows
+        .iter()
+        .filter(|r| !r.employee.trim().is_empty())
+        .map(|r| {
+            (
+                r.employee.trim().to_string(),
+                r.dept.trim().to_string(),
+                parse_money(&r.gross),
+                parse_money(&r.social),
+                parse_money(&r.housing),
+                parse_money(&r.deduction),
+                parse_money(&r.additional),
+                parse_money(&r.social_co),
+                parse_money(&r.housing_co),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err(AppError::bad_request("没有可导入的工资行"));
+    }
+    let n = business::payroll_generate(&db, period, &rows)?;
+    db.log(user.username(), "工资", "批量生成工资表", &format!("{} 生成 {} 条", period.label(), n))?;
+    Ok(Json(json!({ "ok": true, "count": n })))
+}
+
+async fn delete_payroll(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    // 删除前拦截已生成凭证的工资行
+    let existing = business::payroll_get_by_id(&db, id)?;
+    match existing {
+        Some(p) if p.voucher_id.is_some() => {
+            return Err(AppError::bad_request("该工资行已生成凭证，不能删除"));
+        }
+        None => return Err(AppError::not_found("工资行不存在")),
+        _ => {}
+    }
+    business::payroll_delete(&db, id)?;
+    db.log(user.username(), "工资", "删除工资行", &id.to_string())?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn payroll_ytd(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<business::YtdPayroll>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let employee = q.get("employee").cloned().unwrap_or_default();
+    if employee.trim().is_empty() {
+        return Err(AppError::bad_request("缺少 employee 参数"));
+    }
+    Ok(Json(business::payroll_ytd(&db, period, employee.trim())?))
+}
+
+#[derive(Deserialize)]
+struct PayrollAccrueReq {
+    #[serde(default)]
+    date: String,
+    expense: String,
+    wage_payable: String,
+    social_payable: String,
+    housing_payable: String,
+}
+
+/// 工资计提凭证
+async fn payroll_accrue(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+    Json(r): Json<PayrollAccrueReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let date = req_date(&r.date, period.last_day())?;
+    let id = business::payroll_accrue_voucher(
+        &db,
+        period,
+        date,
+        r.expense.trim(),
+        r.wage_payable.trim(),
+        r.social_payable.trim(),
+        r.housing_payable.trim(),
+        user.username(),
+    )?;
+    db.log(user.username(), "工资", "生成计提凭证", &format!("{} 凭证 {:?}", period.label(), id))?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct PayrollSocialReq {
+    #[serde(default)]
+    date: String,
+    social_payable: String,
+    housing_payable: String,
+    personal_payable: String,
+    bank_account: String,
+}
+
+/// 缴纳社保公积金凭证
+async fn payroll_social_pay(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+    Json(r): Json<PayrollSocialReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let date = req_date(&r.date, period.last_day())?;
+    let id = business::payroll_social_voucher(
+        &db,
+        period,
+        date,
+        r.social_payable.trim(),
+        r.housing_payable.trim(),
+        r.personal_payable.trim(),
+        r.bank_account.trim(),
+        user.username(),
+    )?;
+    db.log(user.username(), "工资", "生成社保缴纳凭证", &format!("{} 凭证 {:?}", period.label(), id))?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct PayrollPayReq {
+    #[serde(default)]
+    date: String,
+    payable_account: String,
+    bank_account: String,
+    tax_account: String,
+    social_account: String,
+}
+
+/// 工资发放凭证
+async fn payroll_pay(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+    Json(r): Json<PayrollPayReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let date = req_date(&r.date, period.last_day())?;
+    let id = business::payroll_pay_voucher(
+        &db,
+        period,
+        date,
+        r.payable_account.trim(),
+        r.bank_account.trim(),
+        r.tax_account.trim(),
+        r.social_account.trim(),
+        user.username(),
+    )?;
+    db.log(user.username(), "工资", "生成发放凭证", &format!("{} 凭证 {:?}", period.label(), id))?;
+    Ok(Json(json!({ "id": id })))
+}
+
+// ===========================================================================
+// 费用报销（对齐桌面端 finui：草稿→提交→审批→支付→生成凭证，入口权限 VoucherNew）
+// ===========================================================================
+
+#[derive(Deserialize)]
+struct ClaimItemInput {
+    expense_account: String,
+    amount: String,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct ClaimInput {
+    /// 期间 ymm，如 202601
+    #[serde(default)]
+    period: Option<i32>,
+    /// 业务日期 YYYY-MM-DD
+    biz_date: String,
+    applicant: String,
+    #[serde(default)]
+    dept: String,
+    reason: String,
+    amount: String,
+    #[serde(default)]
+    items: Vec<ClaimItemInput>,
+}
+
+fn claim_items(items: &[ClaimItemInput]) -> Vec<business::ClaimItem> {
+    items
+        .iter()
+        .map(|i| business::ClaimItem {
+            expense_account: i.expense_account.trim().to_string(),
+            amount: parse_money(&i.amount),
+            memo: i.memo.trim().to_string(),
+        })
+        .collect()
+}
+
+async fn list_claims(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<business::Claim>>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let status = q.get("status").map(|s| business::ClaimStatus::parse(s));
+    Ok(Json(business::claim_list(&db, period, status)?))
+}
+
+async fn next_claim_no(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let no = business::claim_next_no(&db, period)?;
+    Ok(Json(json!({ "no": no })))
+}
+
+async fn create_claim(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(r): Json<ClaimInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let applicant = r.applicant.trim();
+    if applicant.is_empty() {
+        return Err(AppError::bad_request("申请人必填"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let period = r
+        .period
+        .filter(|ym| *ym > 0)
+        .map(Period::from_ymm)
+        .unwrap_or_else(|| current_period(&state, &user));
+    let date = req_date(&r.biz_date, period.last_day())?;
+    let c = business::Claim {
+        id: 0,
+        period,
+        no: business::claim_next_no(&db, period)?,
+        biz_date: date,
+        applicant: applicant.to_string(),
+        dept: r.dept.trim().to_string(),
+        reason: r.reason.trim().to_string(),
+        amount: parse_money(&r.amount),
+        status: business::ClaimStatus::Draft,
+        items: claim_items(&r.items),
+        approver: String::new(),
+        approved_at: None,
+        payer: String::new(),
+        paid_at: None,
+        voucher_id: None,
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+    let id = business::claim_insert(&db, &c)?;
+    db.log(user.username(), "报销", "新增报销单", &format!("{} {} {}", c.no, applicant, c.amount))?;
+    Ok(Json(json!({ "id": id, "no": c.no })))
+}
+
+async fn update_claim(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(r): Json<ClaimInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut c = business::claim_get(&db, id)?
+        .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if !c.status.editable() {
+        return Err(AppError::bad_request("当前状态不允许修改内容"));
+    }
+    if c.voucher_id.is_some() {
+        return Err(AppError::bad_request("已生成凭证的报销单不能修改"));
+    }
+    let date = req_date(&r.biz_date, c.period.last_day())?;
+    c.biz_date = date;
+    c.applicant = r.applicant.trim().to_string();
+    c.dept = r.dept.trim().to_string();
+    c.reason = r.reason.trim().to_string();
+    c.amount = parse_money(&r.amount);
+    c.items = claim_items(&r.items);
+    business::claim_update(&db, &c)?;
+    db.log(user.username(), "报销", "修改报销单", &format!("{} {}", c.no, c.amount))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_claim(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let c = business::claim_get(&db, id)?
+        .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    // 预检：引擎的通用错误会映射成 500，这里给出明确的 400
+    if c.voucher_id.is_some() {
+        return Err(AppError::bad_request("该报销单已生成凭证，请先删除凭证"));
+    }
+    let label = c.no.clone();
+    business::claim_delete(&db, id)?;
+    db.log(user.username(), "报销", "删除报销单", &label)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ClaimTransitionReq {
+    /// draft / submitted / approved / rejected / paid
+    status: String,
+}
+
+async fn claim_transition(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(r): Json<ClaimTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let to = business::ClaimStatus::parse(&r.status);
+    business::claim_transition(&db, id, to, user.username())?;
+    db.log(user.username(), "报销", "状态流转", &format!("#{id} → {}", to.label()))?;
+    Ok(Json(json!({ "ok": true, "status": to })))
+}
+
+#[derive(Deserialize)]
+struct ClaimVoucherReq {
+    /// 贷方支付科目（如 100201 银行存款）
+    pay_account: String,
+}
+
+async fn claim_voucher(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(r): Json<ClaimVoucherReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let pay = r.pay_account.trim();
+    if pay.is_empty() {
+        return Err(AppError::bad_request("请填写支付科目"));
+    }
+    // 预检给出友好的 400（引擎层也有同样拦截，此处避免落到 500）
+    let c = business::claim_get(&db, id)?
+        .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if c.voucher_id.is_some() {
+        return Err(AppError::bad_request("该报销单已生成过凭证"));
+    }
+    let vid = business::claim_voucher(&db, id, pay, user.username())?;
+    db.log(user.username(), "报销", "生成凭证", &format!("#{id} 凭证 #{vid}"))?;
+    Ok(Json(json!({ "id": vid })))
 }

@@ -127,6 +127,7 @@ impl VoucherSource {
 /// 否则同一笔现金会因标注不同的现金流项目而被拆成多条余额，现金日记账就乱了。
 /// 它单独存一列，只用于现金流量表取数。
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AuxRef {
     pub customer: Option<String>,
     pub supplier: Option<String>,

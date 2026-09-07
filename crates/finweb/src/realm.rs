@@ -294,8 +294,10 @@ impl RealmDb {
             return Err(DbError::Fin(fincore::FinError::msg("新口令至少 6 位")));
         }
         let conn = self.inner.lock().unwrap();
+        // 管理员重置的口令是管理员已知的口令，必须强制用户下次登录自行改一次，
+        // 否则口令会长期停留在管理员设定值上，失去重置的意义。
         conn.execute(
-            "UPDATE realm_user SET password_hash=?2,must_change_pwd=0 WHERE username=?1",
+            "UPDATE realm_user SET password_hash=?2,must_change_pwd=1 WHERE username=?1",
             rusqlite::params![username, hash_password(new)],
         )?;
         Ok(())

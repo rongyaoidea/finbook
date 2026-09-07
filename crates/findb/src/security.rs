@@ -221,10 +221,13 @@ pub fn login(
         let mut nu = u.clone();
         if fincore::user::is_legacy_hash(&u.password_hash) {
             nu.set_password(password);
+            // set_password 会把 must_change_pwd 清掉；强制改密场景需保留该标志，
+            // 否则本次返回后用户关闭页面重登即可绕过改密。
+            nu.must_change_pwd = true;
             crate::users::update(db, &nu)?;
             db.log(username, "安全", "口令升级", "旧版口令哈希已升级为 argon2，并强制改密")?;
         } else {
-            db.log(username, "安全", "强制改密", "口令已升级为argon2格式")?;
+            db.log(username, "安全", "强制改密", "账号处于强制修改口令状态")?;
         }
         return Ok(LoginResult::MustChangePassword(nu));
     }

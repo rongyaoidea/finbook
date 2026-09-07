@@ -458,7 +458,9 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             .ok_or_else(|| AppError::not_found("账套不存在或已被删除"))?;
         let db = state.db_for(&book_key)?;
         let in_book = users::get(&db, &ru.username)?;
-        let allowed = info.is_admin || book.owner_username == info.username || in_book.is_some();
+        // 账套归属授权必须以平台身份库的最新 is_admin 为准，而非登录时快照进会话的
+        // info.is_admin：否则管理员被降权后，旧会话在自然过期前仍能越权查看全部账套。
+        let allowed = ru.is_admin || book.owner_username == ru.username || in_book.is_some();
         if !allowed {
             return Err(AppError::forbidden("无权访问该账套"));
         }
@@ -468,7 +470,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             // 账套内已有该用户行：沿用其账套内角色 / 权限 / 数据范围，不擅自升级
             Some(u) => u,
             None => {
-                if info.is_admin && book.owner_username != info.username {
+                if ru.is_admin && book.owner_username != ru.username {
                     // 平台管理员查看他人账套：构造临时账套管理员身份，不写入该账套 user 表，
                     // 避免在他人账套留下账号记录；操作仍按管理员用户名记入审计与凭证。
                     let mut u = User::new(&ru.username, &ru.display_name, Role::Admin);

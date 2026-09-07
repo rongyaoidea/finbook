@@ -298,6 +298,7 @@ pub fn auto_match(
                 !used.contains(&b.entry_id)
                     && !linked.contains(&b.entry_id)
                     && b.signed() == s.signed()
+                    && (b.debit + b.credit).round2() == (s.debit + s.credit).round2()
                     && (b.date - s.biz_date).num_days().abs() <= date_tolerance
             })
             .collect();
@@ -319,7 +320,10 @@ pub fn auto_match(
         let cands: Vec<&BookEntry> = books
             .iter()
             .filter(|b| {
-                !used.contains(&b.entry_id) && !linked.contains(&b.entry_id) && b.signed() == s.signed()
+                !used.contains(&b.entry_id)
+                    && !linked.contains(&b.entry_id)
+                    && b.signed() == s.signed()
+                    && (b.debit + b.credit).round2() == (s.debit + s.credit).round2()
             })
             .collect();
         if cands.len() == 1 {

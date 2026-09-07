@@ -31,6 +31,8 @@ use crate::state::{
 };
 
 const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
+/// 单账号最多可自建账套数（防无限建账占满磁盘）
+const MAX_BOOKS_PER_USER: i64 = 10;
 
 /// 组装路由
 pub fn router(state: Arc<WebState>) -> Router {
@@ -336,9 +338,6 @@ async fn post_login(
     };
     // 登录成功，清空该账号的失败计数
     state.login_limiter.clear(&username);
-    if ru.disabled {
-        return Err(AppError::forbidden("账户已停用，请联系管理员"));
-    }
     // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
     if !ru.is_admin {
         match state.realm.bind_device(&username, &req.device_id)? {
@@ -420,6 +419,13 @@ async fn create_book(
     Json(req): Json<CreateBookReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let owner = user.username.clone();
+    // 限制每账号账套数量，防止无限建账占满磁盘
+    let owned = state.realm.count_books_of(&owner)?;
+    if owned >= MAX_BOOKS_PER_USER {
+        return Err(AppError::bad_request(format!(
+            "每个账号最多创建 {MAX_BOOKS_PER_USER} 个账套（当前已创建 {owned} 个）"
+        )));
+    }
     let company = req.company.trim().to_string();
     let key = make_book_key(&req.key, &owner, &state.realm)?;
     let path = state.books_dir.join(format!("{key}.fbk"));
@@ -875,6 +881,7 @@ async fn get_options(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<fincore::BookOptions>, AppError> {
+    user.require(Perm::SysOption)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(db.options()))
 }

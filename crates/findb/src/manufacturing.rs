@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use fincore::{Money, Period};
 use rusqlite::OptionalExtension;
 
-use crate::{Db, DbResult, FinError};
+use crate::{Db, DbError, DbResult, FinError};
 use crate::scm::{BomItem, ProdStatus, ProductionOrder};
 
 // ===========================================================================
@@ -190,6 +190,21 @@ pub fn overhead_allocate_with(
     base: OverheadBase,
     apply: bool,
 ) -> DbResult<Vec<(i64, Money)>> {
+    if apply {
+        // 防重复落地：同一期间只允许执行一次制造费用分摊，
+        // 否则误触按钮/重复点击会把制造费用反复归集到在制订单成本。
+        let already: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM prod_cost pc JOIN production_order o ON o.id = pc.po_id
+             WHERE o.period=?1 AND pc.cost_type='overhead' AND pc.memo='制造费用分摊'",
+            rusqlite::params![period.ymm()],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            return Err(DbError::Fin(FinError::msg(
+                "本期已执行过制造费用分摊，请勿重复分摊",
+            )));
+        }
+    }
     let wip = wip_cost(db, period)?;
     let base_sum = overhead_base_sum(&wip, base);
     if base_sum.is_zero() || amount.is_zero() {
@@ -707,5 +722,35 @@ mod tests {
         assert_eq!(debit140501, m("90"));
         assert_eq!(credit500101, m("60"));
         assert_eq!(credit500102, m("30"));
+    }
+
+    #[test]
+    fn overhead_apply_rejects_duplicate() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let tx = db.conn().unchecked_transaction().unwrap();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        tx.execute(
+            "INSERT INTO production_order(period, no, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![
+                p.ymm(), "SC2026010003", "2026-01-02", "140501", "成品Y",
+                "5", "0", "in_progress", "WC01", "u1", "",
+                now.clone(), now.clone()
+            ],
+        ).unwrap();
+        tx.commit().unwrap();
+        // 给在制单归集一部分成本，使分摊基准非零
+        let po_id = 1;
+        add_cost(&db, po_id, CostType::Material, m("100"), "领料").unwrap();
+        add_cost(&db, po_id, CostType::Labor, m("50"), "人工").unwrap();
+
+        // 第一次落地成功
+        let alloc = overhead_allocate_with(&db, p, m("30"), OverheadBase::Cost, true).unwrap();
+        assert_eq!(alloc.len(), 1);
+        assert_eq!(alloc[0].1, m("30"));
+        // 第二次落地被拒绝（防重复归集）
+        let err = overhead_allocate_with(&db, p, m("30"), OverheadBase::Cost, true).unwrap_err();
+        assert!(err.to_string().contains("请勿重复分摊"), "实际错误：{err}");
     }
 }

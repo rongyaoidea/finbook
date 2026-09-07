@@ -28,6 +28,7 @@ pub fn voucher_print_from(
 ) -> VoucherPrint {
     let mut rows = Vec::with_capacity(v.entries.len());
     let mut debit_total = Money::ZERO;
+    let mut credit_total = Money::ZERO;
     for e in &v.entries {
         if e.debit.is_zero() && e.credit.is_zero() {
             continue;
@@ -48,6 +49,7 @@ pub fn voucher_print_from(
             }
         }
         debit_total += e.debit;
+        credit_total += e.credit;
         rows.push(VoucherPrintRow {
             summary: e.summary.clone(),
             gen_name: gen,
@@ -63,6 +65,7 @@ pub fn voucher_print_from(
         attachments: v.attachments,
         rows,
         debit_total,
+        credit_total,
     }
 }
 
@@ -103,6 +106,7 @@ pub struct VoucherPrint {
     pub attachments: i32,
     pub rows: Vec<VoucherPrintRow>,
     pub debit_total: Money,
+    pub credit_total: Money,
 }
 
 impl VoucherPrint {
@@ -243,7 +247,7 @@ fn one_voucher_form(
         rows = body,
         page = esc(&page),
         di = v.debit_total.fmt_money(),
-        ci = v.debit_total.fmt_money(),
+        ci = v.credit_total.fmt_money(),
         cap = esc(&caption),
     )
 }
@@ -426,6 +430,7 @@ mod tests {
         assert_eq!(p.rows.len(), 2);
         assert_eq!(p.rows[0].gen_name, "生产成本");
         assert_eq!(p.debit_total, Money::from_cents(120_000));
+        assert_eq!(p.credit_total, Money::from_cents(120_000));
         assert_eq!(p.voucher_no(), "记-0001");
     }
 

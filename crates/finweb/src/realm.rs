@@ -302,26 +302,51 @@ impl RealmDb {
     }
 
     /// 设备绑定（Web 端"一人一机"）：首次登录自动绑定当前设备。
+    /// 单次持锁内完成"读-判-写"，并用条件 UPDATE 兜底，
+    /// 避免两个设备几乎同时首次登录时互相覆盖绑定。
     /// 返回 Result：Ok = 绑定成功或无绑定；Err(msg) = 该账号已绑定其它设备。
     pub fn bind_device(&self, username: &str, device_id: &str) -> DbResult<Result<(), String>> {
-        let u = self
-            .get_user(username)?
-            .ok_or_else(|| fincore::FinError::not_found("平台账号不存在"))?;
-        if u.device_id.is_empty() {
-            let conn = self.inner.lock().unwrap();
-            conn.execute(
-                "UPDATE realm_user SET device_id=?2 WHERE username=?1",
-                rusqlite::params![username, device_id],
-            )?;
-            return Ok(Ok(()));
+        let conn = self.inner.lock().unwrap();
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT device_id FROM realm_user WHERE username=?1",
+                rusqlite::params![username],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let cur = match cur {
+            Some(c) => c,
+            None => {
+                return Err(DbError::Fin(fincore::FinError::msg("平台账号不存在")));
+            }
+        };
+        if !cur.is_empty() {
+            return if cur == device_id {
+                Ok(Ok(()))
+            } else {
+                Ok(Err("该账号已绑定其它设备，如需更换请联系管理员重置设备".to_string()))
+            };
         }
-        if u.device_id == device_id {
-            Ok(Ok(()))
+        // 条件更新：仅当仍为空时写入，并发首登不会互相覆盖
+        let n = conn.execute(
+            "UPDATE realm_user SET device_id=?2 WHERE username=?1 AND device_id=''",
+            rusqlite::params![username, device_id],
+        )?;
+        Ok(if n == 1 {
+            Ok(())
         } else {
-            Ok(Err(
-                "该账号已绑定其它设备，如需更换请联系管理员重置设备".to_string()
-            ))
-        }
+            // 竞态下另一请求抢先绑定：回读最新值判定
+            let now: String = conn.query_row(
+                "SELECT device_id FROM realm_user WHERE username=?1",
+                rusqlite::params![username],
+                |r| r.get(0),
+            )?;
+            if now == device_id {
+                Ok(())
+            } else {
+                Err("该账号已绑定其它设备，如需更换请联系管理员重置设备".to_string())
+            }
+        })
     }
 
     /// 解绑设备（管理员「重置设备」）：清空后该账号下次登录自动重新绑定

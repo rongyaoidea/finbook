@@ -486,8 +486,11 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             state.sessions.remove(&token);
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
         }
-        // "一人一机"逐请求复核：管理员豁免；普通账号一旦绑定了新设备，旧设备会话立即失效
-        if !user.is_admin() && !user.device_id.is_empty() && user.device_id != info.device_id {
+        // "一人一机"逐请求复核（平台层 Web 设备绑定，与桌面端账套内 device_id 相互独立）：
+        // 管理员豁免；普通账号一旦在平台层绑定了新设备，旧设备会话立即失效。
+        // 不能拿账套内 user.device_id 与浏览器指纹比较——那是桌面端绑定的机器指纹，
+        // 会令「桌面端登录过 → Web 端同账号所有请求 403」的双端互斥。
+        if !ru.is_admin && !ru.device_id.is_empty() && ru.device_id != info.device_id {
             state.sessions.remove(&token);
             return Err(AppError::unauthorized(
                 "该账号已在其他设备登录，本设备会话已被下线",

@@ -217,9 +217,9 @@ pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
              unit_price, tax_rate, amount, tax_amount, memo)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
-                id, line.item_code, line.item_name, line.qty_ordered.to_string(),
-                line.qty_received.to_string(), line.unit_price.to_string(),
-                line.tax_rate.to_string(), line.amount.to_string(),
+                id, line.item_code, line.item_name, crate::exact_param(line.qty_ordered),
+                crate::exact_param(line.qty_received), crate::exact_param(line.unit_price),
+                crate::exact_param(line.tax_rate), line.amount.to_string(),
                 line.tax_amount.to_string(), line.memo
             ],
         )?;
@@ -346,9 +346,9 @@ pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
              unit_price, tax_rate, amount, tax_amount, memo)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
-                id, line.item_code, line.item_name, line.qty_ordered.to_string(),
-                line.qty_shipped.to_string(), line.unit_price.to_string(),
-                line.tax_rate.to_string(), line.amount.to_string(),
+                id, line.item_code, line.item_name, crate::exact_param(line.qty_ordered),
+                crate::exact_param(line.qty_shipped), crate::exact_param(line.unit_price),
+                crate::exact_param(line.tax_rate), line.amount.to_string(),
                 line.tax_amount.to_string(), line.memo
             ],
         )?;
@@ -468,7 +468,7 @@ pub fn bom_save_version(db: &Db, parent_code: &str, version: &str, children: &[(
     for (i, (child_code, qty, loss_rate)) in children.iter().enumerate() {
         tx.execute(
             "INSERT INTO bom(parent_code, child_code, version, qty, loss_rate, seq) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![parent_code, child_code, version, qty.to_string(), loss_rate.to_string(), i as i32]
+            rusqlite::params![parent_code, child_code, version, crate::exact_param(*qty), crate::exact_param(*loss_rate), i as i32]
         )?;
     }
     bom_log_tx(&tx, parent_code, "save", &format!("版本 {}，{} 个子件", version, children.len()), who)?;
@@ -552,7 +552,7 @@ pub fn bom_substitute_save(db: &Db, s: &Substitute, who: &str) -> DbResult<i64> 
          VALUES(?1,?2,?3,?4,?5)
          ON CONFLICT(parent_code, child_code, substitute) DO UPDATE SET
              ratio=excluded.ratio, priority=excluded.priority",
-        rusqlite::params![s.parent_code, s.child_code, s.substitute, s.ratio.to_string(), s.priority],
+        rusqlite::params![s.parent_code, s.child_code, s.substitute, crate::exact_param(s.ratio), s.priority],
     )?;
     let id: i64 = tx.query_row(
         "SELECT id FROM bom_substitute WHERE parent_code=?1 AND child_code=?2 AND substitute=?3",

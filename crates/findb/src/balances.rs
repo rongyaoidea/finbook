@@ -516,7 +516,7 @@ pub fn upsert_begin(db: &Db, r: &BeginRow) -> DbResult<()> {
             crate::money_param(r.year_begin),
             crate::money_param(r.debit_accum),
             crate::money_param(r.credit_accum),
-            r.qty_begin.map(crate::money_param),
+            r.qty_begin.map(crate::exact_param),
         ],
     )?;
     Ok(())

@@ -210,7 +210,7 @@ pub fn sc_post(db: &Db, id: i64) -> DbResult<usize> {
                 kind,
                 l.item,
                 c.warehouse,
-                qty.to_string(),
+                crate::exact_param(qty),
                 format!("盘点{}", if diff.is_positive() { "盘盈" } else { "盘亏" })
             ],
         )?;

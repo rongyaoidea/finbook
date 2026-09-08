@@ -198,6 +198,16 @@ impl Money {
         rescale_to(self.0, MONEY_DP).to_string()
     }
 
+    /// 满精度、无千分位，用于落库小数位可超过 2 位的字段（数量、单价、汇率、费率）。
+    ///
+    /// 这类字段不要用 `to_string()` 或 `fmt_plain()` 写库：`Display` 走
+    /// `fmt_money()`，既四舍五入到 2 位又插千分位逗号，汇率 7.2345 会变 7.23、
+    /// 数量 0.123456 会变 0.12。这里刻意不调 `normalize()`——它会把 100.00
+    /// 变成 `1E+2`，而读取侧的 `Decimal::from_str_exact` 不接受科学计数法。
+    pub fn fmt_exact(self) -> String {
+        self.0.to_string()
+    }
+
     /// 大写金额（人民币），用于票据/打印
     pub fn to_capital(self) -> String {
         let v = self.round2();
@@ -464,6 +474,34 @@ mod tests {
         assert_eq!(Money::parse("-1234.5").unwrap().fmt_money(), "-1,234.50");
         assert_eq!(Money::ZERO.fmt_money(), "0.00");
         assert_eq!(Money::parse("100").unwrap().fmt_plain(), "100.00");
+    }
+
+    /// 落库精度：fmt_exact 保留满精度、无千分位，且可被 Money::parse 原样读回。
+    /// `to_string()`（Display）会截到 2 位并加逗号，所以数量/单价/汇率不能用它落库。
+    #[test]
+    fn fmt_exact_keeps_precision_for_storage() {
+        let rate = Money::parse("7.2345").unwrap();
+        assert_eq!(rate.to_string(), "7.23"); // 反例：旧落库方式丢精度
+        assert_eq!(rate.fmt_exact(), "7.2345");
+
+        let qty = Money::parse("0.123456").unwrap();
+        assert_eq!(qty.fmt_exact(), "0.123456");
+        assert_eq!(qty.to_string(), "0.12");
+
+        let tax = Money::parse("0.095").unwrap(); // 9.5% 税率
+        assert_eq!(tax.fmt_exact(), "0.095");
+        assert_eq!(tax.to_string(), "0.10");
+
+        // 整值保留原 scale，不会变成 normalize() 那种科学计数法（1E+2），
+        // 因为 from_str_exact 读不回科学计数法
+        assert_eq!(Money::parse("100").unwrap().fmt_exact(), "100");
+        assert_eq!(Money::new(Decimal::new(10000, 2)).fmt_exact(), "100.00");
+        assert_eq!(Money::parse("1234567.89").unwrap().fmt_exact(), "1234567.89");
+
+        for s in ["7.2345", "0.123456", "0.095", "100", "1234567.89", "-0.5"] {
+            let m = Money::parse(s).unwrap();
+            assert_eq!(Money::parse(&m.fmt_exact()).unwrap(), m, "回读不一致：{s}");
+        }
     }
 
     #[test]

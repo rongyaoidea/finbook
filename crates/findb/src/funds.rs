@@ -318,7 +318,7 @@ pub fn loan_save(db: &Db, l: &mut Loan) -> DbResult<i64> {
                 l.id, l.kind, l.no, l.bank, l.principal.to_string(),
                 l.start_date.format("%Y-%m-%d").to_string(),
                 l.end_date.format("%Y-%m-%d").to_string(),
-                l.status, l.rate_pct.to_string(), l.memo
+                l.status, crate::exact_param(l.rate_pct), l.memo
             ],
         )?;
         l.id
@@ -330,7 +330,7 @@ pub fn loan_save(db: &Db, l: &mut Loan) -> DbResult<i64> {
                 l.kind, l.no, l.bank, l.principal.to_string(),
                 l.start_date.format("%Y-%m-%d").to_string(),
                 l.end_date.format("%Y-%m-%d").to_string(),
-                l.status, l.rate_pct.to_string(), l.memo, l.created_by, now()
+                l.status, crate::exact_param(l.rate_pct), l.memo, l.created_by, now()
             ],
         )?;
         db.conn().last_insert_rowid()

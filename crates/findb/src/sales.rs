@@ -73,7 +73,7 @@ pub fn quo_save(db: &Db, q: &mut Quotation) -> DbResult<i64> {
             rusqlite::params![
                 q.id, q.period.ymm(), q.date.format("%Y-%m-%d").to_string(),
                 q.customer_code, q.customer_name, q.item_code, q.item_name,
-                q.qty.to_string(), q.unit_price.to_string(), q.status, q.prepared_by, q.memo
+                crate::exact_param(q.qty), crate::exact_param(q.unit_price), q.status, q.prepared_by, q.memo
             ],
         )?;
         q.id
@@ -84,7 +84,7 @@ pub fn quo_save(db: &Db, q: &mut Quotation) -> DbResult<i64> {
             rusqlite::params![
                 q.no, q.period.ymm(), q.date.format("%Y-%m-%d").to_string(),
                 q.customer_code, q.customer_name, q.item_code, q.item_name,
-                q.qty.to_string(), q.unit_price.to_string(), q.status, q.prepared_by, q.memo
+                crate::exact_param(q.qty), crate::exact_param(q.unit_price), q.status, q.prepared_by, q.memo
             ],
         )?;
         db.conn().last_insert_rowid()
@@ -133,7 +133,7 @@ pub fn so_shipment_add(db: &Db, so_id: i64, period: Period, date: NaiveDate, qty
     }
     db.conn().execute(
         "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
-        rusqlite::params![so_id, period.ymm(), date.format("%Y-%m-%d").to_string(), qty.to_string(), memo],
+        rusqlite::params![so_id, period.ymm(), date.format("%Y-%m-%d").to_string(), crate::exact_param(qty), memo],
     )?;
     Ok(db.conn().last_insert_rowid())
 }

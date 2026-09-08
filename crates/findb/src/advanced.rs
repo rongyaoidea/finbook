@@ -102,8 +102,8 @@ pub fn routing_save_version(db: &Db, item_code: &str, version: &str, ops: &[Rout
                 op.op_code,
                 op.op_name,
                 op.work_center,
-                op.std_hours.to_string(),
-                op.rate.to_string()
+                crate::exact_param(op.std_hours),
+                crate::exact_param(op.rate)
             ],
         )?;
     }
@@ -290,7 +290,7 @@ pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult
     };
     db.conn().execute(
         "UPDATE prod_op SET qty_done=?2, hours=?3, status=?4 WHERE id=?1",
-        rusqlite::params![op_id, new_qty.to_string(), new_hours.to_string(), status],
+        rusqlite::params![op_id, crate::exact_param(new_qty), crate::exact_param(new_hours), status],
     )?;
     Ok(())
 }

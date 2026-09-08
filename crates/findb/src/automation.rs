@@ -58,7 +58,7 @@ pub fn fx_set(db: &Db, period: Period, currency: &str, rate: Money) -> DbResult<
     db.conn().execute(
         "INSERT INTO fx_rate(period,currency,rate) VALUES(?1,?2,?3)
          ON CONFLICT(period,currency) DO UPDATE SET rate=excluded.rate",
-        rusqlite::params![period.ymm(), currency, rate.to_string()],
+        rusqlite::params![period.ymm(), currency, crate::exact_param(rate)],
     )?;
     Ok(())
 }
@@ -386,7 +386,7 @@ pub fn at_insert(db: &Db, r: &AutoTransfer) -> DbResult<i64> {
             r.src_aux,
             r.src_kind.code(),
             r.src_dir.code(),
-            r.ratio.to_string(),
+            crate::exact_param(r.ratio),
             if r.ratio_mode_is_ratio { "ratio" } else { "amount" },
             r.dst_account,
             r.dst_aux,
@@ -413,7 +413,7 @@ pub fn at_update(db: &Db, r: &AutoTransfer) -> DbResult<()> {
             r.src_aux,
             r.src_kind.code(),
             r.src_dir.code(),
-            r.ratio.to_string(),
+            crate::exact_param(r.ratio),
             if r.ratio_mode_is_ratio { "ratio" } else { "amount" },
             r.dst_account,
             r.dst_aux,

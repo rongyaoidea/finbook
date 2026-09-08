@@ -10,7 +10,9 @@ use fincore::{
 };
 use rusqlite::OptionalExtension;
 
-use crate::{money_param, read_date_opt, read_money, read_money_opt, Db, DbError, DbResult};
+use crate::{
+    exact_param, money_param, read_date_opt, read_money, read_money_opt, Db, DbError, DbResult,
+};
 
 /// 凭证查询条件
 #[derive(Clone, Default, Debug)]
@@ -406,8 +408,8 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
             serde_json::to_string(&e.aux)?,
             money_param(e.debit),
             money_param(e.credit),
-            e.qty.map(money_param),
-            e.price.map(money_param),
+            e.qty.map(exact_param),
+            e.price.map(exact_param),
             e.currency,
             e.amount_for.map(money_param),
             e.rate.map(|r| r.to_string()),

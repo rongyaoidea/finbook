@@ -149,9 +149,9 @@ pub fn stock_insert(db: &Db, m: &StockMove) -> DbResult<i64> {
             m.item,
             m.warehouse,
             m.batch_no,
-            m.qty.to_string(),
-            m.price.to_string(),
-            m.amount.to_string(),
+            crate::exact_param(m.qty),
+            crate::exact_param(m.price),
+            crate::money_param(m.amount),
             m.voucher_id,
             m.memo
         ],
@@ -162,7 +162,7 @@ pub fn stock_insert(db: &Db, m: &StockMove) -> DbResult<i64> {
 pub fn stock_update_amount(db: &Db, id: i64, price: Money, amount: Money) -> DbResult<()> {
     db.conn().execute(
         "UPDATE stock_move SET price=?2, amount=?3 WHERE id=?1",
-        rusqlite::params![id, price.to_string(), amount.to_string()],
+        rusqlite::params![id, crate::exact_param(price), crate::money_param(amount)],
     )?;
     Ok(())
 }
@@ -455,7 +455,7 @@ pub fn item_cost_method_set(
     db.conn().execute(
         "INSERT INTO item_cost_method(item,method,standard_cost) VALUES(?1,?2,?3)
          ON CONFLICT(item) DO UPDATE SET method=excluded.method, standard_cost=excluded.standard_cost",
-        rusqlite::params![item, code, standard_cost.to_string()],
+        rusqlite::params![item, code, crate::exact_param(standard_cost)],
     )?;
     Ok(())
 }

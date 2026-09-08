@@ -1194,17 +1194,62 @@ fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// DDL 里声明的全部表名（进程内解析一次并缓存）。
+fn ddl_tables() -> &'static [String] {
+    static TABLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        const MARK: &str = "CREATE TABLE IF NOT EXISTS ";
+        let mut out = Vec::new();
+        let mut rest = DDL;
+        while let Some(i) = rest.find(MARK) {
+            let after = &rest[i + MARK.len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '(')
+                .collect();
+            if name.is_empty() {
+                break;
+            }
+            out.push(name.clone());
+            rest = &after[name.len()..];
+        }
+        out
+    })
+}
+
+/// DDL 声明的表是否都已存在。
+///
+/// 不能只凭 SCHEMA_VERSION 判断：历史上 `invoice`（5e1efc1）和 `prod_cost`
+/// （9b84d95）都是只往 DDL 加表、没升版本号，靠每次 open 跑 DDL 才补上。
+/// 这条查询是只读的，不占写锁。
+fn tables_complete(conn: &Connection) -> Result<bool, DbError> {
+    let mut st = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+    let have: std::collections::HashSet<String> = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(ddl_tables().iter().all(|t| have.contains(t)))
+}
+
 /// 初始化 schema（幂等）
+///
+/// 快速路径：版本已是最新、且 DDL 声明的表都在，就不开任何写事务直接返回。
+/// Web 端每个请求都会 `Db::open` 一次，若每次都跑一遍 DDL（BEGIN IMMEDIATE），
+/// 连纯读请求也在抢写锁，并发下会退化成 SQLITE_BUSY。
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
     // busy_timeout 让并发写入时等待而不是立刻报 database is locked。
     // 注意：PRAGMA 不能在事务内执行，必须先单独完成。
+    // busy_timeout 必须排在 journal_mode 之前：切 WAL 要拿排他锁，此时若
+    // busy_timeout 仍是默认 0，并发的 Db::open 会直接失败而不是等锁。
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
-         PRAGMA busy_timeout = 5000;
          PRAGMA synchronous = NORMAL;",
     )?;
+    if version(conn) >= SCHEMA_VERSION && tables_complete(conn)? {
+        return Ok(());
+    }
     // DDL + 全部迁移放进一个事务：任一环节失败整体回滚。
     // 否则 migrate_v7/v9/v10 的「建新表 → DROP TABLE → 改名」中途崩溃会把账套表搞丢。
     conn.execute_batch("BEGIN IMMEDIATE;")?;

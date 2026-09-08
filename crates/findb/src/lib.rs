@@ -455,6 +455,15 @@ pub fn money_param(m: fincore::Money) -> String {
     m.fmt_plain()
 }
 
+/// 数量 / 单价 / 汇率 / 费率落库用：保留满精度。
+///
+/// 与 `money_param` 的区别是它不量化到 2 位。凡是被 `costing` 之类引擎按
+/// QTY_DP(6) 以上口径参与的字段，写入都必须走这里，否则读回来已经丢了尾数。
+#[inline]
+pub fn exact_param(m: fincore::Money) -> String {
+    m.fmt_exact()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +490,143 @@ mod tests {
         assert!(a > 100, "内置科目表应有一百多个科目，实际 {a}");
         assert_eq!(db.options().base_currency, "CNY");
         assert!(users::get(&db, "admin").unwrap().is_some());
+    }
+
+    /// 汇率与数量/单价必须满精度落库。Money 的 Display 会截到 2 位，
+    /// 所以这些字段只能走 exact_param。
+    #[test]
+    fn fx_rate_and_qty_roundtrip_full_precision() {
+        use fincore::Money;
+        let db = mem();
+        let p = fincore::Period::new(2026, 1).unwrap();
+
+        automation::fx_set(&db, p, "USD", Money::parse("7.2345").unwrap()).unwrap();
+        let raw: String = db
+            .conn()
+            .query_row(
+                "SELECT rate FROM fx_rate WHERE period=?1 AND currency=?2",
+                rusqlite::params![p.ymm(), "USD"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "7.2345", "汇率落库被截断为 {raw}");
+        let back = automation::fx_get(&db, p, "USD").unwrap().unwrap();
+        assert_eq!(back.rate, Money::parse("7.2345").unwrap());
+
+        let mv = business::StockMove {
+            id: 0,
+            period: p,
+            biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            kind: business::StockKind::Purchase,
+            item: "A001".to_string(),
+            warehouse: "W1".to_string(),
+            batch_no: String::new(),
+            qty: Money::parse("0.123456").unwrap(),
+            price: Money::parse("9.876543").unwrap(),
+            amount: Money::parse("1.22").unwrap(),
+            voucher_id: None,
+            memo: String::new(),
+        };
+        let id = business::stock_insert(&db, &mv).unwrap();
+        let (q, pr): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT qty, price FROM stock_move WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(q, "0.123456", "数量落库被截断为 {q}");
+        assert_eq!(pr, "9.876543", "单价落库被截断为 {pr}");
+    }
+
+    /// schema 已是最新版本时，重新打开账套走免写事务的快速路径，且数据完好。
+    #[test]
+    fn reopen_book_keeps_data_on_fast_path() {
+        let dir = std::env::temp_dir().join(format!("finbook_test_reopen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.fbk");
+
+        let p = fincore::Period::new(2026, 1).unwrap();
+        {
+            let db = Db::create(&path, &BookOptions::default()).unwrap();
+            assert_eq!(schema::version(db.conn()), schema::SCHEMA_VERSION);
+            automation::fx_set(&db, p, "EUR", fincore::Money::parse("7.8543").unwrap()).unwrap();
+        }
+        // 二次打开：版本已最新，init 应跳过 DDL，且已有数据可读回
+        let db = Db::open(&path).unwrap();
+        let rate = automation::fx_get(&db, p, "EUR").unwrap().unwrap().rate;
+        assert_eq!(rate, fincore::Money::parse("7.8543").unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 版本号已是最新、但 DDL 里某张表缺失时，重新打开必须把它补建出来。
+    /// 历史上 `invoice` / `prod_cost` 就是只加 DDL 没升 SCHEMA_VERSION，
+    /// 快速路径若只看版本号，这两张表对老账套就永远回不来了。
+    #[test]
+    fn reopen_recreates_table_missing_at_current_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "finbook_test_repair_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b2.fbk");
+
+        {
+            let db = Db::create(&path, &BookOptions::default()).unwrap();
+            db.conn()
+                .execute_batch("DROP TABLE invoice;")
+                .expect("删表失败");
+            assert_eq!(schema::version(db.conn()), schema::SCHEMA_VERSION);
+        }
+        let db = Db::open(&path).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='invoice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "invoice 表应在重开时被补建");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 快速路径的实际收益：一个连接正持有写事务时，另一个连接仍应立即打开账套，
+    /// 而不是等 busy_timeout 超时。旧实现每次 open 都跑 BEGIN IMMEDIATE + DDL，
+    /// 纯读请求也会去抢写锁，Web 端并发下就是成片 500。
+    #[test]
+    fn open_is_not_blocked_by_another_write_tx() {
+        let dir = std::env::temp_dir().join(format!(
+            "finbook_test_conc_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b3.fbk");
+        {
+            let _ = Db::create(&path, &BookOptions::default()).unwrap();
+        }
+        let writer = Db::open(&path).unwrap();
+        writer
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("开写事务失败");
+        let t = std::time::Instant::now();
+        let reader = Db::open(&path);
+        assert!(
+            reader.is_ok() && t.elapsed() < std::time::Duration::from_secs(2),
+            "只读打开被写事务挡住（耗时 {:?}）",
+            t.elapsed()
+        );
+        writer.conn().execute_batch("COMMIT;").unwrap();
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

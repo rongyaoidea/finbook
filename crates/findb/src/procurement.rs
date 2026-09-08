@@ -65,7 +65,7 @@ pub fn pr_save(db: &Db, r: &mut PurchaseReq) -> DbResult<i64> {
              qty=?6, status=?7, requester=?8, memo=?9 WHERE id=?1",
             rusqlite::params![
                 r.id, r.period.ymm(), r.date.format("%Y-%m-%d").to_string(),
-                r.item_code, r.item_name, r.qty.to_string(), r.status, r.requester, r.memo
+                r.item_code, r.item_name, crate::exact_param(r.qty), r.status, r.requester, r.memo
             ],
         )?;
         r.id
@@ -75,7 +75,7 @@ pub fn pr_save(db: &Db, r: &mut PurchaseReq) -> DbResult<i64> {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 r.no, r.period.ymm(), r.date.format("%Y-%m-%d").to_string(),
-                r.item_code, r.item_name, r.qty.to_string(), r.status, r.requester, r.memo
+                r.item_code, r.item_name, crate::exact_param(r.qty), r.status, r.requester, r.memo
             ],
         )?;
         db.conn().last_insert_rowid()
@@ -134,7 +134,7 @@ pub fn po_receipt_add(db: &Db, r: &PoReceipt) -> DbResult<i64> {
     }
     let id = db.conn().execute(
         "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
-        rusqlite::params![r.po_id, r.period.ymm(), r.date.format("%Y-%m-%d").to_string(), r.qty.to_string(), r.memo],
+        rusqlite::params![r.po_id, r.period.ymm(), r.date.format("%Y-%m-%d").to_string(), crate::exact_param(r.qty), r.memo],
     )?;
     // 执行进度以 po_receipt 流水累计为准（Rust 侧 Decimal），不落冗余字段
     Ok(db.conn().last_insert_rowid())
@@ -207,7 +207,7 @@ pub fn price_history_record(db: &Db, item_code: &str, supplier_code: &str, unit_
     db.conn().execute(
         "INSERT INTO price_history(item_code,supplier_code,unit_price,date) VALUES(?1,?2,?3,?4)
          ON CONFLICT(item_code,supplier_code,date) DO UPDATE SET unit_price=excluded.unit_price",
-        rusqlite::params![item_code, supplier_code, unit_price.to_string(), date.format("%Y-%m-%d").to_string()],
+        rusqlite::params![item_code, supplier_code, crate::exact_param(unit_price), date.format("%Y-%m-%d").to_string()],
     )?;
     Ok(())
 }

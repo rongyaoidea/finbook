@@ -1659,3 +1659,111 @@ async fn readonly_roles_cannot_write() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "出纳删凭证模板应被拒");
 }
+
+/// 通过 extra_perms 拿到 UserManage 的普通用户，不能改自己的角色 / 权限矩阵 /
+/// 数据范围（那等于一步自我提权）；改他人的授权仍然放行。
+#[tokio::test]
+async fn user_manager_cannot_escalate_self() {
+    let (state, _bd, _dir) = test_state();
+    let (_, boss_sid) = login(&state, "boss", "Admin!2026").await;
+
+    for u in ["sup1", "acc9"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss_sid,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Init123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台账号 {u}");
+    }
+    assert_eq!(select_book(&state, &boss_sid, "b1").await, StatusCode::OK);
+    for (u, role, extra) in [
+        ("sup1", "accountant", vec!["user_manage"]),
+        ("acc9", "accountant", vec![]),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &boss_sid,
+                serde_json::json!({
+                    "username": u, "display_name": u, "password": "Init123456",
+                    "role": role, "must_change_pwd": false, "extra_perms": extra,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {u}");
+    }
+
+    let mut sid_sup = String::new();
+    for u in ["sup1", "acc9"] {
+        let (st, sid) = login(&state, u, "Init123456").await;
+        assert_eq!(st, StatusCode::OK, "{u} 登录");
+        // 平台账号建号时强制首登改密，不改密会被拦在账套之外
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Init123456", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 首登改密");
+        let (st, sid) = login(&state, u, "Pass123456").await;
+        assert_eq!(st, StatusCode::OK, "{u} 改密后重登");
+        assert_eq!(
+            select_book(&state, &sid, "b1").await,
+            StatusCode::OK,
+            "{u} 进账套"
+        );
+        if u == "sup1" {
+            sid_sup = sid;
+        }
+    }
+
+    // 给自己加授权：三种载体都要被拦
+    for body in [
+        serde_json::json!({ "role": "admin" }),
+        serde_json::json!({ "extra_perms": ["user_manage", "backup"] }),
+        serde_json::json!({ "deny_perms": [] }),
+        serde_json::json!({ "data_scope": {} }),
+        serde_json::json!({ "disabled": true }),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_put("/api/users/sup1", &sid_sup, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "自我提权应被拒，body={body}"
+        );
+    }
+
+    // 改自己的显示名/备注不涉及授权，放行
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/sup1",
+            &sid_sup,
+            serde_json::json!({ "display_name": "我自己改的" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "自助改显示名不该被拦");
+
+    // 改他人授权仍然可以：说明拦的是「改自己」而不是把 UserManage 削没了
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/acc9",
+            &sid_sup,
+            serde_json::json!({ "role": "viewer" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改他人角色应放行");
+    let v: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).expect("响应应是 JSON");
+    assert_eq!(v["ok"], serde_json::json!(true));
+}

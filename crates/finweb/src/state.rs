@@ -248,6 +248,8 @@ pub struct SessionInfo {
     /// 登录时的设备指纹（用于逐请求复核"一人一机"策略）
     pub device_id: String,
     pub last_active: i64,
+    /// 会话创建时刻：用于绝对寿命上限，touch 不能把它往后推
+    pub created_at: i64,
     /// 当前工作期间（ymm），0 表示未设定（用账套默认值）
     pub period_ymm: i32,
     /// 当前账套 key（多账套切换）
@@ -285,7 +287,9 @@ impl SessionStore {
         let token = Self::new_token();
         let now = now_secs();
         let mut g = self.inner.lock().unwrap();
-        g.retain(|_, i| now - i.last_active < SESSION_MAX_SECS);
+        // 清理的是「超过绝对寿命」的会话，不是空闲超时的：活跃用户会不断 touch
+        // last_active，若按它裁剪，一直用的会话就永远留在表里。
+        g.retain(|_, i| now - i.created_at < SESSION_MAX_SECS);
         g.insert(
             token.clone(),
             SessionInfo {
@@ -293,6 +297,7 @@ impl SessionStore {
                 is_admin,
                 device_id: device_id.to_string(),
                 last_active: now,
+                created_at: now,
                 period_ymm,
                 book_key: book_key.to_string(),
             },
@@ -300,11 +305,18 @@ impl SessionStore {
         token
     }
 
-    /// 取会话；空闲超时（分钟）大于 0 且已超时则视为失效并清除。
+    /// 取会话；空闲超时（分钟）大于 0 且已超时，或已超过绝对寿命，则视为失效并清除。
+    ///
+    /// 两个判据都要有：只有空闲判据的话，用户持续操作就会不断 touch，服务端会话
+    /// 永不过期，被长期遗留的令牌一旦被窃取可无限续命。绝对上限与登录 Cookie 的
+    /// Max-Age 同值（7 天），所以不会比浏览器侧更早把用户踢下线。
     pub fn get(&self, token: &str, idle_minutes: i64) -> Option<SessionInfo> {
         let mut g = self.inner.lock().unwrap();
         let info = g.get(token)?;
-        if idle_minutes > 0 && now_secs() - info.last_active > idle_minutes * 60 {
+        let now = now_secs();
+        let idle_out = idle_minutes > 0 && now - info.last_active > idle_minutes * 60;
+        let expired = now - info.created_at > SESSION_MAX_SECS;
+        if idle_out || expired {
             g.remove(token);
             return None;
         }
@@ -394,6 +406,15 @@ impl FromRequestParts<Arc<WebState>> for RealmUser {
         if ru.disabled {
             state.sessions.remove(&token);
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
+        }
+        // "一人一机"逐请求复核。CurrentUser 提取器里本来就有这段，但平台级接口
+        // （建账套、选账套、改密）只走本提取器；缺了它，被管理员重置过设备的旧
+        // 浏览器仍能拿着旧会话在账套之外建套、改密。
+        if !ru.is_admin && !ru.device_id.is_empty() && ru.device_id != info.device_id {
+            state.sessions.remove(&token);
+            return Err(AppError::unauthorized(
+                "该账号已在其他设备登录，本设备会话已被下线",
+            ));
         }
         // 强制改密拦截：必须改密的用户只能访问改密和退出接口
         // （不删除会话——否则改密请求自身也会被挡在门外，用户被迫重新登录）

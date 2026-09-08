@@ -748,6 +748,21 @@ async fn update_user(
             return Err(AppError::bad_request("不能修改账套归属者的账套内身份"));
         }
     }
+    // 不能改自己的授权字段：`UserManage` 是一个可单独授予主管的权限，若能改自己，
+    // 把 role 设成 Admin 或清空 deny_perms 就是一次自我提权。显示名/备注不涉及授权，
+    // 允许自助修改。
+    if username == user.username() {
+        let touches_grant = req.role.is_some()
+            || req.extra_perms.is_some()
+            || req.deny_perms.is_some()
+            || req.data_scope.is_some()
+            || req.disabled == Some(true);
+        if touches_grant {
+            return Err(AppError::bad_request(
+                "不能修改自己的角色、权限矩阵或停用本人，请由其他管理员操作",
+            ));
+        }
+    }
     if let Some(d) = req.display_name {
         u.display_name = d;
     }

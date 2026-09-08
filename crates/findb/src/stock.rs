@@ -104,7 +104,7 @@ pub fn sc_next_no(db: &Db, period: Period) -> DbResult<String> {
 }
 
 pub fn sc_save(db: &Db, c: &mut StockCount) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let id = if c.id > 0 {
         tx.execute(
             "UPDATE stock_count SET period=?2, date=?3, warehouse=?4, status=?5,
@@ -142,7 +142,7 @@ pub fn sc_save(db: &Db, c: &mut StockCount) -> DbResult<i64> {
     for l in &c.lines {
         tx.execute(
             "INSERT INTO stock_count_line(sc_id,item,book_qty,count_qty,memo) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![id, l.item, l.book_qty.to_string(), l.count_qty.to_string(), l.memo],
+            rusqlite::params![id, l.item, crate::exact_param(l.book_qty), crate::exact_param(l.count_qty), l.memo],
         )?;
     }
     tx.commit()?;
@@ -189,7 +189,7 @@ pub fn sc_post(db: &Db, id: i64) -> DbResult<usize> {
         return Err(fincore::FinError::msg("盘点单已过账").into());
     }
     let mut n = 0usize;
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     for l in &c.lines {
         let diff = l.diff();
         if diff.is_zero() {

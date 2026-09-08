@@ -173,7 +173,7 @@ pub fn usage_with_children(db: &Db, code: &str) -> DbResult<(i64, i64)> {
 
 /// 批量导入（覆盖同名编码）
 pub fn import_many(db: &Db, accounts: &[Account]) -> DbResult<usize> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let mut n = 0;
     for a in accounts {
         tx.execute(

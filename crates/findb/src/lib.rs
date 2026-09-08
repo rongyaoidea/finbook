@@ -202,6 +202,24 @@ impl Db {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    /// 开启写事务（BEGIN IMMEDIATE）。多表写入一律用它。
+    ///
+    /// 不要再用 `conn().transaction()` / `unchecked_transaction()`：两者默认
+    /// DEFERRED，事务里先读后写时 SQLite 要到真正写入那一刻才去拿写锁，WAL 下
+    /// 若期间快照已被别的事务改动，会直接返回 SQLITE_BUSY_SNAPSHOT —— 而
+    /// busy_timeout 对这个错误码不会重试，只读请求也跟着失败。
+    ///
+    /// rusqlite 0.32 的 `transaction_with_behavior` 要 `&mut self`，而账套连接一律以
+    /// `&Db` 流转，故走 `Transaction::new_unchecked`：它只借 `&Connection`，自己发
+    /// `BEGIN IMMEDIATE`，drop 时回滚。嵌套开启仍会由 SQLite 报错，与原先
+    /// `unchecked_transaction()` 的运行时行为一致。
+    pub fn write_tx(&self) -> DbResult<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
     #[inline]
     pub fn path(&self) -> &Path {
         &self.path
@@ -361,7 +379,7 @@ impl Db {
 
     /// 清空全部业务数据，保留基础资料（用于重新建账 / 演示重置）
     pub fn clear_vouchers(&self) -> DbResult<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute_batch(
             "DELETE FROM voucher_entry;
              DELETE FROM voucher;
@@ -593,6 +611,43 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "invoice 表应在重开时被补建");
         drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_tx` 必须真的发 `BEGIN IMMEDIATE`：持有它之后，另一连接应立即抢不到
+    /// 写锁。退回 DEFERRED 时 BEGIN 本身不拿锁，第二个连接就会成功，此测试失败。
+    #[test]
+    fn write_tx_holds_write_lock_from_begin() {
+        let dir = std::env::temp_dir().join(format!(
+            "finbook_test_immediate_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b4.fbk");
+        {
+            let _ = Db::create(&path, &BookOptions::default()).unwrap();
+        }
+        let holder = Db::open(&path).unwrap();
+        let other = Db::open(&path).unwrap();
+        other
+            .conn()
+            .execute_batch("PRAGMA busy_timeout = 50;")
+            .unwrap();
+
+        let tx = holder.write_tx().expect("开写事务失败");
+        let locked = other.conn().execute_batch("BEGIN IMMEDIATE;");
+        assert!(
+            locked.is_err(),
+            "write_tx 只开了 DEFERRED 事务：另一连接仍能拿到写锁"
+        );
+        drop(tx);
+        other
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("事务释放后应能拿到写锁");
+        drop(other);
+        drop(holder);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -334,7 +334,7 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
         .into_result()?;
 
     // ---- 1. 落库 ----
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let id: i64 = if v.id > 0 {
@@ -566,7 +566,7 @@ pub fn post_many(db: &Db, ids: &[i64], who: &str) -> DbResult<(usize, Vec<String
     let mut ok = 0usize;
     let mut errs = Vec::new();
     let mut labels = Vec::new();
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     for id in ids {
         match post_tx(&tx, *id, who) {
             Ok(label) => {
@@ -716,7 +716,7 @@ pub fn renumber(db: &Db, period: Period, word: &str) -> DbResult<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let mut stmt = tx.prepare("UPDATE voucher SET no=?2 WHERE id=?1")?;
     let mut n = 0i32;
     for (id, _d, _no) in &rows {

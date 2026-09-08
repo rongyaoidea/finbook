@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use fincore::engine::aging::{AgingBucket, AgingItem, AgingLine};
 use fincore::{Money, Period};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{Db, DbResult};
 
@@ -65,9 +65,12 @@ pub fn list_for_entry(db: &Db, entry_id: i64) -> DbResult<Vec<SettleRecord>> {
 }
 
 /// 某分录已被核销掉的金额
-pub fn settled_of(db: &Db, entry_id: i64) -> DbResult<Money> {
+///
+/// 收 `&Connection` 而非 `&Db`：核销要在同一事务里「读未核销额 → 校验 → 写回」，
+/// 需要能借给事务句柄（`Transaction` 会 Deref 到 `Connection`）。
+pub fn settled_of(conn: &Connection, entry_id: i64) -> DbResult<Money> {
     // 金额在库里是 TEXT，SUM 会走浮点，精度不可控；这里取行在 Rust 侧用定点累加
-    let mut st = db.conn().prepare(
+    let mut st = conn.prepare(
         "SELECT amount FROM settle_record WHERE from_entry=?1 OR to_entry=?1",
     )?;
     let rows = st
@@ -129,11 +132,15 @@ pub fn settle(
     if amount <= Money::ZERO {
         return Err(fincore::FinError::msg("核销金额必须大于零").into());
     }
-    let f = match entry_of(db, from_entry)? {
+    // 「读未核销额 → 校验 → 累加写回」必须整体原子。BEGIN IMMEDIATE 在开头就取得
+    // 写锁，期间不会有别的写事务插进来；否则两笔并发核销会各自通过超额校验，
+    // 并把对方的累计额覆盖掉（唯一索引只保证行唯一，管不住金额）。
+    let tx = db.write_tx()?;
+    let f = match entry_of(&tx, from_entry)? {
         Some(e) => e,
         None => return Err(fincore::FinError::not_found("被核销分录").into()),
     };
-    let t = match entry_of(db, to_entry)? {
+    let t = match entry_of(&tx, to_entry)? {
         Some(e) => e,
         None => return Err(fincore::FinError::not_found("核销方分录").into()),
     };
@@ -151,8 +158,8 @@ pub fn settle(
         .into());
     }
     // 检查超额
-    let open_f = f.signed().abs() - settled_of(db, from_entry)?;
-    let open_t = t.signed().abs() - settled_of(db, to_entry)?;
+    let open_f = f.signed().abs() - settled_of(&tx, from_entry)?;
+    let open_t = t.signed().abs() - settled_of(&tx, to_entry)?;
     if amount > open_f {
         return Err(fincore::FinError::msg(format!(
             "核销金额 {amount} 超过被核销方未核销额 {open_f}"
@@ -167,8 +174,7 @@ pub fn settle(
     }
 
     // 读取现有累计核销额（TEXT 列，避免在 SQL 侧做字符串加法）
-    let existing = db
-        .conn()
+    let existing = tx
         .query_row(
             "SELECT amount FROM settle_record WHERE from_entry=?1 AND to_entry=?2",
             rusqlite::params![from_entry, to_entry],
@@ -178,7 +184,7 @@ pub fn settle(
     let old_amount = Money::parse_or_zero(&existing);
     let new_amount = old_amount + amount;
 
-    db.conn().execute(
+    tx.execute(
         "INSERT INTO settle_record(period,account_code,aux_key,from_entry,to_entry,amount,
             settled_by,settled_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
@@ -195,7 +201,9 @@ pub fn settle(
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         ],
     )?;
-    Ok(db.conn().last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn unsettle(db: &Db, id: i64) -> DbResult<()> {
@@ -260,9 +268,8 @@ impl OpenEntry {
     }
 }
 
-fn entry_of(db: &Db, entry_id: i64) -> DbResult<Option<OpenEntry>> {
-    db.conn()
-        .query_row(
+fn entry_of(conn: &Connection, entry_id: i64) -> DbResult<Option<OpenEntry>> {
+    conn.query_row(
             "SELECT e.id, v.id, v.period, v.date, v.word, v.no, e.line, e.summary,
                     e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
              FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
@@ -643,7 +650,7 @@ mod tests {
         let (_, e_cash) = ar_voucher(&db, p, d2, 2, "C01", "600", false, "100201");
 
         settle(&db, e_ar, e_cash, Money::parse("600").unwrap(), "u1").unwrap();
-        assert_eq!(settled_of(&db, e_ar).unwrap(), Money::parse("600").unwrap());
+        assert_eq!(settled_of(db.conn(), e_ar).unwrap(), Money::parse("600").unwrap());
 
         // 超额核销要拦
         assert!(settle(&db, e_ar, e_cash, Money::parse("500").unwrap(), "u1").is_err());
@@ -657,7 +664,7 @@ mod tests {
         // 取消核销后恢复
         let recs = list_for_entry(&db, e_ar).unwrap();
         unsettle(&db, recs[0].id).unwrap();
-        assert_eq!(settled_of(&db, e_ar).unwrap(), Money::ZERO);
+        assert_eq!(settled_of(db.conn(), e_ar).unwrap(), Money::ZERO);
     }
 
     #[test]

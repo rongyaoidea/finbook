@@ -51,7 +51,7 @@ pub struct ProdCostItem {
 // ===========================================================================
 
 pub fn add_cost(db: &Db, po_id: i64, cost_type: CostType, amount: Money, memo: &str) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     
     tx.execute(
@@ -343,37 +343,41 @@ pub fn prod_issue_materials(
         return Err(FinError::msg(format!("产品 {} 无BOM，无法领料", order.item_code)).into());
     }
     
+    // 先把所有物料的单位成本算完再开始写库：`get_item_cost` 对没有采购记录的物料会
+    // 报「物料成本未知」，若留在写入循环里，前面的领料已经落了库和成本归集、后面的
+    // 没做，这张订单的成本就永久停在半路上。
+    let mut planned: Vec<(String, Money, Money)> = Vec::with_capacity(bom_items.len());
+    for item in &bom_items {
+        let qty_required = (item.qty * order.planned_qty * (Money::ONE + item.loss_rate)).abs();
+        let unit_cost = get_item_cost(db, &item.child_code, period.ymm())?;
+        planned.push((item.child_code.clone(), qty_required, qty_required * unit_cost));
+    }
+
     let mut results = Vec::new();
     // 归集每笔领料的分录：借 生产成本-直接材料，贷 各物料科目（数量核算）
     let mut credit_entries: Vec<(String, Money, Money)> = Vec::new(); // (item, qty, amount)
-    
-    for item in &bom_items {
-        let qty_required = item.qty * order.planned_qty * (Money::ONE + item.loss_rate);
-        
+
+    for (child_code, qty, amount) in planned {
         let mut move_record = StockMove {
             id: 0,
             period,
             biz_date: issue_date,
             kind: StockKind::OtherOut,
-            item: item.child_code.clone(),
+            item: child_code.clone(),
             warehouse: String::new(),
             batch_no: String::new(),
-            qty: -qty_required,
+            qty: -qty,
             price: Money::ZERO,
             amount: Money::ZERO,
             voucher_id: None,
             memo: format!("生产领料 PO#{}", order.no),
         };
-        
+
         stock_insert(db, &mut move_record)?;
-        
-        let unit_cost = get_item_cost(db, &item.child_code, period.ymm())?;
-        let amount = qty_required.abs() * unit_cost;
-        
         // 归集材料成本到 prod_cost（供完工结转取用）
         add_cost(db, po_id, CostType::Material, amount, "生产领料")?;
-        credit_entries.push((item.child_code.clone(), qty_required.abs(), amount));
-        results.push((item.child_code.clone(), qty_required.abs(), amount));
+        credit_entries.push((child_code.clone(), qty, amount));
+        results.push((child_code, qty, amount));
     }
     
     // 生成领料结转凭证：借 500101 / 贷 各物料科目
@@ -521,19 +525,32 @@ pub fn prod_complete(
     };
     
     let move_id = stock_insert(db, &mut move_record)?;
-    
-    let tx = db.conn().unchecked_transaction()?;
+
+    // 条件更新：只有仍停在 in_progress 的订单能被本次完工推进，否则两个人同时
+    // 点完工会各入库一次、成本被重复结转。
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    tx.execute(
-        "UPDATE production_order SET status='completed', completed_qty=?, updated_at=? WHERE id=?",
-        rusqlite::params![completed_qty.to_string(), now, po_id]
-    )?;
-    tx.commit()?;
-    
+    let advanced = db.conn().execute(
+        "UPDATE production_order SET status='completed', completed_qty=?2, updated_at=?3
+         WHERE id=?1 AND status='in_progress'",
+        rusqlite::params![po_id, crate::exact_param(completed_qty), now],
+    );
+    // 抢输或写回出错都要把刚插入的入库行收回来，否则会留下没有订单对应的库存
+    match &advanced {
+        Ok(0) | Err(_) => {
+            let _ = crate::business::stock_delete(db, move_id);
+        }
+        _ => {}
+    }
+    if advanced? == 0 {
+        return Err(FinError::state("订单状态已被他人变更，请刷新后重试").into());
+    }
+
     // 生成完工结转凭证：借 库存商品(140501) / 贷 生产成本各要素。
     // 材料、人工、制造费用分别由 500101 / 500102 / 500103 承接。
-    let _ = completion_voucher(db, order.period, complete_date, &order, completed_qty, who)?;
-    
+    // 出错必须上抛：原先写成 `let _ = ...?`，凭证生成失败会被整个吞掉——订单显示
+    // 已完工、库存已入库，账上却没有对应凭证。
+    completion_voucher(db, order.period, complete_date, &order, completed_qty, who)?;
+
     Ok(move_id)
 }
 
@@ -630,7 +647,7 @@ mod tests {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
         
-        let tx = db.conn().unchecked_transaction().unwrap();
+        let tx = db.write_tx().unwrap();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
@@ -679,7 +696,7 @@ mod tests {
         }
 
         // 生产订单
-        let tx = db.conn().unchecked_transaction().unwrap();
+        let tx = db.write_tx().unwrap();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
@@ -728,7 +745,7 @@ mod tests {
     fn overhead_apply_rejects_duplicate() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        let tx = db.conn().unchecked_transaction().unwrap();
+        let tx = db.write_tx().unwrap();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)

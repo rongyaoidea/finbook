@@ -86,7 +86,7 @@ pub fn routing_save(db: &Db, item_code: &str, ops: &[RoutingOp]) -> DbResult<()>
 
 /// 带版本保存工艺路线
 pub fn routing_save_version(db: &Db, item_code: &str, version: &str, ops: &[RoutingOp]) -> DbResult<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute(
         "DELETE FROM routing WHERE item_code=?1 AND version=?2",
         rusqlite::params![item_code, version],
@@ -239,7 +239,7 @@ pub fn prod_op_init_from_routing(db: &Db, po_id: i64, item_code: &str) -> DbResu
     if cnt > 0 {
         return Ok(0);
     }
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     for op in &ops {
         tx.execute(
             "INSERT INTO prod_op(po_id,routing_id,op_name,work_center,worker,qty_done,hours,status,memo)
@@ -559,7 +559,7 @@ pub fn mrp_run(db: &Db, demands: &[(String, Money, String)]) -> DbResult<String>
     }
 
     // 落库：先清掉同一 run_at（理论上不会冲突），再逐条插入
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     for (code, a) in &acc {
         let on_hand = on_hand_qty(db, code)?;
         let plan = item_plan_get(db, code)?.unwrap_or(ItemPlan {
@@ -675,7 +675,7 @@ pub fn bversion_list(db: &Db) -> DbResult<Vec<BudgetVersion>> {
 }
 
 pub fn bversion_save(db: &Db, v: &BudgetVersion) -> DbResult<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     if v.is_current {
         // 单一生效版本：先把其他版本全部置为不生效
         tx.execute("UPDATE budget_version SET is_current=0", [])?;
@@ -690,7 +690,7 @@ pub fn bversion_save(db: &Db, v: &BudgetVersion) -> DbResult<()> {
 }
 
 pub fn bversion_delete(db: &Db, key: &str) -> DbResult<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute(
         "DELETE FROM budget WHERE version=?1",
         rusqlite::params![key],
@@ -826,7 +826,7 @@ pub fn approval_start(
     if exists.is_some() {
         return Err(FinError::msg("该单据已存在审批流，不能重复发起").into());
     }
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute(
         "INSERT INTO approval(biz_kind,biz_id,title,applicant,current_node,status,created_at)
          VALUES(?1,?2,?3,?4,1,'pending',?5)",
@@ -918,7 +918,7 @@ pub fn approval_act(
         .into());
     }
     let action = if approve { "approve" } else { "reject" };
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute(
         "UPDATE approval_step SET action=?1, comment=?2, acted_at=?3 WHERE id=?4",
         rusqlite::params![action, comment, now(), cur.id],

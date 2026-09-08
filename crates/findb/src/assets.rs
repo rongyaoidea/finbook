@@ -567,7 +567,7 @@ pub fn ac_next_no(db: &Db, period: Period) -> DbResult<String> {
 }
 
 pub fn ac_save(db: &Db, c: &mut AssetCount) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let id = if c.id > 0 {
         tx.execute(
             "UPDATE asset_count SET period=?2, date=?3, status=?4, prepared_by=?5, memo=?6 WHERE id=?1",
@@ -602,7 +602,7 @@ pub fn ac_post(db: &Db, id: i64) -> DbResult<usize> {
         .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))?
         .collect::<Result<Vec<_>, _>>()?;
     let mut n = 0;
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     for (asset_id, found) in lines {
         if !found {
             if let Some(mut a) = get(db, asset_id)? {

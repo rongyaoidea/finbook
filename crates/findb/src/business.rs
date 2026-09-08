@@ -1210,10 +1210,18 @@ pub fn claim_insert(db: &Db, c: &Claim) -> DbResult<i64> {
 }
 
 pub fn claim_update(db: &Db, c: &Claim) -> DbResult<()> {
-    db.conn().execute(
+    claim_update_cas(db, c, None)?;
+    Ok(())
+}
+
+/// 按 id 全量更新报销单。`expect_status` 非空时是条件更新（CAS）：库里状态已被
+/// 别人改走就一条都不动，返回受影响行数让调用方判定自己是否抢输。
+fn claim_update_cas(db: &Db, c: &Claim, expect_status: Option<ClaimStatus>) -> DbResult<usize> {
+    let expect = expect_status.map(|s| s.code().to_string());
+    let n = db.conn().execute(
         "UPDATE expense_claim SET no=?2,biz_date=?3,applicant=?4,dept=?5,reason=?6,amount=?7,
              status=?8,items_json=?9,approver=?10,approved_at=?11,payer=?12,paid_at=?13,
-             voucher_id=?14 WHERE id=?1",
+             voucher_id=?14 WHERE id=?1 AND (?15 IS NULL OR status=?15)",
         rusqlite::params![
             c.id,
             c.no,
@@ -1228,10 +1236,11 @@ pub fn claim_update(db: &Db, c: &Claim) -> DbResult<()> {
             c.approved_at,
             c.payer,
             c.paid_at,
-            c.voucher_id
+            c.voucher_id,
+            expect.as_deref()
         ],
     )?;
-    Ok(())
+    Ok(n)
 }
 
 pub fn claim_delete(db: &Db, id: i64) -> DbResult<()> {
@@ -1262,6 +1271,8 @@ pub fn claim_transition(
         Some(c) => c,
         None => return Err(fincore::FinError::not_found("报销单").into()),
     };
+    // 记住读到的原状态：末尾按它做条件更新，避免两个人同时审批/付款时互相覆盖
+    let from = c.status;
     match to {
         ClaimStatus::Submitted => {
             if c.status != ClaimStatus::Draft && c.status != ClaimStatus::Rejected {
@@ -1299,7 +1310,13 @@ pub fn claim_transition(
         }
     }
     c.status = to;
-    claim_update(db, &c)
+    if claim_update_cas(db, &c, Some(from))? == 0 {
+        return Err(fincore::FinError::state(
+            "该单据状态刚被他人变更，请刷新后重试",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// 报销单生成凭证：借 各费用科目（按明细）/ 贷 支付科目
@@ -1309,7 +1326,7 @@ pub fn claim_voucher(
     pay_account: &str,
     who: &str,
 ) -> DbResult<i64> {
-    let mut c = match claim_get(db, id)? {
+    let c = match claim_get(db, id)? {
         Some(c) => c,
         None => return Err(fincore::FinError::not_found("报销单").into()),
     };
@@ -1364,8 +1381,18 @@ pub fn claim_voucher(
     });
     v.renumber();
     let vid = crate::vouchers::save(db, &mut v)?;
-    c.voucher_id = Some(vid);
-    claim_update(db, &c)?;
+    // `vouchers::save` 自带事务，无法和上面「读单据 → 校验」并进同一事务，所以改用
+    // 条件更新来防并发重复出凭证：只有仍没挂凭证的单据能被本次结果占上。
+    // 抢输的一方删掉自己刚生成的那张（此刻还是草稿，删除安全），代价是留一个凭证
+    // 断号，可用「断号重排」补齐。
+    let taken = db.conn().execute(
+        "UPDATE expense_claim SET voucher_id=?2 WHERE id=?1 AND voucher_id IS NULL",
+        rusqlite::params![id, vid],
+    )?;
+    if taken == 0 {
+        let _ = crate::vouchers::delete(db, vid);
+        return Err(fincore::FinError::state("该报销单已生成过凭证").into());
+    }
     Ok(vid)
 }
 
@@ -1567,6 +1594,56 @@ mod tests {
         assert!(claim_delete(&db, id).is_err());
         // 重复生成要拦
         assert!(claim_voucher(&db, id, "100201", "u").is_err());
+    }
+
+    /// 条件更新（CAS）：库里状态与期望值不符时一条都不动。
+    /// 单据状态流转靠它拦住「两人同时审批 / 付款」互相覆盖。
+    #[test]
+    fn claim_update_cas_guards_on_expected_status() {
+        let db = tmpdb("claimcas");
+        let p = Period::new(2026, 1).unwrap();
+        let mut c = Claim {
+            id: 0,
+            period: p,
+            no: claim_next_no(&db, p).unwrap(),
+            biz_date: d(2026, 1, 15),
+            applicant: "E01".into(),
+            dept: "D01".into(),
+            reason: "差旅费".into(),
+            amount: m("800"),
+            status: ClaimStatus::Draft,
+            items: vec![ClaimItem {
+                expense_account: "660203".into(),
+                amount: m("800"),
+                memo: "机票".into(),
+            }],
+            approver: String::new(),
+            approved_at: None,
+            payer: String::new(),
+            paid_at: None,
+            voucher_id: None,
+            created_at: now_str(),
+        };
+        let id = claim_insert(&db, &c).unwrap();
+        c.id = id;
+
+        // 期望状态与库里一致 → 正常生效
+        c.status = ClaimStatus::Submitted;
+        assert_eq!(claim_update_cas(&db, &c, Some(ClaimStatus::Draft)).unwrap(), 1);
+
+        // 库里已是 submitted，仍按 draft 去更新 → 抢输，0 行且任何列都不动
+        c.reason = "并发覆盖进来的内容".into();
+        assert_eq!(claim_update_cas(&db, &c, Some(ClaimStatus::Draft)).unwrap(), 0);
+        let after = claim_get(&db, id).unwrap().unwrap();
+        assert_eq!(after.status, ClaimStatus::Submitted);
+        assert_eq!(after.reason, "差旅费", "CAS 抢输时不能改动任何列");
+
+        // 不传期望状态即无条件更新，保持 claim_update 的既有语义
+        assert_eq!(claim_update_cas(&db, &c, None).unwrap(), 1);
+        assert_eq!(
+            claim_get(&db, id).unwrap().unwrap().reason,
+            "并发覆盖进来的内容"
+        );
     }
 
     #[test]

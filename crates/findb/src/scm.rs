@@ -176,7 +176,7 @@ pub fn so_next_no(db: &Db, period: Period) -> DbResult<String> {
 }
 
 pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     po.total_amount = po.lines.iter().map(|l| l.amount).sum();
     po.total_tax = po.lines.iter().map(|l| l.tax_amount).sum();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -305,7 +305,7 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
 }
 
 pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     so.total_amount = so.lines.iter().map(|l| l.amount).sum();
     so.total_tax = so.lines.iter().map(|l| l.tax_amount).sum();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -463,7 +463,7 @@ pub fn bom_save(db: &Db, parent_code: &str, children: &[(String, Money, Money)])
 
 /// 带版本保存 BOM，并记录变更历史
 pub fn bom_save_version(db: &Db, parent_code: &str, version: &str, children: &[(String, Money, Money)], who: &str) -> DbResult<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute("DELETE FROM bom WHERE parent_code=?1 AND version=?2", rusqlite::params![parent_code, version])?;
     for (i, (child_code, qty, loss_rate)) in children.iter().enumerate() {
         tx.execute(
@@ -477,7 +477,7 @@ pub fn bom_save_version(db: &Db, parent_code: &str, version: &str, children: &[(
 }
 
 pub fn bom_delete(db: &Db, parent_code: &str, version: &str, who: &str) -> DbResult<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute("DELETE FROM bom WHERE parent_code=?1 AND version=?2", rusqlite::params![parent_code, version])?;
     bom_log_tx(&tx, parent_code, "delete", &format!("版本 {}", version), who)?;
     tx.commit()?;
@@ -546,7 +546,7 @@ pub fn bom_substitutes(db: &Db, parent_code: &str, child_code: &str) -> DbResult
 }
 
 pub fn bom_substitute_save(db: &Db, s: &Substitute, who: &str) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute(
         "INSERT INTO bom_substitute(parent_code, child_code, substitute, ratio, priority)
          VALUES(?1,?2,?3,?4,?5)
@@ -567,7 +567,7 @@ pub fn bom_substitute_save(db: &Db, s: &Substitute, who: &str) -> DbResult<i64> 
 pub fn bom_substitute_delete(db: &Db, id: i64, who: &str) -> DbResult<()> {
     let parent: Option<String> = db.conn().query_row(
         "SELECT parent_code FROM bom_substitute WHERE id=?1", [id], |r| r.get(0)).optional()?;
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     tx.execute("DELETE FROM bom_substitute WHERE id=?1", [id])?;
     if let Some(p) = parent {
         bom_log_tx(&tx, &p, "del_sub", &format!("替代料 id={id}"), who)?;
@@ -776,7 +776,7 @@ pub fn prod_next_no(db: &Db, period: Period) -> DbResult<String> {
 }
 
 pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     
     let id = if order.id > 0 {
@@ -786,7 +786,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
              WHERE id=?",
             rusqlite::params![
                 order.period.ymm(), order.date, order.item_code, order.item_name,
-                order.planned_qty.to_string(), order.completed_qty.to_string(),
+                crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 serde_json::to_value(&order.status)?.as_str().unwrap(),
                 order.work_center, order.prepared_by, order.memo, now, order.id
             ],
@@ -799,7 +799,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
             rusqlite::params![
                 order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
-                order.planned_qty.to_string(), order.completed_qty.to_string(),
+                crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 serde_json::to_value(&order.status)?.as_str().unwrap(),
                 order.work_center, order.prepared_by, order.memo, now
             ],

@@ -245,7 +245,7 @@ fn t92_settle_and_aging_loop() {
 
     // 手工核销 600
     settle::settle(&db, e_sale, e_pay, m("600"), "测试员").unwrap();
-    assert_eq!(settle::settled_of(&db, e_sale).unwrap(), m("600"));
+    assert_eq!(settle::settled_of(db.conn(), e_sale).unwrap(), m("600"));
 
     // 未核销余 400
     let open = settle::open_entries(&db, "1122", p, false).unwrap();

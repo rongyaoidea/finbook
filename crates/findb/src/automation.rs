@@ -504,12 +504,22 @@ pub fn at_generated(db: &Db, period: Period, rule_name: &str) -> DbResult<bool> 
     Ok(n > 0)
 }
 
+/// 同进程内串行化自动转账执行。
+///
+/// `at_generated` 的判重是「先 SELECT 再 INSERT」，而 `vouchers::save` 自带事务、
+/// 没法并进外层事务，所以并发执行两次会各自判重通过、各计提一次（重复记账）。
+/// 串行化后，第二次执行必然看到第一次已落库的凭证，走「本期已生成过，跳过」分支。
+/// 只覆盖本进程：桌面端与 Web 端各自持锁，跨进程同开一个账套文件仍需人工避免。
+static AT_RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn at_run(
     db: &Db,
     period: Period,
     date: chrono::NaiveDate,
     who: &str,
 ) -> DbResult<(Vec<i64>, Vec<String>)> {
+    // 锁被毒化（前次执行 panic 过）不影响正确性：取锁只为串行化，接管即可
+    let _serial = AT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let previews = at_preview_all(db, period)?;
     let mut ids = Vec::new();
     let mut skips = Vec::new();

@@ -178,7 +178,7 @@ pub fn usage(db: &Db, kind: AuxKind, code: &str) -> DbResult<i64> {
 
 /// 批量导入
 pub fn import_many(db: &Db, items: &[AuxEntity]) -> DbResult<usize> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let mut n = 0;
     for e in items {
         tx.execute(

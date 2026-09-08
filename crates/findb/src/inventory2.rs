@@ -29,7 +29,7 @@ pub struct Serial {
 
 /// 入库登记序列号（批量）
 pub fn serial_in(db: &Db, item: &str, serials: &[String], batch_no: &str, date: NaiveDate) -> DbResult<usize> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let mut n = 0;
     for s in serials {
         tx.execute(
@@ -45,7 +45,7 @@ pub fn serial_in(db: &Db, item: &str, serials: &[String], batch_no: &str, date: 
 
 /// 出库登记序列号：在库 → 已出库
 pub fn serial_out(db: &Db, serials: &[String], date: NaiveDate) -> DbResult<usize> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.write_tx()?;
     let mut n = 0;
     for s in serials {
         let cnt = tx.execute(

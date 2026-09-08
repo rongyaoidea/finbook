@@ -160,7 +160,7 @@ pub fn quota_set(db: &Db, period: Period, supplier: &str, item: &str, quota_qty:
     db.conn().execute(
         "INSERT INTO supplier_quota(period,supplier_code,item,quota_qty,used_qty) VALUES(?1,?2,?3,?4,'0')
          ON CONFLICT(period,supplier_code,item) DO UPDATE SET quota_qty=excluded.quota_qty",
-        rusqlite::params![period.ymm(), supplier, item, quota_qty.to_string()],
+        rusqlite::params![period.ymm(), supplier, item, crate::exact_param(quota_qty)],
     )?;
     Ok(())
 }

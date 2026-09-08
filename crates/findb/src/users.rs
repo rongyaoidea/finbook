@@ -223,7 +223,8 @@ pub fn authenticate(db: &Db, username: &str, password: &str) -> DbResult<Option<
             }
         }
         None => {
-            let _ = fincore::user::verify_password(password, "0$dummy");
+            // 等价的空校验：哈希长度对齐后执行一次真实 sha256，降低用户名枚举的时序差异
+            let _ = fincore::user::verify_password(password, &format!("0${}", "0".repeat(64)));
             Ok(None)
         }
     }

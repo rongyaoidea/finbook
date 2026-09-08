@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use axum::Router;
 use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
 
 use fincore::user::PasswordPolicy;
 
@@ -17,8 +18,19 @@ use finweb::handlers;
 use finweb::realm::RealmDb;
 use finweb::state::{BookRegistry, SessionStore, WebState};
 
+/// 初始化日志：默认 info 级（含 HTTP 访问日志），可用 RUST_LOG 调级
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     // 平台身份库（全局账号 + 账套目录）
     let realm_path =
@@ -100,11 +112,13 @@ fn default_period() -> i32 {
     (now.year() as i32) * 100 + now.month() as i32
 }
 
-/// 组装应用：API 路由 + 静态资源（前端 SPA）
+/// 组装应用：API 路由 + 访问日志 + 静态资源（前端 SPA）
 fn build_app(state: std::sync::Arc<WebState>, static_dir: PathBuf) -> Router {
     // handlers::router 内部已带 /api 前缀，这里用 merge 而不是 nest，避免变成 /api/api/...
+    // 访问日志：先挂 TraceLayer 再补 fallback，API 与静态资源请求均留痕
     let api = handlers::router(state);
-    api.fallback_service(ServeDir::new(static_dir))
+    api.layer(TraceLayer::new_for_http())
+        .fallback_service(ServeDir::new(static_dir))
 }
 
 /// 定位静态资源目录：优先环境变量，其次可执行文件同级的 static/，最后当前目录的 static/

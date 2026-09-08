@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
-# FinBook Web 端容器镜像（多阶段构建）
+# FinBook Web 端容器镜像（多阶段构建，多租户模式）
 # 构建: docker build -t finbook:latest .
 # 运行: docker run -d --name finbook -p 8080:8080 \
 #         -v finbook_data:/data finbook:latest
-# 说明: 账套文件默认放在 /data/finbook.fbk（工作目录 /app），
-#       容器内务必备份到卷挂载目录；正式使用建议配合反向代理提供 HTTPS。
+# 说明: 平台身份库 realm.db 与用户自建账套 books/ 都放在 /data（数据卷），
+#       容器销毁重建不会丢数据；正式使用建议配合反向代理提供 HTTPS。
+# 平台管理员首次启动自动引导，账号口令见启动日志（可用 FINBOOK_ADMIN_USER/PASS 预置）。
 
 # ── 构建阶段 ──────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
@@ -33,9 +34,10 @@ WORKDIR /app
 COPY --from=builder /build/target/release/finweb /usr/local/bin/finweb
 # 静态资源（SPA）
 COPY crates/finweb/static ./static
-# 账套数据卷挂载点
+# 平台身份库 + 账套目录统一挂到 /data 数据卷（重建容器不丢数据）
 VOLUME ["/data"]
-ENV FINBOOK_DB=/data/finbook.fbk \
+ENV FINBOOK_REALM=/data/realm.db \
+    FINBOOK_BOOKS_DIR=/data/books \
     FINBOOK_LISTEN=0.0.0.0:8080 \
     FINWEB_STATIC_DIR=/app/static
 EXPOSE 8080

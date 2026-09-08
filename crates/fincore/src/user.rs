@@ -493,6 +493,18 @@ pub fn is_legacy_hash(stored: &str) -> bool {
     !stored.starts_with("$argon2")
 }
 
+/// 时序缓解：执行一次与真实口令校验等价的 argon2 哈希。
+///
+/// 登录接口在"用户不存在"或"口令错误"路径上用它做等价空校验，
+/// 避免两种路径耗时差异过大造成用户名枚举。返回恒为 false，仅消耗时间。
+pub fn burn_argon2(plain: &str) -> bool {
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::{Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut OsRng);
+    let _ = Argon2::default().hash_password(plain.as_bytes(), &salt);
+    false
+}
+
 /// 旧版 `salt$sha256(password)`。仅测试用：验证旧哈希的升级迁移路径。
 #[cfg(test)]
 fn legacy_hash_password(plain: &str) -> String {

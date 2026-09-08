@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use findb::{users, Db, DbError, DbResult};
-use fincore::user::{hash_password, verify_password, Role, User};
+use fincore::user::{burn_argon2, hash_password, verify_password, Role, User};
 use rusqlite::{Connection, OptionalExtension};
 
 /// 全局账号（平台层）
@@ -193,13 +193,14 @@ impl RealmDb {
                 if verify_password(password, &u.password_hash) {
                     Ok(Some(u))
                 } else {
-                    // 等价的空校验，降低用户名枚举的时序差异
-                    let _ = verify_password(password, &"$argon2id$v=19$m=19456,t=2,p=1$deadbeef$0000");
+                    // 口令错误时做等价空校验，降低用户名枚举的时序差异
+                    let _ = burn_argon2(password);
                     Ok(None)
                 }
             }
             None => {
-                let _ = verify_password(password, &"$argon2id$v=19$m=19456,t=2,p=1$deadbeef$0000");
+                // 用户不存在也做等价空校验：真实执行一次 argon2，耗时与真实校验相当
+                let _ = burn_argon2(password);
                 Ok(None)
             }
         }

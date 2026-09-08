@@ -90,8 +90,8 @@ fn map_stmt(r: &rusqlite::Row) -> rusqlite::Result<Statement> {
 const COLS: &str = "id,period,account_code,biz_date,summary,settle_no,debit,credit,balance,
      entry_id,matched_at,matched_by";
 
-pub fn list(db: &Db, period: Period, account: &str) -> DbResult<Vec<Statement>> {
-    let mut st = db.conn().prepare(&format!(
+pub fn list(c: &impl crate::AsConn, period: Period, account: &str) -> DbResult<Vec<Statement>> {
+    let mut st = c.conn_ref().prepare(&format!(
         "SELECT {COLS} FROM bank_statement WHERE period=?1 AND account_code=?2
          ORDER BY biz_date, id"
     ))?;
@@ -102,16 +102,16 @@ pub fn list(db: &Db, period: Period, account: &str) -> DbResult<Vec<Statement>> 
 }
 
 /// 本期本科目已导入的流水数
-pub fn count(db: &Db, period: Period, account: &str) -> DbResult<i64> {
-    Ok(db.conn().query_row(
+pub fn count(c: &impl crate::AsConn, period: Period, account: &str) -> DbResult<i64> {
+    Ok(c.conn_ref().query_row(
         "SELECT COUNT(*) FROM bank_statement WHERE period=?1 AND account_code=?2",
         rusqlite::params![period.ymm(), account],
         |r| r.get(0),
     )?)
 }
 
-pub fn insert(db: &Db, s: &Statement) -> DbResult<i64> {
-    db.conn().execute(
+pub fn insert(c: &impl crate::AsConn, s: &Statement) -> DbResult<i64> {
+    c.conn_ref().execute(
         "INSERT INTO bank_statement(period,account_code,biz_date,summary,settle_no,
             debit,credit,balance,entry_id,matched_at,matched_by)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -129,7 +129,7 @@ pub fn insert(db: &Db, s: &Statement) -> DbResult<i64> {
             s.matched_by
         ],
     )?;
-    Ok(db.conn().last_insert_rowid())
+    Ok(c.conn_ref().last_insert_rowid())
 }
 
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
@@ -147,8 +147,8 @@ pub fn clear(db: &Db, period: Period, account: &str) -> DbResult<usize> {
 }
 
 /// 勾对：一条银行流水 ↔ 一条凭证分录
-pub fn link(db: &Db, stmt_id: i64, entry_id: i64, who: &str) -> DbResult<()> {
-    db.conn().execute(
+pub fn link(c: &impl crate::AsConn, stmt_id: i64, entry_id: i64, who: &str) -> DbResult<()> {
+    c.conn_ref().execute(
         "UPDATE bank_statement SET entry_id=?2, matched_at=?3, matched_by=?4 WHERE id=?1",
         rusqlite::params![
             stmt_id,
@@ -180,8 +180,8 @@ pub fn unlink_all(db: &Db, period: Period, account: &str) -> DbResult<usize> {
 // ---------------- 账面侧 ----------------
 
 /// 取出某科目某期所有已记账的银行收支分录（含是否已被勾对）
-pub fn book_side(db: &Db, period: Period, account: &str) -> DbResult<Vec<BookEntry>> {
-    let mut st = db.conn().prepare(
+pub fn book_side(c: &impl crate::AsConn, period: Period, account: &str) -> DbResult<Vec<BookEntry>> {
+    let mut st = c.conn_ref().prepare(
         "SELECT e.id, v.id, v.date, v.word, v.no, e.summary,
                 COALESCE(e.settle_no,''), e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON v.id = e.voucher_id
@@ -210,8 +210,8 @@ pub fn book_side(db: &Db, period: Period, account: &str) -> DbResult<Vec<BookEnt
 }
 
 /// 账面侧已被勾对的分录 id
-pub fn linked_entry_ids(db: &Db, period: Period, account: &str) -> DbResult<Vec<i64>> {
-    let mut st = db.conn().prepare(
+pub fn linked_entry_ids(c: &impl crate::AsConn, period: Period, account: &str) -> DbResult<Vec<i64>> {
+    let mut st = c.conn_ref().prepare(
         "SELECT entry_id FROM bank_statement
          WHERE period=?1 AND account_code=?2 AND entry_id IS NOT NULL",
     )?;
@@ -248,9 +248,13 @@ pub fn auto_match(
     date_tolerance: i64,
     who: &str,
 ) -> DbResult<MatchResult> {
-    let mut stmts = list(db, period, account)?;
-    let books = book_side(db, period, account)?;
-    let linked = linked_entry_ids(db, period, account)?;
+    // 读快照与写勾对必须在同一事务：勾对本质是「查哪些没勾 → 逐条写 entry_id」，
+    // 两个并发 auto_match（或自动勾对撞上手工勾对）会各自基于旧快照判定，把同一
+    // 条流水/分录勾到别处。BEGIN IMMEDIATE 让整个过程独占写锁。
+    let tx = db.write_tx()?;
+    let mut stmts = list(&tx, period, account)?;
+    let books = book_side(&tx, period, account)?;
+    let linked = linked_entry_ids(&tx, period, account)?;
     let linked: std::collections::HashSet<i64> = linked.into_iter().collect();
 
     let mut res = MatchResult::default();
@@ -280,7 +284,7 @@ pub fn auto_match(
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
             done_stmt.insert(s.id);
-            link(db, s.id, cands[0].entry_id, who)?;
+            link(&tx, s.id, cands[0].entry_id, who)?;
             res.by_no += 1;
         } else if cands.len() > 1 {
             res.ambiguous += 1;
@@ -305,7 +309,7 @@ pub fn auto_match(
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
             done_stmt.insert(s.id);
-            link(db, s.id, cands[0].entry_id, who)?;
+            link(&tx, s.id, cands[0].entry_id, who)?;
             res.by_amount_date += 1;
         } else if cands.len() > 1 {
             res.ambiguous += 1;
@@ -329,7 +333,7 @@ pub fn auto_match(
         if cands.len() == 1 {
             used.insert(cands[0].entry_id);
             done_stmt.insert(s.id);
-            link(db, s.id, cands[0].entry_id, who)?;
+            link(&tx, s.id, cands[0].entry_id, who)?;
             res.by_amount += 1;
         } else if cands.len() > 1 {
             res.ambiguous += 1;
@@ -337,8 +341,9 @@ pub fn auto_match(
     }
 
     // 重新读一次，统计最终勾对数（含本次之前已勾的）
-    stmts = list(db, period, account)?;
+    stmts = list(&tx, period, account)?;
     res.matched = stmts.iter().filter(|s| s.matched()).count();
+    tx.commit()?;
     Ok(res)
 }
 
@@ -510,7 +515,9 @@ pub fn import_csv(
     text: &str,
 ) -> DbResult<(usize, Vec<String>)> {
     let mut warns: Vec<String> = Vec::new();
-    let mut n = 0usize;
+    // 先把能解析的行全部解析出来，再一次事务写库：逐行自动提交的话，导入中途
+    // 失败会留下半份对账单，重新导入同一文件就会重复。
+    let mut rows: Vec<Statement> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = raw.trim().trim_start_matches('\u{feff}');
         if line.is_empty() {
@@ -555,25 +562,27 @@ pub fn import_csv(
             continue;
         }
 
-        insert(
-            db,
-            &Statement {
-                id: 0,
-                period,
-                account_code: account.to_string(),
-                biz_date: date,
-                summary,
-                settle_no,
-                debit,
-                credit,
-                balance,
-                entry_id: None,
-                matched_at: None,
-                matched_by: None,
-            },
-        )?;
-        n += 1;
+        rows.push(Statement {
+            id: 0,
+            period,
+            account_code: account.to_string(),
+            biz_date: date,
+            summary,
+            settle_no,
+            debit,
+            credit,
+            balance,
+            entry_id: None,
+            matched_at: None,
+            matched_by: None,
+        });
     }
+    let n = rows.len();
+    let tx = db.write_tx()?;
+    for s in &rows {
+        insert(&tx, s)?;
+    }
+    tx.commit()?;
     Ok((n, warns))
 }
 

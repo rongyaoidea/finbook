@@ -297,8 +297,30 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
 /// 借贷不平衡、科目不合法、期间已结账、或已审核/已记账的凭证写进账套。
 /// 界面层负责给友好提示，数据库层必须无条件拦住。
 pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
+    let tx = db.write_tx()?;
+    let id = save_in(&tx, v)?;
+    tx.commit()?;
+    v.id = id;
+    Ok(id)
+}
+
+/// 在**调用方已开启的事务**里保存凭证：守卫与落库都在该事务内完成，既不发
+/// `BEGIN` 也不提交。
+///
+/// 「生成凭证 + 回写业务单据 / 扣库存 / 归集成本」需要原子的调用方用它。
+/// `save` 自带事务，那些流程只能拆成两次提交，中途失败就留下「库存已扣、账上无
+/// 凭证」的半成品；`next_no` 取号也因跨事务而会并发撞号。
+pub fn save_in(tx: &rusqlite::Transaction, v: &mut Voucher) -> DbResult<i64> {
+    save_on(tx, v)
+}
+
+/// 守卫 + 落库，全部跑在给定的连接上（通常就是调用方的事务；`Transaction` 会
+/// Deref 到 `Connection`）。不发 BEGIN、不提交。
+fn save_on(tx: &rusqlite::Connection, v: &mut Voucher) -> DbResult<i64> {
     // ---- 0. 前置守卫 ----
-    let closed = crate::periods::closed_upto(db)?;
+    // 守卫一律在同一事务里读，否则「查结账线 / 查凭证号占用 → 写入」之间存在
+    // 别人见缝插针的窗口（期间刚被结账、或同号凭证刚被别人插入）。
+    let closed = crate::periods::closed_upto_of(tx)?;
     if let Some(upto) = closed {
         if v.period <= upto {
             return Err(FinError::state(format!(
@@ -309,32 +331,47 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
         }
     }
     if v.id > 0 {
-        // 更新：草稿可直接改；已审核/已记账需先反审核/反记账
-        let old = get(db, v.id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{}", v.id)))?;
-        if !old.status.can_edit() {
+        // 更新：草稿可直接改；已审核/已记账需先反审核/反记账。
+        // 只取 status 一列，不必像 get() 那样把分录全捞出来。
+        let old_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM voucher WHERE id=?1",
+                rusqlite::params![v.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let old_status = old_status
+            .ok_or_else(|| FinError::not_found(format!("凭证 #{}", v.id)))?;
+        let old_status = serde_json::from_str::<VoucherStatus>(&format!("\"{old_status}\""))
+            .unwrap_or(VoucherStatus::Draft);
+        if !old_status.can_edit() {
             return Err(FinError::state(format!(
                 "凭证当前状态为「{}」，不能修改（请先反审核 / 反记账）",
-                old.status.label()
+                old_status.label()
             ))
             .into());
         }
     } else if v.status == VoucherStatus::Void {
         return Err(FinError::state("新增凭证不能直接标记为「已作废」".to_string()).into());
     }
-    if no_taken(db, v.period, &v.word, v.no, v.id)? {
+    let taken: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM voucher WHERE period=?1 AND word=?2 AND no=?3 AND id<>?4",
+        rusqlite::params![v.period.ymm(), v.word, v.no, v.id],
+        |r| r.get(0),
+    )?;
+    if taken > 0 {
         return Err(FinError::msg(format!(
             "{}-{:04} 已存在，请更换凭证号",
             v.word, v.no
         ))
         .into());
     }
-    let chart = crate::accounts::chart(db)?;
-    let opts = db.options();
+    let chart = crate::accounts::chart_of(tx)?;
+    let opts = crate::options_of(tx);
     fincore::engine::validate_for_save(v, &fincore::engine::ValidateCtx::new(&chart, &opts, closed))
         .into_result()?;
 
     // ---- 1. 落库 ----
-    let tx = db.write_tx()?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let id: i64 = if v.id > 0 {
@@ -420,26 +457,45 @@ pub fn save(db: &Db, v: &mut Voucher) -> DbResult<i64> {
         ])?;
     }
     drop(stmt);
-    tx.commit()?;
     v.id = id;
     Ok(id)
 }
 
 /// 删除凭证（连同分录，外键 ON DELETE CASCADE）
 ///
-/// 先清理该凭证的所有附件（含磁盘 `.attachments/` 中的大文件），
-/// 再删除凭证行；否则外存附件会随级联删除而成为孤儿文件。
+/// 顺序是「记下磁盘附件 → 删库并提交 → 再删文件」。反过来做（旧实现先删文件）
+/// 一旦删库失败——状态被拦、拿不到写锁、外键报错——凭证还留在账上而附件文件已经
+/// 没了，变成引用空文件的坏账。删文件失败只留下孤儿文件，无害得多。
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
-    crate::attach::delete_for_voucher(db, id)?;
+    let files: Vec<String> = crate::attach::list(db, id)?
+        .into_iter()
+        .filter(|a| !a.inline)
+        .filter_map(|a| a.path)
+        .collect();
     db.conn()
         .execute("DELETE FROM voucher WHERE id=?1", rusqlite::params![id])?;
+    let dir = crate::attach::dir_of(db);
+    for rel in files {
+        // 与 attach::delete 保持同样的路径约束，避免越出附件目录
+        if rel.contains("..") || rel.contains('/') || rel.contains('\\') {
+            continue;
+        }
+        let _ = std::fs::remove_file(dir.join(rel));
+    }
     Ok(())
 }
 
 /// 下一个可用凭证号
+///
+/// 单独取号只在**同一个写事务里接着 `save_in`** 时才可靠；两者跨事务时并发调用者
+/// 会取到同一个号，靠 `voucher(period,word,no)` 唯一索引兜底成一次失败。
 pub fn next_no(db: &Db, period: Period, word: &str) -> DbResult<i32> {
-    let max: Option<i32> = db
-        .conn()
+    next_no_of(db.conn(), period, word)
+}
+
+/// 同 `next_no`，但只依赖连接，可在调用方的事务内取号。
+pub fn next_no_of(tx: &rusqlite::Connection, period: Period, word: &str) -> DbResult<i32> {
+    let max: Option<i32> = tx
         .query_row(
             "SELECT MAX(no) FROM voucher WHERE period=?1 AND word=?2",
             rusqlite::params![period.ymm(), word],

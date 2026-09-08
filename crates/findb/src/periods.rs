@@ -9,8 +9,14 @@ use crate::{accounts, vouchers, Db, DbResult};
 
 /// 已结账的最大期间。结账必须逐月连续，因此只需要记住最后一个。
 pub fn closed_upto(db: &Db) -> DbResult<Option<Period>> {
-    let v: Option<i32> = db
-        .conn()
+    closed_upto_of(db.conn())
+}
+
+/// 同 `closed_upto`，但只依赖连接，可在已开启的事务内调用
+/// （`rusqlite::Transaction` 会 Deref 到 `Connection`）。凭证守卫要在事务里读它，
+/// 否则「查结账线 → 写入」之间存在把凭证写进刚被结账期间的窗口。
+pub fn closed_upto_of(conn: &rusqlite::Connection) -> DbResult<Option<Period>> {
+    let v: Option<i32> = conn
         .query_row(
             "SELECT MAX(period) FROM period_state WHERE closed=1",
             [],

@@ -76,6 +76,28 @@ impl From<DbError> for FinError {
 /// 结果别名
 pub type DbResult<T> = Result<T, DbError>;
 
+/// 能借出一个 `&Connection` 的对象：`Db` 本身，以及调用方已开启的
+/// `rusqlite::Transaction`。
+///
+/// 仓储函数把参数声明成 `&impl AsConn` 后，既有调用点传 `&Db` 照常编译，
+/// 新的事务内调用传 `&tx` 也能编译——读、写因此可以放进同一个事务而不必
+/// 复制一份 SQL。
+pub trait AsConn {
+    fn conn_ref(&self) -> &rusqlite::Connection;
+}
+
+impl AsConn for Db {
+    fn conn_ref(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+}
+
+impl AsConn for rusqlite::Transaction<'_> {
+    fn conn_ref(&self) -> &rusqlite::Connection {
+        self
+    }
+}
+
 /// 账套数据库连接
 pub struct Db {
     conn: Connection,
@@ -243,10 +265,7 @@ impl Db {
 
     /// 账套参数
     pub fn options(&self) -> BookOptions {
-        match self.meta_get("options") {
-            Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-            None => BookOptions::default(),
-        }
+        options_of(&self.conn)
     }
     pub fn set_options(&self, o: &BookOptions) -> DbResult<()> {
         let s = serde_json::to_string(o)?;
@@ -466,6 +485,17 @@ pub fn prune_auto_backups(dir: &Path, keep: usize) -> DbResult<()> {
 /// 写入一段 JSON 配置到账套
 pub fn set_options_json<T: serde::Serialize>(db: &Db, key: &str, v: &T) -> DbResult<()> {
     db.meta_set_json(key, v)
+}
+
+/// 读取账套参数。只依赖连接，因此可以在已开启的事务内调用
+/// （`Db::options` 只是它的一层委托）。
+pub fn options_of(conn: &rusqlite::Connection) -> fincore::BookOptions {
+    conn.query_row("SELECT value FROM meta WHERE key='options'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+    .unwrap_or_default()
 }
 
 #[inline]

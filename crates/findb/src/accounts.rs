@@ -30,7 +30,12 @@ fn map_account(r: &rusqlite::Row) -> rusqlite::Result<Account> {
 
 /// 全部科目（按编码排序）
 pub fn list(db: &Db) -> DbResult<Vec<Account>> {
-    let mut stmt = db.conn().prepare(
+    list_of(db.conn())
+}
+
+/// 同 `list`，但只依赖连接，可在事务内调用。
+pub fn list_of(conn: &rusqlite::Connection) -> DbResult<Vec<Account>> {
+    let mut stmt = conn.prepare(
         "SELECT code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
                 cf_item,bs_item,pl_item,disabled,memo
          FROM account ORDER BY code",
@@ -74,8 +79,14 @@ pub fn get(db: &Db, code: &str) -> DbResult<Option<Account>> {
 
 /// 构建科目表（含树形关系）
 pub fn chart(db: &Db) -> DbResult<Chart> {
-    let scheme = CodeScheme(db.options().code_scheme.clone());
-    Ok(Chart::with_accounts(scheme, list(db)?))
+    chart_of(db.conn())
+}
+
+/// 同 `chart`，但只依赖连接：凭证守卫要在自己的事务里取科目表，
+/// 不能反过来要求调用方先交出一个 `&Db`。
+pub fn chart_of(conn: &rusqlite::Connection) -> DbResult<Chart> {
+    let scheme = CodeScheme(crate::options_of(conn).code_scheme.clone());
+    Ok(Chart::with_accounts(scheme, list_of(conn)?))
 }
 
 pub fn insert(db: &Db, a: &Account) -> DbResult<()> {

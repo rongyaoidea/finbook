@@ -492,8 +492,16 @@ pub fn at_preview_all(db: &Db, period: Period) -> DbResult<Vec<TransferPreview>>
 /// 自动转账生成的是草稿凭证，未记账前不进余额，直接重复执行会出两张一样的分录。
 /// 这里按"期间 + 来源 + 规则名"判断是否已生成过。
 pub fn at_generated(db: &Db, period: Period, rule_name: &str) -> DbResult<bool> {
-    let n: i64 = db
-        .conn()
+    at_generated_of(db.conn(), period, rule_name)
+}
+
+/// 同 `at_generated`，但只依赖连接：判重要与写入同处一个事务才可靠。
+pub fn at_generated_of(
+    conn: &rusqlite::Connection,
+    period: Period,
+    rule_name: &str,
+) -> DbResult<bool> {
+    let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM voucher WHERE period=?1 AND source='auto_transfer'
                AND memo = ?2",
@@ -539,7 +547,15 @@ pub fn at_run(
             r.offset_account.clone()
         };
         let dst_is_debit = r.dst_dir != EntryDir::Credit;
-        let no = crate::vouchers::next_no(db, period, "记")?;
+        // 判重 → 取号 → 写凭证收进同一事务。判重本质是「先查后插」，跨事务时
+        // 并发执行会各生成一张、各计提一次；这里权威判重放在事务内，即便绕过
+        // 上面的进程内串行锁（跨进程、或未来改成多线程调度）也不会重复计提。
+        let tx = db.write_tx()?;
+        if at_generated_of(&tx, period, &r.name)? {
+            skips.push(format!("{}：本期已生成过，跳过", r.name));
+            continue; // tx 在此 drop，即回滚
+        }
+        let no = crate::vouchers::next_no_of(&tx, period, "记")?;
         let mut v = Voucher::new(period, date, "记", no);
         v.prepared_by = who.to_string();
         v.source = VoucherSource::AutoTransfer;
@@ -562,8 +578,11 @@ pub fn at_run(
             ..Entry::new(2, &offset, &summary)
         });
         v.renumber();
-        match crate::vouchers::save(db, &mut v) {
-            Ok(id) => ids.push(id),
+        match crate::vouchers::save_in(&tx, &mut v) {
+            Ok(id) => {
+                tx.commit()?;
+                ids.push(id);
+            }
             Err(e) => skips.push(format!("{}：{}", r.name, e)),
         }
     }

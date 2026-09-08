@@ -139,7 +139,14 @@ pub fn stock_list_item(db: &Db, item: &str, upto: Period) -> DbResult<Vec<StockM
 }
 
 pub fn stock_insert(db: &Db, m: &StockMove) -> DbResult<i64> {
-    db.conn().execute(
+    let id = stock_insert_of(db.conn(), m)?;
+    Ok(id)
+}
+
+/// 同 `stock_insert`，但只依赖连接：领料/完工要把「扣库存 + 归集成本 + 出凭证」
+/// 放进同一个事务，调用方持的是事务句柄。
+pub fn stock_insert_of(conn: &rusqlite::Connection, m: &StockMove) -> DbResult<i64> {
+    conn.execute(
         "INSERT INTO stock_move(period,biz_date,kind,item,warehouse,batch_no,qty,price,amount,voucher_id,memo)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         rusqlite::params![
@@ -156,7 +163,7 @@ pub fn stock_insert(db: &Db, m: &StockMove) -> DbResult<i64> {
             m.memo
         ],
     )?;
-    Ok(db.conn().last_insert_rowid())
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn stock_update_amount(db: &Db, id: i64, price: Money, amount: Money) -> DbResult<()> {
@@ -1349,7 +1356,11 @@ pub fn claim_voucher(
     }
     let period = c.period;
     let date = c.biz_date;
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    // 取号 → 写凭证 → 把单据标记为已挂凭证，三步同一个事务。分次提交时任何一步
+    // 失败都会留下孤儿凭证或「已付款但无凭证」的单据；合并后抢输的一方整个回滚，
+    // 连凭证号都不消耗。
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -1380,19 +1391,17 @@ pub fn claim_voucher(
         ..Entry::new(i, pay_account, &c.reason)
     });
     v.renumber();
-    let vid = crate::vouchers::save(db, &mut v)?;
-    // `vouchers::save` 自带事务，无法和上面「读单据 → 校验」并进同一事务，所以改用
-    // 条件更新来防并发重复出凭证：只有仍没挂凭证的单据能被本次结果占上。
-    // 抢输的一方删掉自己刚生成的那张（此刻还是草稿，删除安全），代价是留一个凭证
-    // 断号，可用「断号重排」补齐。
-    let taken = db.conn().execute(
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    // 条件更新防并发重复出凭证：只有仍没挂凭证的单据能被本次结果占上。
+    // 与凭证写入同事务，抢输的一方整体回滚——不再需要先出凭证再删的补丁。
+    let taken = tx.execute(
         "UPDATE expense_claim SET voucher_id=?2 WHERE id=?1 AND voucher_id IS NULL",
         rusqlite::params![id, vid],
     )?;
     if taken == 0 {
-        let _ = crate::vouchers::delete(db, vid);
         return Err(fincore::FinError::state("该报销单已生成过凭证").into());
     }
+    tx.commit()?;
     Ok(vid)
 }
 

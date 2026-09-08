@@ -51,24 +51,31 @@ pub struct ProdCostItem {
 // ===========================================================================
 
 pub fn add_cost(db: &Db, po_id: i64, cost_type: CostType, amount: Money, memo: &str) -> DbResult<i64> {
-    let tx = db.write_tx()?;
+    let id = add_cost_of(db.conn(), po_id, cost_type, amount, memo)?;
+    Ok(id)
+}
+
+/// 同 `add_cost`，但只依赖连接：领料要把「扣库存 + 归集成本 + 出凭证」放进同一事务。
+pub fn add_cost_of(
+    conn: &rusqlite::Connection,
+    po_id: i64,
+    cost_type: CostType,
+    amount: Money,
+    memo: &str,
+) -> DbResult<i64> {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    
-    tx.execute(
+    conn.execute(
         "INSERT INTO prod_cost(po_id, cost_type, amount, memo, created_at)
          VALUES(?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             po_id,
             cost_type.code(),
-            amount.to_string(),
+            crate::money_param(amount),
             memo,
             now
         ],
     )?;
-    
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn get_prod_cost(db: &Db, po_id: i64) -> DbResult<(Money, Money, Money)> {
@@ -92,6 +99,26 @@ pub fn get_prod_cost(db: &Db, po_id: i64) -> DbResult<(Money, Money, Money)> {
         parse_sum(&lab_str),
         parse_sum(&oh_str),
     ))
+}
+
+/// 同 `get_prod_cost`，但只依赖连接：完工结转要在自己的事务里读归集成本。
+pub fn get_prod_cost_of(conn: &rusqlite::Connection, po_id: i64) -> DbResult<(Money, Money, Money)> {
+    let mat_sql = "SELECT COALESCE(GROUP_CONCAT(amount, '+'), '0') FROM prod_cost WHERE po_id=? AND cost_type='material'";
+    let lab_sql = "SELECT COALESCE(GROUP_CONCAT(amount, '+'), '0') FROM prod_cost WHERE po_id=? AND cost_type='labor'";
+    let oh_sql = "SELECT COALESCE(GROUP_CONCAT(amount, '+'), '0') FROM prod_cost WHERE po_id=? AND cost_type='overhead'";
+
+    let mat_str: String = conn.query_row(mat_sql, [po_id], |r| r.get(0))?;
+    let lab_str: String = conn.query_row(lab_sql, [po_id], |r| r.get(0))?;
+    let oh_str: String = conn.query_row(oh_sql, [po_id], |r| r.get(0))?;
+
+    let parse_sum = |s: &str| -> Money {
+        if s == "0" {
+            return Money::ZERO;
+        }
+        s.split('+').map(|x| Money::parse_or_zero(x)).sum()
+    };
+
+    Ok((parse_sum(&mat_str), parse_sum(&lab_str), parse_sum(&oh_str)))
 }
 
 pub fn get_prod_total_cost(db: &Db, po_id: i64) -> DbResult<Money> {
@@ -331,7 +358,7 @@ pub fn prod_issue_materials(
     who: &str,
 ) -> DbResult<Vec<(String, Money, Money)>> {
     use crate::scm::bom_list;
-    use crate::business::{stock_insert, StockMove, StockKind};
+    use crate::business::{stock_insert_of, StockMove, StockKind};
     
     let order = match get_prod_order(db, po_id)? {
         Some(o) => o,
@@ -357,6 +384,10 @@ pub fn prod_issue_materials(
     // 归集每笔领料的分录：借 生产成本-直接材料，贷 各物料科目（数量核算）
     let mut credit_entries: Vec<(String, Money, Money)> = Vec::new(); // (item, qty, amount)
 
+    // 扣库存、归集成本、出结转凭证必须在同一事务：原先各写各的提交，中途失败
+    // （最常见的是末尾出凭证报错）会留下「库存已扣、成本已归集、账上无凭证」的
+    // 半成品，这张订单的成本再也补不齐。
+    let tx = db.write_tx()?;
     for (child_code, qty, amount) in planned {
         let mut move_record = StockMove {
             id: 0,
@@ -373,16 +404,17 @@ pub fn prod_issue_materials(
             memo: format!("生产领料 PO#{}", order.no),
         };
 
-        stock_insert(db, &mut move_record)?;
+        stock_insert_of(&tx, &mut move_record)?;
         // 归集材料成本到 prod_cost（供完工结转取用）
-        add_cost(db, po_id, CostType::Material, amount, "生产领料")?;
+        add_cost_of(&tx, po_id, CostType::Material, amount, "生产领料")?;
         credit_entries.push((child_code.clone(), qty, amount));
         results.push((child_code, qty, amount));
     }
-    
+
     // 生成领料结转凭证：借 500101 / 贷 各物料科目
-    material_voucher(db, period, issue_date, &order, &credit_entries, who)?;
-    
+    material_voucher_in(&tx, period, issue_date, &order, &credit_entries, who)?;
+    tx.commit()?;
+
     Ok(results)
 }
 
@@ -396,12 +428,28 @@ pub fn material_voucher(
     issues: &[(String, Money, Money)],
     who: &str,
 ) -> DbResult<i64> {
+    let tx = db.write_tx()?;
+    let id = material_voucher_in(&tx, period, date, order, issues, who)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// 在调用方事务内生成领料结转凭证（不发 BEGIN、不提交）。
+/// 领料的「扣库存 + 归集成本 + 出凭证」必须同一事务。
+pub fn material_voucher_in(
+    tx: &rusqlite::Transaction,
+    period: Period,
+    date: NaiveDate,
+    order: &ProductionOrder,
+    issues: &[(String, Money, Money)],
+    who: &str,
+) -> DbResult<i64> {
     use fincore::{AuxRef, Entry, Voucher, VoucherSource};
     let total: Money = issues.iter().map(|i| i.2).sum();
     if total.is_zero() {
         return Ok(0);
     }
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    let no = crate::vouchers::next_no_of(tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -419,7 +467,7 @@ pub fn material_voucher(
         });
     }
     v.renumber();
-    crate::vouchers::save(db, &mut v)
+    crate::vouchers::save_in(tx, &mut v)
 }
 
 fn get_item_cost(db: &Db, item_code: &str, period_ymm: i32) -> DbResult<Money> {
@@ -491,7 +539,7 @@ pub fn prod_complete(
     completed_qty: Money,
     who: &str,
 ) -> DbResult<i64> {
-    use crate::business::{stock_insert, StockMove, StockKind};
+    use crate::business::{stock_insert_of, StockMove, StockKind};
     
     let order = match get_prod_order(db, po_id)? {
         Some(o) => o,
@@ -502,13 +550,29 @@ pub fn prod_complete(
         return Err(FinError::msg("只有进行中的订单才能完工入库").into());
     }
     
-    let total_cost = get_prod_total_cost(db, po_id)?;
+    // 归集成本、推进订单、入库、结转凭证收进同一事务：
+    // - 订单推进是条件更新（只允许 in_progress → completed），抢输的一方整体回滚，
+    //   不会各入库一次、重复结转成本，也不再需要「抢输后手工回收入库行」的补丁；
+    // - 出凭证失败则整个事务回滚，订单仍是进行中、库存未动，可以直接重试。
+    let tx = db.write_tx()?;
+    let (mat, lab, oh) = get_prod_cost_of(&tx, po_id)?;
+    let total_cost = mat + lab + oh;
     let unit_cost = if completed_qty > Money::ZERO {
         total_cost / completed_qty
     } else {
         Money::ZERO
     };
-    
+
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let advanced = tx.execute(
+        "UPDATE production_order SET status='completed', completed_qty=?2, updated_at=?3
+         WHERE id=?1 AND status='in_progress'",
+        rusqlite::params![po_id, crate::exact_param(completed_qty), now],
+    )?;
+    if advanced == 0 {
+        return Err(FinError::state("订单状态已被他人变更，请刷新后重试").into());
+    }
+
     let mut move_record = StockMove {
         id: 0,
         period,
@@ -523,33 +587,12 @@ pub fn prod_complete(
         voucher_id: None,
         memo: format!("完工入库 PO#{}", order.no),
     };
-    
-    let move_id = stock_insert(db, &mut move_record)?;
-
-    // 条件更新：只有仍停在 in_progress 的订单能被本次完工推进，否则两个人同时
-    // 点完工会各入库一次、成本被重复结转。
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let advanced = db.conn().execute(
-        "UPDATE production_order SET status='completed', completed_qty=?2, updated_at=?3
-         WHERE id=?1 AND status='in_progress'",
-        rusqlite::params![po_id, crate::exact_param(completed_qty), now],
-    );
-    // 抢输或写回出错都要把刚插入的入库行收回来，否则会留下没有订单对应的库存
-    match &advanced {
-        Ok(0) | Err(_) => {
-            let _ = crate::business::stock_delete(db, move_id);
-        }
-        _ => {}
-    }
-    if advanced? == 0 {
-        return Err(FinError::state("订单状态已被他人变更，请刷新后重试").into());
-    }
+    let move_id = stock_insert_of(&tx, &mut move_record)?;
 
     // 生成完工结转凭证：借 库存商品(140501) / 贷 生产成本各要素。
     // 材料、人工、制造费用分别由 500101 / 500102 / 500103 承接。
-    // 出错必须上抛：原先写成 `let _ = ...?`，凭证生成失败会被整个吞掉——订单显示
-    // 已完工、库存已入库，账上却没有对应凭证。
-    completion_voucher(db, order.period, complete_date, &order, completed_qty, who)?;
+    completion_voucher_in(&tx, order.period, complete_date, &order, completed_qty, who)?;
+    tx.commit()?;
 
     Ok(move_id)
 }
@@ -564,13 +607,28 @@ pub fn completion_voucher(
     completed_qty: Money,
     who: &str,
 ) -> DbResult<i64> {
+    let tx = db.write_tx()?;
+    let id = completion_voucher_in(&tx, period, date, order, completed_qty, who)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// 在调用方事务内生成完工结转凭证（不发 BEGIN、不提交）。
+pub fn completion_voucher_in(
+    tx: &rusqlite::Transaction,
+    period: Period,
+    date: NaiveDate,
+    order: &ProductionOrder,
+    completed_qty: Money,
+    who: &str,
+) -> DbResult<i64> {
     use fincore::{AuxRef, Entry, Voucher, VoucherSource};
-    let (mat, lab, oh) = get_prod_cost(db, order.id)?;
+    let (mat, lab, oh) = get_prod_cost_of(tx, order.id)?;
     let total = mat + lab + oh;
     if total.is_zero() || completed_qty.is_zero() {
         return Ok(0);
     }
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    let no = crate::vouchers::next_no_of(tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -602,7 +660,7 @@ pub fn completion_voucher(
         idx += 1;
     }
     v.renumber();
-    crate::vouchers::save(db, &mut v)
+    crate::vouchers::save_in(tx, &mut v)
 }
 
 pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> {

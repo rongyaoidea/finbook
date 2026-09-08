@@ -156,6 +156,10 @@ impl BookRegistry {
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// 窗口内允许的最大失败次数，超过则拒绝后续尝试直至窗口滑出
 const LOGIN_MAX_FAILURES: usize = 10;
+/// 攒够这么多条目才做一次全局裁剪，摊薄扫描成本
+const LOGIN_SWEEP_MARK: usize = 1024;
+/// 限流表的账号数上界，超过直接清空
+const LOGIN_MAX_TRACKED: usize = 10_000;
 
 /// 登录限流：按账号做滑动窗口计数。
 ///
@@ -173,27 +177,53 @@ impl LoginLimiter {
     }
 
     /// 检查该账号当前是否允许再尝试登录；返回 `Err(剩余等待秒数)` 表示已被限流。
+    ///
+    /// 未限流的账号一律不建条目：本函数在口令校验之前调用，用户名由客户端任意
+    /// 提交，若在这里 `or_default()`，任何一次探测都会永久留下一个 key。
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let mut g = self.inner.lock().unwrap();
         let now = Instant::now();
-        let v = g.entry(key.to_string()).or_default();
-        v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
-        if v.len() >= LOGIN_MAX_FAILURES {
-            // 窗口滑出到最早一次失败时，允许再次尝试
-            let wait = LOGIN_WINDOW.saturating_sub(now.duration_since(v[0]));
-            return Err(wait.as_secs().max(1));
+        let mut stale = false;
+        let verdict = match g.get_mut(key) {
+            Some(v) => {
+                v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+                if v.is_empty() {
+                    stale = true;
+                    Ok(())
+                } else if v.len() >= LOGIN_MAX_FAILURES {
+                    // 窗口滑出到最早一次失败时，允许再次尝试
+                    let wait = LOGIN_WINDOW.saturating_sub(now.duration_since(v[0]));
+                    Err(wait.as_secs().max(1))
+                } else {
+                    Ok(())
+                }
+            }
+            None => Ok(()),
+        };
+        if stale {
+            g.remove(key);
         }
-        Ok(())
+        verdict
     }
 
     /// 记录一次失败尝试
     pub fn record_failure(&self, key: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .entry(key.to_string())
-            .or_default()
-            .push(Instant::now());
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        // 只记录失败、从不裁剪的话，用随机用户名刷登录就能把表无限撑大。
+        // 攒够一批再全局扫，避免每次失败都 O(n) 遍历。
+        if g.len() > LOGIN_SWEEP_MARK {
+            g.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+                !v.is_empty()
+            });
+            // 大量账号同时被爆破时仍超限，直接清空换回内存上界：
+            // 这是纵深防御，宁可偶尔放宽限流也不能耗尽内存拖垮整个服务。
+            if g.len() > LOGIN_MAX_TRACKED {
+                g.clear();
+            }
+        }
+        g.entry(key.to_string()).or_default().push(now);
     }
 
     /// 登录成功后清零该账号的失败记录
@@ -660,5 +690,33 @@ pub fn parse_money(s: &str) -> fincore::Money {
     match rust_decimal::Decimal::from_str(s.trim()) {
         Ok(d) => fincore::Money::new(d),
         Err(_) => fincore::Money::ZERO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 探测式登录（用户名乱填、永远认证失败）不该在限流表里留下条目：
+    /// check 早于口令校验，若它 or_default() 建键，随机用户名就能把表无限撑大。
+    #[test]
+    fn check_does_not_create_entries() {
+        let l = LoginLimiter::new();
+        for i in 0..500 {
+            let name = format!("ghost{i}");
+            assert!(l.check(&name).is_ok());
+        }
+        assert!(l.inner.lock().unwrap().is_empty(), "check 不该建条目");
+    }
+
+    #[test]
+    fn throttles_after_max_failures() {
+        let l = LoginLimiter::new();
+        for _ in 0..LOGIN_MAX_FAILURES {
+            l.record_failure("bob");
+        }
+        assert!(l.check("bob").is_err(), "达到阈值应拒绝");
+        l.clear("bob");
+        assert!(l.check("bob").is_ok(), "登录成功清零后应放行");
     }
 }

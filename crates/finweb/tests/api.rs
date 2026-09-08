@@ -1553,3 +1553,109 @@ async fn login_rate_limited_after_repeated_failures() {
     let s = body_string(resp).await;
     assert!(s.contains("retry_after"), "响应体应含剩余等待秒数：{s}");
 }
+
+/// 越权回归：只读（Viewer）与出纳不得写入这些端点。
+///
+/// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，
+/// 而 Report 是每个角色（含 Viewer）都自带的最低权限，等于对只读账号开放了写入；
+/// 模板 / 工资 / 报销的 DELETE 又误用了 Perm::VoucherNew，使无 VoucherDelete
+/// 的出纳也能删。
+#[tokio::test]
+async fn readonly_roles_cannot_write() {
+    let (state, _bd, _dir) = test_state();
+    let (_, boss_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // 平台账号（首登强制改密）
+    for u in ["view1", "cash1"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss_sid,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Init123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台账号 {u}");
+    }
+    // boss 进入名下账套 b1，把两人拉成 Viewer / 出纳
+    assert_eq!(
+        select_book(&state, &boss_sid, "b1").await,
+        StatusCode::OK,
+        "boss 应能进入 b1"
+    );
+    for (u, role) in [("view1", "viewer"), ("cash1", "cashier")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &boss_sid,
+                serde_json::json!({
+                    "username": u, "display_name": u, "password": "Init123456",
+                    "role": role, "must_change_pwd": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {u} 为 {role}");
+    }
+
+    let mut sids = Vec::new();
+    for u in ["view1", "cash1"] {
+        let (st, sid) = login(&state, u, "Init123456").await;
+        assert_eq!(st, StatusCode::OK, "{u} 平台登录");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Init123456", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 首登改密");
+        let (st, sid) = login(&state, u, "Pass123456").await;
+        assert_eq!(st, StatusCode::OK, "{u} 改密后重登");
+        assert_eq!(
+            select_book(&state, &sid, "b1").await,
+            StatusCode::OK,
+            "{u} 应能进入 b1"
+        );
+        sids.push(sid);
+    }
+    let view_sid = sids[0].clone();
+    let cash_sid = sids[1].clone();
+
+    // Viewer 读权限仍在
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/budget/versions", &view_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "Viewer 应能读预算版本");
+
+    // 但所有写入口一律 403
+    for (uri, body) in [
+        (
+            "/api/budget/versions",
+            serde_json::json!({ "key": "v1", "name": "回归" }),
+        ),
+        (
+            "/api/approvals",
+            serde_json::json!({ "biz_kind": "purchase", "biz_id": 1, "title": "t", "approvers": ["boss"] }),
+        ),
+        (
+            "/api/reports/notes",
+            serde_json::json!({ "report_key": "balance-sheet", "period": 202601, "content": "x" }),
+        ),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(uri, &view_sid, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "Viewer 写 {uri} 应被拒");
+    }
+
+    // 出纳无 VoucherDelete，不能删凭证模板
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/templates/1", &cash_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "出纳删凭证模板应被拒");
+}

@@ -530,12 +530,21 @@ async fn get_me(
     Ok(Json(PublicUser::from_user(&user.user)))
 }
 
+/// 凡是要把口令写进存储的入口，都必须先过这道校验。
+///
+/// 之前各入口只写死 `len() < 6`，账套里配置的 PasswordPolicy（默认 8 位且需含
+/// 字母+数字）只在桌面端 security::admin_reset_password 生效，Web 端能设 123456。
+fn check_password(state: &WebState, pwd: &str) -> Result<(), AppError> {
+    state.policy.check(pwd).map_err(AppError::bad_request)
+}
+
 async fn post_change_password(
     State(state): State<Arc<WebState>>,
     user: RealmUser,
     Json(req): Json<ChangePwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 改的是平台口令（与登录身份一致）
+    check_password(&state, &req.new)?;
     let r = state.realm.change_password(&user.username, &req.old, &req.new)?;
     match r {
         Ok(()) => {
@@ -579,9 +588,10 @@ async fn create_platform_user(
     if !user.is_admin {
         return Err(AppError::forbidden("该操作仅限平台管理员"));
     }
-    if req.username.trim().is_empty() || req.password.len() < 6 {
-        return Err(AppError::bad_request("用户名不能为空，口令至少 6 位"));
+    if req.username.trim().is_empty() {
+        return Err(AppError::bad_request("用户名不能为空"));
     }
+    check_password(&state, &req.password)?;
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     let id = state
         .realm
@@ -635,6 +645,7 @@ async fn reset_platform_password(
     if !user.is_admin {
         return Err(AppError::forbidden("该操作仅限平台管理员"));
     }
+    check_password(&state, &req.new)?;
     state.realm.reset_password(&username, &req.new)?;
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
         let _ = state
@@ -686,9 +697,10 @@ async fn create_user(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
     let username = req.username.trim().to_string();
-    if username.is_empty() || req.password.len() < 6 {
-        return Err(AppError::bad_request("用户名不能为空，口令至少 6 位"));
+    if username.is_empty() {
+        return Err(AppError::bad_request("用户名不能为空"));
     }
+    check_password(&state, &req.password)?;
     let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_some() {
         return Err(AppError::bad_request("该用户名已存在"));
@@ -3255,12 +3267,15 @@ struct BVersionReq {
     pub memo: String,
 }
 
+// 预算版本 / 审批流 / 报表附注 / 会计档案的写操作统一要求 Perm::AccountEdit，
+// 与其余业务写路由保持一致。不要用 Perm::Report 把关：Report 是只读权限，
+// 且每个角色（含只读 Viewer）都自带它，等于对只读账号开放了写入。
 async fn save_budget_version(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
     Json(req): Json<BVersionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     advanced::bversion_save(
         &db,
@@ -3280,7 +3295,7 @@ async fn delete_budget_version(
     user: CurrentUser,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     advanced::bversion_delete(&db, &key)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -3291,7 +3306,7 @@ async fn activate_budget_version(
     user: CurrentUser,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let mut v = advanced::bversion_list(&db)?
         .into_iter()
@@ -3313,7 +3328,7 @@ async fn copy_budget_version(
     user: CurrentUser,
     Json(req): Json<BCopyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let n = advanced::bversion_copy(&db, &req.from, &req.to)?;
     Ok(Json(serde_json::json!({ "ok": true, "copied": n })))
@@ -3368,7 +3383,7 @@ async fn start_approval(
     user: CurrentUser,
     Json(req): Json<ApprovalStartReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let id = advanced::approval_start(
         &db,
@@ -3394,7 +3409,7 @@ async fn act_approval(
     Path(id): Path<i64>,
     Json(req): Json<ApprovalActReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let ap = advanced::approval_act(&db, id, user.username(), req.approve, &req.comment)?;
     Ok(Json(serde_json::json!({ "approval": ap })))
@@ -3405,7 +3420,7 @@ async fn cancel_approval(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     advanced::approval_cancel(&db, id, user.username())?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -3445,7 +3460,7 @@ async fn save_note(
     user: CurrentUser,
     Json(req): Json<NoteReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let mut n = advanced::ReportNote {
         id: req.id,
@@ -3466,7 +3481,7 @@ async fn delete_note(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     advanced::note_delete(&db, id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -3503,7 +3518,7 @@ async fn create_archive(
     user: CurrentUser,
     Json(req): Json<ArchiveReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = Period::from_ymm(req.period);
     let file_no = if req.file_no.trim().is_empty() {
@@ -4351,7 +4366,7 @@ async fn delete_template(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherNew)?;
+    user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
     template::delete(&db, id)?;
     db.log(user.username(), "凭证模板", "删除模板", &id.to_string())?;
@@ -4607,7 +4622,7 @@ async fn delete_payroll(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherNew)?;
+    user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
     // 删除前拦截已生成凭证的工资行
     let existing = business::payroll_get_by_id(&db, id)?;
@@ -4879,7 +4894,7 @@ async fn delete_claim(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherNew)?;
+    user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
     let c = business::claim_get(&db, id)?
         .ok_or_else(|| AppError::not_found("报销单不存在"))?;

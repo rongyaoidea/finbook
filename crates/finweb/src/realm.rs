@@ -191,6 +191,18 @@ impl RealmDb {
                     return Ok(None);
                 }
                 if verify_password(password, &u.password_hash) {
+                    // 顺手把旧版 salt$sha256 升级成 argon2id 并回写。桌面端登录走
+                    // findb::security::login 有这一步，Web 端走本函数；缺了它，
+                    // 历史账号会永久停在弱哈希上，且弱哈希还会被同步进各账套。
+                    let mut u = u;
+                    if fincore::user::is_legacy_hash(&u.password_hash) {
+                        u.password_hash = hash_password(password);
+                        let conn = self.inner.lock().unwrap();
+                        conn.execute(
+                            "UPDATE realm_user SET password_hash=?2 WHERE username=?1",
+                            rusqlite::params![username, u.password_hash],
+                        )?;
+                    }
                     Ok(Some(u))
                 } else {
                     // 口令错误时做等价空校验，降低用户名枚举的时序差异

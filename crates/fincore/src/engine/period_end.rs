@@ -62,8 +62,10 @@ pub fn generate_carry_forward(
         if !chart.is_leaf(&r.account_code) {
             continue;
         }
-        let net = r.debit - r.credit;
-        if net.round2().is_zero() {
+        // 先取整到 2 位再入账：余额聚合可能带出分位以下的尾数，原样入账会把
+        // 0.005 级的金额写进账簿，与「金额一律 2 位」的口径冲突。
+        let net = (r.debit - r.credit).round2();
+        if net.is_zero() {
             continue;
         }
 
@@ -204,7 +206,10 @@ pub fn check_can_close(input: &CloseCheckInput) -> Issues {
         iss.push(format!("本期还有 {} 张草稿凭证，请检查是否需要记账或删除", input.drafts));
     }
 
-    if !input.trial.period_balanced() {
+    // 用 is_balanced（期初 + 本期发生 + 期末）而不是只看本期发生额：
+    // 只看发生额的话，期初就不平的账套（例如期初导入出错）能一路结账下去，
+    // 资产负债表恒等式被永久破坏。problems() 三项都会给出来。
+    if !input.trial.is_balanced() {
         for s in input.trial.problems() {
             iss.push(s);
         }

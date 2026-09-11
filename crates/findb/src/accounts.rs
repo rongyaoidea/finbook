@@ -168,14 +168,14 @@ pub fn usage(db: &Db, code: &str) -> DbResult<(i64, i64)> {
 
 /// 科目及其所有下级被引用情况
 pub fn usage_with_children(db: &Db, code: &str) -> DbResult<(i64, i64)> {
-    let like = format!("{code}%");
+    let like = format!("{}%", crate::escape_like(code));
     let e: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM voucher_entry WHERE account_code LIKE ?1",
+        "SELECT COUNT(*) FROM voucher_entry WHERE account_code LIKE ?1 ESCAPE '\\'",
         rusqlite::params![like],
         |r| r.get(0),
     )?;
     let b: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM begin_balance WHERE account_code LIKE ?1",
+        "SELECT COUNT(*) FROM begin_balance WHERE account_code LIKE ?1 ESCAPE '\\'",
         rusqlite::params![like],
         |r| r.get(0),
     )?;
@@ -217,11 +217,11 @@ pub fn import_many(db: &Db, accounts: &[Account]) -> DbResult<usize> {
 
 /// 关键字搜索（编码或名称）
 pub fn search(db: &Db, kw: &str, limit: i64) -> DbResult<Vec<Account>> {
-    let like = format!("%{kw}%");
+    let like = format!("%{}%", crate::escape_like(kw));
     let mut stmt = db.conn().prepare(
         "SELECT code,name,category,dir,aux_mask,unit,currency,has_qty,is_cash,is_bank,
                 cf_item,bs_item,pl_item,disabled,memo
-         FROM account WHERE code LIKE ?1 OR name LIKE ?1 ORDER BY code LIMIT ?2",
+         FROM account WHERE code LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\' ORDER BY code LIMIT ?2",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![like, limit], map_account)?

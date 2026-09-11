@@ -24,7 +24,7 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     // 平台身份库：引导管理员 boss（不强制改密，便于测试）
     let realm = RealmDb::open(dir.path().join("realm.db")).expect("建 realm 失败");
     realm
-        .ensure_bootstrap("boss", "Admin!2026", false)
+        .ensure_bootstrap("boss", "Admin!2026", false, &PasswordPolicy::default())
         .expect("引导管理员失败");
 
     // 预置一个归属 boss 的账套 b1

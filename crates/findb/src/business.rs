@@ -389,7 +389,15 @@ pub fn stock_cost_voucher(
     if total.is_zero() {
         return Ok(None);
     }
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    // 回写目标先在事务外读好；取号 + 存凭证 + 回写流水在同一写事务里原子提交，
+    // 避免"凭证已存、回写一半"的半成品（save 自带事务，跨事务拆分必留窗口）。
+    let out_ids: Vec<i64> = stock_list(db, period)?
+        .iter()
+        .filter(|m| m.qty.is_negative())
+        .map(|m| m.id)
+        .collect();
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -410,14 +418,15 @@ pub fn stock_cost_voucher(
         });
     }
     v.renumber();
-    let id = crate::vouchers::save(db, &mut v)?;
-    // 回写流水
-    for m in stock_list(db, period)?.iter().filter(|m| m.qty.is_negative()) {
-        db.conn().execute(
+    let id = crate::vouchers::save_in(&tx, &mut v)?;
+    // 回写流水（同事务）
+    for mid in out_ids {
+        tx.execute(
             "UPDATE stock_move SET voucher_id=?2 WHERE id=?1",
-            rusqlite::params![m.id, id],
+            rusqlite::params![mid, id],
         )?;
     }
+    tx.commit()?;
     Ok(Some(id))
 }
 
@@ -864,7 +873,9 @@ pub fn payroll_accrue_voucher(
     let sco: Money = rows.iter().map(|r| r.social_co).sum();
     let hco: Money = rows.iter().map(|r| r.housing_co).sum();
 
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    // 取号 + 存凭证 + 回写工资单在同一写事务里原子提交。
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -907,13 +918,14 @@ pub fn payroll_accrue_voucher(
         });
     }
     v.renumber();
-    let id = crate::vouchers::save(db, &mut v)?;
+    let id = crate::vouchers::save_in(&tx, &mut v)?;
     for r in &rows {
-        db.conn().execute(
+        tx.execute(
             "UPDATE payroll SET voucher_id=?2 WHERE id=?1",
             rusqlite::params![r.id, id],
         )?;
     }
+    tx.commit()?;
     Ok(Some(id))
 }
 

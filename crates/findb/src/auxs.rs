@@ -58,8 +58,8 @@ pub fn list(db: &Db, q: &AuxQuery) -> DbResult<Vec<AuxEntity>> {
         sql.push_str(" AND disabled = 0");
     }
     if let Some(ref kw) = q.keyword {
-        sql.push_str(" AND (code LIKE ? OR name LIKE ?)");
-        let k = format!("%{kw}%");
+        sql.push_str(" AND (code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')");
+        let k = format!("%{}%", crate::escape_like(kw));
         params.push(Box::new(k.clone()));
         params.push(Box::new(k));
     }
@@ -167,9 +167,9 @@ pub fn full_name_map(db: &Db) -> DbResult<BTreeMap<String, String>> {
 
 /// 档案被凭证引用的次数
 pub fn usage(db: &Db, kind: AuxKind, code: &str) -> DbResult<i64> {
-    let pattern = format!("%{}={}%", kind.code(), code);
+    let pattern = format!("%{}={}%", kind.code(), crate::escape_like(code));
     let c: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM voucher_entry WHERE aux_key LIKE ?1",
+        "SELECT COUNT(*) FROM voucher_entry WHERE aux_key LIKE ?1 ESCAPE '\\'",
         rusqlite::params![pattern],
         |r| r.get(0),
     )?;

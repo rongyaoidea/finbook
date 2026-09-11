@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use findb::{users, Db, DbError, DbResult};
-use fincore::user::{burn_argon2, hash_password, verify_password, Role, User};
+use fincore::user::{burn_argon2, hash_password, verify_password, PasswordPolicy, Role, User};
 use rusqlite::{Connection, OptionalExtension};
 
 /// 全局账号（平台层）
@@ -137,6 +137,7 @@ impl RealmDb {
         admin_user: &str,
         admin_pass: &str,
         must_change: bool,
+        policy: &PasswordPolicy,
     ) -> DbResult<Option<(String, String)>> {
         if self.count_users()? > 0 {
             return Ok(None);
@@ -147,7 +148,7 @@ impl RealmDb {
         } else {
             (admin_user.to_string(), admin_pass.to_string())
         };
-        self.create_user(&user, "平台管理员", &pass, true, must_change)?;
+        self.create_user(&user, "平台管理员", &pass, true, must_change, policy)?;
         Ok(Some((user, pass)))
     }
 
@@ -158,13 +159,17 @@ impl RealmDb {
         password: &str,
         is_admin: bool,
         must_change: bool,
+        policy: &PasswordPolicy,
     ) -> DbResult<i64> {
         let username = username.trim().to_string();
-        if username.is_empty() || password.len() < 6 {
-            return Err(DbError::Fin(fincore::FinError::msg(
-                "用户名不能为空，口令至少 6 位",
-            )));
+        if username.is_empty() {
+            return Err(DbError::Fin(fincore::FinError::msg("用户名不能为空")));
         }
+        // 口令强度统一走应用级 PasswordPolicy，不再各入口手写 len() < 6。
+        policy
+            .check(password)
+            .map_err(fincore::FinError::msg)
+            .map_err(DbError::Fin)?;
         if self.get_user(&username)?.is_some() {
             return Err(DbError::Fin(fincore::FinError::msg("该用户名已存在")));
         }
@@ -302,10 +307,11 @@ impl RealmDb {
         Ok(())
     }
 
-    pub fn reset_password(&self, username: &str, new: &str) -> DbResult<()> {
-        if new.len() < 6 {
-            return Err(DbError::Fin(fincore::FinError::msg("新口令至少 6 位")));
-        }
+    pub fn reset_password(&self, username: &str, new: &str, policy: &PasswordPolicy) -> DbResult<()> {
+        policy
+            .check(new)
+            .map_err(fincore::FinError::msg)
+            .map_err(DbError::Fin)?;
         let conn = self.inner.lock().unwrap();
         // 管理员重置的口令是管理员已知的口令，必须强制用户下次登录自行改一次，
         // 否则口令会长期停留在管理员设定值上，失去重置的意义。
@@ -375,15 +381,21 @@ impl RealmDb {
     }
 
     /// 修改自身口令（需校验旧口令）
-    pub fn change_password(&self, username: &str, old: &str, new: &str) -> DbResult<Result<(), String>> {
+    pub fn change_password(
+        &self,
+        username: &str,
+        old: &str,
+        new: &str,
+        policy: &PasswordPolicy,
+    ) -> DbResult<Result<(), String>> {
         let u = self
             .get_user(username)?
             .ok_or_else(|| fincore::FinError::not_found("平台账号不存在"))?;
         if !verify_password(old, &u.password_hash) {
             return Ok(Err("原口令不正确".to_string()));
         }
-        if new.len() < 6 {
-            return Ok(Err("新口令至少 6 位".to_string()));
+        if let Err(msg) = policy.check(new) {
+            return Ok(Err(msg));
         }
         let conn = self.inner.lock().unwrap();
         conn.execute(
@@ -474,11 +486,21 @@ impl RealmDb {
         Ok(rows.into_iter().map(PathBuf::from).collect())
     }
 
-    /// 把某用户所有账套内的同名用户行的口令哈希同步为最新（改平台口令后保持一致）
-    pub fn sync_password_to_books(&self, books_dir: &Path, username: &str, new_hash: &str) -> DbResult<()> {
-        let books = self.list_books_for(username, false)?;
-        for b in books {
-            let p = PathBuf::from(&b.path);
+    /// 把平台口令同步到该用户出现过的**所有账套**（自建 + 被邀请加入的）。
+    ///
+    /// 单密码统一后账套内不再设独立口令：账套内同名用户行只是平台口令的镜像
+    /// （供桌面端直连 .fbk 登录用）。同步时一并同步改密标志并解除锁定，
+    /// 与旧"账套内重置"语义对齐。缺行则跳过（平台管理员看他人账套是临时身份，
+    /// 不留行）；单个账套失败只记日志，不影响其他账套。
+    pub fn sync_password_to_books(
+        &self,
+        books_dir: &Path,
+        username: &str,
+        new_hash: &str,
+        must_change: bool,
+    ) -> DbResult<()> {
+        let paths = self.load_all_book_paths()?;
+        for p in paths {
             if !p.exists() {
                 continue;
             }
@@ -490,10 +512,29 @@ impl RealmDb {
                     }
                 }
             }
-            if let Ok(db) = Db::open(&p) {
-                if let Ok(Some(mut u)) = users::get(&db, username) {
+            let db = match Db::open(&p) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("[realm] 同步口令打不开账套 {}: {e}", p.display());
+                    continue;
+                }
+            };
+            match users::get(&db, username) {
+                Ok(Some(mut u)) => {
                     u.password_hash = new_hash.to_string();
-                    let _ = users::update(&db, &u);
+                    u.must_change_pwd = must_change;
+                    u.locked_until = None;
+                    if let Err(e) = users::update(&db, &u) {
+                        eprintln!("[realm] 同步口令写账套失败 {}: {e}", p.display());
+                        continue;
+                    }
+                    if let Err(e) = findb::security::clear_attempts(&db, Some(username)) {
+                        eprintln!("[realm] 同步口令清失败计数失败 {}: {e}", p.display());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[realm] 同步口令读账套失败 {}: {e}", p.display());
                 }
             }
         }

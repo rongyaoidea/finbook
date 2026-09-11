@@ -17,6 +17,12 @@ use rand::Rng;
 
 use crate::realm::{ensure_book_admin, RealmDb, RealmUser as RealmAccount};
 
+/// Mutex 毒化守卫：任一持有锁的线程 panic 后，后续请求仍能取到内部数据
+/// （ poisoned 锁直接 unwrap 会把一次 panic 放大成全服务 500）。
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 全局共享状态（以 Arc 包裹，可被多请求并发引用）
 pub struct WebState {
     /// 账套注册表（多账套支持）：key → 文件路径
@@ -107,7 +113,7 @@ impl BookRegistry {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "default".to_string());
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.iter().any(|(k, _)| *k == key) {
             return;
         }
@@ -116,19 +122,17 @@ impl BookRegistry {
 
     /// 注销账套（删除账套时调用）：避免后续请求把已删除文件重新打开成空库
     pub fn unregister(&self, key: &str) {
-        self.inner.lock().unwrap().retain(|(k, _)| k != key);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| k != key);
     }
 
     /// 所有账套 key + 文件路径（供列表展示）
     pub fn list(&self) -> Vec<(String, PathBuf)> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.iter().map(|(k, p)| (k.clone(), p.clone())).collect()
     }
 
     pub fn first_key(&self) -> String {
-        self.inner
-            .lock()
-            .unwrap()
+        lock(&self.inner)
             .first()
             .map(|(k, _)| k.clone())
             .unwrap_or_else(|| "default".to_string())
@@ -136,10 +140,7 @@ impl BookRegistry {
 
     /// 打开指定账套（owned 连接，无借用生命周期问题）
     pub fn open(&self, key: &str) -> Result<Db, DbError> {
-        let path = self
-            .inner
-            .lock()
-            .unwrap()
+        let path = lock(&self.inner)
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, p)| p.clone())
@@ -181,7 +182,7 @@ impl LoginLimiter {
     /// 未限流的账号一律不建条目：本函数在口令校验之前调用，用户名由客户端任意
     /// 提交，若在这里 `or_default()`，任何一次探测都会永久留下一个 key。
     pub fn check(&self, key: &str) -> Result<(), u64> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let mut stale = false;
         let verdict = match g.get_mut(key) {
@@ -208,7 +209,7 @@ impl LoginLimiter {
 
     /// 记录一次失败尝试
     pub fn record_failure(&self, key: &str) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         // 只记录失败、从不裁剪的话，用随机用户名刷登录就能把表无限撑大。
         // 攒够一批再全局扫，避免每次失败都 O(n) 遍历。
@@ -228,7 +229,7 @@ impl LoginLimiter {
 
     /// 登录成功后清零该账号的失败记录
     pub fn clear(&self, key: &str) {
-        self.inner.lock().unwrap().remove(key);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
 }
 
@@ -286,7 +287,7 @@ impl SessionStore {
     ) -> String {
         let token = Self::new_token();
         let now = now_secs();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // 清理的是「超过绝对寿命」的会话，不是空闲超时的：活跃用户会不断 touch
         // last_active，若按它裁剪，一直用的会话就永远留在表里。
         g.retain(|_, i| now - i.created_at < SESSION_MAX_SECS);
@@ -311,7 +312,7 @@ impl SessionStore {
     /// 永不过期，被长期遗留的令牌一旦被窃取可无限续命。绝对上限与登录 Cookie 的
     /// Max-Age 同值（7 天），所以不会比浏览器侧更早把用户踢下线。
     pub fn get(&self, token: &str, idle_minutes: i64) -> Option<SessionInfo> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let info = g.get(token)?;
         let now = now_secs();
         let idle_out = idle_minutes > 0 && now - info.last_active > idle_minutes * 60;
@@ -324,36 +325,36 @@ impl SessionStore {
     }
 
     pub fn touch(&self, token: &str) {
-        if let Some(i) = self.inner.lock().unwrap().get_mut(token) {
+        if let Some(i) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_mut(token) {
             i.last_active = now_secs();
         }
     }
 
     pub fn period(&self, token: &str) -> Option<i32> {
-        self.inner.lock().unwrap().get(token).map(|i| i.period_ymm)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(token).map(|i| i.period_ymm)
     }
 
     pub fn set_period(&self, token: &str, ymm: i32) {
-        if let Some(i) = self.inner.lock().unwrap().get_mut(token) {
+        if let Some(i) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_mut(token) {
             i.period_ymm = ymm;
         }
     }
 
     /// 切换当前账套（登录后选账套时调用）
     pub fn set_book_key(&self, token: &str, key: &str) {
-        if let Some(i) = self.inner.lock().unwrap().get_mut(token) {
+        if let Some(i) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_mut(token) {
             i.book_key = key.to_string();
         }
     }
 
     pub fn remove(&self, token: &str) {
-        self.inner.lock().unwrap().remove(token);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(token);
     }
 
     /// 账套被删除后，把仍停留在该账套的会话退回"未选账套"状态，
     /// 否则用户会卡在 404「账套不存在」而无法自行回到选择页。
     pub fn clear_book_key(&self, key: &str) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for info in g.values_mut() {
             if info.book_key == key {
                 info.book_key.clear();
@@ -364,7 +365,7 @@ impl SessionStore {
     /// 清掉某个用户的全部会话（重置设备绑定 / 删除 / 停用账号时调用），
     /// 否则旧设备上的会话还能继续用到自然过期，"一人一机"会被绕过。
     pub fn remove_by_username(&self, username: &str) {
-        self.inner.lock().unwrap().retain(|_, i| i.username != username);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, i| i.username != username);
     }
 }
 
@@ -639,11 +640,15 @@ impl IntoResponse for AppError {
             AppError::NotFound(m) => {
                 (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "error": m }))).into_response()
             }
-            AppError::Db(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({ "error": format!("数据库错误：{e}") })),
-            )
-                .into_response(),
+            AppError::Db(e) => {
+                // 内部错误详情只记服务端日志，不返给客户端（防表名/路径/SQL 泄露）。
+                eprintln!("[finweb] db error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": "数据库错误，请稍后重试或联系管理员" })),
+                )
+                    .into_response()
+            }
             AppError::RateLimited { msg, retry_secs } => {
                 let mut resp = (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -673,9 +678,12 @@ pub fn now_secs() -> i64 {
 
 /// 构造 Set-Cookie 头值
 pub fn cookie_header(token: &str, max_age_secs: i64) -> HeaderValue {
+    // 财务系统默认 Secure：仅 HTTPS 传输会话 Cookie。本地回环调试时浏览器
+    // 仍接受 localhost 上的 Secure Cookie；若确需明文 LAN 联调，显式设置
+    // FINWEB_SECURE_COOKIE=0。
     let secure = std::env::var("FINWEB_SECURE_COOKIE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
     let suffix = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
         "finbook_sid={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
@@ -685,7 +693,7 @@ pub fn cookie_header(token: &str, max_age_secs: i64) -> HeaderValue {
 }
 
 pub fn clear_cookie_header() -> HeaderValue {
-    HeaderValue::from_static("finbook_sid=; Path=/; HttpOnly; Max-Age=0")
+    HeaderValue::from_static("finbook_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
 /// 期间 -> "YYYY-MM"
@@ -727,7 +735,7 @@ mod tests {
             let name = format!("ghost{i}");
             assert!(l.check(&name).is_ok());
         }
-        assert!(l.inner.lock().unwrap().is_empty(), "check 不该建条目");
+        assert!(l.inner.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "check 不该建条目");
     }
 
     #[test]

@@ -372,12 +372,12 @@ pub fn account_daily_report(
 ) -> DbResult<Vec<DailyRow>> {
     let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, to))?;
     let begin = snap.for_account(code, None).begin;
-    let pattern = format!("{code}%");
+    let pattern = format!("{}%", crate::escape_like(code));
     let mut stmt = db.conn().prepare(
         "SELECT v.date, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
-           AND e.account_code LIKE ?3
+           AND e.account_code LIKE ?3 ESCAPE '\\'
          ORDER BY v.date",
     )?;
     let mut rows = stmt.query(rusqlite::params![from.ymm(), to.ymm(), pattern])?;

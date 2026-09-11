@@ -360,17 +360,7 @@ impl Db {
 
     // ---------------- 日志 ----------------
     pub fn log(&self, user: &str, module: &str, action: &str, detail: &str) -> DbResult<()> {
-        self.conn.execute(
-            "INSERT INTO audit_log(ts,user,module,action,detail) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                user,
-                module,
-                action,
-                detail
-            ],
-        )?;
-        Ok(())
+        log_on(&self.conn, user, module, action, detail)
     }
 
     pub fn recent_logs(&self, limit: i64) -> DbResult<Vec<AuditLog>> {
@@ -384,10 +374,11 @@ impl Db {
     }
 
     pub fn search_logs(&self, keyword: &str, limit: i64) -> DbResult<Vec<AuditLog>> {
-        let kw = format!("%{keyword}%");
+        let kw = format!("%{}%", escape_like(keyword));
         let mut stmt = self.conn.prepare(
             "SELECT id,ts,user,module,action,detail FROM audit_log
-             WHERE user LIKE ?1 OR module LIKE ?1 OR action LIKE ?1 OR detail LIKE ?1
+             WHERE user LIKE ?1 ESCAPE '\\' OR module LIKE ?1 ESCAPE '\\'
+               OR action LIKE ?1 ESCAPE '\\' OR detail LIKE ?1 ESCAPE '\\'
              ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -419,6 +410,28 @@ fn map_log(r: &rusqlite::Row) -> rusqlite::Result<AuditLog> {
         action: r.get(4)?,
         detail: r.get(5)?,
     })
+}
+
+/// 在给定连接上写操作日志（[`Db::log`] 的事务内版本：`Transaction` 可 Deref 为
+/// `Connection`，多表写入时与业务 SQL 共用同一事务，避免"业务已落库、日志没写上"的半成品）。
+pub fn log_on(
+    conn: &rusqlite::Connection,
+    user: &str,
+    module: &str,
+    action: &str,
+    detail: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO audit_log(ts,user,module,action,detail) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            user,
+            module,
+            action,
+            detail
+        ],
+    )?;
+    Ok(())
 }
 
 /// 从行中读取金额（金额以 TEXT 存储）
@@ -510,6 +523,22 @@ pub fn money_param(m: fincore::Money) -> String {
 #[inline]
 pub fn exact_param(m: fincore::Money) -> String {
     m.fmt_exact()
+}
+
+/// LIKE 转义：把 `\`、`%`、`_` 逐个加 `\` 前缀，配合 `ESCAPE '\'` 使用。
+///
+/// 调用方统一用 `format!("%{}%", escape_like(kw))` 构造含通配符的查询参数，
+/// 避免用户输入的 `%_\\` 被当成通配符（LIKE 注入导致越权/漏数）。
+#[inline]
+pub fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]

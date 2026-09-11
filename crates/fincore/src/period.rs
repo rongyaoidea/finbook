@@ -31,6 +31,17 @@ impl Period {
         Period(ymm)
     }
 
+    /// 校验构造：非法期间返回错误而非 panic（Web 层非法输入应返 400）。
+    pub fn from_ymm_checked(ymm: i32) -> Result<Self, FinError> {
+        let y = ymm / 100;
+        let m = (ymm % 100) as u32;
+        Period::new(y, m).map_err(|_| {
+            FinError::msg(format!(
+                "非法期间 {ymm}：应为 YYYYMM（年份 1900-2999，月份 1-12）"
+            ))
+        })
+    }
+
     /// 解析期间。容忍 `202601` / `2026-01` / `2026/01` / `2026年1月` 等写法。
     pub fn parse(s: &str) -> Result<Self, FinError> {
         let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();

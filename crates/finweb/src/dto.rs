@@ -200,7 +200,9 @@ pub struct ChangePwdReq {
 pub struct CreateUserReq {
     pub username: String,
     pub display_name: String,
-    pub password: String,
+    /// 单密码统一后不再需要独立口令：可选、兼容旧前端；若传了则忽略。
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default)]
     pub role: Role,
     /// 是否强制首次登录改密（默认 true，测试场景可设为 false）

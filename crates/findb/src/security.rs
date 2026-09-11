@@ -373,8 +373,8 @@ pub fn audit_query(db: &Db, q: &LogQuery) -> DbResult<Vec<fincore::user::AuditLo
         args.push(Box::new(q.module.clone()));
     }
     if !q.keyword.is_empty() {
-        sql.push_str(" AND (action LIKE ? OR detail LIKE ?)");
-        let kw = format!("%{}%", q.keyword);
+        sql.push_str(" AND (action LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')");
+        let kw = format!("%{}%", crate::escape_like(&q.keyword));
         args.push(Box::new(kw.clone()));
         args.push(Box::new(kw));
     }

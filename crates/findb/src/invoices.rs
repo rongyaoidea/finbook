@@ -94,9 +94,9 @@ pub fn list(db: &Db, q: &InvoiceQuery) -> DbResult<Vec<Invoice>> {
     }
     if let Some(kw) = &q.keyword {
         if !kw.trim().is_empty() {
-            let k = format!("%{}%", kw.trim());
+            let k = format!("%{}%", crate::escape_like(kw.trim()));
             sql.push_str(
-                " AND (number LIKE ? OR code LIKE ? OR buyer LIKE ? OR seller LIKE ?)",
+                " AND (number LIKE ? ESCAPE '\\' OR code LIKE ? ESCAPE '\\' OR buyer LIKE ? ESCAPE '\\' OR seller LIKE ? ESCAPE '\\')",
             );
             for _ in 0..4 {
                 params.push(Box::new(k.clone()));

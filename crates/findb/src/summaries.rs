@@ -34,9 +34,9 @@ pub fn search(db: &Db, kw: &str) -> DbResult<Vec<Summary>> {
     if kw.is_empty() {
         return list(db);
     }
-    let pat = format!("%{kw}%");
+    let pat = format!("%{}%", crate::escape_like(kw));
     let mut st = db.conn().prepare(
-        "SELECT text,use_count FROM summary WHERE text LIKE ?1
+        "SELECT text,use_count FROM summary WHERE text LIKE ?1 ESCAPE '\\'
          ORDER BY use_count DESC, text LIMIT 50",
     )?;
     let rows = st

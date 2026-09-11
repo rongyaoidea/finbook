@@ -248,26 +248,26 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
     }
     if let Some(ref code) = q.account_code {
         sql.push_str(
-            " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.account_code LIKE ?)",
+            " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.account_code LIKE ? ESCAPE '\\')",
         );
-        params.push(Box::new(format!("{code}%")));
+        params.push(Box::new(format!("{}%", crate::escape_like(code))));
     }
     if let Some(ref aux) = q.aux {
         let key = aux.key();
         if !key.is_empty() {
             sql.push_str(
-                " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.aux_key LIKE ?)",
+                " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.aux_key LIKE ? ESCAPE '\\')",
             );
-            params.push(Box::new(format!("%{key}%")));
+            params.push(Box::new(format!("%{}%", crate::escape_like(&key))));
         }
     }
     if let Some(ref kw) = q.keyword {
         sql.push_str(
-            " AND (v.memo LIKE ? OR CAST(v.no AS TEXT) LIKE ?
+            " AND (v.memo LIKE ? ESCAPE '\\' OR CAST(v.no AS TEXT) LIKE ?
                    OR EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id
-                             AND (e.summary LIKE ? OR e.account_code LIKE ?)))",
+                             AND (e.summary LIKE ? ESCAPE '\\' OR e.account_code LIKE ? ESCAPE '\\')))",
         );
-        let k = format!("%{kw}%");
+        let k = format!("%{}%", crate::escape_like(kw));
         for _ in 0..4 {
             params.push(Box::new(k.clone()));
         }
@@ -544,7 +544,9 @@ pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
         }
     }
     iss.into_result()?;
-    db.conn().execute(
+    // 状态更新与操作日志进同一事务，避免"已记账、没日志"的半成品。
+    let tx = db.write_tx()?;
+    tx.execute(
         "UPDATE voucher SET status='posted', posted_by=?2, updated_at=?3 WHERE id=?1",
         rusqlite::params![
             id,
@@ -552,7 +554,8 @@ pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         ],
     )?;
-    db.log(who, "凭证", "记账", &v.voucher_no())?;
+    crate::log_on(&tx, who, "凭证", "记账", &v.voucher_no())?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -561,11 +564,13 @@ pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
     let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
     let iss = fincore::engine::validate_unpost(&v, crate::periods::closed_upto(db)?);
     iss.into_result()?;
-    db.conn().execute(
+    let tx = db.write_tx()?;
+    tx.execute(
         "UPDATE voucher SET status='draft', posted_by=NULL, updated_at=?2 WHERE id=?1",
         rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
     )?;
-    db.log(v.posted_by.as_deref().unwrap_or_default(), "凭证", "反记账", &v.voucher_no())?;
+    crate::log_on(&tx, v.posted_by.as_deref().unwrap_or_default(), "凭证", "反记账", &v.voucher_no())?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -580,11 +585,13 @@ pub fn cashier_sign(db: &Db, id: i64, who: &str) -> DbResult<()> {
         iss.push("凭证无内容".to_string());
     }
     iss.into_result()?;
-    db.conn().execute(
+    let tx = db.write_tx()?;
+    tx.execute(
         "UPDATE voucher SET cashier=?2 WHERE id=?1",
         rusqlite::params![id, who],
     )?;
-    db.log(who, "凭证", "出纳签字", &v.voucher_no())?;
+    crate::log_on(&tx, who, "凭证", "出纳签字", &v.voucher_no())?;
+    tx.commit()?;
     Ok(())
 }
 

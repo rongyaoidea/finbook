@@ -80,7 +80,9 @@ pub fn close(db: &Db, p: Period, who: &str, require_carry: bool) -> DbResult<Vec
         return Ok(iss.iter().cloned().collect());
     }
 
-    db.conn().execute(
+    // 写操作进同一事务：结账标记与操作日志要么一起落库，要么一起回滚。
+    let tx = db.write_tx()?;
+    tx.execute(
         "INSERT INTO period_state(period,closed,closed_at,closed_by)
          VALUES(?1,1,?2,?3)
          ON CONFLICT(period) DO UPDATE SET closed=1, closed_at=excluded.closed_at,
@@ -91,7 +93,8 @@ pub fn close(db: &Db, p: Period, who: &str, require_carry: bool) -> DbResult<Vec
             who
         ],
     )?;
-    db.log(who, "期末", "结账", &p.label())?;
+    crate::log_on(&tx, who, "期末", "结账", &p.label())?;
+    tx.commit()?;
     Ok(Vec::new())
 }
 
@@ -99,11 +102,13 @@ pub fn close(db: &Db, p: Period, who: &str, require_carry: bool) -> DbResult<Vec
 pub fn unclose(db: &Db, p: Period, who: &str) -> DbResult<()> {
     let iss = fincore::engine::check_can_unclose(p, closed_upto(db)?);
     iss.into_result()?;
-    db.conn().execute(
+    let tx = db.write_tx()?;
+    tx.execute(
         "UPDATE period_state SET closed=0, closed_at=NULL, closed_by=NULL WHERE period=?1",
         rusqlite::params![p.ymm()],
     )?;
-    db.log(who, "期末", "反结账", &p.label())?;
+    crate::log_on(&tx, who, "期末", "反结账", &p.label())?;
+    tx.commit()?;
     Ok(())
 }
 

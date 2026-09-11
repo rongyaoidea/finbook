@@ -465,12 +465,12 @@ async fn select_book(
         .realm
         .get_book(&key)?
         .ok_or_else(|| AppError::not_found("账套不存在"))?;
-    // 授权三层：平台管理员 / 归属者 / 账套内已有该用户的行（被邀请成员）
-    let is_member = state
-        .db_for(&key)
-        .ok()
-        .and_then(|db| users::get(&db, &user.username).ok().flatten())
-        .is_some();
+    // 授权三层：平台管理员 / 归属者 / 账套内已有该用户的行（被邀请成员）。
+    // 注意：账套打不开（文件损坏等）必须透出 500，不能吞成"无权访问"误导用户。
+    let is_member = match state.db_for(&key) {
+        Ok(db) => users::get(&db, &user.username).ok().flatten().is_some(),
+        Err(e) => return Err(e.into()),
+    };
     let allowed =
         user.is_admin || book.owner_username == user.username || is_member;
     if !allowed {
@@ -506,7 +506,9 @@ async fn delete_book(
     state.realm.delete_book(&key)?;
     let p = std::path::PathBuf::from(&book.path);
     if p.exists() {
-        let _ = std::fs::remove_file(&p);
+        if let Err(e) = std::fs::remove_file(&p) {
+            eprintln!("[finweb] 删除账套文件失败 {}: {e}", p.display());
+        }
         let _ = std::fs::remove_file(format!("{}-wal", p.display()));
         let _ = std::fs::remove_file(format!("{}-shm", p.display()));
     }
@@ -532,8 +534,8 @@ async fn get_me(
 
 /// 凡是要把口令写进存储的入口，都必须先过这道校验。
 ///
-/// 之前各入口只写死 `len() < 6`，账套里配置的 PasswordPolicy（默认 8 位且需含
-/// 字母+数字）只在桌面端 security::admin_reset_password 生效，Web 端能设 123456。
+/// 单密码统一后所有口令入口都走应用级 PasswordPolicy（默认 8 位且需含字母+数字）：
+/// Web 层先由本函数做 400 校验，realm 层再以 policy 参数复核，双层一致。
 fn check_password(state: &WebState, pwd: &str) -> Result<(), AppError> {
     state.policy.check(pwd).map_err(AppError::bad_request)
 }
@@ -545,14 +547,17 @@ async fn post_change_password(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 改的是平台口令（与登录身份一致）
     check_password(&state, &req.new)?;
-    let r = state.realm.change_password(&user.username, &req.old, &req.new)?;
+    let r = state.realm.change_password(&user.username, &req.old, &req.new, &state.policy)?;
     match r {
         Ok(()) => {
-            // 同步到该用户自己拥有的账套内的同名用户行，保持一致
+            // 同步到该用户出现过的所有账套内的同名用户行，保持单密码一致
             if let Ok(Some(ru)) = state.realm.get_user(&user.username) {
-                let _ = state
-                    .realm
-                    .sync_password_to_books(&state.books_dir, &user.username, &ru.password_hash);
+                let _ = state.realm.sync_password_to_books(
+                    &state.books_dir,
+                    &user.username,
+                    &ru.password_hash,
+                    ru.must_change_pwd,
+                );
             }
             Ok(Json(json!({"ok": true})))
         }
@@ -595,7 +600,7 @@ async fn create_platform_user(
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     let id = state
         .realm
-        .create_user(&req.username, &req.display_name, &req.password, req.is_admin, true)?;
+        .create_user(&req.username, &req.display_name, &req.password, req.is_admin, true, &state.policy)?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -646,11 +651,14 @@ async fn reset_platform_password(
         return Err(AppError::forbidden("该操作仅限平台管理员"));
     }
     check_password(&state, &req.new)?;
-    state.realm.reset_password(&username, &req.new)?;
+    state.realm.reset_password(&username, &req.new, &state.policy)?;
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
-        let _ = state
-            .realm
-            .sync_password_to_books(&state.books_dir, &username, &ru.password_hash);
+        let _ = state.realm.sync_password_to_books(
+            &state.books_dir,
+            &username,
+            &ru.password_hash,
+            ru.must_change_pwd,
+        );
     }
     Ok(Json(json!({"ok": true})))
 }
@@ -700,20 +708,20 @@ async fn create_user(
     if username.is_empty() {
         return Err(AppError::bad_request("用户名不能为空"));
     }
-    check_password(&state, &req.password)?;
+    // Web 端登录只认平台身份库：账套内子账号必须对应一个已存在的平台账号，
+    // 否则开出来的账号无法登录（死账号）。单密码统一后账套内不再独立设口令，
+    // 直接沿用平台口令哈希，前端若传了 password 则忽略（兼容旧前端）。
+    let ru = state.realm.get_user(&username)?.ok_or_else(|| {
+        AppError::bad_request(
+            "该账号尚未开通平台账号，请先让平台管理员在「平台账号」中开通同名账号",
+        )
+    })?;
     let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_some() {
         return Err(AppError::bad_request("该用户名已存在"));
     }
-    // Web 端登录只认平台身份库：账套内子账号必须对应一个已存在的平台账号，
-    // 否则开出来的账号无法登录（死账号）。
-    if state.realm.get_user(&username)?.is_none() {
-        return Err(AppError::bad_request(
-            "该账号尚未开通平台账号，请先让平台管理员在「平台账号」中开通同名账号",
-        ));
-    }
     let mut u = User::new(&username, &req.display_name, req.role);
-    u.set_password(&req.password);
+    u.password_hash = ru.password_hash.clone();
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     u.must_change_pwd = req.must_change_pwd;
     u.memo = req.memo;
@@ -810,15 +818,27 @@ async fn reset_user_password(
     Json(req): Json<ResetPwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
+    // 单密码统一：账套内没有独立口令，重置即重置该用户的平台口令，
+    // 再同步到其出现过的所有账套。目标必须是当前账套成员，防越权重置陌生人口令。
     let db = state.db_for(&user.book_key)?;
-    let r = security::admin_reset_password(&db, &username, &req.new, &state.policy)?;
-    match r {
-        Ok(()) => {
-            db.log(user.username(), "安全", "重置口令", &format!("重置「{username}」的口令"))?;
-            Ok(Json(json!({"ok": true})))
-        }
-        Err(msg) => Err(AppError::bad_request(msg)),
+    if users::get(&db, &username)?.is_none() {
+        return Err(AppError::not_found("该用户不在当前账套"));
     }
+    if state.realm.get_user(&username)?.is_none() {
+        return Err(AppError::bad_request("该账号尚未开通平台账号"));
+    }
+    check_password(&state, &req.new)?;
+    state.realm.reset_password(&username, &req.new, &state.policy)?;
+    if let Ok(Some(ru)) = state.realm.get_user(&username) {
+        let _ = state.realm.sync_password_to_books(
+            &state.books_dir,
+            &username,
+            &ru.password_hash,
+            ru.must_change_pwd,
+        );
+    }
+    db.log(user.username(), "安全", "重置口令", &format!("重置「{username}」的口令（平台口令）"))?;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn reset_user_device(

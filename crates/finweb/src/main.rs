@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FINBOOK_ADMIN_MUST_CHANGE")
             .map(|v| v != "0" && v != "false")
             .unwrap_or(false),
+        &PasswordPolicy::default(),
     )?;
 
     // 账套注册表：启动时把平台账套目录全量载入（key → path）

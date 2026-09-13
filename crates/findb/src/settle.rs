@@ -733,15 +733,16 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let (vid, e_ar) = ar_voucher(&db, p, d, 1, "C01", "1000", true, "600101");
-        let entries = crate::vouchers::entries_of(&db, vid).unwrap();
-        let e_bank = entries[1].id;
+        // 收款凭证（贷 112201），提供同科目的核销方分录
+        let (_, e_pay) = ar_voucher(&db, p, d, 2, "C01", "600", false, "100201");
 
-        settle(&db, e_ar, e_bank, Money::parse("600").unwrap(), "u1").unwrap();
+        settle(&db, e_ar, e_pay, Money::parse("600").unwrap(), "u1").unwrap();
+        // 银行勾对也挂在将被重写的这张凭证的分录上
         db.conn()
             .execute(
                 "INSERT INTO bank_statement(period,account_code,biz_date,summary,settle_no,debit,credit,balance,entry_id,matched_at,matched_by)
-                 VALUES(?1,'100201','2026-01-05','测试','','1000','0','0',?2,'now','u')",
-                rusqlite::params![p.ymm(), e_bank],
+                 VALUES(?1,'112201','2026-01-05','测试','','1000','0','0',?2,'now','u')",
+                rusqlite::params![p.ymm(), e_ar],
             )
             .unwrap();
         assert_eq!(list_for_entry(&db, e_ar).unwrap().len(), 1);
@@ -761,7 +762,7 @@ mod tests {
         let linked: Option<i64> = db
             .conn()
             .query_row(
-                "SELECT entry_id FROM bank_statement WHERE period=?1 AND account_code='100201'",
+                "SELECT entry_id FROM bank_statement WHERE period=?1 AND account_code='112201'",
                 rusqlite::params![p.ymm()],
                 |r| r.get(0),
             )

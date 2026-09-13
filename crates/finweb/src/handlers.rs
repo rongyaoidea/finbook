@@ -227,7 +227,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 成本：计价配置 + 期末结价
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
-        .route("/api/cost/period-end", get(run_period_end_cost))
+        .route("/api/cost/period-end", get(run_period_end_cost).post(run_period_end_cost))
         // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
         .route("/api/accounts", post(create_account).put(update_account))
         .route("/api/accounts/:code", delete(delete_account))
@@ -320,6 +320,11 @@ async fn post_login(
 ) -> Result<Response, AppError> {
     // 全局登录（认平台身份库，而非某一套账）
     let username = req.username.trim().to_string();
+    // 设备指纹必须非空：空串会让"一人一机"首次绑定写成空值从而永久绕过校验
+    let device_id = req.device_id.trim().to_string();
+    if device_id.is_empty() || device_id.len() > 128 {
+        return Err(AppError::bad_request("缺少有效的设备标识，请刷新页面后重试"));
+    }
     // 登录限流：先查是否已被锁定，避免锁定期内继续做昂贵/可枚举的密码校验
     if let Err(secs) = state.login_limiter.check(&username) {
         let mins = secs.div_ceil(60).max(1);
@@ -340,7 +345,7 @@ async fn post_login(
     state.login_limiter.clear(&username);
     // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
     if !ru.is_admin {
-        match state.realm.bind_device(&username, &req.device_id)? {
+        match state.realm.bind_device(&username, &device_id)? {
             Ok(()) => {}
             Err(msg) => return Err(AppError::forbidden(msg)),
         }
@@ -352,7 +357,7 @@ async fn post_login(
     let token = state.sessions.create(
         &username,
         ru.is_admin,
-        &req.device_id,
+        &device_id,
         state.default_period,
         "", // 账套登录后由"选择账套"设定
     );
@@ -437,7 +442,7 @@ async fn create_book(
         opts.company = company.clone();
     }
     if req.start_period > 0 {
-        opts.start_period = Period::from_ymm(req.start_period);
+        opts.start_period = period_checked(req.start_period)?;
     }
     let db = Db::create_no_admin(&path, &opts)?;
     // 种子所有者为账套内管理员（复制平台口令哈希，便于必要时直接登账套）
@@ -559,6 +564,8 @@ async fn post_change_password(
                     ru.must_change_pwd,
                 );
             }
+            // 口令已变：吊销本人其他设备上的旧会话，当前设备保留
+            state.sessions.remove_others(&user.username, &user.token);
             Ok(Json(json!({"ok": true})))
         }
         Err(msg) => Err(AppError::bad_request(msg)),
@@ -716,6 +723,11 @@ async fn create_user(
             "该账号尚未开通平台账号，请先让平台管理员在「平台账号」中开通同名账号",
         )
     })?;
+    // 账套管理员不能把平台管理员拉进自己的账套：账套内重置口令会重置平台口令，
+    // 否则任何能建账的用户都能借此接管平台管理员账号。
+    if ru.is_admin {
+        return Err(AppError::forbidden("不能将平台管理员加入账套"));
+    }
     let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_some() {
         return Err(AppError::bad_request("该用户名已存在"));
@@ -824,11 +836,20 @@ async fn reset_user_password(
     if users::get(&db, &username)?.is_none() {
         return Err(AppError::not_found("该用户不在当前账套"));
     }
-    if state.realm.get_user(&username)?.is_none() {
-        return Err(AppError::bad_request("该账号尚未开通平台账号"));
+    let ru = state.realm.get_user(&username)?.ok_or_else(|| {
+        AppError::bad_request("该账号尚未开通平台账号")
+    })?;
+    // 平台管理员的口令只能由平台管理员在「平台账号」中重置。账套管理员若能把
+    // 平台管理员邀请进本套再调本接口，就能重置其平台口令并同步到全部账套。
+    if ru.is_admin {
+        return Err(AppError::forbidden(
+            "平台管理员的口令请由平台管理员在「平台账号」中重置",
+        ));
     }
     check_password(&state, &req.new)?;
     state.realm.reset_password(&username, &req.new, &state.policy)?;
+    // 口令已变，立即吊销该账号的全部旧会话（被盗会话不能继续用满 7 天）
+    state.sessions.remove_by_username(&username);
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
         let _ = state.realm.sync_password_to_books(
             &state.books_dir,
@@ -952,6 +973,25 @@ fn current_period(state: &WebState, user: &CurrentUser) -> Period {
         .or_else(|| state.sessions.period(&user.token))
         .unwrap_or(state.default_period);
     Period::from_ymm(ymm)
+}
+
+/// 校验用户传入的期间（YYYYMM）：非法值返回 400。
+/// 直接用 `Period::from_ymm` 会让非法期间一路流到 `first_day()/last_day()` 处 panic，
+/// 在 `panic = "abort"` 的 release 下等于把整个服务打挂。
+fn period_checked(ymm: i32) -> Result<Period, AppError> {
+    Period::from_ymm_checked(ymm).map_err(|e| AppError::bad_request(e.to_string()))
+}
+
+/// 汇总类报表尚未把数据范围（科目区间/部门/仅本人）下沉到查询层，
+/// 对设置了范围的账号直接拒绝：配置了范围却看到全量汇总属于静默越权。
+fn deny_scoped_report(user: &CurrentUser) -> Result<(), AppError> {
+    if user.user.data_scope.is_unrestricted() {
+        Ok(())
+    } else {
+        Err(AppError::forbidden(
+            "当前账号设置了数据范围（科目/部门/仅本人），该汇总报表暂不支持按范围过滤；请改用账簿/余额表等已支持范围的报表",
+        ))
+    }
 }
 
 async fn get_dashboard(
@@ -1088,7 +1128,7 @@ async fn post_period(
         )));
     }
     state.sessions.set_period(&user.token, req.ymm);
-    Ok(Json(json!({"ok": true, "period": period_to_str(Period::from_ymm(req.ymm))})))
+    Ok(Json(json!({"ok": true, "period": period_to_str(period_checked(req.ymm)?)})))
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,7 +1766,7 @@ async fn import_run(
     let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     let res = if req.kind == "voucher" {
         let period = if req.period > 0 {
-            Period::from_ymm(req.period)
+            period_checked(req.period)?
         } else {
             current_period(&state, &user)
         };
@@ -2187,7 +2227,7 @@ fn trial_balance_csv(rows: &[fincore::balance::BalanceRow]) -> String {
         let (e_dir, e_amt) = r.end_dir_amount();
         s.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{}\n",
-            r.account_code,
+            csv_escape(&r.account_code),
             csv_escape(&r.account_name),
             b_dir.label(),
             b_amt.fmt_plain(),
@@ -2271,6 +2311,7 @@ async fn get_summary_table(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
     let db = state.db_for(&user.book_key)?;
@@ -2284,6 +2325,7 @@ async fn get_fin_ratios(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         // 默认年初（同一会计年度 1 月）
@@ -2302,6 +2344,7 @@ async fn get_equity_statement(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         fincore::Period::new(period.year(), 1).unwrap_or(period)
@@ -2321,6 +2364,7 @@ async fn get_report_compare(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let key = q.get("key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
     let cur = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let prev = q.get("prev").and_then(|s| parse_period(s)).unwrap_or(cur.prev());
@@ -2403,7 +2447,7 @@ async fn stock_adjust_endpoint(
     }
     let delta = parse_money(&req.delta);
     let period = if req.period > 0 {
-        Period::from_ymm(req.period)
+        period_checked(req.period)?
     } else {
         current_period(&state, &user)
     };
@@ -2645,7 +2689,7 @@ async fn add_estimate(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money(&req.est_amount))?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
@@ -2730,7 +2774,7 @@ async fn set_quota(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money(&req.quota_qty))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2809,7 +2853,7 @@ async fn add_po_receipt(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -2828,7 +2872,7 @@ async fn add_po_return(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -2857,7 +2901,7 @@ async fn add_po_payment(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -2964,7 +3008,7 @@ async fn add_so_shipment(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -2981,7 +3025,7 @@ async fn add_so_return(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -3010,7 +3054,7 @@ async fn add_so_payment(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = if req.period > 0 { Period::from_ymm(req.period) } else { current_period(&state, &user) };
+    let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
         period.first_day()
     } else {
@@ -3500,7 +3544,7 @@ async fn save_note(
     let mut n = advanced::ReportNote {
         id: req.id,
         report_key: req.report_key,
-        period: Period::from_ymm(req.period),
+        period: period_checked(req.period)?,
         seq: req.seq,
         title: req.title,
         content: req.content,
@@ -3555,7 +3599,7 @@ async fn create_archive(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let period = Period::from_ymm(req.period);
+    let period = period_checked(req.period)?;
     let file_no = if req.file_no.trim().is_empty() {
         advanced::archive_next_no(&db, period, &req.kind)?
     } else {
@@ -3648,7 +3692,7 @@ async fn save_bill(
         id: req.id,
         kind: req.kind,
         no: req.no,
-        period: Period::from_ymm(req.period),
+        period: period_checked(req.period)?,
         issue_date: parse_date(&req.issue_date)?,
         due_date: parse_date(&req.due_date)?,
         counterpart: req.counterpart,
@@ -3869,12 +3913,19 @@ async fn clear_cost_method(
 async fn run_period_end_cost(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
+    method: axum::http::Method,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::PeriodClose)?;
     let db = state.db_for(&user.book_key)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let apply = q.get("apply").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // 落库动作不能藏在 GET 里：顶层导航/预取都可能带 Cookie 触发写操作
+    if apply && method != axum::http::Method::POST {
+        return Err(AppError::bad_request(
+            "期末结价落库请使用 POST /api/cost/period-end?apply=1",
+        ));
+    }
     let rows = findb::business::period_end_cost(&db, period, apply)?;
     Ok(Json(serde_json::json!({ "period": period.label(), "rows": rows, "apply": apply })))
 }
@@ -4045,6 +4096,7 @@ async fn get_cash_flow(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let cf = findb::reports::cash_flow_statement(&db, from, to)?;
@@ -4073,6 +4125,7 @@ async fn print_cash_flow(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let cf = findb::reports::cash_flow_statement(&db, from, to)?;
@@ -4087,6 +4140,7 @@ async fn print_equity_statement(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     user.require(Perm::Report)?;
+    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let stmt = findb::reports::equity_statement(&db, from, to)?;
@@ -4277,14 +4331,21 @@ async fn list_backups(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Backup)?;
     let dir = state.books_dir.join("backups");
+    // 备份目录是全局共享的，只能列出属于当前账套的备份（文件名后缀 _<key>.fbk），
+    // 否则租户 A 能枚举甚至恢复租户 B 的全套账。
+    let suffix = format!("_{}.fbk", user.book_key);
     let mut items = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|s| s.to_str()) == Some("fbk") {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !name.ends_with(&suffix) {
+                    continue;
+                }
                 if let Ok(meta) = std::fs::metadata(&p) {
                     items.push(json!({
-                        "name": e.file_name().to_string_lossy(),
+                        "name": name,
                         "size": meta.len(),
                         "mtime": meta.modified().map(|t| format!("{:?}", t)).unwrap_or_default(),
                     }));
@@ -4327,11 +4388,15 @@ async fn restore_backup(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Backup)?;
     let key = user.book_key.clone();
-    // 路径安全：仅允许 backups 目录下的纯文件名，禁止任何路径穿越
+    // 路径安全：仅允许 backups 目录下的纯文件名，禁止任何路径穿越；
+    // 且只接受属于当前账套的备份（后缀 _<key>.fbk），防止跨租户恢复。
     let file_name = match std::path::Path::new(&req.file).file_name().and_then(|s| s.to_str()) {
         Some(n) if !n.contains("..") && !n.contains('/') && !n.contains('\\') => n.to_string(),
         _ => return Err(AppError::bad_request("非法的备份文件名")),
     };
+    if !file_name.ends_with(&format!("_{}.fbk", user.book_key)) {
+        return Err(AppError::bad_request("该备份不属于当前账套"));
+    }
     let src = state.books_dir.join("backups").join(&file_name);
     if !src.exists() {
         return Err(AppError::not_found("备份文件不存在"));
@@ -4563,7 +4628,16 @@ async fn list_payroll(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
-    Ok(Json(business::payroll_list(&db, period)?))
+    let rows = business::payroll_list(&db, period)?;
+    // 「仅看本人经手的业务单据」：工资按员工姓名匹配当前登录人
+    let rows: Vec<business::Payroll> = if user.user.data_scope.own_doc_only {
+        rows.into_iter()
+            .filter(|r| r.employee == user.user.display_name || r.employee == user.user.username)
+            .collect()
+    } else {
+        rows
+    };
+    Ok(Json(rows))
 }
 
 /// 录入/修改一条工资：后端按累计预扣预缴法算个税与实发，前端无需自己算税
@@ -4841,7 +4915,16 @@ async fn list_claims(
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let status = q.get("status").map(|s| business::ClaimStatus::parse(s));
-    Ok(Json(business::claim_list(&db, period, status)?))
+    let rows = business::claim_list(&db, period, status)?;
+    // 「仅看本人经手的业务单据」：报销按申请人匹配当前登录人
+    let rows: Vec<business::Claim> = if user.user.data_scope.own_doc_only {
+        rows.into_iter()
+            .filter(|c| c.applicant == user.user.display_name || c.applicant == user.user.username)
+            .collect()
+    } else {
+        rows
+    };
+    Ok(Json(rows))
 }
 
 async fn next_claim_no(

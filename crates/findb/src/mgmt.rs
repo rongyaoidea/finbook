@@ -97,8 +97,13 @@ pub fn budget_upsert_version(db: &Db, b: &Budget) -> DbResult<i64> {
 
 /// 全年预算（12 个月）
 pub fn budget_year(db: &Db, year: i32) -> DbResult<Vec<Budget>> {
-    let from = Period::new(year, 1).unwrap().ymm();
-    let to = Period::new(year, 12).unwrap().ymm();
+    // 年份可能来自外部输入，非法年份返回错误而不是 panic
+    let from = Period::new(year, 1)
+        .map_err(|e| crate::DbError::Fin(fincore::FinError::msg(format!("非法年份 {year}：{e}"))))?
+        .ymm();
+    let to = Period::new(year, 12)
+        .map_err(|e| crate::DbError::Fin(fincore::FinError::msg(format!("非法年份 {year}：{e}"))))?
+        .ymm();
     let mut st = db.conn().prepare(&format!(
         "SELECT {BG_COLS} FROM budget WHERE period BETWEEN ?1 AND ?2 ORDER BY period, account_code"
     ))?;
@@ -319,8 +324,17 @@ pub fn budget_analysis(
     upto: Option<Period>,
 ) -> DbResult<Vec<BudgetAnalysisRow>> {
     let chart = crate::accounts::chart(db)?;
-    let end = upto.unwrap_or_else(|| Period::new(year, 12).unwrap());
-    let from = Period::new(year, 1).unwrap();
+    // 年份来自外部输入（Web 查询参数），必须校验后再构造期间：
+    // `Period::new(...).unwrap()` 会在非法年份时 panic，abort 配置下等于打挂进程。
+    let end = match upto {
+        Some(p) => p,
+        None => Period::new(year, 12).map_err(|e| {
+            crate::DbError::Fin(fincore::FinError::msg(format!("非法年份 {year}：{e}")))
+        })?,
+    };
+    let from = Period::new(year, 1).map_err(|e| {
+        crate::DbError::Fin(fincore::FinError::msg(format!("非法年份 {year}：{e}")))
+    })?;
     let budgets = budget_list_version(db, None, version)?;
 
     // 预算按 (期间, 科目, 部门) 聚合成映射

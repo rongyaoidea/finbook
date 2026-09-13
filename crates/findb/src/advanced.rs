@@ -1231,10 +1231,10 @@ pub fn multi_column_table(
         "SELECT v.date, v.word, v.no, e.summary, e.debit, e.credit, e.voucher_id
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
-           AND e.account_code LIKE ?3
+           AND e.account_code LIKE ?3 ESCAPE '\\'
          ORDER BY v.date, v.id, e.line",
     )?;
-    let like = format!("{main_code}%");
+    let like = format!("{}%", crate::escape_like(main_code));
     let mut rows = st.query(rusqlite::params![from.ymm(), to.ymm(), like])?;
 
     // 主科目分录：voucher_id -> (date, no, summary, amount)

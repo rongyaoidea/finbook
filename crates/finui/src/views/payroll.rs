@@ -150,7 +150,13 @@ impl PayrollView {
         self.key = key;
         self.dirty = false;
 
-        self.rows = business::payroll_list(ctx.db(), p).unwrap_or_default();
+        // 「仅看本人经手的业务单据」：工资按员工姓名过滤
+        let mut rows = business::payroll_list(ctx.db(), p).unwrap_or_default();
+        let u = ctx.user();
+        if u.data_scope.own_doc_only {
+            rows.retain(|r| r.employee == u.display_name || r.employee == u.username);
+        }
+        self.rows = rows;
         // 职员档案只用来做显示名与下拉选项，取不到也不影响录入
         let emps = findb::auxs::list(
             ctx.db(),

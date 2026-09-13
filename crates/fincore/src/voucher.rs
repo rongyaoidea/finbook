@@ -388,9 +388,16 @@ impl Voucher {
     pub fn diff(&self) -> Money {
         self.debit_total() - self.credit_total()
     }
-    /// 借贷是否平衡
+    /// 借贷是否平衡（按落库口径：每条分录先量化到 2 位再比较）。
+    ///
+    /// 不能只用 `diff().round2().is_zero()`：写库时每条分录各自 round2，
+    /// 借 100.015 / 贷 100.010 的差额 0.005 会被容差放过，但入库后变成
+    /// 100.02 / 100.01，账套里就出现了一张不平的凭证。这里与 `money_param`
+    /// 保持完全一致的量化口径。
     pub fn balanced(&self) -> bool {
-        self.diff().round2().is_zero()
+        let debit: Money = self.entries.iter().map(|e| e.debit.round2()).sum();
+        let credit: Money = self.entries.iter().map(|e| e.credit.round2()).sum();
+        debit == credit
     }
 
     /// 空行（借贷均为零）行号

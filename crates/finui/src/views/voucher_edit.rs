@@ -382,6 +382,12 @@ impl VoucherEdit {
             ctx.error("已作废的凭证不能修改");
             return;
         }
+        // 保存入口必须自己做权限校验：顶栏可达本页，侧栏的门槛在这里不生效
+        let needed = if self.id == 0 { Perm::VoucherNew } else { Perm::VoucherEdit };
+        if !ctx.can(needed) {
+            ctx.error(format!("没有「{}」权限", needed.label()));
+            return;
+        }
         let mut v = match self.to_voucher() {
             Ok(v) => v,
             Err(e) => {
@@ -398,10 +404,17 @@ impl VoucherEdit {
         }
 
         // 校验（含期间锁定、借贷平衡、科目末级、辅助核算必录等）
+        let closed_res = findb::periods::closed_upto(ctx.db());
+        let closed = match closed_res {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.error(format!("读取结账线失败：{e}"));
+                return;
+            }
+        };
         let res = {
             let db = ctx.db();
             let opts = db.options();
-            let closed = findb::periods::closed_upto(db).unwrap_or(None);
             validate_voucher(&v, &ValidateCtx::new(ctx.chart(), &opts, closed)).into_result()
         };
         if let Err(e) = res {
@@ -579,12 +592,16 @@ impl VoucherEdit {
                 self.print_open = true;
             }
             if ui.button("删除").clicked() && self.id > 0 {
-                ctx.confirm_dangerous(
-                    "删除凭证",
-                    &format!("确定删除 {} 吗？删除后凭证号会留下断号。", self.no_text()),
-                    crate::state::ConfirmAction::DeleteVoucher(self.id),
-                    true,
-                );
+                if !ctx.can(Perm::VoucherDelete) {
+                    ctx.error(format!("没有「{}」权限", Perm::VoucherDelete.label()));
+                } else {
+                    ctx.confirm_dangerous(
+                        "删除凭证",
+                        &format!("确定删除 {} 吗？删除后凭证号会留下断号。", self.no_text()),
+                        crate::state::ConfirmAction::DeleteVoucher(self.id),
+                        true,
+                    );
+                }
             }
         });
 

@@ -16,14 +16,13 @@ pub fn closed_upto(db: &Db) -> DbResult<Option<Period>> {
 /// （`rusqlite::Transaction` 会 Deref 到 `Connection`）。凭证守卫要在事务里读它，
 /// 否则「查结账线 → 写入」之间存在把凭证写进刚被结账期间的窗口。
 pub fn closed_upto_of(conn: &rusqlite::Connection) -> DbResult<Option<Period>> {
-    let v: Option<i32> = conn
-        .query_row(
-            "SELECT MAX(period) FROM period_state WHERE closed=1",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
+    // 只有「查无已结账期间」才算 None；查询本身失败必须上抛，
+    // 否则 `.ok()` 一吞，结账线读不到时所有期间守卫都 fail-open。
+    let v: Option<i32> = conn.query_row(
+        "SELECT MAX(period) FROM period_state WHERE closed=1",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(v.map(Period::from_ymm))
 }
 

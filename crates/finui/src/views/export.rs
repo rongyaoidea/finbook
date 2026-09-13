@@ -42,12 +42,20 @@ impl Sheet {
     }
 }
 
-/// CSV 单元格转义
+/// CSV 单元格转义（含防公式注入）
 fn csv_cell(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    // 以 = + - @ 开头的文本在 Excel/LibreOffice 打开时会被当公式执行；
+    // 摘要、客户名等常来自导入数据，必须在导出侧统一加单引号前缀。
+    let guarded = if s.starts_with('=') || s.starts_with('+') || s.starts_with('-') || s.starts_with('@')
+    {
+        format!("'{s}")
     } else {
         s.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
     }
 }
 

@@ -336,6 +336,25 @@ mod tests {
         assert!(iss.iter().any(|s| s.contains("借贷不平衡")));
     }
 
+    /// 量化口径必须与落库一致：借 100.015 / 贷 100.010 的原始差额 0.005
+    /// 会被旧的 `diff().round2()` 容差放过，但入库逐行 round2 后变成
+    /// 100.02 / 100.01，账套里就多出一张不平的凭证。
+    #[test]
+    fn quantization_mismatch_detected() {
+        let c = chart();
+        let o = opts();
+        let ctx = ValidateCtx::new(&c, &o, None);
+        let mut v = base_voucher();
+        v.entries[0].debit = Money::parse("100.015").unwrap();
+        v.entries[1].credit = Money::parse("100.010").unwrap();
+        let iss = validate_voucher(&v, &ctx);
+        assert!(
+            iss.iter().any(|s| s.contains("借贷不平衡")),
+            "{:?}",
+            iss.iter().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn non_leaf_detected() {
         let c = chart();

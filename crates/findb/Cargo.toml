@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 calamine = "0.26"
+zip = { version = "2", default-features = false }

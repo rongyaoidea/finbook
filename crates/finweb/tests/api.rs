@@ -1767,3 +1767,126 @@ async fn user_manager_cannot_escalate_self() {
         serde_json::from_str(&body_string(resp).await).expect("响应应是 JSON");
     assert_eq!(v["ok"], serde_json::json!(true));
 }
+
+// ---------------------------------------------------------------------------
+// 回归：租户边界（2026-09 审查修复）
+// ---------------------------------------------------------------------------
+
+/// 平台管理员开通一个非管理员账号，完成首登改密后返回可用的 sid（尚未选账套）
+async fn provision_plain_user(
+    state: &Arc<WebState>,
+    admin_sid: &str,
+    username: &str,
+    init_pwd: &str,
+) -> String {
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            admin_sid,
+            serde_json::json!({ "username": username, "display_name": username, "password": init_pwd }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号 {username} 应成功");
+    let (st, sid) = login(state, username, init_pwd).await;
+    assert_eq!(st, StatusCode::OK, "{username} 首次登录应成功");
+    let new_pwd = format!("{init_pwd}x");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sid,
+            serde_json::json!({ "old": init_pwd, "new": new_pwd }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{username} 首登改密应成功");
+    sid
+}
+
+/// 账套管理员不能把平台管理员拉进自己的账套（否则可用账套内重置口令
+/// 重置他人的平台口令，形成提权链）
+#[tokio::test]
+async fn cannot_invite_platform_admin_into_book() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let zhang = provision_plain_user(&state, &admin_sid, "zhangx", "Zx12345678").await;
+    let (status, body) = create_book(&state, &zhang, "张记").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &zhang, &key).await, StatusCode::OK);
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &zhang,
+            serde_json::json!({
+                "username": "boss", "display_name": "平台管理员", "password": "Boss123456",
+                "role": "accountant", "must_change_pwd": false,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "不应允许邀请平台管理员进账套");
+}
+
+/// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
+#[tokio::test]
+async fn backups_isolated_per_book() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let zhang = provision_plain_user(&state, &admin_sid, "zhangy", "Zy12345678").await;
+    let li = provision_plain_user(&state, &admin_sid, "liy", "Ly12345678").await;
+
+    let (status, body) = create_book(&state, &zhang, "张记").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let zk = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &zhang, &zk).await, StatusCode::OK);
+
+    let (status, body) = create_book(&state, &li, "李记").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lk = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &li, &lk).await, StatusCode::OK);
+
+    // 张备份后拿到文件名
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/backups", &zhang, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "备份应成功");
+    let v: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).expect("备份响应应是 JSON");
+    let zname = v["name"].as_str().expect("应返回备份文件名").to_string();
+
+    // 李的备份列表里不能出现张的备份
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/backups", &li))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = body_string(resp).await;
+    assert!(!list.contains(&zname), "不应看到其他账套的备份：{list}");
+
+    // 李恢复张的备份必须被拒（不是 404，而是明确属于别的账套）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/restore", &li, serde_json::json!({ "file": zname })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不应允许恢复其他账套的备份");
+
+    // 自己的备份仍可见（确认过滤没有把范围清空）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/backups", &zhang))
+        .await
+        .unwrap();
+    let own = body_string(resp).await;
+    assert!(own.contains(&zname), "自己的备份应可见：{own}");
+}

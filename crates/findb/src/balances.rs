@@ -38,6 +38,8 @@ pub struct BalanceQuery {
     pub non_zero_only: bool,
     /// 只显示到第几级科目（None 表示全部级次）
     pub max_level: Option<u8>,
+    /// 只统计已记账凭证（默认含草稿，即"记录即进表"口径）
+    pub posted_only: bool,
 }
 
 impl BalanceQuery {
@@ -51,6 +53,7 @@ impl BalanceQuery {
             only_leaf: false,
             non_zero_only: false,
             max_level: None,
+            posted_only: false,
         }
     }
     pub fn range(from: Period, to: Period) -> Self {
@@ -70,6 +73,11 @@ impl BalanceQuery {
     }
     pub fn with_max_level(mut self, lv: Option<u8>) -> Self {
         self.max_level = lv;
+        self
+    }
+    /// 只统计已记账凭证（账簿"只含已记账"勾选项）
+    pub fn with_posted_only(mut self, on: bool) -> Self {
+        self.posted_only = on;
         self
     }
     pub fn with_code_range(mut self, from: Option<String>, to: Option<String>) -> Self {
@@ -164,11 +172,13 @@ impl BalanceSnapshot {
             } else {
                 q.to.year() * 100 + 1
             };
-            let mut stmt = db.conn().prepare(
+            let status_filter = if q.posted_only { "v.status = 'posted'" } else { "v.status != 'void'" };
+            let sql = format!(
                 "SELECT e.account_code, e.aux_key, e.aux_json, e.period, e.debit, e.credit, e.qty
                  FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-                 WHERE v.status != 'void' AND e.period <= ?1",
-            )?;
+                 WHERE {status_filter} AND e.period <= ?1"
+            );
+            let mut stmt = db.conn().prepare(&sql)?;
             let mut r = stmt.query(rusqlite::params![q.to.ymm()])?;
             while let Some(row) = r.next()? {
                 let code: String = row.get(0)?;
@@ -567,6 +577,7 @@ pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow
         &BalanceQuery {
             from: q.from,
             to: q.to,
+            posted_only: q.posted_only,
             ..BalanceQuery::period(q.from)
         },
     )?;
@@ -656,6 +667,7 @@ pub fn general_ledger(db: &Db, q: &LedgerQuery) -> DbResult<Vec<GeneralLedgerRow
         &BalanceQuery {
             from: q.from,
             to: q.to,
+            posted_only: q.posted_only,
             ..BalanceQuery::period(q.from)
         },
     )?;

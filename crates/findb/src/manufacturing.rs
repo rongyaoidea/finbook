@@ -217,10 +217,11 @@ pub fn overhead_allocate_with(
     base: OverheadBase,
     apply: bool,
 ) -> DbResult<Vec<(i64, Money)>> {
-    if apply {
-        // 防重复落地：同一期间只允许执行一次制造费用分摊，
-        // 否则误触按钮/重复点击会把制造费用反复归集到在制订单成本。
-        let already: i64 = db.conn().query_row(
+    // 落地时才开写事务（试算不加写锁）。判重与逐单 add_cost 必须在同一事务内：
+    // 否则并发请求都能通过"已分摊？"检查，各归集一次；中途失败也会留下半批数据。
+    let tx = if apply { Some(db.write_tx()?) } else { None };
+    if let Some(tx) = &tx {
+        let already: i64 = tx.query_row(
             "SELECT COUNT(*) FROM prod_cost pc JOIN production_order o ON o.id = pc.po_id
              WHERE o.period=?1 AND pc.cost_type='overhead' AND pc.memo='制造费用分摊'",
             rusqlite::params![period.ymm()],
@@ -254,8 +255,13 @@ pub fn overhead_allocate_with(
         assigned += share;
         out.push((w.po_id, share));
         if apply && !share.is_zero() {
-            add_cost(db, w.po_id, CostType::Overhead, share, "制造费用分摊")?;
+            if let Some(tx) = &tx {
+                add_cost_of(tx, w.po_id, CostType::Overhead, share, "制造费用分摊")?;
+            }
         }
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
     }
     Ok(out)
 }

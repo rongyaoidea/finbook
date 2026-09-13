@@ -165,23 +165,22 @@ pub fn quota_set(db: &Db, period: Period, supplier: &str, item: &str, quota_qty:
     Ok(())
 }
 
-/// 配额占用：采购订单保存后累计已用数量
+/// 配额占用：采购订单保存后累计已用数量（读改写进同一事务，避免丢更新）
 pub fn quota_use(db: &Db, period: Period, supplier: &str, item: &str, qty: Money) -> DbResult<()> {
-    db.conn().execute(
-        "UPDATE supplier_quota SET used_qty = CAST(used_qty AS TEXT) WHERE period=?1 AND supplier_code=?2 AND item=?3",
-        rusqlite::params![period.ymm(), supplier, item],
-    )?;
-    // Rust 侧累加，避免 SQL 浮点
-    let used: Option<String> = db.conn().query_row(
-        "SELECT used_qty FROM supplier_quota WHERE period=?1 AND supplier_code=?2 AND item=?3",
-        rusqlite::params![period.ymm(), supplier, item],
-        |r| r.get(0),
-    ).optional()?;
+    let tx = db.write_tx()?;
+    let used: Option<String> = tx
+        .query_row(
+            "SELECT used_qty FROM supplier_quota WHERE period=?1 AND supplier_code=?2 AND item=?3",
+            rusqlite::params![period.ymm(), supplier, item],
+            |r| r.get(0),
+        )
+        .optional()?;
     let new_used = used.map(|s| m(&s)).unwrap_or(Money::ZERO) + qty;
-    db.conn().execute(
+    tx.execute(
         "UPDATE supplier_quota SET used_qty=?2 WHERE period=?1 AND supplier_code=?3 AND item=?4",
         rusqlite::params![period.ymm(), new_used.to_string(), supplier, item],
     )?;
+    tx.commit()?;
     Ok(())
 }
 

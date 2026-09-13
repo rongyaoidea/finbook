@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use egui::{Align, Color32, Layout, RichText, Ui};
 use findb::Db;
-use fincore::{AuxKind, Period};
+use fincore::{AuxKind, Period, Perm};
 
 use state::{AppCtx, AppState, ConfirmAction, NavItem};
 
@@ -79,6 +79,10 @@ impl FinBookApp {
         let mut ctx = AppCtx { st, now: 0.0 };
         match act {
             ConfirmAction::DeleteVoucher(id) => {
+                if !ctx.can(Perm::VoucherDelete) {
+                    ctx.error(format!("没有「{}」权限", Perm::VoucherDelete.label()));
+                    return;
+                }
                 // 与 web 端及引擎 validate_delete 口径一致：仅草稿可删、已结账期间不可删
                 let db = ctx.db();
                 let closed = findb::periods::closed_upto(db).unwrap_or(None);
@@ -106,6 +110,10 @@ impl FinBookApp {
                 }
             }
             ConfirmAction::DeleteAccount(code) => {
+                if !ctx.can(Perm::AccountEdit) {
+                    ctx.error(format!("没有「{}」权限", Perm::AccountEdit.label()));
+                    return;
+                }
                 let r = findb::accounts::delete(ctx.db(), &code);
                 if ctx.handle(r).is_some() {
                     ctx.log("科目", "删除科目", &code);
@@ -132,6 +140,10 @@ impl FinBookApp {
                 }
             }
             ConfirmAction::DeleteUser(id) => {
+                if !ctx.can(Perm::UserManage) {
+                    ctx.error(format!("没有「{}」权限", Perm::UserManage.label()));
+                    return;
+                }
                 let r = findb::users::delete(ctx.db(), id);
                 if ctx.handle(r).is_some() {
                     ctx.log("用户", "删除用户", &format!("#{id}"));
@@ -176,6 +188,12 @@ impl FinBookApp {
                 }
             }
             ConfirmAction::ClearVouchers => {
+                // 清空全部凭证与期初是高危不可逆操作，不能只靠期末处理入口的
+                // CarryForward 权限：要求备份权限（默认仅管理员）。
+                if !ctx.can(Perm::Backup) {
+                    ctx.error(format!("没有「{}」权限，无法清空业务数据", Perm::Backup.label()));
+                    return;
+                }
                 let r = ctx.db().clear_vouchers();
                 if ctx.handle(r).is_some() {
                     ctx.log("账套", "清空业务数据", "全部凭证与期初");
@@ -381,7 +399,15 @@ impl eframe::App for FinBookApp {
                     ui.label(RichText::new("FinBook").size(19.0).strong().color(theme::palette::PRIMARY));
                     ui.add_space(14.0);
                     if ui.button("填制凭证").clicked() {
-                        self.st.nav = NavItem::VoucherNew;
+                        // 顶栏入口必须与侧栏同一套权限门槛，否则 Viewer/Auditor 可绕过导航限制
+                        if self.st.user.as_ref().map(|u| u.can(Perm::VoucherNew)).unwrap_or(false) {
+                            self.st.nav = NavItem::VoucherNew;
+                        } else {
+                            let now = ui.input(|i| i.time);
+                            self.st
+                                .toasts
+                                .push(format!("没有「{}」权限", Perm::VoucherNew.label()), true, now);
+                        }
                     }
                     if ui.button("凭证查询").clicked() {
                         self.st.nav = NavItem::VoucherList;

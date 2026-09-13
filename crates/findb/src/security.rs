@@ -165,12 +165,16 @@ pub fn login(
     let u = match crate::users::get(db, username)? {
         Some(u) => u,
         None => {
-            // 用户不存在也记一笔，防止用登录接口枚举用户名
+            // 用户不存在也付出一次同等成本的 Argon2，避免用响应时间枚举用户名。
+            // （只记一笔失败，用于防暴力枚举。）
+            let _ = fincore::user::burn_argon2(password);
             log_attempt(db, username, false)?;
             return Ok(LoginResult::NoSuchUser);
         }
     };
     if u.disabled {
+        // 同样做等时处理，否则"已停用"比"口令错误"快得多，也能暴露账号存在性
+        let _ = fincore::user::burn_argon2(password);
         return Ok(LoginResult::Disabled);
     }
     if u.is_locked_out() {
@@ -418,14 +422,21 @@ pub fn audit_modules(db: &Db) -> DbResult<Vec<String>> {
     Ok(rows)
 }
 
-/// 只保留最近 `keep` 条日志
+/// 只保留最近 `keep` 条日志。
+///
+/// 审计日志是追责证据，不能成为"抹除痕迹"的工具：最少保留 200 条，
+/// 且裁剪动作本身写入一条审计（谁在什么时候裁掉了多少）。
 pub fn audit_trim(db: &Db, keep: i64) -> DbResult<usize> {
+    let keep = keep.max(200);
     let n = db.conn().execute(
         "DELETE FROM audit_log WHERE id NOT IN (
             SELECT id FROM audit_log ORDER BY id DESC LIMIT ?1
          )",
         rusqlite::params![keep],
     )?;
+    if n > 0 {
+        db.log("系统", "审计", "裁剪日志", &format!("保留最近 {keep} 条，删除 {n} 条"))?;
+    }
     Ok(n)
 }
 

@@ -384,19 +384,22 @@ pub fn stock_cost_voucher(
     asset_account: &str,
     who: &str,
 ) -> DbResult<Option<i64>> {
+    // 先开写事务再算汇总：`stock_summary` 会把出库成本回写到 stock_move，
+    // 事务外回写一旦后续保存凭证失败（如已结账被拒），成本已被悄悄改掉。
+    // 同一连接上直接执行也在事务内，`stock_summary`/`save_in` 无需改成 tx 版本。
+    let tx = db.write_tx()?;
     let sum = stock_summary(db, period, method)?;
     let total: Money = sum.iter().map(|s| s.out_amount).sum();
     if total.is_zero() {
         return Ok(None);
     }
-    // 回写目标先在事务外读好；取号 + 存凭证 + 回写流水在同一写事务里原子提交，
+    // 回写目标先在事务内读好；取号 + 存凭证 + 回写流水原子提交，
     // 避免"凭证已存、回写一半"的半成品（save 自带事务，跨事务拆分必留窗口）。
     let out_ids: Vec<i64> = stock_list(db, period)?
         .iter()
         .filter(|m| m.qty.is_negative())
         .map(|m| m.id)
         .collect();
-    let tx = db.write_tx()?;
     let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
@@ -532,6 +535,8 @@ pub struct PeriodEndCostRow {
 /// 期末结价。`period` 为本期，方法按各存货配置读取；
 /// `apply` 为 true 时把调整写入 stock_move（kind=adjust）。
 pub fn period_end_cost(db: &Db, period: Period, apply: bool) -> DbResult<Vec<PeriodEndCostRow>> {
+    // 落地的多条调整必须在同一事务内：中途失败不能留下半批调整
+    let tx = if apply { Some(db.write_tx()?) } else { None };
     let mut items = stock_items(db)?;
     items.sort();
     let mut out = Vec::new();
@@ -596,6 +601,9 @@ pub fn period_end_cost(db: &Db, period: Period, apply: bool) -> DbResult<Vec<Per
             unit_cost,
             adjust,
         });
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
     }
     Ok(out)
 }
@@ -846,6 +854,28 @@ pub fn payroll_generate(
     Ok(n)
 }
 
+/// 工资类业务凭证的幂等闸：同一期间 + 同一摘要的非作废凭证只允许存在一张。
+/// 摘要由系统按「计提/缴纳/发放 + 期间」固定生成，重复点击/重试会生成重复入账凭证。
+pub(crate) fn ensure_unique_biz_voucher(
+    tx: &rusqlite::Connection,
+    period: Period,
+    memo: &str,
+) -> DbResult<()> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM voucher
+         WHERE period=?1 AND source='Business' AND memo=?2 AND status != 'void'",
+        rusqlite::params![period.ymm(), memo],
+        |r| r.get(0),
+    )?;
+    if n > 0 {
+        return Err(fincore::FinError::state(format!(
+            "「{memo}」的凭证已经生成过，请勿重复生成"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// 工资计提凭证
 ///
 /// 三条腿各自对应不同明细科目，混进一个"应付职工薪酬"会导致后面缴社保时对不上账：
@@ -917,6 +947,7 @@ pub fn payroll_accrue_voucher(
             ..Entry::new(i, housing_payable, "计提公积金（企业）")
         });
     }
+    ensure_unique_biz_voucher(&tx, period, &v.memo)?;
     v.renumber();
     let id = crate::vouchers::save_in(&tx, &mut v)?;
     for r in &rows {
@@ -952,7 +983,8 @@ pub fn payroll_social_voucher(
     if total.is_zero() {
         return Ok(None);
     }
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -987,8 +1019,10 @@ pub fn payroll_social_voucher(
         },
         ..Entry::new(i, bank_account, "缴纳社保公积金")
     });
+    ensure_unique_biz_voucher(&tx, period, &v.memo)?;
     v.renumber();
-    let id = crate::vouchers::save(db, &mut v)?;
+    let id = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
     Ok(Some(id))
 }
 
@@ -1010,7 +1044,8 @@ pub fn payroll_pay_voucher(
     let net: Money = rows.iter().map(|r| r.net).sum();
     let tax: Money = rows.iter().map(|r| r.tax).sum();
     let social: Money = rows.iter().map(|r| r.social + r.housing + r.deduction).sum();
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -1044,8 +1079,10 @@ pub fn payroll_pay_voucher(
             ..Entry::new(i, social_account, "代扣社保公积金")
         });
     }
+    ensure_unique_biz_voucher(&tx, period, &v.memo)?;
     v.renumber();
-    let id = crate::vouchers::save(db, &mut v)?;
+    let id = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
     Ok(Some(id))
 }
 

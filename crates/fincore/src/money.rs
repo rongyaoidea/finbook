@@ -10,7 +10,7 @@
 //! - "借方/贷方发生额" 恒为非负，"余额" 用带符号的 `signed` 表示（正=借、负=贷）。
 
 use rust_decimal::prelude::*;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::iter::Sum;
@@ -90,14 +90,16 @@ impl Money {
         self.0
     }
 
+    /// 四舍五入到 2 位（会计惯例，0.005 进位；不用 Decimal 默认的银行家舍入）
     #[inline]
     pub fn round2(self) -> Self {
-        Self(self.0.round_dp(MONEY_DP))
+        Self(round_half_up(self.0, MONEY_DP))
     }
 
+    /// 四舍五入到指定小数位（会计惯例，半值远离零）
     #[inline]
     pub fn round_dp(self, dp: u32) -> Self {
-        Self(self.0.round_dp(dp))
+        Self(round_half_up(self.0, dp))
     }
 
     #[inline]
@@ -302,11 +304,19 @@ impl Money {
     }
 }
 
+/// 会计口径的舍入：半值远离零（即常说的四舍五入）。
+///
+/// `rust_decimal` 的 `round_dp` 默认是 `MidpointNearestEven`（银行家舍入），
+/// 0.005 → 0.00、0.125 → 0.12，与财务惯例及本文档/界面的口径都不一致。
+fn round_half_up(d: Decimal, dp: u32) -> Decimal {
+    d.round_dp_with_strategy(dp, RoundingStrategy::MidpointAwayFromZero)
+}
+
 /// 四舍五入到指定小数位，并**补足**小数位数。
 /// `Decimal::round_dp` 在小数位已足够时不会补零（100.round_dp(2) 仍是 100），
 /// 而财务报表要求固定两位小数，所以需要额外 rescale。
 fn rescale_to(d: Decimal, dp: u32) -> Decimal {
-    let mut d = d.round_dp(dp);
+    let mut d = round_half_up(d, dp);
     if d.scale() < dp {
         d.rescale(dp);
     }
@@ -511,6 +521,19 @@ mod tests {
         assert_eq!(Money::parse("¥ 88").unwrap().fmt_plain(), "88.00");
         assert_eq!(Money::parse("").unwrap(), Money::ZERO);
         assert!(Money::parse("abc").is_err());
+    }
+
+    /// 会计惯例是四舍五入（半值远离零），不是 Decimal 默认的银行家舍入
+    #[test]
+    fn round_half_up_midpoints() {
+        assert_eq!(Money::parse("0.005").unwrap().round2().fmt_plain(), "0.01");
+        assert_eq!(Money::parse("0.015").unwrap().round2().fmt_plain(), "0.02");
+        assert_eq!(Money::parse("0.125").unwrap().round2().fmt_plain(), "0.13");
+        assert_eq!(Money::parse("-0.005").unwrap().round2().fmt_plain(), "-0.01");
+        assert_eq!(Money::parse("2.675").unwrap().round2().fmt_plain(), "2.68");
+        // 非中点保持最近舍入
+        assert_eq!(Money::parse("0.004").unwrap().round2().fmt_plain(), "0.00");
+        assert_eq!(Money::parse("0.006").unwrap().round2().fmt_plain(), "0.01");
     }
 
     #[test]

@@ -552,7 +552,10 @@ pub fn bad_debt_provision_voucher(
         return Ok(None);
     }
 
-    let no = crate::vouchers::next_no(db, period, "记")?;
+    // 幂等 + 事务：判重、取号、存凭证原子完成，重复点击不会生成第二张全额计提凭证
+    let tx = db.write_tx()?;
+    crate::business::ensure_unique_biz_voucher(&tx, period, "计提坏账准备")?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
     let mut v = fincore::Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = fincore::voucher::VoucherSource::Business;
@@ -581,7 +584,8 @@ pub fn bad_debt_provision_voucher(
         line_no += 1;
     }
     v.renumber();
-    let id = crate::vouchers::save(db, &mut v)?;
+    let id = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
     Ok(Some(id))
 }
 

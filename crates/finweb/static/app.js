@@ -3126,7 +3126,7 @@ async function viewCost(main) {
     const run = async (apply) => {
       const p = $("#ce-period").value.trim();
       try {
-        const r = await api(`/cost/period-end?period=${encodeURIComponent(p)}&apply=${apply}`);
+        const r = await api(`/cost/period-end?period=${encodeURIComponent(p)}&apply=${apply}`, apply ? { method: "POST" } : {});
         const rows = r.rows || [];
         const sumAdj = rows.reduce((a, x) => a + moneyNum(x.adjust), 0);
         $("#ce-list").innerHTML = rows.length

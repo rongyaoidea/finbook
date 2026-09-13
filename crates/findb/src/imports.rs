@@ -199,10 +199,39 @@ pub fn read_xlsx(path: &std::path::Path) -> Result<Vec<Vec<String>>, fincore::Fi
     read_xlsx_bytes(&bytes)
 }
 
+/// xlsx/ods 本质是 zip：解压前先看各条目声明的解压后大小合计，拒绝解压炸弹
+/// （上传限制只看压缩后体积，一个 2MB 的 xlsx 可膨胀到 GB 级内存）。
+fn check_zip_bomb(bytes: &[u8]) -> Result<(), fincore::FinError> {
+    const MAX_UNCOMPRESSED: u64 = 128 * 1024 * 1024;
+    let is_zip = bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x06\x06");
+    if !is_zip {
+        return Ok(()); // .xls（OLE2）等非 zip 格式交给 calamine
+    }
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| fincore::FinError::io(format!("打开 Excel 失败：{e}")))?;
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let f = zip
+            .by_index(i)
+            .map_err(|e| fincore::FinError::io(format!("读取 Excel 失败：{e}")))?;
+        total = total.saturating_add(f.size());
+        if total > MAX_UNCOMPRESSED {
+            return Err(fincore::FinError::validate(format!(
+                "Excel 解压后体积过大（超过 {} MB），已拒绝导入",
+                MAX_UNCOMPRESSED / 1024 / 1024
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 从字节读取 Excel（.xlsx/.xls/.ods）第一个 sheet，返回所有行（每行是单元格列表）
 ///
 /// Web 端可直接把上传的文件字节交给本函数，无需落盘。
 pub fn read_xlsx_bytes(bytes: &[u8]) -> Result<Vec<Vec<String>>, fincore::FinError> {
+    check_zip_bomb(bytes)?;
     use calamine::{open_workbook_auto_from_rs, Data, Reader};
     let mut wb = open_workbook_auto_from_rs(Cursor::new(bytes))
         .map_err(|e| fincore::FinError::io(format!("打开 Excel 失败：{e}")))?;
@@ -214,6 +243,17 @@ pub fn read_xlsx_bytes(bytes: &[u8]) -> Result<Vec<Vec<String>>, fincore::FinErr
     let range = wb
         .worksheet_range(&sheet_name)
         .map_err(|e| fincore::FinError::io(format!("读取 sheet 失败：{e}")))?;
+    // 解析后再兜一道行数/单元格数上限：即使解压体积没超，超大表也没有导入意义
+    const MAX_IMPORT_ROWS: usize = 200_000;
+    const MAX_IMPORT_CELLS: usize = 2_000_000;
+    if range.height() > MAX_IMPORT_ROWS || range.height().saturating_mul(range.width()) > MAX_IMPORT_CELLS
+    {
+        return Err(fincore::FinError::validate(format!(
+            "Excel 规模过大（{} 行 × {} 列），最多支持 {MAX_IMPORT_ROWS} 行 / {MAX_IMPORT_CELLS} 个单元格",
+            range.height(),
+            range.width()
+        )));
+    }
     let mut rows = Vec::new();
     for row in range.rows() {
         let cells: Vec<String> = row
@@ -286,7 +326,9 @@ fn parse_money(s: &str) -> Money {
         .map(|c| match c {
             '\u{ff0d}' => '-', // 全角减号
             '\u{2212}' => '-', // Unicode 减号
-            '\u{FF00}'..='\u{FF60}' => (c as u32 - 0xFFEE) as u8 as char, // 全角数字转半角
+            // 全角 ASCII（U+FF01–U+FF5E）→ 半角（U+0021–U+007E）。
+            // 偏移量是 0xFEE0；写成 0xFFEE 会下溢（debug panic）且把全角数字映射成乱码。
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
             _ => c,
         })
         .collect();
@@ -876,5 +918,15 @@ mod tests {
         let bank = rows.iter().find(|r| r.account_code == "100201").unwrap();
         assert_eq!(bank.year_begin, Money::parse("-2000").unwrap());
         assert_eq!(bank.credit_accum, Money::parse("2000").unwrap());
+    }
+
+    #[test]
+    fn parse_money_fullwidth_digits() {
+        // 全角数字是中文用户最常粘贴的格式：偏移写错会导致金额静默归零/错乱
+        assert_eq!(parse_money("１００"), Money::parse("100").unwrap());
+        assert_eq!(parse_money("１，２３４．５６"), Money::parse("1234.56").unwrap());
+        assert_eq!(parse_money("－１２．３０"), Money::parse("-12.30").unwrap());
+        // 全角字母不应变成数字（旧的 0xFFEE 偏移会把 Ａ 映射成 3）
+        assert_eq!(parse_money("ＡＢＣ"), Money::ZERO);
     }
 }

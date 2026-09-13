@@ -144,8 +144,27 @@ pub fn update(db: &Db, a: &Account) -> DbResult<()> {
     Ok(())
 }
 
-/// 删除科目。调用前业务层需自行校验（无下级、无余额、无凭证）。
+/// 删除科目。业务层可先行提示，但最后防线在数据层：
+/// 已被凭证分录/期初引用（含下级）或仍有下级的科目一律拒绝物理删除。
 pub fn delete(db: &Db, code: &str) -> DbResult<()> {
+    let (entries, begins) = usage_with_children(db, code)?;
+    if entries > 0 || begins > 0 {
+        return Err(FinError::state(format!(
+            "科目 {code}（或其下级）已被 {entries} 条凭证分录、{begins} 条期初引用，不能删除；请改为停用"
+        ))
+        .into());
+    }
+    let children: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM account WHERE code LIKE ?1 ESCAPE '\\' AND code <> ?2",
+        rusqlite::params![format!("{}%", crate::escape_like(code)), code],
+        |r| r.get(0),
+    )?;
+    if children > 0 {
+        return Err(FinError::state(format!(
+            "科目 {code} 仍有 {children} 个下级科目，请先删除下级"
+        ))
+        .into());
+    }
     db.conn()
         .execute("DELETE FROM account WHERE code=?1", rusqlite::params![code])?;
     Ok(())

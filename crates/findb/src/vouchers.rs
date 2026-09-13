@@ -263,7 +263,7 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
     }
     if let Some(ref kw) = q.keyword {
         sql.push_str(
-            " AND (v.memo LIKE ? ESCAPE '\\' OR CAST(v.no AS TEXT) LIKE ?
+            " AND (v.memo LIKE ? ESCAPE '\\' OR CAST(v.no AS TEXT) LIKE ? ESCAPE '\\'
                    OR EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id
                              AND (e.summary LIKE ? ESCAPE '\\' OR e.account_code LIKE ? ESCAPE '\\')))",
         );
@@ -467,6 +467,9 @@ fn save_on(tx: &rusqlite::Connection, v: &mut Voucher) -> DbResult<i64> {
 /// 一旦删库失败——状态被拦、拿不到写锁、外键报错——凭证还留在账上而附件文件已经
 /// 没了，变成引用空文件的坏账。删文件失败只留下孤儿文件，无害得多。
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
+    // 持久层最后防线：状态与结账线在这里再校验一次，UI/Web 漏检也删不掉
+    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    fincore::engine::validate_delete(&v, crate::periods::closed_upto(db)?).into_result()?;
     let files: Vec<String> = crate::attach::list(db, id)?
         .into_iter()
         .filter(|a| !a.inline)
@@ -518,8 +521,8 @@ pub fn no_taken(db: &Db, period: Period, word: &str, no: i32, except_id: i64) ->
 
 // ---------------- 状态流转 ----------------
 
-fn set_status(db: &Db, id: i64, s: VoucherStatus) -> DbResult<()> {
-    db.conn().execute(
+fn set_status_on(conn: &rusqlite::Connection, id: i64, s: VoucherStatus) -> DbResult<()> {
+    conn.execute(
         "UPDATE voucher SET status=?2, updated_at=?3 WHERE id=?1",
         rusqlite::params![
             id,
@@ -532,44 +535,43 @@ fn set_status(db: &Db, id: i64, s: VoucherStatus) -> DbResult<()> {
 
 /// 记账（未记账 → 已记账；无审核环节，核对无误后直接记账）
 pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let opts = db.options();
-    let mut iss = fincore::engine::validate_post(&v, &opts);
-    if !v.balanced() {
-        iss.push("凭证借贷不平衡，不能记账".to_string());
-    }
-    if let Some(upto) = crate::periods::closed_upto(db)? {
-        if v.period <= upto {
-            iss.push(format!("{} 及以前期间已结账", upto.label()));
-        }
-    }
-    iss.into_result()?;
-    // 状态更新与操作日志进同一事务，避免"已记账、没日志"的半成品。
+    // 校验与状态更新必须在同一个写事务里重读：否则并发结账/作废后，
+    // 本请求按事务外的旧快照仍会写入 posted。
     let tx = db.write_tx()?;
-    tx.execute(
-        "UPDATE voucher SET status='posted', posted_by=?2, updated_at=?3 WHERE id=?1",
-        rusqlite::params![
-            id,
-            who,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-        ],
-    )?;
-    crate::log_on(&tx, who, "凭证", "记账", &v.voucher_no())?;
+    let label = post_tx(&tx, id, who)?;
+    crate::log_on(&tx, who, "凭证", "记账", &label)?;
     tx.commit()?;
     Ok(())
 }
 
 /// 反记账（已记账 → 未记账）
 pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let iss = fincore::engine::validate_unpost(&v, crate::periods::closed_upto(db)?);
-    iss.into_result()?;
     let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    let closed: Option<i32> = tx.query_row(
+        "SELECT MAX(period) FROM period_state WHERE closed=1",
+        [],
+        |r| r.get(0),
+    )?;
+    fincore::engine::validate_unpost(&v, closed.map(Period::from_ymm)).into_result()?;
     tx.execute(
         "UPDATE voucher SET status='draft', posted_by=NULL, updated_at=?2 WHERE id=?1",
         rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
     )?;
-    crate::log_on(&tx, v.posted_by.as_deref().unwrap_or_default(), "凭证", "反记账", &v.voucher_no())?;
+    crate::log_on(
+        &tx,
+        v.posted_by.as_deref().unwrap_or_default(),
+        "凭证",
+        "反记账",
+        &v.voucher_no(),
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -597,11 +599,34 @@ pub fn cashier_sign(db: &Db, id: i64, who: &str) -> DbResult<()> {
 
 /// 作废 / 恢复。作废与取消作废都会记入操作日志。
 pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    // 已结账期间的凭证不能作废/恢复，否则已封账期间的报表口径会被改写
+    let closed: Option<i32> = tx.query_row(
+        "SELECT MAX(period) FROM period_state WHERE closed=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if let Some(upto) = closed {
+        if v.period.ymm() <= upto {
+            return Err(FinError::state(format!(
+                "{} 及以前期间已结账，不能作废或恢复凭证",
+                Period::from_ymm(upto).label()
+            ))
+            .into());
+        }
+    }
     if void {
         let iss = fincore::engine::validate_void(&v);
         iss.into_result()?;
-        set_status(db, id, VoucherStatus::Void)?;
+        set_status_on(&tx, id, VoucherStatus::Void)?;
     } else {
         if v.status != VoucherStatus::Void {
             return Err(FinError::state("该凭证未处于作废状态").into());
@@ -613,14 +638,17 @@ pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
         } else {
             VoucherStatus::Draft
         };
-        set_status(db, id, back)?;
+        set_status_on(&tx, id, back)?;
     }
-    db.log(
+    // 状态与日志同事务：崩溃也不会留下"状态已改、无审计"的缺口
+    crate::log_on(
+        &tx,
         who,
         "凭证",
         if void { "作废" } else { "取消作废" },
         &v.voucher_no(),
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -662,6 +690,10 @@ fn post_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbE
     // 与单条记账保持同一套把关：借贷必须平衡，期间不能已结账
     if !v.balanced() {
         return Err(FinError::state("凭证借贷不平衡，不能记账").into());
+    }
+    let opts = crate::options_of(tx);
+    if opts.require_cashier && v.cashier.is_none() {
+        return Err(FinError::state("该账套要求出纳签字后才能记账").into());
     }
     let closed: Option<i32> = tx.query_row(
         "SELECT MAX(period) FROM period_state WHERE closed=1",
@@ -779,8 +811,26 @@ pub fn renumber(db: &Db, period: Period, word: &str) -> DbResult<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
+    let closed = crate::periods::closed_upto(db)?;
+    if let Some(upto) = closed {
+        if period <= upto {
+            return Err(FinError::state(format!(
+                "{} 及以前期间已结账，不能重排凭证号",
+                upto.label()
+            ))
+            .into());
+        }
+    }
     let tx = db.write_tx()?;
     let mut stmt = tx.prepare("UPDATE voucher SET no=?2 WHERE id=?1")?;
+    // 两阶段重排：日期序与原凭证号序可能不一致，直接按目标号更新会撞到
+    // 尚未让位的号（UNIQUE(period,word,no)）。先写成互不冲突的临时负数，
+    // 再写成 1..n，整批最多两次 UPDATE。
+    let mut n = 0i32;
+    for (id, _d, _no) in &rows {
+        n += 1;
+        stmt.execute(rusqlite::params![id, -n])?;
+    }
     let mut n = 0i32;
     for (id, _d, _no) in &rows {
         n += 1;

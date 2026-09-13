@@ -118,8 +118,16 @@ pub fn update(db: &Db, u: &User) -> DbResult<()> {
 }
 
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
+    // 先取用户名留审计：删用户不写日志的话，人员变动就无迹可查
+    let name: Option<String> = db
+        .conn()
+        .query_row("SELECT username FROM user WHERE id=?1", rusqlite::params![id], |r| r.get(0))
+        .optional()?;
     db.conn()
         .execute("DELETE FROM user WHERE id=?1", rusqlite::params![id])?;
+    if let Some(n) = name {
+        db.log("系统", "安全", "删除用户", &format!("删除账套账号「{n}」"))?;
+    }
     Ok(())
 }
 

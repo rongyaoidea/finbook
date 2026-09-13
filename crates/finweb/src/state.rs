@@ -367,6 +367,15 @@ impl SessionStore {
     pub fn remove_by_username(&self, username: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, i| i.username != username);
     }
+
+    /// 吊销某个用户名下除当前会话外的全部会话（改密后调用：当前设备是本人，
+    /// 其他设备上的旧会话必须立即失效，不必把本人也踢去重新登录）。
+    pub fn remove_others(&self, username: &str, keep_token: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|t, i| i.username != username || t == keep_token);
+    }
 }
 
 // ---------------------------------------------------------------------------

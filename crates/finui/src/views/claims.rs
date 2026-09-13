@@ -105,7 +105,13 @@ impl ClaimsView {
         }
         self.key = key;
         self.dirty = false;
-        self.rows = business::claim_list(ctx.db(), p, self.status_filter()).unwrap_or_default();
+        // 「仅看本人经手的业务单据」：报销按申请人过滤
+        let mut rows = business::claim_list(ctx.db(), p, self.status_filter()).unwrap_or_default();
+        let u = ctx.user();
+        if u.data_scope.own_doc_only {
+            rows.retain(|c| c.applicant == u.display_name || c.applicant == u.username);
+        }
+        self.rows = rows;
         self.paging.reset();
     }
 

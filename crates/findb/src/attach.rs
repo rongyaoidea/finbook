@@ -385,7 +385,16 @@ fn sha256(data: &[u8]) -> String {
 pub fn temp_export_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir().join("finbook_attachments");
     let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-    p.push(format!("{stamp}_{name}"));
+    // 附件名可能来自上传方：只取文件名部分，替换分隔符/上跳字符，
+    // 防止 "../x" 之类把落地文件写到临时目录之外。
+    let safe: String = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
+        .collect();
+    p.push(format!("{stamp}_{safe}"));
     p
 }
 

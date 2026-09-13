@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use axum::Router;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -119,6 +120,8 @@ fn build_app(state: std::sync::Arc<WebState>, static_dir: PathBuf) -> Router {
     // 访问日志：先挂 TraceLayer 再补 fallback，API 与静态资源请求均留痕
     let api = handlers::router(state);
     api.layer(TraceLayer::new_for_http())
+        // 最外层兜 panic：即使某条请求路径上的 unwrap 触发，也只返回 500，不拖垮进程
+        .layer(CatchPanicLayer::new())
         .fallback_service(ServeDir::new(static_dir))
 }
 

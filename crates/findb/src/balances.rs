@@ -40,6 +40,8 @@ pub struct BalanceQuery {
     pub max_level: Option<u8>,
     /// 只统计已记账凭证（默认含草稿，即"记录即进表"口径）
     pub posted_only: bool,
+    /// 只统计某人填制的凭证（数据范围 own_voucher_only）
+    pub prepared_by: Option<String>,
 }
 
 impl BalanceQuery {
@@ -54,6 +56,7 @@ impl BalanceQuery {
             non_zero_only: false,
             max_level: None,
             posted_only: false,
+            prepared_by: None,
         }
     }
     pub fn range(from: Period, to: Period) -> Self {
@@ -109,6 +112,17 @@ impl BalanceQuery {
         };
         self
     }
+
+    /// 套用用户完整数据范围：科目区间 + "仅本人填制的凭证"。
+    /// 报表/账簿统一用它，避免"配置了范围却看到全量"的静默越权。
+    pub fn with_user_scope(mut self, user: &fincore::user::User) -> Self {
+        let own = user.data_scope.own_voucher_only;
+        self = self.with_data_scope(&user.data_scope);
+        if own {
+            self.prepared_by = Some(user.username.clone());
+        }
+        self
+    }
 }
 
 /// 某一时点的余额快照。加载一次，多处复用。
@@ -134,11 +148,27 @@ impl BalanceSnapshot {
 
         // 1) 期初：启用期之前的累计
         {
-            let mut stmt = db.conn().prepare(
+            let mut sql = String::from(
                 "SELECT account_code, aux_key, aux_json, year_begin, debit_accum, credit_accum, qty_begin
                  FROM begin_balance",
-            )?;
-            let mut r = stmt.query([])?;
+            );
+            let mut conds: Vec<String> = Vec::new();
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(f) = &q.code_from {
+                params.push(Box::new(f.clone()));
+                conds.push(format!("account_code >= ?{}", params.len()));
+            }
+            if let Some(t) = &q.code_to {
+                params.push(Box::new(t.clone()));
+                conds.push(format!("account_code <= ?{}", params.len()));
+            }
+            if !conds.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conds.join(" AND "));
+            }
+            let mut stmt = db.conn().prepare(&sql)?;
+            let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let mut r = stmt.query(refs.as_slice())?;
             while let Some(row) = r.next()? {
                 let code: String = row.get(0)?;
                 let aux_key: String = row.get(1)?;
@@ -173,13 +203,27 @@ impl BalanceSnapshot {
                 q.to.year() * 100 + 1
             };
             let status_filter = if q.posted_only { "v.status = 'posted'" } else { "v.status != 'void'" };
-            let sql = format!(
+            let mut sql = format!(
                 "SELECT e.account_code, e.aux_key, e.aux_json, e.period, e.debit, e.credit, e.qty
                  FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
                  WHERE {status_filter} AND e.period <= ?1"
             );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(q.to.ymm())];
+            if let Some(f) = &q.code_from {
+                params.push(Box::new(f.clone()));
+                sql.push_str(&format!(" AND e.account_code >= ?{}", params.len()));
+            }
+            if let Some(t) = &q.code_to {
+                params.push(Box::new(t.clone()));
+                sql.push_str(&format!(" AND e.account_code <= ?{}", params.len()));
+            }
+            if let Some(who) = &q.prepared_by {
+                params.push(Box::new(who.clone()));
+                sql.push_str(&format!(" AND v.prepared_by = ?{}", params.len()));
+            }
             let mut stmt = db.conn().prepare(&sql)?;
-            let mut r = stmt.query(rusqlite::params![q.to.ymm()])?;
+            let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let mut r = stmt.query(refs.as_slice())?;
             while let Some(row) = r.next()? {
                 let code: String = row.get(0)?;
                 let aux_key: String = row.get(1)?;
@@ -1151,6 +1195,47 @@ mod tests {
         assert!(!codes.contains(&"1001"));
         let _ = AcctCategory::Asset;
         let _ = AuxMask::NONE.with(AuxKind::Dept);
+    }
+
+    #[test]
+    fn own_voucher_only_scope_filters_balance() {
+        use fincore::user::{Role, User};
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let _id1 = post_voucher(
+            &db,
+            p,
+            5,
+            vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
+        ); // 张三
+        let id2 = post_voucher(
+            &db,
+            p,
+            6,
+            vec![("1001", "借", "300"), ("600101", "贷", "300")],
+        );
+        db.conn()
+            .execute(
+                "UPDATE voucher SET prepared_by='李四' WHERE id=?1",
+                rusqlite::params![id2],
+            )
+            .unwrap();
+
+        // 非管理员默认 own_voucher_only：快照只应统计本人填制的凭证
+        let u = User::new("张三", "张三", Role::Accountant);
+        let bq = BalanceQuery::period(p).with_user_scope(&u);
+        let snap = BalanceSnapshot::load(&db, &bq).unwrap();
+        let chart = crate::accounts::chart(&db).unwrap();
+        let t = snap.trial_balance(&chart);
+        assert_eq!(t.period_debit, Money::parse("1000").unwrap(), "只应统计张三的凭证");
+        assert_eq!(t.period_credit, Money::parse("1000").unwrap());
+
+        // 管理员视角不受限
+        let admin = User::new("admin", "管理员", Role::Admin);
+        let bq2 = BalanceQuery::period(p).with_user_scope(&admin);
+        let snap2 = BalanceSnapshot::load(&db, &bq2).unwrap();
+        let t2 = snap2.trial_balance(&chart);
+        assert_eq!(t2.period_debit, Money::parse("1300").unwrap());
     }
 
     #[test]

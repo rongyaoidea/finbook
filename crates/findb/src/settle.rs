@@ -530,16 +530,18 @@ pub fn aging(
     Ok(fincore::engine::aging::analyze(&items, as_of, buckets)?)
 }
 
-/// 计提坏账准备：按应收（1122/1221）账龄与默认坏账比例计算应提额，
-/// 生成「借 资产减值损失(6701) / 贷 坏账准备(1231)」凭证（辅助核算保留往来对象）。
-/// 无可提额（账龄为 0 或比例全 0）时返回 `Ok(None)`。
+/// 计提坏账准备：按应收（1122/1221）账龄与默认坏账比例计算**目标余额**，
+/// 与账上 1231 现有余额比对，只按差额计提/冲回，辅助核算保留往来对象。
+///
+/// 这样同期间重复执行、跨期data变化后的再执行都是幂等的：
+/// 差额为 0 时返回 `Ok(None)`，不会重复全额计提；应提额减少时自动冲回。
 pub fn bad_debt_provision_voucher(
     db: &Db,
     period: Period,
     date: NaiveDate,
     who: &str,
 ) -> DbResult<Option<i64>> {
-    use fincore::engine::aging::{bad_debt_provision, buckets_by_year, default_bad_debt_rates};
+    use fincore::engine::aging::{buckets_by_year, default_bad_debt_rates};
     let buckets = buckets_by_year();
     let rates = default_bad_debt_rates();
 
@@ -547,24 +549,9 @@ pub fn bad_debt_provision_voucher(
     for acct in ["1122", "1221"] {
         lines.extend(aging(db, acct, period, date, &buckets)?);
     }
-    let total = bad_debt_provision(&lines, &rates);
-    if total.is_zero() {
-        return Ok(None);
-    }
 
-    // 幂等 + 事务：判重、取号、存凭证原子完成，重复点击不会生成第二张全额计提凭证
-    let tx = db.write_tx()?;
-    crate::business::ensure_unique_biz_voucher(&tx, period, "计提坏账准备")?;
-    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
-    let mut v = fincore::Voucher::new(period, date, "记", no);
-    v.prepared_by = who.to_string();
-    v.source = fincore::voucher::VoucherSource::Business;
-    v.memo = "计提坏账准备".to_string();
-    v.push_entry(fincore::voucher::Entry {
-        debit: total,
-        ..fincore::voucher::Entry::new(1, "6701", "计提坏账准备")
-    });
-    let mut line_no = 2;
+    // 目标余额按往来对象汇总（同一对象可能同时有应收/其他应收）
+    let mut targets: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
     for l in &lines {
         let prov: Money = l
             .amounts
@@ -575,13 +562,82 @@ pub fn bad_debt_provision_voucher(
         if prov.is_zero() {
             continue;
         }
-        let aux = fincore::voucher::AuxRef::from_key(&l.key);
-        v.push_entry(fincore::voucher::Entry {
-            credit: prov,
-            aux,
-            ..fincore::voucher::Entry::new(line_no, "1231", "计提坏账准备")
-        });
+        *targets.entry(l.key.clone()).or_insert(Money::ZERO) += prov;
+    }
+
+    // 差额 = 目标 − 现有（口径与余额表一致：非作废凭证，含未记账草稿）
+    let tx = db.write_tx()?;
+    let mut existing: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
+    {
+        let mut st = tx.prepare(
+            "SELECT e.aux_key, e.credit, e.debit
+             FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
+             WHERE e.account_code='1231' AND e.period <= ?1 AND v.status <> 'void'",
+        )?;
+        let mut rows = st.query(rusqlite::params![period.ymm()])?;
+        while let Some(r) = rows.next()? {
+            let key: String = r.get(0)?;
+            let c = Money::parse_or_zero(&r.get::<_, String>(1)?);
+            let d = Money::parse_or_zero(&r.get::<_, String>(2)?);
+            *existing.entry(key).or_insert(Money::ZERO) += c - d;
+        }
+    }
+
+    let mut keys: Vec<String> = targets.keys().chain(existing.keys()).cloned().collect();
+    keys.sort();
+    keys.dedup();
+    let mut deltas: Vec<(String, Money)> = Vec::new();
+    let (mut inc, mut dec) = (Money::ZERO, Money::ZERO);
+    for k in keys {
+        let t = targets.get(&k).copied().unwrap_or(Money::ZERO);
+        let e = existing.get(&k).copied().unwrap_or(Money::ZERO);
+        let d = t - e;
+        if d.is_positive() {
+            inc += d;
+            deltas.push((k, d));
+        } else if d.is_negative() {
+            dec += d.abs();
+            deltas.push((k, d));
+        }
+    }
+    if inc.is_zero() && dec.is_zero() {
+        return Ok(None); // 已按目标计提，无差额可调
+    }
+
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = fincore::Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = fincore::voucher::VoucherSource::Business;
+    v.memo = if dec > inc { "冲回坏账准备".to_string() } else { "计提坏账准备".to_string() };
+    let mut line_no = 1;
+    for (key, d) in &deltas {
+        let aux = fincore::voucher::AuxRef::from_key(key);
+        if d.is_positive() {
+            v.push_entry(fincore::voucher::Entry {
+                credit: *d,
+                aux,
+                ..fincore::voucher::Entry::new(line_no, "1231", "计提坏账准备")
+            });
+        } else {
+            v.push_entry(fincore::voucher::Entry {
+                debit: d.abs(),
+                aux,
+                ..fincore::voucher::Entry::new(line_no, "1231", "冲回坏账准备")
+            });
+        }
         line_no += 1;
+    }
+    // 净额腿：增提走借方 6701，冲回走贷方 6701，保证借贷恒等
+    if inc > dec {
+        v.push_entry(fincore::voucher::Entry {
+            debit: inc - dec,
+            ..fincore::voucher::Entry::new(line_no, "6701", "计提坏账准备")
+        });
+    } else if dec > inc {
+        v.push_entry(fincore::voucher::Entry {
+            credit: dec - inc,
+            ..fincore::voucher::Entry::new(line_no, "6701", "冲回坏账准备")
+        });
     }
     v.renumber();
     let id = crate::vouchers::save_in(&tx, &mut v)?;
@@ -672,6 +728,48 @@ mod tests {
     }
 
     #[test]
+    fn entry_rewrite_clears_dangling_refs() {
+        let db = tmpdb("dangling");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let (vid, e_ar) = ar_voucher(&db, p, d, 1, "C01", "1000", true, "600101");
+        let entries = crate::vouchers::entries_of(&db, vid).unwrap();
+        let e_bank = entries[1].id;
+
+        settle(&db, e_ar, e_bank, Money::parse("600").unwrap(), "u1").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bank_statement(period,account_code,biz_date,summary,settle_no,debit,credit,balance,entry_id,matched_at,matched_by)
+                 VALUES(?1,'100201','2026-01-05','测试','','1000','0','0',?2,'now','u')",
+                rusqlite::params![p.ymm(), e_bank],
+            )
+            .unwrap();
+        assert_eq!(list_for_entry(&db, e_ar).unwrap().len(), 1);
+
+        // 反记账后重写凭证（save 会整表 DELETE 旧分录再插入）：
+        // 核销记录应级联删除、银行勾对应置空，不能留下指向已删分录的悬空引用
+        crate::vouchers::unpost(&db, vid).unwrap();
+        let mut v = crate::vouchers::get(&db, vid).unwrap().unwrap();
+        v.memo = "改过摘要".to_string();
+        crate::vouchers::save(&db, &mut v).unwrap();
+
+        assert_eq!(
+            list_for_entry(&db, e_ar).unwrap().len(),
+            0,
+            "重写分录后核销记录不应悬空"
+        );
+        let linked: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT entry_id FROM bank_statement WHERE period=?1 AND account_code='100201'",
+                rusqlite::params![p.ymm()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(linked.is_none(), "银行勾对应被置空");
+    }
+
+    #[test]
     fn cross_account_rejected() {
         let db = tmpdb("cross");
         let p = Period::new(2026, 1).unwrap();
@@ -737,6 +835,90 @@ mod tests {
         let credit: Money = v.entries.iter().filter(|e| e.account_code == "1231").map(|e| e.credit).sum();
         assert_eq!(credit, Money::parse("3100").unwrap());
         assert_eq!(v.source, fincore::voucher::VoucherSource::Business);
+    }
+
+    #[test]
+    fn bad_debt_provision_adjusts_target_and_reverses() {
+        let db = tmpdb("baddebt_diff");
+        let p1 = Period::new(2026, 3).unwrap();
+        let (_, e_new) = ar_voucher(
+            &db,
+            p1,
+            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+            1,
+            "C01",
+            "2000",
+            true,
+            "600101",
+        );
+        let (_, e_old) = ar_voucher(
+            &db,
+            p1,
+            NaiveDate::from_ymd_opt(2023, 1, 5).unwrap(),
+            2,
+            "C01",
+            "10000",
+            true,
+            "600101",
+        );
+        let as_of = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        bad_debt_provision_voucher(&db, p1, as_of, "u1").unwrap().expect("首次应计提");
+        // 目标未变：重复执行差额为 0，不再生成
+        assert!(
+            bad_debt_provision_voucher(&db, p1, as_of, "u1").unwrap().is_none(),
+            "目标不变时不应重复计提"
+        );
+
+        // 期后全部收回 → 应提额降为 0，应自动冲回
+        let p2 = Period::new(2026, 4).unwrap();
+        let (_, e_pay) = ar_voucher(
+            &db,
+            p2,
+            NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+            3,
+            "C01",
+            "12000",
+            false,
+            "100201",
+        );
+        settle(&db, e_new, e_pay, Money::parse("2000").unwrap(), "u1").unwrap();
+        settle(&db, e_old, e_pay, Money::parse("10000").unwrap(), "u1").unwrap();
+
+        let rev = bad_debt_provision_voucher(
+            &db,
+            p2,
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+            "u1",
+        )
+        .unwrap()
+        .expect("应生成冲回凭证");
+        let v = crate::vouchers::get(&db, rev).unwrap().unwrap();
+        assert!(v.balanced());
+        let debit: Money = v
+            .entries
+            .iter()
+            .filter(|e| e.account_code == "1231")
+            .map(|e| e.debit)
+            .sum();
+        let credit: Money = v
+            .entries
+            .iter()
+            .filter(|e| e.account_code == "6701")
+            .map(|e| e.credit)
+            .sum();
+        assert_eq!(debit, Money::parse("3100").unwrap());
+        assert_eq!(credit, Money::parse("3100").unwrap());
+        // 已到目标余额：再执行不再生成
+        assert!(
+            bad_debt_provision_voucher(
+                &db,
+                p2,
+                NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
+                "u1"
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

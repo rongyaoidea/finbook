@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -237,7 +237,8 @@ CREATE TABLE IF NOT EXISTS bank_statement (
     debit       TEXT NOT NULL DEFAULT '0',   -- 银行口径：进账
     credit      TEXT NOT NULL DEFAULT '0',   -- 银行口径：支出
     balance     TEXT NOT NULL DEFAULT '0',   -- 对账单上的余额
-    entry_id    INTEGER,                     -- 勾对上的凭证分录 id
+    -- 勾对上的凭证分录 id。分录被重写/删除时自动置空，避免留下悬空勾对
+    entry_id    INTEGER REFERENCES voucher_entry(id) ON DELETE SET NULL,
     matched_at  TEXT,
     matched_by  TEXT
 );
@@ -250,8 +251,10 @@ CREATE TABLE IF NOT EXISTS settle_record (
     period       INTEGER NOT NULL,
     account_code TEXT NOT NULL,
     aux_key      TEXT NOT NULL DEFAULT '',
-    from_entry   INTEGER NOT NULL,   -- 被核销的分录（原单据）
-    to_entry     INTEGER NOT NULL,   -- 核销方分录（收款/付款）
+    -- 被核销/核销方分录；分录被重写或删除时核销记录随之级联删除，
+    -- 否则会留下指向已删分录的"幽灵核销"，让往来重新显示未核销
+    from_entry   INTEGER NOT NULL REFERENCES voucher_entry(id) ON DELETE CASCADE,
+    to_entry     INTEGER NOT NULL REFERENCES voucher_entry(id) ON DELETE CASCADE,
     amount       TEXT NOT NULL,      -- 本次核销金额（正数）
     settled_by   TEXT NOT NULL DEFAULT '',
     settled_at   TEXT NOT NULL DEFAULT '',
@@ -1194,6 +1197,86 @@ fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// 表上是否已有引用指定列的 FOREIGN KEY（迁移判存用）
+fn has_fk(conn: &Connection, table: &str, column: &str) -> Result<bool, DbError> {
+    let mut st = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(3)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v17 → v18：给核销与银行勾对补外键。
+///
+/// `settle_record.from_entry/to_entry`、`bank_statement.entry_id` 指向
+/// `voucher_entry(id)`，但此前没有外键：凭证保存会整表 DELETE 再插入分录，
+/// 删除凭证会级联删分录——两处引用都会变成指向不存在行的"悬空引用"，
+/// 表现为核销静默消失、银行流水显示已勾对但挂空。
+/// SQLite 不支持 ALTER 加外键，只能重建表。
+fn migrate_v18(conn: &Connection) -> Result<(), DbError> {
+    let bank_done = has_fk(conn, "bank_statement", "entry_id")?;
+    let settle_done = has_fk(conn, "settle_record", "from_entry")?;
+    if bank_done && settle_done {
+        return Ok(());
+    }
+    // 重建前先清掉历史悬空引用，否则带外键的新表会拒绝那些行
+    conn.execute_batch(
+        "UPDATE bank_statement SET entry_id=NULL, matched_at=NULL, matched_by=NULL
+           WHERE entry_id IS NOT NULL
+             AND entry_id NOT IN (SELECT id FROM voucher_entry);
+         DELETE FROM settle_record
+           WHERE from_entry NOT IN (SELECT id FROM voucher_entry)
+              OR to_entry NOT IN (SELECT id FROM voucher_entry);",
+    )?;
+    if !bank_done {
+        conn.execute_batch(
+            "CREATE TABLE bank_statement_new (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                period       INTEGER NOT NULL,
+                account_code TEXT NOT NULL,
+                biz_date     TEXT NOT NULL,
+                summary      TEXT NOT NULL DEFAULT '',
+                settle_no    TEXT NOT NULL DEFAULT '',
+                debit        TEXT NOT NULL DEFAULT '0',
+                credit       TEXT NOT NULL DEFAULT '0',
+                balance      TEXT NOT NULL DEFAULT '0',
+                entry_id     INTEGER REFERENCES voucher_entry(id) ON DELETE SET NULL,
+                matched_at   TEXT,
+                matched_by   TEXT
+             );
+             INSERT INTO bank_statement_new SELECT * FROM bank_statement;
+             DROP TABLE bank_statement;
+             ALTER TABLE bank_statement_new RENAME TO bank_statement;
+             CREATE INDEX IF NOT EXISTS idx_stmt_period ON bank_statement(period, account_code);
+             CREATE INDEX IF NOT EXISTS idx_stmt_entry  ON bank_statement(entry_id);",
+        )?;
+    }
+    if !settle_done {
+        conn.execute_batch(
+            "CREATE TABLE settle_record_new (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                period       INTEGER NOT NULL,
+                account_code TEXT NOT NULL,
+                aux_key      TEXT NOT NULL DEFAULT '',
+                from_entry   INTEGER NOT NULL REFERENCES voucher_entry(id) ON DELETE CASCADE,
+                to_entry     INTEGER NOT NULL REFERENCES voucher_entry(id) ON DELETE CASCADE,
+                amount       TEXT NOT NULL,
+                settled_by   TEXT NOT NULL DEFAULT '',
+                settled_at   TEXT NOT NULL DEFAULT '',
+                UNIQUE(from_entry, to_entry)
+             );
+             INSERT INTO settle_record_new SELECT * FROM settle_record;
+             DROP TABLE settle_record;
+             ALTER TABLE settle_record_new RENAME TO settle_record;
+             CREATE INDEX IF NOT EXISTS idx_settle_entry ON settle_record(from_entry, to_entry);",
+        )?;
+    }
+    Ok(())
+}
+
 /// DDL 里声明的全部表名（进程内解析一次并缓存）。
 fn ddl_tables() -> &'static [String] {
     static TABLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -1270,6 +1353,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_v9(conn)?;
             migrate_v10(conn)?;
             migrate_generic(conn, MIGRATE_V17)?;
+            migrate_v18(conn)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

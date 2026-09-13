@@ -982,18 +982,6 @@ fn period_checked(ymm: i32) -> Result<Period, AppError> {
     Period::from_ymm_checked(ymm).map_err(|e| AppError::bad_request(e.to_string()))
 }
 
-/// 汇总类报表尚未把数据范围（科目区间/部门/仅本人）下沉到查询层，
-/// 对设置了范围的账号直接拒绝：配置了范围却看到全量汇总属于静默越权。
-fn deny_scoped_report(user: &CurrentUser) -> Result<(), AppError> {
-    if user.user.data_scope.is_unrestricted() {
-        Ok(())
-    } else {
-        Err(AppError::forbidden(
-            "当前账号设置了数据范围（科目/部门/仅本人），该汇总报表暂不支持按范围过滤；请改用账簿/余额表等已支持范围的报表",
-        ))
-    }
-}
-
 async fn get_dashboard(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -1030,7 +1018,7 @@ async fn get_overview(
         .unwrap_or_else(|| current_period(&state, &user));
     let o = findb::reports::overview(&db, period)?;
     let recent: Vec<VoucherListItem> = o.recent.iter().map(to_item).collect();
-    let a = findb::advanced::financial_analysis(&db, period)?;
+    let a = findb::advanced::financial_analysis(&db, period, Some(&user.user))?;
     let trend: Vec<serde_json::Value> = a
         .trend
         .iter()
@@ -1728,29 +1716,38 @@ async fn import_analyze(
     Json(req): Json<ImportAnalyzeReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
-    let db = state.db_for(&user.book_key)?;
-    let tmpl = findb::imports::ImportTemplate::parse(&req.template);
-    let is_begin = req.kind != "voucher";
-    // Excel 上传：把字节转成 CSV 文本走同一套预检
-    let text = if let Some(b64) = &req.file {
-        if b64.trim().is_empty() {
-            return Err(AppError::bad_request("请选择 Excel 文件或粘贴 CSV 内容"));
-        }
-        let bytes = b64_decode(b64)?;
-        let rows = findb::imports::read_xlsx_bytes(&bytes)?;
-        findb::imports::xlsx_to_csv_text(&rows)
-    } else {
-        req.text.clone()
-    };
-    if text.trim().is_empty() {
-        return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
+    let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_file && req.text.trim().is_empty() {
+        return Err(AppError::bad_request("请选择 Excel 文件或粘贴 CSV 内容"));
     }
-    let missing = findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?;
-    let items: Vec<serde_json::Value> = missing
-        .iter()
-        .map(|m| json!({ "code": m.code, "count": m.count }))
-        .collect();
-    Ok(Json(json!({ "missing": items })))
+    let file_bytes: Option<Vec<u8>> = if has_file {
+        Some(b64_decode(req.file.as_deref().unwrap_or(""))?)
+    } else {
+        None
+    };
+    let key = user.book_key.clone();
+    let state2 = state.clone();
+    // 预检也要解析整份 Excel：同样放阻塞池
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, AppError> {
+        let db = state2.db_for(&key)?;
+        let tmpl = findb::imports::ImportTemplate::parse(&req.template);
+        let is_begin = req.kind != "voucher";
+        let text = if let Some(bytes) = &file_bytes {
+            let rows = findb::imports::read_xlsx_bytes(bytes)?;
+            findb::imports::xlsx_to_csv_text(&rows)
+        } else {
+            req.text.clone()
+        };
+        let missing = findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?;
+        let items: Vec<serde_json::Value> = missing
+            .iter()
+            .map(|m| json!({ "code": m.code, "count": m.count }))
+            .collect();
+        Ok(json!({ "missing": items }))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("导入预检失败：{e}")))??;
+    Ok(Json(out))
 }
 
 /// 执行导入（期初余额表 / 凭证），带科目映射；支持 CSV 文本或 Excel 文件
@@ -1760,39 +1757,45 @@ async fn import_run(
     Json(req): Json<ImportRunReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
-    let db = state.db_for(&user.book_key)?;
-    let who = user.username().to_string();
-    let tmpl = findb::imports::ImportTemplate::parse(&req.template);
     let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let res = if req.kind == "voucher" {
-        let period = if req.period > 0 {
-            period_checked(req.period)?
-        } else {
-            current_period(&state, &user)
-        };
-        if has_file {
-            let bytes = b64_decode(req.file.as_deref().unwrap_or(""))?;
-            findb::imports::import_vouchers_bytes(&db, period, &bytes, &who, &req.mapping, tmpl)?
-        } else {
-            if req.text.trim().is_empty() {
-                return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
-            }
-            findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping, tmpl)?
-        }
-    } else if has_file {
-        let bytes = b64_decode(req.file.as_deref().unwrap_or(""))?;
-        findb::imports::import_begin_bytes(&db, &bytes, &who, &req.mapping, tmpl)?
+    if !has_file && req.text.trim().is_empty() {
+        return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
+    }
+    // 文件解码放请求线程，重活（解析 Excel + 批量写库）整体进阻塞池
+    let file_bytes: Option<Vec<u8>> = if has_file {
+        Some(b64_decode(req.file.as_deref().unwrap_or(""))?)
     } else {
-        if req.text.trim().is_empty() {
-            return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
-        }
-        findb::imports::import_begin(&db, &req.text, &who, &req.mapping, tmpl)?
+        None
     };
-    Ok(Json(json!({
-        "ok": res.ok,
-        "skipped": res.skipped,
-        "warnings": res.warnings,
-    })))
+    let key = user.book_key.clone();
+    let who = user.username().to_string();
+    let fallback_ymm = current_period(&state, &user).ymm();
+    let explicit_ymm = if req.period > 0 { Some(period_checked(req.period)?.ymm()) } else { None };
+    let state2 = state.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, AppError> {
+        let db = state2.db_for(&key)?;
+        let tmpl = findb::imports::ImportTemplate::parse(&req.template);
+        let res = if req.kind == "voucher" {
+            let period = fincore::Period::from_ymm(explicit_ymm.unwrap_or(fallback_ymm));
+            if let Some(bytes) = &file_bytes {
+                findb::imports::import_vouchers_bytes(&db, period, bytes, &who, &req.mapping, tmpl)?
+            } else {
+                findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping, tmpl)?
+            }
+        } else if let Some(bytes) = &file_bytes {
+            findb::imports::import_begin_bytes(&db, bytes, &who, &req.mapping, tmpl)?
+        } else {
+            findb::imports::import_begin(&db, &req.text, &who, &req.mapping, tmpl)?
+        };
+        Ok(json!({
+            "ok": res.ok,
+            "skipped": res.skipped,
+            "warnings": res.warnings,
+        }))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("导入任务失败：{e}")))??;
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2311,11 +2314,10 @@ async fn get_summary_table(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
     let db = state.db_for(&user.book_key)?;
-    let rows = advanced::summary_table(&db, from, to)?;
+    let rows = advanced::summary_table(&db, from, to, Some(&user.user))?;
     Ok(Json(serde_json::json!({ "from": period_to_str(from), "to": period_to_str(to), "rows": rows })))
 }
 
@@ -2325,14 +2327,13 @@ async fn get_fin_ratios(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         // 默认年初（同一会计年度 1 月）
         fincore::Period::new(period.year(), 1).unwrap_or(period)
     });
     let db = state.db_for(&user.book_key)?;
-    let rows = advanced::fin_ratios(&db, period, from)?;
+    let rows = advanced::fin_ratios(&db, period, from, Some(&user.user))?;
     Ok(Json(serde_json::json!({ "period": period_to_str(period), "ratios": rows })))
 }
 
@@ -2344,13 +2345,12 @@ async fn get_equity_statement(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         fincore::Period::new(period.year(), 1).unwrap_or(period)
     });
     let db = state.db_for(&user.book_key)?;
-    let stmt = findb::reports::equity_statement(&db, from, period)?;
+    let stmt = findb::reports::equity_statement(&db, from, period, Some(&user.user))?;
     Ok(Json(serde_json::json!({
         "from": period_to_str(from),
         "to": period_to_str(period),
@@ -2364,7 +2364,6 @@ async fn get_report_compare(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let key = q.get("key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
     let cur = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let prev = q.get("prev").and_then(|s| parse_period(s)).unwrap_or(cur.prev());
@@ -2376,7 +2375,7 @@ async fn get_report_compare(
         (cur, prev)
     };
     let db = state.db_for(&user.book_key)?;
-    let rows = findb::reports::report_compare(&db, &key, cur_from, cur, prev_from, prev)?;
+    let rows = findb::reports::report_compare(&db, &key, cur_from, cur, prev_from, prev, Some(&user.user))?;
     Ok(Json(serde_json::json!({
         "key": key,
         "current": period_to_str(cur),
@@ -2402,7 +2401,7 @@ async fn get_account_daily(
     if !user.user.can_see_account(&code) {
         return Err(AppError::forbidden("无权查看该科目"));
     }
-    let rows = findb::reports::account_daily_report(&db, &code, from, to)?;
+    let rows = findb::reports::account_daily_report(&db, &code, from, to, Some(&user.user))?;
     Ok(Json(serde_json::json!({ "code": code, "rows": rows })))
 }
 
@@ -4096,10 +4095,9 @@ async fn get_cash_flow(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
-    let cf = findb::reports::cash_flow_statement(&db, from, to)?;
+    let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
     let line = |l: &fincore::report::cashflow::CashFlowLine| {
         json!({ "code": l.code, "name": l.name, "inflow": l.inflow.fmt_money(), "outflow": l.outflow.fmt_money(), "net": l.net.fmt_money() })
     };
@@ -4125,10 +4123,9 @@ async fn print_cash_flow(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
-    let cf = findb::reports::cash_flow_statement(&db, from, to)?;
+    let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
     let html = crate::report_html::cash_flow_html(&cf, &user.company, &subtitle);
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
@@ -4140,10 +4137,9 @@ async fn print_equity_statement(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     user.require(Perm::Report)?;
-    deny_scoped_report(&user)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
-    let stmt = findb::reports::equity_statement(&db, from, to)?;
+    let stmt = findb::reports::equity_statement(&db, from, to, Some(&user.user))?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
     let html = crate::report_html::equity_html(&stmt, &user.company, &subtitle);
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
@@ -4363,22 +4359,30 @@ async fn create_backup(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Backup)?;
     let key = user.book_key.clone();
-    let src = state.books_dir.join(format!("{key}.fbk"));
-    if !src.exists() {
+    if !state.books_dir.join(format!("{key}.fbk")).exists() {
         return Err(AppError::not_found("账套文件不存在"));
     }
-    let dir = state.books_dir.join("backups");
-    let _ = std::fs::create_dir_all(&dir);
-    // 先 checkpoint 把 WAL 合并回主文件，再复制主文件即可得到完整一致快照
-    let db = state.db_for(&user.book_key)?;
-    checkpoint_wal(&db)?;
-    drop(db);
-    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let dst_name = format!("{}_{}.fbk", stamp, key);
-    std::fs::copy(&src, dir.join(&dst_name))?;
-    let db = state.db_for(&user.book_key)?;
-    db.log(user.username(), "系统", "备份账套", &format!("备份 {dst_name}"))?;
-    Ok(Json(json!({"ok": true, "name": dst_name})))
+    let state2 = state.clone();
+    let username = user.username().to_string();
+    // checkpoint + fs::copy 都是阻塞 IO，放阻塞池，别占死 async worker
+    let name = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+        let src = state2.books_dir.join(format!("{key}.fbk"));
+        let dir = state2.books_dir.join("backups");
+        let _ = std::fs::create_dir_all(&dir);
+        // 先 checkpoint 把 WAL 合并回主文件，再复制主文件即可得到完整一致快照
+        let db = state2.db_for(&key)?;
+        checkpoint_wal(&db)?;
+        drop(db);
+        let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let dst_name = format!("{}_{}.fbk", stamp, key);
+        std::fs::copy(&src, dir.join(&dst_name))?;
+        let db = state2.db_for(&key)?;
+        db.log(&username, "系统", "备份账套", &format!("备份 {dst_name}"))?;
+        Ok(dst_name)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("备份任务失败：{e}")))??;
+    Ok(Json(json!({"ok": true, "name": name})))
 }
 
 async fn restore_backup(
@@ -4387,7 +4391,6 @@ async fn restore_backup(
     Json(req): Json<BackupRestoreReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Backup)?;
-    let key = user.book_key.clone();
     // 路径安全：仅允许 backups 目录下的纯文件名，禁止任何路径穿越；
     // 且只接受属于当前账套的备份（后缀 _<key>.fbk），防止跨租户恢复。
     let file_name = match std::path::Path::new(&req.file).file_name().and_then(|s| s.to_str()) {
@@ -4401,26 +4404,35 @@ async fn restore_backup(
     if !src.exists() {
         return Err(AppError::not_found("备份文件不存在"));
     }
-    let dst = state.books_dir.join(format!("{key}.fbk"));
-    // 恢复前先 checkpoint 当前账套并自动备份一次，避免覆盖无法回退
-    let _ = std::fs::create_dir_all(state.books_dir.join("backups"));
-    let db = state.db_for(&user.book_key)?;
-    checkpoint_wal(&db)?;
-    drop(db);
-    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let auto_name = format!("auto_{}_{}.fbk", stamp, key);
-    let _ = std::fs::copy(&dst, state.books_dir.join("backups").join(&auto_name));
-    std::fs::copy(&src, &dst)?;
-    for ext in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(state.books_dir.join(format!("{key}.fbk{ext}")));
-    }
-    // 重新注册账套，使后续请求以新文件重新打开
-    if let Ok(path) = std::fs::canonicalize(&dst) {
-        state.books.unregister(&key);
-        state.books.register(&path, 16);
-    }
-    let db = state.db_for(&user.book_key)?;
-    db.log(user.username(), "系统", "恢复账套", &format!("从 {file_name} 恢复"))?;
+    let key = user.book_key.clone();
+    let username = user.username().to_string();
+    let state2 = state.clone();
+    // 覆盖主库 + 删 WAL + 重注册账套都是阻塞操作，放阻塞池
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let dst = state2.books_dir.join(format!("{key}.fbk"));
+        // 恢复前先 checkpoint 当前账套并自动备份一次，避免覆盖无法回退
+        let _ = std::fs::create_dir_all(state2.books_dir.join("backups"));
+        let db = state2.db_for(&key)?;
+        checkpoint_wal(&db)?;
+        drop(db);
+        let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let auto_name = format!("auto_{}_{}.fbk", stamp, key);
+        let _ = std::fs::copy(&dst, state2.books_dir.join("backups").join(&auto_name));
+        std::fs::copy(&src, &dst)?;
+        for ext in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(state2.books_dir.join(format!("{key}.fbk{ext}")));
+        }
+        // 重新注册账套，使后续请求以新文件重新打开
+        if let Ok(path) = std::fs::canonicalize(&dst) {
+            state2.books.unregister(&key);
+            state2.books.register(&path, 16);
+        }
+        let db = state2.db_for(&key)?;
+        db.log(&username, "系统", "恢复账套", &format!("从 {file_name} 恢复"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("恢复任务失败：{e}")))??;
     Ok(Json(json!({"ok": true})))
 }
 

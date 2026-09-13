@@ -679,12 +679,15 @@ fn import_vouchers_rows(
         };
         let date = line.date;
         // 同一（日期 + 凭证号）内共一张凭证：金蝶模板带凭证号，同日期多张凭证号应分开；
-        // 通用/用友无凭证号，按日期分。
+        // 通用/用友没有凭证号，靠"上一张已借贷平衡"识别同一天多张凭证的边界，
+        // 否则同一天的多张凭证会被合并成一张，凭证字号/张数丢失。
         let new_voucher = match &pending {
             Some(v) => {
                 let date_changed = v.date != date;
                 let no_changed = tmpl == ImportTemplate::Kingdee && pending_no != line.no;
-                date_changed || no_changed
+                let balanced_boundary =
+                    tmpl != ImportTemplate::Kingdee && !v.entries.is_empty() && v.balanced();
+                date_changed || no_changed || balanced_boundary
             }
             None => true,
         };
@@ -840,6 +843,30 @@ mod tests {
         let all = vouchers::list(&db, &vouchers::VoucherQuery::period(p)).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].status, VoucherStatus::Draft);
+    }
+
+    #[test]
+    fn import_vouchers_generic_same_day_splits_on_balance() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        // 同一天两张通用模板凭证（无凭证号列）：以借贷平衡为边界拆分
+        let csv = "\u{feff}日期,凭证字,摘要,科目,借方,贷方\n\
+                   2026-01-05,记,收到货款,100201,0,1000\n\
+                   2026-01-05,记,收到货款,600101,1000,0\n\
+                   2026-01-05,记,提现,1001,500,0\n\
+                   2026-01-05,记,提现,100201,0,500\n";
+        let res = import_vouchers(
+            &db,
+            p,
+            csv,
+            "u1",
+            &std::collections::HashMap::new(),
+            ImportTemplate::Generic,
+        )
+        .unwrap();
+        assert_eq!(res.ok, 2, "同一天的两张凭证不应被合并：{:?}", res.warnings);
+        let all = vouchers::list(&db, &vouchers::VoucherQuery::period(p)).unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]

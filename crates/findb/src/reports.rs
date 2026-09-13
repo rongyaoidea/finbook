@@ -166,13 +166,18 @@ pub fn cash_accounts(db: &Db) -> DbResult<Vec<String>> {
 }
 
 /// 按现金流量项目汇总发生额（只统计现金/银行科目的已记账分录）
-pub fn cash_flow_amounts(db: &Db, from: fincore::Period, to: fincore::Period) -> DbResult<ItemAmounts> {
+pub fn cash_flow_amounts(
+    db: &Db,
+    from: fincore::Period,
+    to: fincore::Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<ItemAmounts> {
     let codes = cash_accounts(db)?;
     if codes.is_empty() {
         return Ok(HashMap::new());
     }
     let placeholders = codes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
+    let mut sql = format!(
         "SELECT e.cf_item, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
@@ -184,6 +189,9 @@ pub fn cash_flow_amounts(db: &Db, from: fincore::Period, to: fincore::Period) ->
     ];
     for c in &codes {
         params.push(Box::new(c.clone()));
+    }
+    if let Some(u) = scope {
+        crate::push_report_scope(&mut sql, &mut params, &u.data_scope, &u.username);
     }
     let mut stmt = db.conn().prepare(&sql)?;
     let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
@@ -214,16 +222,18 @@ pub fn cash_flow_amounts(db: &Db, from: fincore::Period, to: fincore::Period) ->
 }
 
 /// 现金及现金等价物的期初 / 期末余额
-pub fn cash_begin_end(db: &Db, from: fincore::Period, to: fincore::Period) -> DbResult<(Money, Money)> {
+pub fn cash_begin_end(
+    db: &Db,
+    from: fincore::Period,
+    to: fincore::Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<(Money, Money)> {
     let codes = cash_accounts(db)?;
-    let snap = BalanceSnapshot::load(
-        db,
-        &BalanceQuery {
-            from,
-            to,
-            ..BalanceQuery::period(from)
-        },
-    )?;
+    let mut bq = BalanceQuery::range(from, to);
+    if let Some(u) = scope {
+        bq = bq.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let mut begin = Money::ZERO;
     let mut end = Money::ZERO;
     for c in codes {
@@ -239,13 +249,14 @@ pub fn cash_flow_statement(
     db: &Db,
     from: fincore::Period,
     to: fincore::Period,
+    scope: Option<&fincore::user::User>,
 ) -> DbResult<CashFlowStatement> {
-    let mut amounts = cash_flow_amounts(db, from, to)?;
+    let mut amounts = cash_flow_amounts(db, from, to, scope)?;
     let unassigned = amounts
         .remove("__unassigned__")
         .map(|(net, _)| net)
         .unwrap_or(Money::ZERO);
-    let (begin, end) = cash_begin_end(db, from, to)?;
+    let (begin, end) = cash_begin_end(db, from, to, scope)?;
     let items = cash_flow_items(db)?;
     let items = if items.is_empty() {
         default_cash_flow_items()
@@ -264,8 +275,17 @@ pub fn cash_flow_statement(
 /// 取数口径：权益类科目贷方余额为正。年初 = 本年 1 月的期初余额，
 /// 本年增减 = 本年累计贷 − 本年累计借（贷方增加为正），年末 = 年初 + 本年增减。
 /// `from` 应为本会计年度首个期间（通常 1 月），`to` 为报告期末。
-pub fn equity_statement(db: &Db, from: fincore::Period, to: fincore::Period) -> DbResult<EquityStatement> {
-    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, to))?;
+pub fn equity_statement(
+    db: &Db,
+    from: fincore::Period,
+    to: fincore::Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<EquityStatement> {
+    let mut bq = BalanceQuery::range(from, to);
+    if let Some(u) = scope {
+        bq = bq.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let names = [
         ("实收资本", CAPITAL),
         ("资本公积", RESERVE),
@@ -315,6 +335,7 @@ pub fn report_compare(
     current_to: fincore::Period,
     prev_from: fincore::Period,
     prev_to: fincore::Period,
+    scope: Option<&fincore::user::User>,
 ) -> DbResult<Vec<CompareRow>> {
     let def = get_def(db, key)?.unwrap_or_else(|| match key {
         "balance_sheet" => balance_sheet::balance_sheet_def(),
@@ -326,8 +347,14 @@ pub fn report_compare(
             lines: vec![],
         },
     });
-    let cur_snap = BalanceSnapshot::load(db, &BalanceQuery::range(current_from, current_to))?;
-    let prev_snap = BalanceSnapshot::load(db, &BalanceQuery::range(prev_from, prev_to))?;
+    let mut cur_bq = BalanceQuery::range(current_from, current_to);
+    let mut prev_bq = BalanceQuery::range(prev_from, prev_to);
+    if let Some(u) = scope {
+        cur_bq = cur_bq.with_user_scope(u);
+        prev_bq = prev_bq.with_user_scope(u);
+    }
+    let cur_snap = BalanceSnapshot::load(db, &cur_bq)?;
+    let prev_snap = BalanceSnapshot::load(db, &prev_bq)?;
     let cur_table = fincore::report::render_single(&def, &cur_snap, "", "", fincore::report::identity);
     let prev_table = fincore::report::render_single(&def, &prev_snap, "", "", fincore::report::identity);
     let mut out = Vec::with_capacity(cur_table.rows.len());
@@ -369,18 +396,30 @@ pub fn account_daily_report(
     code: &str,
     from: fincore::Period,
     to: fincore::Period,
+    scope: Option<&fincore::user::User>,
 ) -> DbResult<Vec<DailyRow>> {
-    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, to))?;
+    let mut bq = BalanceQuery::range(from, to);
+    if let Some(u) = scope {
+        bq = bq.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let begin = snap.for_account(code, None).begin;
     let pattern = format!("{}%", crate::escape_like(code));
-    let mut stmt = db.conn().prepare(
+    let mut sql = String::from(
         "SELECT v.date, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
-           AND e.account_code LIKE ?3 ESCAPE '\\'
-         ORDER BY v.date",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![from.ymm(), to.ymm(), pattern])?;
+           AND e.account_code LIKE ?3 ESCAPE '\\'",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(from.ymm()), Box::new(to.ymm()), Box::new(pattern)];
+    if let Some(u) = scope {
+        crate::push_report_scope(&mut sql, &mut params, &u.data_scope, &u.username);
+    }
+    sql.push_str(" ORDER BY v.date");
+    let mut stmt = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
     // 按日期聚合
     let mut map: std::collections::BTreeMap<String, (Money, Money)> = std::collections::BTreeMap::new();
     while let Some(r) = rows.next()? {
@@ -541,7 +580,7 @@ pub fn overview(db: &Db, period: fincore::Period) -> DbResult<Overview> {
     let (vouchers, entries, accounts) = db.stats()?;
     let (draft, audited, posted, _void) = crate::vouchers::status_summary(db, period)?;
     let from = fincore::Period::new(period.year(), 1).unwrap_or(period);
-    let totals = crate::advanced::financial_totals(db, period, from)?;
+    let totals = crate::advanced::financial_totals(db, period, from, None)?;
     let mut invoice_in = (Money::ZERO, 0i64);
     let mut invoice_out = (Money::ZERO, 0i64);
     for (kind, amount_tax, _tax, count) in crate::invoices::summary(db)? {
@@ -685,7 +724,7 @@ mod tests {
             ],
         );
 
-        let stmt = cash_flow_statement(&db, p, p).unwrap();
+        let stmt = cash_flow_statement(&db, p, p, None).unwrap();
         assert_eq!(stmt.operating_net, Money::parse("60000").unwrap());
         assert_eq!(stmt.net_increase, Money::parse("60000").unwrap());
         assert_eq!(stmt.begin_cash, Money::ZERO);
@@ -705,7 +744,7 @@ mod tests {
             5,
             vec![("1001", "借", "5000", None), ("600101", "贷", "5000", None)],
         );
-        let stmt = cash_flow_statement(&db, p, p).unwrap();
+        let stmt = cash_flow_statement(&db, p, p, None).unwrap();
         assert_eq!(stmt.unassigned, Money::parse("5000").unwrap());
         assert!(stmt.ties());
     }
@@ -747,7 +786,7 @@ mod tests {
                 ("4001", "贷", "1000000", None),
             ],
         );
-        let stmt = equity_statement(&db, p, p).unwrap();
+        let stmt = equity_statement(&db, p, p, None).unwrap();
         let capital = stmt.lines.iter().find(|l| l.name == "实收资本").unwrap();
         assert_eq!(capital.begin, Money::ZERO);
         assert_eq!(capital.change, Money::parse("1000000").unwrap());
@@ -761,7 +800,7 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         cash_voucher(&db, p, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
         cash_voucher(&db, p, 9, vec![("1001", "借", "500", Some("0103")), ("6301", "贷", "500", None)]);
-        let rows = account_daily_report(&db, "1001", p, p).unwrap();
+        let rows = account_daily_report(&db, "1001", p, p, None).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].balance, Money::parse("1000").unwrap());
         assert_eq!(rows[1].balance, Money::parse("1500").unwrap());
@@ -774,7 +813,7 @@ mod tests {
         let p2 = Period::new(2026, 2).unwrap();
         cash_voucher(&db, p1, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
         cash_voucher(&db, p2, 5, vec![("1001", "借", "3000", Some("0101")), ("600101", "贷", "3000", None)]);
-        let rows = report_compare(&db, "income_statement", p2, p2, p1, p1).unwrap();
+        let rows = report_compare(&db, "income_statement", p2, p2, p1, p1, None).unwrap();
         // 营业收入行：本期 3000 vs 上期 1000 → 差额 2000
         let rev = rows.iter().find(|r| r.no == "1").unwrap();
         assert_eq!(rev.current, Money::parse("3000").unwrap());

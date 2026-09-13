@@ -516,6 +516,32 @@ pub fn money_param(m: fincore::Money) -> String {
     m.fmt_plain()
 }
 
+/// 给报表 SQL 追加数据范围条件（科目区间 + 仅本人填制的凭证）。
+///
+/// 调用方需保证 SQL 中分录表别名是 `e`、凭证表别名是 `v`，且 `params`
+/// 已按现有占位符顺序放好参数（占位符编号按 `params.len()+1` 递增）。
+pub(crate) fn push_report_scope(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    scope: &fincore::user::DataScope,
+    username: &str,
+) {
+    let lo = scope.account_from.trim();
+    if !lo.is_empty() {
+        params.push(Box::new(lo.to_string()));
+        sql.push_str(&format!(" AND e.account_code >= ?{}", params.len()));
+    }
+    let hi = scope.account_to.trim();
+    if !hi.is_empty() {
+        params.push(Box::new(hi.to_string()));
+        sql.push_str(&format!(" AND e.account_code <= ?{}", params.len()));
+    }
+    if scope.own_voucher_only {
+        params.push(Box::new(username.to_string()));
+        sql.push_str(&format!(" AND v.prepared_by = ?{}", params.len()));
+    }
+}
+
 /// 数量 / 单价 / 汇率 / 费率落库用：保留满精度。
 ///
 /// 与 `money_param` 的区别是它不量化到 2 位。凡是被 `costing` 之类引擎按

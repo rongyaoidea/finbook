@@ -591,6 +591,8 @@ pub enum AppError {
     BadRequest(String),
     NotFound(String),
     Db(DbError),
+    /// 内部错误（阻塞任务失败等）：详情只进服务端日志，不返给客户端
+    Internal(String),
     /// 请求过于频繁（如登录限流），附剩余等待秒数
     RateLimited { msg: String, retry_secs: u64 },
 }
@@ -655,6 +657,14 @@ impl IntoResponse for AppError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(serde_json::json!({ "error": "数据库错误，请稍后重试或联系管理员" })),
+                )
+                    .into_response()
+            }
+            AppError::Internal(m) => {
+                eprintln!("[finweb] internal error: {m}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": "服务器内部错误，请稍后重试" })),
                 )
                     .into_response()
             }

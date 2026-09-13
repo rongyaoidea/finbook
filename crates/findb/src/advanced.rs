@@ -1161,14 +1161,26 @@ pub struct SummaryRow {
 /// 摘要汇总表：期间范围内按摘要分组，统计凭证张数与借贷发生额。
 ///
 /// 只统计已过账凭证（status='posted'），金额 Rust 侧 Decimal 累加。
-pub fn summary_table(db: &Db, from: Period, to: Period) -> DbResult<Vec<SummaryRow>> {
-    let mut st = db.conn().prepare(
+pub fn summary_table(
+    db: &Db,
+    from: Period,
+    to: Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<Vec<SummaryRow>> {
+    let mut sql = String::from(
         "SELECT e.summary, e.debit, e.credit, v.id
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2 AND e.summary <> ''
-         ORDER BY e.summary",
-    )?;
-    let mut rows = st.query(rusqlite::params![from.ymm(), to.ymm()])?;
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2 AND e.summary <> ''",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(from.ymm()), Box::new(to.ymm())];
+    if let Some(u) = scope {
+        crate::push_report_scope(&mut sql, &mut params, &u.data_scope, &u.username);
+    }
+    sql.push_str(" ORDER BY e.summary");
+    let mut st = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = st.query(refs.as_slice())?;
     let mut map: std::collections::BTreeMap<String, (Money, Money, std::collections::BTreeSet<i64>)> =
         std::collections::BTreeMap::new();
     while let Some(r) = rows.next()? {
@@ -1360,9 +1372,18 @@ pub struct FinTotals {
 }
 
 /// 计算 [from, period] 区间的财务总量，口径与资产负债表 / 利润表一致
-pub fn financial_totals(db: &Db, period: Period, from: Period) -> DbResult<FinTotals> {
+pub fn financial_totals(
+    db: &Db,
+    period: Period,
+    from: Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<FinTotals> {
     use crate::balances::{BalanceQuery, BalanceSnapshot};
-    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, period))?;
+    let mut bq = BalanceQuery::range(from, period);
+    if let Some(u) = scope {
+        bq = bq.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let b = |code: &str| snap.for_account(code, None).end();
     let occ = |code: &str| {
         let r = snap.for_account(code, None);
@@ -1427,8 +1448,13 @@ pub fn financial_totals(db: &Db, period: Period, from: Period) -> DbResult<FinTo
 /// 常用财务指标：偿债能力 / 营运能力 / 盈利能力
 ///
 /// 全部基于期末余额快照计算，数据源是 BalanceSnapshot，口径与资产负债表一致。
-pub fn fin_ratios(db: &Db, period: Period, from: Period) -> DbResult<Vec<FinRatio>> {
-    let t = financial_totals(db, period, from)?;
+pub fn fin_ratios(
+    db: &Db,
+    period: Period,
+    from: Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<Vec<FinRatio>> {
+    let t = financial_totals(db, period, from, scope)?;
     let (cur_asset, cur_liab) = (t.cur_asset, t.cur_liab);
     let (total_asset, total_liab, equity) = (t.total_asset, t.total_liab, t.equity);
     let (revenue, cost, net_profit) = (t.revenue, t.cost, t.net_profit);
@@ -1589,7 +1615,11 @@ fn flag_series(vals: &[Money]) -> Vec<bool> {
 }
 
 /// 计算 [1月, period] 区间的逐月趋势与异常，并给出指标内因构成
-pub fn financial_analysis(db: &Db, period: Period) -> DbResult<FinancialAnalysis> {
+pub fn financial_analysis(
+    db: &Db,
+    period: Period,
+    scope: Option<&fincore::user::User>,
+) -> DbResult<FinancialAnalysis> {
     use crate::balances::{BalanceQuery, BalanceSnapshot};
 
     let jan = Period::new(period.year(), 1).unwrap_or(period);
@@ -1610,7 +1640,7 @@ pub fn financial_analysis(db: &Db, period: Period) -> DbResult<FinancialAnalysis
     let mut cum_cost = Money::ZERO;
     let mut cum_np = Money::ZERO;
     for mo in &months {
-        let t = financial_totals(db, *mo, *mo)?;
+        let t = financial_totals(db, *mo, *mo, scope)?;
         cum_rev += t.revenue;
         cum_cost += t.cost;
         cum_np += t.net_profit;
@@ -1669,8 +1699,14 @@ pub fn financial_analysis(db: &Db, period: Period) -> DbResult<FinancialAnalysis
 
     // ---- 内因构成（本月 vs 上月，环比展示变化） ----
     let prev = period.prev();
-    let snap_cur = BalanceSnapshot::load(db, &BalanceQuery::period(period))?;
-    let snap_prev = BalanceSnapshot::load(db, &BalanceQuery::period(prev))?;
+    let mut bq_cur = BalanceQuery::period(period);
+    let mut bq_prev = BalanceQuery::period(prev);
+    if let Some(u) = scope {
+        bq_cur = bq_cur.with_user_scope(u);
+        bq_prev = bq_prev.with_user_scope(u);
+    }
+    let snap_cur = BalanceSnapshot::load(db, &bq_cur)?;
+    let snap_prev = BalanceSnapshot::load(db, &bq_prev)?;
     let occ = |snap: &BalanceSnapshot, code: &str| {
         let r = snap.for_account(code, None);
         r.credit - r.debit // 收入类贷方正
@@ -1743,7 +1779,7 @@ pub fn financial_analysis(db: &Db, period: Period) -> DbResult<FinancialAnalysis
     })
     .collect();
 
-    let ratios = fin_ratios(db, period, jan)?;
+    let ratios = fin_ratios(db, period, jan, scope)?;
 
     Ok(FinancialAnalysis {
         trend,
@@ -1987,7 +2023,7 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         post(&db, p, 1, &[("100201", "1000", "0"), ("600101", "0", "1000")]);
         post(&db, p, 2, &[("660201", "300", "0"), ("100201", "0", "300")]);
-        let rows = summary_table(&db, p, p).unwrap();
+        let rows = summary_table(&db, p, p, None).unwrap();
         assert!(!rows.is_empty());
         let r = rows.iter().find(|r| r.summary == "测试摘要").unwrap();
         assert_eq!(r.voucher_count, 2);
@@ -2042,7 +2078,7 @@ mod tests {
         crate::auxs::insert(&db, &AuxEntity::new(AuxKind::Bank, "B01", "工行")).unwrap();
         post(&db, p, 1, &[("100201", "100000", "0"), ("600101", "0", "100000")]);
         post(&db, p, 2, &[("6401", "60000", "0"), ("100201", "0", "60000")]);
-        let ratios = fin_ratios(&db, p, p).unwrap();
+        let ratios = fin_ratios(&db, p, p, None).unwrap();
         assert!(ratios.len() >= 6);
         let gm = ratios.iter().find(|r| r.key == "gross_margin").unwrap();
         // 毛利率 = (100000-60000)/100000 = 40%
@@ -2062,7 +2098,7 @@ mod tests {
         post(&db, p, 1, &[("100201", "30000", "0"), ("600101", "0", "30000")]);
         post(&db, p, 2, &[("6401", "10000", "0"), ("100201", "0", "10000")]);
 
-        let a = financial_analysis(&db, p).unwrap();
+        let a = financial_analysis(&db, p, None).unwrap();
         assert_eq!(a.trend.len(), 2, "应含 1、2 两月趋势点");
         assert_eq!(a.trend[0].revenue, m("100000"));
         assert_eq!(a.trend[0].net_profit, m("60000"));

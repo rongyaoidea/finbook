@@ -127,7 +127,7 @@ impl LedgerView {
                 self.journal = findb::balances::journal(ctx.db(), ctx.chart(), &q).unwrap_or_default();
             }
             Tab::Daily => {
-                self.daily = findb::reports::account_daily_report(ctx.db(), &code, from, to).unwrap_or_default();
+                self.daily = findb::reports::account_daily_report(ctx.db(), &code, from, to, Some(ctx.user())).unwrap_or_default();
             }
         }
         // 期初余额

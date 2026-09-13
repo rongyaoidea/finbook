@@ -84,7 +84,7 @@ impl ReportsView {
                 self.table = None;
                 self.equity = None;
                 self.compare.clear();
-                match findb::reports::cash_flow_statement(ctx.db(), from, to) {
+                match findb::reports::cash_flow_statement(ctx.db(), from, to, Some(ctx.user())) {
                     Ok(s) => self.cf = Some(s),
                     Err(e) => self.err = Some(e.to_string()),
                 }
@@ -94,7 +94,7 @@ impl ReportsView {
                 self.cf = None;
                 self.compare.clear();
                 let yfrom = Period::new(to.year(), 1).unwrap_or(from);
-                match findb::reports::equity_statement(ctx.db(), yfrom, to) {
+                match findb::reports::equity_statement(ctx.db(), yfrom, to, Some(ctx.user())) {
                     Ok(s) => self.equity = Some(s),
                     Err(e) => self.err = Some(e.to_string()),
                 }
@@ -104,7 +104,7 @@ impl ReportsView {
                 self.cf = None;
                 self.equity = None;
                 let prev = from.prev();
-                match findb::reports::report_compare(ctx.db(), "balance_sheet", Period::new(from.year(), 1).unwrap_or(from), from, Period::new(prev.year(), 1).unwrap_or(prev), prev) {
+                match findb::reports::report_compare(ctx.db(), "balance_sheet", Period::new(from.year(), 1).unwrap_or(from), from, Period::new(prev.year(), 1).unwrap_or(prev), prev, Some(ctx.user())) {
                     Ok(rows) => self.compare = rows,
                     Err(e) => self.err = Some(e.to_string()),
                 }

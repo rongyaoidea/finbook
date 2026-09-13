@@ -159,7 +159,7 @@ impl SummaryTableView {
         if !self.dirty && self.key == key { return; }
         self.key = key;
         self.dirty = false;
-        match advanced::summary_table(ctx.db(), p, p) {
+        match advanced::summary_table(ctx.db(), p, p, Some(ctx.user())) {
             Ok(rows) => self.rows = rows,
             Err(e) => { ctx.error(e.to_string()); self.rows.clear(); }
         }
@@ -248,7 +248,7 @@ impl RatiosView {
         self.key = key;
         self.dirty = false;
         let from = Period::new(p.year(), 1).unwrap_or(p);
-        match advanced::fin_ratios(ctx.db(), p, from) {
+        match advanced::fin_ratios(ctx.db(), p, from, Some(ctx.user())) {
             Ok(rows) => self.rows = rows,
             Err(e) => { ctx.error(e.to_string()); self.rows.clear(); }
         }

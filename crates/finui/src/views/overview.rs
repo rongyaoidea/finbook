@@ -71,7 +71,7 @@ impl OverviewView {
                 self.data = None;
             }
         }
-        match findb::advanced::financial_analysis(ctx.db(), p) {
+        match findb::advanced::financial_analysis(ctx.db(), p, Some(ctx.user())) {
             Ok(a) => self.analysis = Some(a),
             Err(e) => {
                 ctx.error(e.to_string());

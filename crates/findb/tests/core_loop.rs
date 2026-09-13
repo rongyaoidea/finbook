@@ -845,7 +845,7 @@ fn t13_income_statement() {
 #[test]
 fn t14_cash_flow_statement() {
     let (db, _chart, _) = posted_book();
-    let cf = reports::cash_flow_statement(&db, p1(), p1()).unwrap();
+    let cf = reports::cash_flow_statement(&db, p1(), p1(), None).unwrap();
 
     // 期初 1,000,000，期末 907,000
     assert_eq!(cf.begin_cash, m("700000.00"));

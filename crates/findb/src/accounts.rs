@@ -306,12 +306,15 @@ mod tests {
 
         // 模拟旧版账套：只保留 1001/1002 两个一级科目，其余全部删掉
         let keep: std::collections::HashSet<String> = ["1001", "1002"].iter().map(|s| s.to_string()).collect();
-        let codes: Vec<String> = list(&db)
+        let mut codes: Vec<String> = list(&db)
             .unwrap()
             .into_iter()
             .map(|a| a.code)
             .filter(|c| !keep.contains(c))
             .collect();
+        // 数据层有"仍有下级不能删"的防线：先删下级（编码大的）再删上级
+        codes.sort();
+        codes.reverse();
         for c in codes {
             delete(&db, &c).unwrap();
         }

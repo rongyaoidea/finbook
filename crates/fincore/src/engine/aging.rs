@@ -141,7 +141,8 @@ pub fn analyze(
                 credit_total: Money::ZERO,
                 max_days: 0,
             });
-        let days = (as_of - it.date).num_days();
+        // 未来日期的单据（days 为负）按 0 天处理，不能落进"最旧"档虚增长账龄
+        let days = (as_of - it.date).num_days().max(0);
         if days > line.max_days {
             line.max_days = days;
         }

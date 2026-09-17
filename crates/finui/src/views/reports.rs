@@ -132,8 +132,15 @@ impl ReportsView {
                         return;
                     }
                 };
-                let mut bq = BalanceQuery::range(from, to);
-                bq = bq.with_data_scope(&ctx.user().data_scope);
+                // 资产负债表第二列是"年初余额"：取数基准必须从会计年度 1 月起，
+                // 不能用用户选的 from（否则 5 月查表会把 5 月初当成"年初"）。
+                let (bq_from, subtitle) = if self.tab == Tab::Balance {
+                    (Period::new(to.year(), 1).unwrap_or(from), to.label())
+                } else {
+                    (from, format!("{} 至 {}", from.label(), to.label()))
+                };
+                let mut bq = BalanceQuery::range(bq_from, to);
+                bq = bq.with_user_scope(ctx.user());
                 let snap = match BalanceSnapshot::load(ctx.db(), &bq) {
                     Ok(s) => s,
                     Err(e) => {
@@ -142,7 +149,6 @@ impl ReportsView {
                     }
                 };
                 let company = ctx.db().options().company;
-                let subtitle = format!("{} 至 {}", from.label(), to.label());
                 let table = if self.tab == Tab::Balance {
                     fincore::report::render(
                         &def,

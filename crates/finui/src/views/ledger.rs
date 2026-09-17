@@ -114,7 +114,11 @@ impl LedgerView {
             from,
             to,
             posted_only: self.posted_only,
-        };
+            prepared_by: None,
+            code_from: None,
+            code_to: None,
+        }
+        .with_user_scope(ctx.user());
         match self.tab {
             Tab::Detail => {
                 self.detail = findb::balances::ledger(ctx.db(), ctx.chart(), &q).unwrap_or_default();
@@ -133,7 +137,7 @@ impl LedgerView {
         // 期初余额
         let snap = findb::balances::BalanceSnapshot::load(
             ctx.db(),
-            &BalanceQuery::range(from, from),
+            &BalanceQuery::range(from, from).with_user_scope(ctx.user()),
         );
         self.begin = match snap {
             Ok(s) => s.for_account(self.code.trim(), None).begin,

@@ -117,7 +117,7 @@ pub fn unit_set(db: &Db, u: &ItemUnit) -> DbResult<()> {
     db.conn().execute(
         "INSERT INTO item_unit(item,base_unit,alt_unit,factor) VALUES(?1,?2,?3,?4)
          ON CONFLICT(item) DO UPDATE SET base_unit=excluded.base_unit, alt_unit=excluded.alt_unit, factor=excluded.factor",
-        rusqlite::params![u.item, u.base_unit, u.alt_unit, u.factor.to_string()],
+        rusqlite::params![u.item, u.base_unit, u.alt_unit, crate::exact_param(u.factor)],
     )?;
     Ok(())
 }

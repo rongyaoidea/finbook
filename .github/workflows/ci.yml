@@ -5,14 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── 全量测试（workspace 单测 + findb 两端到端） ──────────────────────
+  # ── 全量测试（workspace 单测 + findb 两端到端 + 前端工具函数） ────────
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,19 +28,22 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      - name: 前端工具函数测试（node:test）
+        run: node --test crates/finweb/static/util.test.js
 
-  # ── lint（fincore/findb 零警告强制；UI 层允许既有 f32 警告但记录） ────
+  # ── lint（记录型：fincore/findb 收窄允许项；UI 层允许既有 f32 警告） ────
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy（fincore/findb，检查但不强制零警告）
+      - name: clippy（fincore/findb）
         run: cargo clippy -p fincore -p findb --all-targets -- -A clippy::too_many_arguments -A clippy::type_complexity -A clippy::large_enum_variant -A clippy::should_implement_trait -A clippy::field_reassign_with_default
       - name: clippy（全 workspace）
         run: cargo clippy --workspace --all-targets
@@ -41,12 +52,13 @@ jobs:
   build-linux:
     name: Build (Linux x64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build release
-        run: cargo build --release -p finbook -p finweb
+        run: cargo build --release --locked -p finbook -p finweb
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -59,6 +71,7 @@ jobs:
   build-windows:
     name: Build (Windows x64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,7 +81,7 @@ jobs:
       - name: 安装 mingw-w64
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - name: 交叉编译 release
-        run: cargo build --release --target x86_64-pc-windows-gnu -p finbook -p finweb
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu -p finbook -p finweb
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:

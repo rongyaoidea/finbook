@@ -539,6 +539,8 @@ fn import_begin_rows(
         skipped: 0,
         warnings: Vec::new(),
     };
+    // 整批导入同事务：中途任何数据库错误都整体回滚，不留"导了一半"的期初
+    let tx = db.write_tx()?;
     for (i, f) in rows.iter().enumerate() {
         let Some(line) = extract_begin_line(tmpl, f) else {
             continue; // 表头 / 说明行
@@ -556,8 +558,8 @@ fn import_begin_rows(
         // 校验科目
         match chart.get(&code) {
             Some(_) if chart.is_leaf(&code) => {
-                balances::upsert_begin(
-                    db,
+                balances::upsert_begin_on(
+                    &tx,
                     &BeginRow {
                         id: 0,
                         account_code: code.clone(),
@@ -589,6 +591,7 @@ fn import_begin_rows(
     if res.ok > 0 {
         db.log(who, "导入", "导入期初余额", &format!("成功 {} 条", res.ok))?;
     }
+    tx.commit()?;
     Ok(res)
 }
 
@@ -646,6 +649,8 @@ fn import_vouchers_rows(
     let mut pending: Option<Voucher> = None;
     // 当前待提交凭证对应的源凭证号（金蝶模板有；通用/用友无，恒为 None）
     let mut pending_no: Option<i32> = None;
+    // 整批导入同事务：中途任何数据库错误都整体回滚，不留"导了一半"的凭证
+    let tx = db.write_tx()?;
 
     // 收尾提交
     let flush = |v: &mut Option<Voucher>, res: &mut ImportResult, who: &str| -> DbResult<()> {
@@ -661,7 +666,7 @@ fn import_vouchers_rows(
                 res.skipped += 1;
                 return Ok(());
             }
-            match vouchers::save(db, &mut v) {
+            match vouchers::save_in(&tx, &mut v) {
                 Ok(_) => res.ok += 1,
                 Err(e) => {
                     res.warnings.push(format!("凭证 {} 导入失败：{e}", v.voucher_no()));
@@ -695,7 +700,7 @@ fn import_vouchers_rows(
             flush(&mut pending, &mut res, who)?;
             pending_no = line.no;
             let word = if line.word.trim().is_empty() { "记" } else { line.word.trim() };
-            let no = vouchers::next_no(db, period, word)?;
+            let no = vouchers::next_no_of(&tx, period, word)?;
             let mut v = Voucher::new(period, date, word.to_string(), no);
             v.source = VoucherSource::Import; // 导入后为未记账，与录入一致，核对后在期末处理批量记账
             pending = Some(v);
@@ -721,6 +726,7 @@ fn import_vouchers_rows(
     if res.ok > 0 {
         db.log(who, "导入", "导入凭证", &format!("成功 {} 张", res.ok))?;
     }
+    tx.commit()?;
     Ok(res)
 }
 

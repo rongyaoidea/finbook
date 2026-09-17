@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +30,8 @@ pub struct WebState {
     pub policy: PasswordPolicy,
     /// 登录限流（账号维度）
     pub login_limiter: LoginLimiter,
+    /// 登录限流（来源 IP 维度，防同一出口跨账号扫号）
+    pub login_ip_limiter: LoginLimiter,
     /// 平台身份库（全局账号 + 账套目录）
     pub realm: RealmDb,
     /// 用户自建账套的存放目录
@@ -64,6 +65,7 @@ impl WebState {
             sessions,
             policy,
             login_limiter: LoginLimiter::new(),
+            login_ip_limiter: LoginLimiter::with_max(LOGIN_IP_MAX_FAILURES),
             realm,
             books_dir,
             company: std::sync::RwLock::new(String::new()),
@@ -157,23 +159,33 @@ impl BookRegistry {
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// 窗口内允许的最大失败次数，超过则拒绝后续尝试直至窗口滑出
 const LOGIN_MAX_FAILURES: usize = 10;
+/// IP 维度窗口内允许的最大失败次数：同一出口（办公室 NAT / 反代）可能多人共用，
+/// 阈值放宽，只拦"一个来源持续扫号"，不误伤正常打错口令。
+pub const LOGIN_IP_MAX_FAILURES: usize = 50;
 /// 攒够这么多条目才做一次全局裁剪，摊薄扫描成本
 const LOGIN_SWEEP_MARK: usize = 1024;
 /// 限流表的账号数上界，超过直接清空
 const LOGIN_MAX_TRACKED: usize = 10_000;
 
-/// 登录限流：按账号做滑动窗口计数。
+/// 登录限流：按 key（账号 / 来源 IP）做滑动窗口计数。
 ///
 /// 单机内存实现——本服务为单机部署，进程重启即清零；对 WireGuard 等私有组网场景
 /// 主要作纵深防御（防授权设备被攻破后的账号爆破、防内部误操作），不追求跨实例一致性。
 pub struct LoginLimiter {
     inner: Mutex<HashMap<String, Vec<Instant>>>,
+    max_failures: usize,
 }
 
 impl LoginLimiter {
     pub fn new() -> Self {
+        Self::with_max(LOGIN_MAX_FAILURES)
+    }
+
+    /// 指定窗口内最大失败次数的限流器（窗口固定 15 分钟）
+    pub fn with_max(max_failures: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            max_failures,
         }
     }
 
@@ -191,7 +203,7 @@ impl LoginLimiter {
                 if v.is_empty() {
                     stale = true;
                     Ok(())
-                } else if v.len() >= LOGIN_MAX_FAILURES {
+                } else if v.len() >= self.max_failures {
                     // 窗口滑出到最早一次失败时，允许再次尝试
                     let wait = LOGIN_WINDOW.saturating_sub(now.duration_since(v[0]));
                     Err(wait.as_secs().max(1))
@@ -611,7 +623,8 @@ impl From<fincore::FinError> for AppError {
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        AppError::BadRequest(format!("文件操作失败：{e}"))
+        // 详情（含路径）只进服务端日志，不透给客户端
+        AppError::Internal(format!("文件操作失败：{e}"))
     }
 }
 
@@ -697,12 +710,12 @@ pub fn now_secs() -> i64 {
 
 /// 构造 Set-Cookie 头值
 pub fn cookie_header(token: &str, max_age_secs: i64) -> HeaderValue {
-    // 财务系统默认 Secure：仅 HTTPS 传输会话 Cookie。本地回环调试时浏览器
-    // 仍接受 localhost 上的 Secure Cookie；若确需明文 LAN 联调，显式设置
-    // FINWEB_SECURE_COOKIE=0。
+    // 默认不加 Secure：允许内网/HTTP/WireGuard 隧道等明文场景直接使用。
+    // 若前面挂了 HTTPS 反向代理并对外暴露，设置 FINWEB_SECURE_COOKIE=true
+    // 强制会话 Cookie 仅经 HTTPS 传输。
     let secure = std::env::var("FINWEB_SECURE_COOKIE")
         .map(|v| v != "0" && v != "false")
-        .unwrap_or(true);
+        .unwrap_or(false);
     let suffix = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
         "finbook_sid={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
@@ -734,11 +747,12 @@ pub fn parse_period(s: &str) -> Option<fincore::Period> {
 }
 
 /// 解析金额字符串（默认 0）
-pub fn parse_money(s: &str) -> fincore::Money {
-    match rust_decimal::Decimal::from_str(s.trim()) {
-        Ok(d) => fincore::Money::new(d),
-        Err(_) => fincore::Money::ZERO,
-    }
+/// 解析用户提交的金额：非法输入返回 400，不再静默归零（错值=0 会把
+/// 工资、收付款、库存调整等写错且无任何提示）。支持千分位/全角等惯例写法。
+pub fn parse_money_checked(s: &str) -> Result<fincore::Money, AppError> {
+    fincore::Money::parse(s).map_err(|_| {
+        AppError::bad_request(format!("金额格式不正确：{}", s.trim()))
+    })
 }
 
 #[cfg(test)]

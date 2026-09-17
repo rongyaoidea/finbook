@@ -356,13 +356,18 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 s.out_qty += r.qty.abs();
                 let c = cost.unwrap_or(Money::ZERO);
                 s.out_amount += c;
-                // 回写本期的出库成本
+                // 回写本期的出库成本（失败必须上抛：静默吞错会留下"汇总已改、流水未改"的错账）
                 if r.period.ymm() == period.ymm() {
-                    let _ = stock_update_amount(db, r.id, if s.out_qty.is_zero() {
-                        Money::ZERO
-                    } else {
-                        (c / r.qty.abs()).round2()
-                    }, c);
+                    stock_update_amount(
+                        db,
+                        r.id,
+                        if s.out_qty.is_zero() {
+                            Money::ZERO
+                        } else {
+                            (c / r.qty.abs()).round2()
+                        },
+                        c,
+                    )?;
                 }
             }
         }
@@ -691,7 +696,12 @@ pub fn payroll_get(db: &Db, period: Period, employee: &str) -> DbResult<Option<P
 
 /// 新增或覆盖某员工某期工资（UNIQUE(period,employee)）
 pub fn payroll_upsert(db: &Db, p: &Payroll) -> DbResult<i64> {
-    db.conn().execute(
+    payroll_upsert_on(db.conn(), p)
+}
+
+/// 同 `payroll_upsert`，但只依赖连接，可在调用方的事务内执行（批量生成整体原子）
+pub fn payroll_upsert_on(conn: &rusqlite::Connection, p: &Payroll) -> DbResult<i64> {
+    conn.execute(
         "INSERT INTO payroll(period,employee,dept,gross,social,housing,deduction,additional,
              tax_base,tax,net,social_co,housing_co,voucher_id,memo)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
@@ -705,22 +715,22 @@ pub fn payroll_upsert(db: &Db, p: &Payroll) -> DbResult<i64> {
             p.period.ymm(),
             p.employee,
             p.dept,
-            p.gross.to_string(),
-            p.social.to_string(),
-            p.housing.to_string(),
-            p.deduction.to_string(),
-            p.additional.to_string(),
-            p.tax_base.to_string(),
-            p.tax.to_string(),
-            p.net.to_string(),
-            p.social_co.to_string(),
-            p.housing_co.to_string(),
+            crate::money_param(p.gross),
+            crate::money_param(p.social),
+            crate::money_param(p.housing),
+            crate::money_param(p.deduction),
+            crate::money_param(p.additional),
+            crate::money_param(p.tax_base),
+            crate::money_param(p.tax),
+            crate::money_param(p.net),
+            crate::money_param(p.social_co),
+            crate::money_param(p.housing_co),
             p.voucher_id,
             p.memo
         ],
     )?;
     // 冲突更新时 last_insert_rowid 不保证，回查一次
-    let id: i64 = db.conn().query_row(
+    let id: i64 = conn.query_row(
         "SELECT id FROM payroll WHERE period=?1 AND employee=?2",
         rusqlite::params![p.period.ymm(), p.employee],
         |r| r.get(0),
@@ -843,14 +853,17 @@ pub fn payroll_generate(
     rows: &[(String, String, Money, Money, Money, Money, Money, Money, Money)],
     // (employee, dept, gross, social, housing, deduction, additional, social_co, housing_co)
 ) -> DbResult<usize> {
+    // 整批同事务：中途失败整体回滚，避免"工资表生成了一半"
+    let tx = db.write_tx()?;
     let mut n = 0;
     for (emp, dept, gross, social, housing, ded, add, sco, hco) in rows {
         let p = payroll_calc(
             db, period, emp, dept, *gross, *social, *housing, *ded, *add, *sco, *hco, "",
         )?;
-        payroll_upsert(db, &p)?;
+        payroll_upsert_on(&tx, &p)?;
         n += 1;
     }
+    tx.commit()?;
     Ok(n)
 }
 
@@ -1251,7 +1264,7 @@ pub fn claim_insert(db: &Db, c: &Claim) -> DbResult<i64> {
             c.applicant,
             c.dept,
             c.reason,
-            c.amount.to_string(),
+            crate::money_param(c.amount),
             c.status.code(),
             serde_json::to_string(&c.items)?,
             c.approver,
@@ -1285,7 +1298,7 @@ fn claim_update_cas(db: &Db, c: &Claim, expect_status: Option<ClaimStatus>) -> D
             c.applicant,
             c.dept,
             c.reason,
-            c.amount.to_string(),
+            crate::money_param(c.amount),
             c.status.code(),
             serde_json::to_string(&c.items)?,
             c.approver,

@@ -51,7 +51,7 @@ impl MultiColumnView {
         self.dirty = false;
         let cols = self.cols();
         if self.main.trim().is_empty() || cols.is_empty() { self.rows.clear(); return; }
-        match advanced::multi_column_table(ctx.db(), self.main.trim(), &cols, p, p) {
+        match advanced::multi_column_table(ctx.db(), self.main.trim(), &cols, p, p, Some(ctx.user())) {
             Ok(rows) => self.rows = rows,
             Err(e) => { ctx.error(e.to_string()); self.rows.clear(); }
         }

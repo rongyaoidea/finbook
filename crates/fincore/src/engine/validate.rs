@@ -60,6 +60,30 @@ pub fn validate_voucher(v: &Voucher, ctx: &ValidateCtx) -> Issues {
 pub fn validate_for_save(v: &Voucher, ctx: &ValidateCtx) -> Issues {
     let mut iss = Issues::new();
 
+    // 0) 金额/数量量级上限：rust_decimal 的加、乘溢出会直接 panic，
+    //    必须早于 balanced()/合计等任何运算，拦住极端输入。
+    let max_money = Money::parse("999999999999999.99").unwrap_or(Money::ZERO);
+    let max_qty = Money::parse("999999999.999999").unwrap_or(Money::ZERO);
+    let max_price = Money::parse("999999999.99").unwrap_or(Money::ZERO);
+    let mut over_limit = false;
+    for e in &v.entries {
+        if e.debit.abs() > max_money || e.credit.abs() > max_money {
+            over_limit = true;
+        }
+        if e.qty.map(|q| q.abs() > max_qty).unwrap_or(false)
+            || e.price.map(|p| p.abs() > max_price).unwrap_or(false)
+        {
+            over_limit = true;
+        }
+    }
+    if over_limit {
+        iss.push(format!(
+            "金额或数量超出系统上限（金额最大 {}，数量/单价最大 999,999,999）",
+            max_money.fmt_money()
+        ));
+        return iss;
+    }
+
     // 1. 期间锁定
     if let Some(upto) = ctx.closed_upto {
         if v.period <= upto {

@@ -740,20 +740,43 @@ impl PayrollView {
             self.err = "请填写员工编码".to_string();
             return;
         }
-        let money = |s: &str| Money::parse_or_zero(s).round2();
+        // 金额不合法必须报错，不能静默按 0 保存（应发 0 会直接算错个税与实发）
+        let money = |s: &str| -> Result<Money, String> {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(Money::ZERO);
+            }
+            Money::parse(t)
+                .map(|m| m.round2())
+                .map_err(|_| format!("金额格式不正确：{t}"))
+        };
+        let parsed: Result<Vec<Money>, String> = [
+            &d.gross, &d.social, &d.housing, &d.deduction, &d.additional, &d.social_co,
+            &d.housing_co,
+        ]
+        .iter()
+        .map(|s| money(s))
+        .collect();
+        let vals = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                self.err = e;
+                return;
+            }
+        };
         // 税额不让界面自己算：payroll_calc 会带上本年累计数，用累计预扣法算
         let r = business::payroll_calc(
             ctx.db(),
             p,
             d.employee.trim(),
             d.dept.trim(),
-            money(&d.gross),
-            money(&d.social),
-            money(&d.housing),
-            money(&d.deduction),
-            money(&d.additional),
-            money(&d.social_co),
-            money(&d.housing_co),
+            vals[0],
+            vals[1],
+            vals[2],
+            vals[3],
+            vals[4],
+            vals[5],
+            vals[6],
             d.memo.trim(),
         );
         match r.and_then(|x| business::payroll_upsert(ctx.db(), &x).map(|_| x)) {

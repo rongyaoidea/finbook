@@ -249,7 +249,12 @@ pub fn insert(db: &Db, a: &Asset) -> DbResult<i64> {
 }
 
 pub fn update(db: &Db, a: &Asset) -> DbResult<()> {
-    db.conn().execute(
+    update_on(db.conn(), a)
+}
+
+/// 同 `update`，但只依赖连接，可在调用方的事务内执行
+pub fn update_on(conn: &rusqlite::Connection, a: &Asset) -> DbResult<()> {
+    conn.execute(
         "UPDATE fixed_asset SET code=?2,name=?3,category=?4,spec=?5,dept=?6,asset_account=?7,
             dep_account=?8,expense_account=?9,original_value=?10,residual_rate=?11,life_months=?12,
             method=?13,start_period=?14,disposed_period=?15,dispose_amount=?16,status=?17,
@@ -356,9 +361,9 @@ pub fn dep_upsert(db: &Db, r: &DepRecord) -> DbResult<()> {
         rusqlite::params![
             r.asset_id,
             r.period.ymm(),
-            r.amount.to_string(),
-            r.accum.to_string(),
-            r.net_value.to_string(),
+            crate::money_param(r.amount),
+            crate::money_param(r.accum),
+            crate::money_param(r.net_value),
             r.voucher_id
         ],
     )?;
@@ -440,7 +445,7 @@ pub fn ledger(db: &Db, at: Period) -> DbResult<Vec<AssetLedgerRow>> {
     Ok(out)
 }
 
-/// 资产清理：标记状态并删除清理期之后的折旧记录
+/// 资产清理：标记状态并删除清理期之后的折旧记录（同一事务，避免半更新）
 pub fn dispose(db: &Db, id: i64, period: Period, amount: Money) -> DbResult<()> {
     let mut a = match get(db, id)? {
         Some(a) => a,
@@ -449,11 +454,13 @@ pub fn dispose(db: &Db, id: i64, period: Period, amount: Money) -> DbResult<()> 
     a.status = AssetStatus::Disposed;
     a.disposed_period = Some(period);
     a.dispose_amount = Some(amount);
-    update(db, &a)?;
-    db.conn().execute(
+    let tx = db.write_tx()?;
+    update_on(&tx, &a)?;
+    tx.execute(
         "DELETE FROM asset_depreciation WHERE asset_id=?1 AND period>?2",
         rusqlite::params![id, period.ymm()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -486,7 +493,7 @@ pub fn impair(db: &Db, asset_id: i64, period: Period, amount: Money, memo: &str)
     }
     db.conn().execute(
         "INSERT INTO asset_impairment(asset_id,period,amount,memo) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![asset_id, period.ymm(), amount.to_string(), memo],
+        rusqlite::params![asset_id, period.ymm(), crate::money_param(amount), memo],
     )?;
     Ok(db.conn().last_insert_rowid())
 }

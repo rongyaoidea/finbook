@@ -189,9 +189,11 @@ pub fn build_cash_flow(
             continue;
         }
         let (dr, cr) = amounts.get(&it.code).copied().unwrap_or((Money::ZERO, Money::ZERO));
+        // 保留红字冲回的符号（流入项目出现净流出时为负数），不能用零截断：
+        // 截断会让表内净额与货币资金实际变动对不上，红字冲回被凭空抹掉。
         let (inflow, outflow) = match it.dir {
-            CashFlowDirection::In => (dr.saturating_sub(cr), Money::ZERO),
-            CashFlowDirection::Out => (Money::ZERO, cr.saturating_sub(dr)),
+            CashFlowDirection::In => (dr - cr, Money::ZERO),
+            CashFlowDirection::Out => (Money::ZERO, cr - dr),
         };
         groups.entry(it.group).or_default().push(CashFlowLine {
             code: it.code.clone(),
@@ -223,21 +225,6 @@ pub fn build_cash_flow(
         begin_cash,
         end_cash,
         unassigned,
-    }
-}
-
-// Money 没有 saturating_sub，这里补一个语义等价的小工具
-trait SaturatingSub {
-    fn saturating_sub(self, rhs: Self) -> Self;
-}
-impl SaturatingSub for Money {
-    fn saturating_sub(self, rhs: Self) -> Self {
-        let v = self - rhs;
-        if v.is_negative() {
-            Money::ZERO
-        } else {
-            v
-        }
     }
 }
 

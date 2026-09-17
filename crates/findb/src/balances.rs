@@ -557,7 +557,12 @@ pub fn list_begin(db: &Db) -> DbResult<Vec<BeginRow>> {
 
 /// 写入 / 更新一条期初余额（按 科目+辅助核算 唯一）
 pub fn upsert_begin(db: &Db, r: &BeginRow) -> DbResult<()> {
-    db.conn().execute(
+    upsert_begin_on(db.conn(), r)
+}
+
+/// 同 `upsert_begin`，但只依赖连接，可在调用方的事务内执行（导入整体原子化）
+pub fn upsert_begin_on(conn: &rusqlite::Connection, r: &BeginRow) -> DbResult<()> {
+    conn.execute(
         "INSERT INTO begin_balance(account_code,aux_key,aux_json,year_begin,debit_accum,credit_accum,qty_begin)
          VALUES(?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(account_code,aux_key) DO UPDATE SET
@@ -612,19 +617,50 @@ pub struct LedgerQuery {
     pub to: Period,
     /// 只显示已记账凭证
     pub posted_only: bool,
+    /// 仅本人填制的凭证（own_voucher_only，由 with_user_scope 填充）
+    pub prepared_by: Option<String>,
+    /// 数据范围科目区间（由 with_user_scope 填充）
+    pub code_from: Option<String>,
+    pub code_to: Option<String>,
+}
+
+impl LedgerQuery {
+    /// 套用用户完整数据范围：科目区间 + "仅本人填制的凭证"。
+    /// Web/桌面调用方都应使用，避免配置了范围却看到全量的静默越权。
+    pub fn with_user_scope(mut self, user: &fincore::user::User) -> Self {
+        let s = &user.data_scope;
+        if s.own_voucher_only {
+            self.prepared_by = Some(user.username.clone());
+        }
+        let lo = s.account_from.trim();
+        let hi = s.account_to.trim();
+        if !lo.is_empty() {
+            self.code_from = Some(lo.to_string());
+        }
+        if !hi.is_empty() {
+            self.code_to = Some(hi.to_string());
+        }
+        self
+    }
+
+    /// 数据范围是否为空（无任何限制）
+    pub fn scope_unrestricted(&self) -> bool {
+        self.prepared_by.is_none() && self.code_from.is_none() && self.code_to.is_none()
+    }
 }
 
 /// 明细账：逐笔滚动余额
 pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow>> {
-    let snap = BalanceSnapshot::load(
-        db,
-        &BalanceQuery {
-            from: q.from,
-            to: q.to,
-            posted_only: q.posted_only,
-            ..BalanceQuery::period(q.from)
-        },
-    )?;
+    let mut bq = BalanceQuery {
+        from: q.from,
+        to: q.to,
+        posted_only: q.posted_only,
+        ..BalanceQuery::period(q.from)
+    };
+    bq.prepared_by = q.prepared_by.clone();
+    bq.code_from = q.code_from.clone();
+    bq.code_to = q.code_to.clone();
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let mut running = snap.for_account(&q.code, q.aux.as_ref()).begin;
     let mut qty_running = snap
         .for_account(&q.code, q.aux.as_ref())
@@ -633,21 +669,39 @@ pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow
         .unwrap_or(Money::ZERO);
 
     let pattern = if q.include_children {
-        format!("{}%", q.code)
+        format!("{}%", crate::escape_like(&q.code))
     } else {
-        q.code.clone()
+        crate::escape_like(&q.code)
     };
     // 记录即进表：无论是否勾选"只含已记账"，账簿都只排除作废凭证
-    let status_filter = " AND v.status != 'void'";
-    let sql = format!(
+    let mut sql = String::from(
         "SELECT v.period, v.date, v.id, v.word, v.no, e.line, e.summary, e.account_code,
                 e.aux_json, e.debit, e.credit, e.qty, v.status
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3 {status_filter}
-         ORDER BY v.date, v.word, v.no, e.line"
+         WHERE e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3 ESCAPE '\\'
+           AND v.status != 'void'",
     );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(q.from.ymm()),
+        Box::new(q.to.ymm()),
+        Box::new(pattern),
+    ];
+    if let Some(who) = &q.prepared_by {
+        params.push(Box::new(who.clone()));
+        sql.push_str(&format!(" AND v.prepared_by = ?{}", params.len()));
+    }
+    if let Some(f) = &q.code_from {
+        params.push(Box::new(f.clone()));
+        sql.push_str(&format!(" AND e.account_code >= ?{}", params.len()));
+    }
+    if let Some(t) = &q.code_to {
+        params.push(Box::new(t.clone()));
+        sql.push_str(&format!(" AND e.account_code <= ?{}", params.len()));
+    }
+    sql.push_str(" ORDER BY v.date, v.word, v.no, e.line");
     let mut stmt = db.conn().prepare(&sql)?;
-    let mut rows = stmt.query(rusqlite::params![q.from.ymm(), q.to.ymm(), pattern])?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
 
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
@@ -706,30 +760,51 @@ pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow
 
 /// 总账：按期间汇总
 pub fn general_ledger(db: &Db, q: &LedgerQuery) -> DbResult<Vec<GeneralLedgerRow>> {
-    let snap = BalanceSnapshot::load(
-        db,
-        &BalanceQuery {
-            from: q.from,
-            to: q.to,
-            posted_only: q.posted_only,
-            ..BalanceQuery::period(q.from)
-        },
-    )?;
+    let mut bq = BalanceQuery {
+        from: q.from,
+        to: q.to,
+        posted_only: q.posted_only,
+        ..BalanceQuery::period(q.from)
+    };
+    bq.prepared_by = q.prepared_by.clone();
+    bq.code_from = q.code_from.clone();
+    bq.code_to = q.code_to.clone();
+    let snap = BalanceSnapshot::load(db, &bq)?;
     let mut running = snap.for_account(&q.code, q.aux.as_ref()).begin;
 
     let pattern = if q.include_children {
-        format!("{}%", q.code)
+        format!("{}%", crate::escape_like(&q.code))
     } else {
-        q.code.clone()
+        crate::escape_like(&q.code)
     };
     // 按期间聚合，金额在 Rust 侧累加
     let mut acc: BTreeMap<i32, (Money, Money)> = BTreeMap::new();
-    let mut stmt = db.conn().prepare(
+    let mut sql = String::from(
         "SELECT e.period, e.debit, e.credit, e.aux_json
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![q.from.ymm(), q.to.ymm(), pattern])?;
+         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+           AND e.account_code LIKE ?3 ESCAPE '\\'",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(q.from.ymm()),
+        Box::new(q.to.ymm()),
+        Box::new(pattern),
+    ];
+    if let Some(who) = &q.prepared_by {
+        params.push(Box::new(who.clone()));
+        sql.push_str(&format!(" AND v.prepared_by = ?{}", params.len()));
+    }
+    if let Some(f) = &q.code_from {
+        params.push(Box::new(f.clone()));
+        sql.push_str(&format!(" AND e.account_code >= ?{}", params.len()));
+    }
+    if let Some(t) = &q.code_to {
+        params.push(Box::new(t.clone()));
+        sql.push_str(&format!(" AND e.account_code <= ?{}", params.len()));
+    }
+    let mut stmt = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
     while let Some(r) = rows.next()? {
         let aux_json: String = r.get(3)?;
         let aux: AuxRef = serde_json::from_str(&aux_json).unwrap_or_default();
@@ -1028,6 +1103,9 @@ mod tests {
                 from: p,
                 to: p,
                 posted_only: true,
+                prepared_by: None,
+                code_from: None,
+                code_to: None,
             },
         )
         .unwrap();
@@ -1057,6 +1135,9 @@ mod tests {
                 from: p,
                 to: p,
                 posted_only: true,
+                prepared_by: None,
+                code_from: None,
+                code_to: None,
             },
         )
         .unwrap();

@@ -14,7 +14,7 @@
                                                         └── books/*.fbk  用户自建账套（每套一个 SQLite 文件，WAL 模式）
 ```
 
-- **finweb**：Axum HTTP 服务，默认监听 `0.0.0.0:8080`（生产建议 `127.0.0.1:8080` + 反向代理）
+- **finweb**：Axum HTTP 服务，默认监听 `127.0.0.1:8080`（裸跑不对外；Docker 镜像内置 `0.0.0.0:8080`，但只应映射到回环再经反代）
 - **多租户**：所有用户共用一套 `realm.db`（平台账号、账套目录）；每个账套是 `books/` 下的独立 `.fbk` 文件，账套之间彼此隔离
 - **多用户**：同一服务器上多浏览器同时登录同一账套，由 WAL + `busy_timeout=5s` 保证并发安全
 - **会话**：登录态存**服务进程内存**（见 §7 限制），部署时务必保持单进程
@@ -48,7 +48,11 @@
    ```bash
    sudo useradd --system --home /opt/finbook --shell /usr/sbin/nologin finbook
    sudo mkdir -p /opt/finbook/data
-   sudo chown -R finbook:finbook /opt/finbook
+   # 数据目录归运行用户；二进制/静态资源保持 root 只读，防服务被攻破后篡改自身
+   sudo chown -R finbook:finbook /opt/finbook/data
+   sudo chown -R root:root /opt/finbook/finweb /opt/finbook/static
+   sudo chmod 755 /opt/finbook/finweb
+   sudo chmod -R a-w /opt/finbook/finweb /opt/finbook/static
    sudo cp deploy/finweb.service /etc/systemd/system/
    sudo systemctl daemon-reload && sudo systemctl enable --now finweb
    ```
@@ -92,14 +96,23 @@ server {
     ssl_certificate     /etc/letsencrypt/live/finance.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/finance.example.com/privkey.pem;
 
+    # 导入 Excel 走 base64 JSON，按需放宽（后端上限约 2MB 请求体 + 10MB 附件）
+    client_max_body_size 12m;
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        # 会话 cookie 仅随导航请求携带，SSE/长连接场景不需要关缓冲
-        proxy_buffering off;
+        # 报表/导入/备份可能较慢，默认 60s 易被截断
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        # 常见安全响应头（应用侧未内置）
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy same-origin always;
+        add_header X-Frame-Options DENY always;
     }
 }
 
@@ -120,7 +133,7 @@ finance.example.com {
 
 > 证书建议用 Let's Encrypt（certbot 或 caddy 自动签发）。纯 HTTPS 部署时把
 > `FINWEB_SECURE_COOKIE` 设为 `true`，会话 Cookie 会带 `Secure` 标记；
-> 同时确保浏览器访问地址始终是 `https://`。
+> 同时确保浏览器访问地址始终是 `https://`。内网/WireGuard 明文访问时保持默认关闭。
 
 ## 6. 备份策略（必须）
 
@@ -130,23 +143,37 @@ finance.example.com {
 |---|---|---|
 | 平台身份库 | `realm.db` | 平台账号、账套目录（不含账套业务数据） |
 | 账套库 | `books/*.fbk` | 每个账套一个文件（业务数据全部在此） |
-| 外置附件 | 各账套同目录 `.attachments/` | 大于 256KB 的附件落盘，备份时必须一起打包 |
+| 应用内备份 | `books/backups/*.fbk` | Web 端「备份」功能产出的副本（若使用过） |
+| 外置附件 | 各账套同目录 `.attachments/` | 大于 256KB 的附件落盘，备份时必须一起打包（桌面端） |
 
-- **热备**（finweb 运行时可以直接执行）：
+- **热备**（finweb 运行时可以直接执行，需主机安装 sqlite3）：
   ```bash
+  set -euo pipefail
+  BK=/backup/$(date +%F_%H%M)
+  mkdir -p "$BK/books"
   # 账套：VACUUM INTO 产出紧凑副本，不影响运行
   for f in /opt/finbook/data/books/*.fbk; do
+    [ -e "$f" ] || continue
     key=$(basename "$f" .fbk)
-    sqlite3 "$f" "VACUUM INTO '/backup/books/${key}-$(date +%F).fbk'"
+    sub="$BK/books/$key"
+    mkdir -p "$sub"
+    sqlite3 "$f" "VACUUM INTO '$sub/$key.fbk'"
+    # 附件随账套分目录保存，避免不同账套同名文件互相覆盖
+    if [ -d "$(dirname "$f")/.attachments" ]; then
+      cp -a "$(dirname "$f")/.attachments" "$sub/.attachments"
+    fi
   done
   # 平台身份库：同样用 VACUUM INTO（realm.db 是 SQLite）
-  sqlite3 /opt/finbook/data/realm.db "VACUUM INTO '/backup/realm-$(date +%F).db'"
-  # 附件目录
-  rsync -a /opt/finbook/data/books/*/.attachments/ /backup/attachments/ 2>/dev/null || true
+  sqlite3 /opt/finbook/data/realm.db "VACUUM INTO '$BK/realm.db'"
   ```
-- **冷备**：`systemctl stop finweb` 后直接 `cp -a /opt/finbook/data` 整个目录。
-- **轮转建议**：每日全量 + 保留 30 天（cron 脚本按上例组织）。
-- 恢复：停止 finweb → 用备份覆盖 `realm.db` 与 `books/`（注意与附件目录配对）→ 启动。
+- **冷备**：`systemctl stop finweb` 后直接 `cp -a /opt/finbook/data /backup/cold-$(date +%F)` 整个目录。
+- **轮转建议**：每日全量 + 保留 30 天（cron 脚本按上例组织；同日重跑前先清理旧目录）。
+- **恢复（务必按顺序）**：
+  1. `systemctl stop finweb`（或停容器）
+  2. 用备份覆盖 `realm.db`
+  3. 把 `<key>.fbk` 按原文件名放回 `books/<key>.fbk`（应用内备份目录 `books/backups/` 同理）
+  4. 把各账套附件放回对应账套目录 `.attachments/`
+  5. 启动服务，抽查登录与账套数据（列表/报表）
 
 > ⚠️ 不要把 `realm.db` / `books/` 放在 NFS/SMB 网络盘被多台电脑并发直开（WAL 在网络文件系统上不稳定）。
 > 多用户请统一走「服务器本机运行 + 浏览器访问」模式。

@@ -81,6 +81,24 @@ pub fn close(db: &Db, p: Period, who: &str, require_carry: bool) -> DbResult<Vec
 
     // 写操作进同一事务：结账标记与操作日志要么一起落库，要么一起回滚。
     let tx = db.write_tx()?;
+    // 事务内复核：上面的检查跑在事务外，检查与落库之间可能有人补录凭证或并发结账。
+    // BEGIN IMMEDIATE 保证复核后不会再被写事务插队。
+    let unposted_now: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM voucher WHERE period=?1 AND status IN ('draft','audited')",
+        rusqlite::params![p.ymm()],
+        |r| r.get(0),
+    )?;
+    if unposted_now > 0 {
+        return Ok(vec![format!(
+            "{} 还有 {unposted_now} 张未记账凭证，请先记账后再结账",
+            p.label()
+        )]);
+    }
+    if let Some(upto) = closed_upto_of(&tx)? {
+        if p <= upto {
+            return Ok(vec![format!("{} 及以前期间已结账", p.label())]);
+        }
+    }
     tx.execute(
         "INSERT INTO period_state(period,closed,closed_at,closed_by)
          VALUES(?1,1,?2,?3)
@@ -99,9 +117,9 @@ pub fn close(db: &Db, p: Period, who: &str, require_carry: bool) -> DbResult<Vec
 
 /// 反结账。这是敏感操作，需要记录是谁做的。
 pub fn unclose(db: &Db, p: Period, who: &str) -> DbResult<()> {
-    let iss = fincore::engine::check_can_unclose(p, closed_upto(db)?);
-    iss.into_result()?;
     let tx = db.write_tx()?;
+    // 复核放在事务内：check_can_unclose 依赖结账线，事务外读会与并发结账竞争
+    fincore::engine::check_can_unclose(p, closed_upto_of(&tx)?).into_result()?;
     tx.execute(
         "UPDATE period_state SET closed=0, closed_at=NULL, closed_by=NULL WHERE period=?1",
         rusqlite::params![p.ymm()],

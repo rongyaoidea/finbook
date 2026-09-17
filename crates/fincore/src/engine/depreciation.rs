@@ -97,6 +97,10 @@ impl DepInput {
         if self.life_months <= 0 {
             return Err(FinError::msg("预计使用月数必须大于 0"));
         }
+        // 上限防止超大年限导致折旧计划表内存暴涨（最长 100 年）
+        if self.life_months > 1200 {
+            return Err(FinError::msg("预计使用月数不能超过 1200（100 年）"));
+        }
         if self.original.is_negative() {
             return Err(FinError::msg("资产原值不能为负"));
         }

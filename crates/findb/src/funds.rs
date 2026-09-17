@@ -173,7 +173,7 @@ pub fn bill_save(db: &Db, b: &mut Bill) -> DbResult<i64> {
                 b.id, b.kind, b.no,
                 b.issue_date.format("%Y-%m-%d").to_string(),
                 b.due_date.format("%Y-%m-%d").to_string(),
-                b.status, b.period.ymm(), b.counterpart, b.bank, b.amount.to_string(),
+                b.status, b.period.ymm(), b.counterpart, b.bank, crate::money_param(b.amount),
                 b.handled_date.map(|d| d.format("%Y-%m-%d").to_string()), b.memo
             ],
         )?;
@@ -187,7 +187,7 @@ pub fn bill_save(db: &Db, b: &mut Bill) -> DbResult<i64> {
                 b.kind, b.no,
                 b.issue_date.format("%Y-%m-%d").to_string(),
                 b.due_date.format("%Y-%m-%d").to_string(),
-                b.status, b.period.ymm(), b.counterpart, b.bank, b.amount.to_string(),
+                b.status, b.period.ymm(), b.counterpart, b.bank, crate::money_param(b.amount),
                 b.handled_date.map(|d| d.format("%Y-%m-%d").to_string()), b.memo,
                 b.created_by, now()
             ],
@@ -315,7 +315,7 @@ pub fn loan_save(db: &Db, l: &mut Loan) -> DbResult<i64> {
             "UPDATE loan SET kind=?2, no=?3, bank=?4, principal=?5, start_date=?6, end_date=?7,
              status=?8, rate_pct=?9, memo=?10 WHERE id=?1",
             rusqlite::params![
-                l.id, l.kind, l.no, l.bank, l.principal.to_string(),
+                l.id, l.kind, l.no, l.bank, crate::money_param(l.principal),
                 l.start_date.format("%Y-%m-%d").to_string(),
                 l.end_date.format("%Y-%m-%d").to_string(),
                 l.status, crate::exact_param(l.rate_pct), l.memo
@@ -327,7 +327,7 @@ pub fn loan_save(db: &Db, l: &mut Loan) -> DbResult<i64> {
             "INSERT INTO loan(kind,no,bank,principal,start_date,end_date,status,rate_pct,memo,created_by,created_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             rusqlite::params![
-                l.kind, l.no, l.bank, l.principal.to_string(),
+                l.kind, l.no, l.bank, crate::money_param(l.principal),
                 l.start_date.format("%Y-%m-%d").to_string(),
                 l.end_date.format("%Y-%m-%d").to_string(),
                 l.status, crate::exact_param(l.rate_pct), l.memo, l.created_by, now()

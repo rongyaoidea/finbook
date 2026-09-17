@@ -48,6 +48,15 @@ impl Row {
     }
 }
 
+/// 未保存修改确认后的载入目标
+#[derive(Clone, Copy)]
+enum PendingLoad {
+    /// 载入一张空白新凭证
+    New,
+    /// 重新载入指定凭证
+    Existing(i64),
+}
+
 pub struct VoucherEdit {
     pub id: i64,
     pub status: VoucherStatus,
@@ -61,6 +70,10 @@ pub struct VoucherEdit {
     pub rows: Vec<Row>,
     pub loaded: bool,
     pub dirty: bool,
+    /// 载入/保存时的表单指纹：与当前不一致即视为有未保存修改
+    loaded_sig: u64,
+    /// 有未保存修改时，等待用户选择是否放弃
+    confirm_discard: Option<PendingLoad>,
     pub picker: AccountPickerState,
     /// 正在编辑辅助核算的行号
     pub aux_row: Option<usize>,
@@ -89,6 +102,8 @@ impl Default for VoucherEdit {
             rows: Vec::new(),
             loaded: false,
             dirty: false,
+            loaded_sig: 0,
+            confirm_discard: None,
             picker: AccountPickerState::default(),
             aux_row: None,
             print_open: false,
@@ -103,6 +118,48 @@ impl Default for VoucherEdit {
 impl VoucherEdit {
     pub fn invalidate(&mut self) {
         self.loaded = false;
+    }
+
+    /// 表单指纹：用于判断是否有未保存的修改（切换页面/期间/凭证前确认）
+    fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut h);
+        format!("{:?}", self.status).hash(&mut h);
+        self.period.ymm().hash(&mut h);
+        self.date.hash(&mut h);
+        self.word.hash(&mut h);
+        self.no.hash(&mut h);
+        self.attachments.hash(&mut h);
+        self.memo.hash(&mut h);
+        for r in &self.rows {
+            r.summary.hash(&mut h);
+            r.code.hash(&mut h);
+            r.debit.hash(&mut h);
+            r.credit.hash(&mut h);
+            r.qty.hash(&mut h);
+            r.price.hash(&mut h);
+            r.cf.hash(&mut h);
+            r.aux.key().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn has_unsaved(&self) -> bool {
+        self.loaded_sig != self.signature()
+    }
+
+    /// 请求载入：有未保存修改时先弹确认条，不静默丢弃
+    fn request_load(&mut self, ctx: &mut AppCtx<'_>, target: PendingLoad) {
+        if self.has_unsaved() {
+            self.confirm_discard = Some(target);
+        } else {
+            self.confirm_discard = None;
+            match target {
+                PendingLoad::New => self.load(ctx, None),
+                PendingLoad::Existing(id) => self.load(ctx, Some(id)),
+            }
+        }
     }
 
     /// 载入凭证；id 为 None 表示新建
@@ -168,6 +225,8 @@ impl VoucherEdit {
         }
         self.loaded = true;
         self.dirty = false;
+        self.loaded_sig = self.signature();
+        self.confirm_discard = None;
     }
 
     fn new_voucher(&mut self, ctx: &mut AppCtx<'_>) {
@@ -462,7 +521,7 @@ impl VoucherEdit {
     fn reload_after(&mut self, ctx: &mut AppCtx<'_>) {
         let id = self.id;
         if id > 0 {
-            self.load(ctx, Some(id));
+            self.request_load(ctx, PendingLoad::Existing(id));
         }
     }
 
@@ -507,9 +566,39 @@ impl VoucherEdit {
     // 界面
     // ------------------------------------------------------------------
     pub fn show(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        // 外部失效（切期间/切页面）时若表单有未保存修改，先让用户确认
+        if !self.loaded && self.confirm_discard.is_none() && self.has_unsaved() {
+            self.confirm_discard = Some(PendingLoad::New);
+        }
+        if let Some(target) = self.confirm_discard {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    palette::WARN,
+                    "当前凭证有未保存的修改，继续将丢失这些内容。",
+                );
+                if ui.button("放弃修改").clicked() {
+                    self.confirm_discard = None;
+                    match target {
+                        PendingLoad::New => self.load(ctx, None),
+                        PendingLoad::Existing(id) => self.load(ctx, Some(id)),
+                    }
+                }
+                if ui.button("继续编辑").clicked() {
+                    self.confirm_discard = None;
+                    // 保留当前编辑内容：把表单标记为已载入，避免下一帧被重新加载覆盖
+                    self.loaded = true;
+                }
+            });
+            ui.separator();
+            // 等用户选择期间不渲染编辑表单，避免"看起来还能改"
+            if self.confirm_discard.is_some() {
+                return;
+            }
+        }
         if !self.loaded {
             self.load(ctx, None);
         }
+        self.dirty = self.has_unsaved();
         let readonly = !self.status.can_edit();
         let ectx = ui.ctx().clone();
 
@@ -535,7 +624,7 @@ impl VoucherEdit {
             }
             ui.separator();
             if ui.button("新增").clicked() {
-                self.load(ctx, None);
+                self.request_load(ctx, PendingLoad::New);
             }
             if ui.button("增行").clicked() && !readonly {
                 self.rows.push(Row::default());
@@ -1131,7 +1220,7 @@ impl VoucherEdit {
             }
         };
         let id = list[next].id;
-        self.load(ctx, Some(id));
+        self.request_load(ctx, PendingLoad::Existing(id));
     }
 }
 

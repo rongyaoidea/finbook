@@ -185,7 +185,7 @@ pub struct PoPayment {
 pub fn po_payment_add(db: &Db, p: &PoPayment) -> DbResult<i64> {
     db.conn().execute(
         "INSERT INTO po_payment(po_id,period,date,amount,memo) VALUES(?1,?2,?3,?4,?5)",
-        rusqlite::params![p.po_id, p.period.ymm(), p.date.format("%Y-%m-%d").to_string(), p.amount.to_string(), p.memo],
+        rusqlite::params![p.po_id, p.period.ymm(), p.date.format("%Y-%m-%d").to_string(), crate::money_param(p.amount), p.memo],
     )?;
     Ok(db.conn().last_insert_rowid())
 }

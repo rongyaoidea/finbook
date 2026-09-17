@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use axum::routing::{delete, get, post, put};
@@ -26,7 +26,7 @@ use serde_json::json;
 use crate::dto::*;
 use crate::realm::RealmDb;
 use crate::state::{
-    period_to_str, parse_money, parse_period, clear_cookie_header, AppError, CurrentUser, RealmUser,
+    period_to_str, parse_money_checked, parse_period, clear_cookie_header, AppError, CurrentUser, RealmUser,
     WebState,
 };
 
@@ -255,7 +255,71 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/claims/:id/voucher", post(claim_voucher))
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
+        .layer(axum::middleware::from_fn(csrf_guard))
         .with_state(state)
+}
+
+/// CSRF 纵深防御：对状态变更请求校验 Sec-Fetch-Site / Origin / Referer。
+///
+/// 主防线仍是 SameSite=Lax + JSON Content-Type（跨站表单拿不到 Cookie 也发不出 JSON），
+/// 这里额外拦"同站被攻破的其他源/旧浏览器/代理改写"等场景。非浏览器客户端
+/// （curl/脚本）不带这些头，不拦截——它们本来也不依赖 Cookie 自动携带。
+async fn csrf_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::Method;
+    let method = req.method().clone();
+    if matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH) {
+        let reject = || {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "跨站请求被拒绝" })),
+            )
+                .into_response()
+        };
+        if let Some(site) = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+        {
+            if site != "same-origin" && site != "none" {
+                return reject();
+            }
+        }
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase());
+        if let Some(origin) = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !origin_host_matches(origin, host.as_deref()) {
+                return reject();
+            }
+        } else if let Some(referer) = req
+            .headers()
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !origin_host_matches(referer, host.as_deref()) {
+                return reject();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// `scheme://host[:port]/...` 的主机是否与 Host 头一致（无 Host 头时无法比较，放行）
+fn origin_host_matches(url: &str, host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let origin_host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !origin_host.is_empty() && origin_host == host
 }
 
 /// 返回 SPA 首页，并把 `{{V}}` 占位符替换为当前资源版本号。
@@ -266,11 +330,13 @@ async fn serve_index(State(state): State<Arc<WebState>>) -> Response {
     let html = match std::fs::read_to_string(&path) {
         Ok(h) => h,
         Err(e) => {
+            // 路径只进服务端日志，避免未登录即可探测文件系统布局
+            eprintln!("[finweb] 读取 index.html 失败 {}: {e}", path.display());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("index.html 读取失败：{e}"),
+                Json(json!({ "error": "服务器内部错误，请稍后重试" })),
             )
-                .into_response()
+                .into_response();
         }
     };
     Html(html.replace("{{V}}", &state.assets_ver)).into_response()
@@ -314,8 +380,28 @@ async fn list_books(
     })))
 }
 
+/// 取来源 IP：优先反代写入的 X-Forwarded-For（首个地址）/ X-Real-IP。
+/// 直连（未配反代）时取不到，返回 None，仅跳过 IP 维度限流，账号维度仍生效。
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    let pick = |v: &str| -> Option<String> {
+        let s = v.split(',').next().unwrap_or("").trim().to_string();
+        (!s.is_empty() && s.len() <= 64).then_some(s)
+    };
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(pick)
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(pick)
+        })
+}
+
 async fn post_login(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, AppError> {
     // 全局登录（认平台身份库，而非某一套账）
@@ -325,6 +411,7 @@ async fn post_login(
     if device_id.is_empty() || device_id.len() > 128 {
         return Err(AppError::bad_request("缺少有效的设备标识，请刷新页面后重试"));
     }
+    let ip = client_ip(&headers);
     // 登录限流：先查是否已被锁定，避免锁定期内继续做昂贵/可枚举的密码校验
     if let Err(secs) = state.login_limiter.check(&username) {
         let mins = secs.div_ceil(60).max(1);
@@ -333,16 +420,31 @@ async fn post_login(
             secs,
         ));
     }
+    if let Some(ip) = &ip {
+        if let Err(secs) = state.login_ip_limiter.check(ip) {
+            let mins = secs.div_ceil(60).max(1);
+            return Err(AppError::rate_limited(
+                format!("该来源尝试过于频繁，请约 {mins} 分钟后再试"),
+                secs,
+            ));
+        }
+    }
     let ru = match state.realm.authenticate(&username, &req.password) {
         Ok(Some(ru)) => ru,
         Ok(None) => {
             state.login_limiter.record_failure(&username);
+            if let Some(ip) = &ip {
+                state.login_ip_limiter.record_failure(ip);
+            }
             return Err(AppError::unauthorized("用户名或口令错误"));
         }
         Err(e) => return Err(AppError::from(e)),
     };
     // 登录成功，清空该账号的失败计数
     state.login_limiter.clear(&username);
+    if let Some(ip) = &ip {
+        state.login_ip_limiter.clear(ip);
+    }
     // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
     if !ru.is_admin {
         match state.realm.bind_device(&username, &device_id)? {
@@ -846,6 +948,26 @@ async fn reset_user_password(
             "平台管理员的口令请由平台管理员在「平台账号」中重置",
         ));
     }
+    // 平台口令是全局的：账套管理员只允许重置「仅属于本账套、且不拥有任何账套」的
+    // 成员。否则"把任意平台账号邀请进自己的账套，再重置其全局口令"即可跨租户
+    // 接管/锁死他人账号（受害者口令被改，且会同步覆盖其名下所有账套）。
+    let caller_is_platform_admin = state
+        .realm
+        .get_user(user.username())?
+        .map(|u| u.is_admin)
+        .unwrap_or(false);
+    if !caller_is_platform_admin {
+        if state.realm.count_books_of(&username)? > 0 {
+            return Err(AppError::forbidden(
+                "该账号拥有自己的账套，账套管理员不能重置其平台口令，请由平台管理员处理",
+            ));
+        }
+        if state.realm.count_books_containing(&state.books_dir, &username)? > 1 {
+            return Err(AppError::forbidden(
+                "该账号还属于其他账套，账套管理员不能重置其平台口令，请由平台管理员处理",
+            ));
+        }
+    }
     check_password(&state, &req.new)?;
     state.realm.reset_password(&username, &req.new, &state.policy)?;
     // 口令已变，立即吊销该账号的全部旧会话（被盗会话不能继续用满 7 天）
@@ -869,6 +991,10 @@ async fn reset_user_device(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
     let db = state.db_for(&user.book_key)?;
+    // 目标必须是本账套成员：否则凭用户名即可强制下线任意平台用户的全部会话
+    if users::get(&db, &username)?.is_none() {
+        return Err(AppError::not_found("该用户不在当前账套"));
+    }
     users::reset_device(&db, &username)?;
     // 立刻下线该用户全部会话：旧设备不能靠存量会话绕过"一人一机"
     state.sessions.remove_by_username(&username);
@@ -961,6 +1087,17 @@ async fn put_options(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::SysOption)?;
     let db = state.db_for(&user.book_key)?;
+    // 落库前校验：非法启用期间会灌进会话并污染年度累计口径，后续 first_day/last_day panic
+    period_checked(opts.start_period.ymm())?;
+    if opts.code_scheme.is_empty()
+        || opts.code_scheme.len() > 8
+        || opts.code_scheme.iter().any(|s| !(1..=12u8).contains(s))
+    {
+        return Err(AppError::bad_request("科目编码级长非法（每级 1-12 位，最多 8 级）"));
+    }
+    if opts.voucher_words.is_empty() || opts.voucher_words.iter().any(|w| w.trim().is_empty()) {
+        return Err(AppError::bad_request("凭证字号不能为空"));
+    }
     db.set_options(&opts)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -972,7 +1109,10 @@ fn current_period(state: &WebState, user: &CurrentUser) -> Period {
         .then(|| state.default_period)
         .or_else(|| state.sessions.period(&user.token))
         .unwrap_or(state.default_period);
-    Period::from_ymm(ymm)
+    // 会话/配置中的期间也做校验：脏数据不能让后续 first_day/last_day panic
+    Period::from_ymm_checked(ymm)
+        .or_else(|_| Period::from_ymm_checked(state.default_period))
+        .unwrap_or_else(|_| Period::default())
 }
 
 /// 校验用户传入的期间（YYYYMM）：非法值返回 400。
@@ -986,6 +1126,7 @@ async fn get_dashboard(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<Dashboard>, AppError> {
+    user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
     let (v, e, a) = db.stats()?;
     let start = db.options().start_period;
@@ -1081,6 +1222,7 @@ async fn get_periods(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
     let start = db.options().start_period;
     let this_year = Period::default().year();
@@ -1127,6 +1269,7 @@ async fn list_accounts(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<Vec<fincore::Account>>, AppError> {
+    user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(accounts::list(&db)?))
 }
@@ -1180,6 +1323,16 @@ fn can_view_vouchers(user: &CurrentUser) -> bool {
         || user.can(Perm::VoucherPost)
 }
 
+/// 「仅看本人经手的业务单据」（own_doc_only）：工资按员工、报销按申请人匹配
+/// 当前登录人的用户名/显示名。只过滤列表是不够的——按 id/参数的读写入口都要过这里。
+fn doc_in_scope(user: &CurrentUser, who: &str) -> bool {
+    if !user.user.data_scope.own_doc_only {
+        return true;
+    }
+    let who = who.trim();
+    who == user.user.username || who == user.user.display_name
+}
+
 fn to_item(v: &Voucher) -> VoucherListItem {
     VoucherListItem {
         id: v.id,
@@ -1225,9 +1378,11 @@ async fn list_vouchers(
     if let Some(st) = q.get("status").and_then(|s| parse_voucher_status(s)) {
         query.status = Some(st);
     }
+    // 上限 1000：limit 传负数时 SQLite 视为不限制，会把全库凭证+分录读进内存
     query.limit = q
         .get("limit")
         .and_then(|s| s.parse::<i64>().ok())
+        .map(|v| v.clamp(1, 1000))
         .or(Some(200));
     let mut list = vouchers::list(&db, &query)?;
     // 列表需要摘要与借贷合计：`vouchers::list` 只读表头，这里批量补充分录
@@ -1359,8 +1514,8 @@ async fn save_voucher(
         let account_code = normalize_bank_account(&chart, &e.account_code)
             .unwrap_or_else(|| e.account_code.clone());
         let mut en = Entry::new(e.line, account_code.clone(), e.summary.clone());
-        en.debit = parse_money(&e.debit);
-        en.credit = parse_money(&e.credit);
+        en.debit = parse_money_checked(&e.debit)?;
+        en.credit = parse_money_checked(&e.credit)?;
         en.aux = AuxRef::default();
         // 如果是银行科目，将尾号存入辅助核算银行字段
         if en.account_code.starts_with("1002") {
@@ -1392,6 +1547,9 @@ async fn voucher_post(
     let db = state.db_for(&user.book_key)?;
     let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权记账该凭证"));
+    }
     if v.status == VoucherStatus::Posted {
         return Ok(Json(json!({"ok": true, "already_posted": true})));
     }
@@ -1409,9 +1567,18 @@ async fn voucher_batch_post(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherPost)?;
     let db = state.db_for(&user.book_key)?;
-    let (n, errs) = vouchers::post_many(&db, &req.ids, user.username())?;
-    db.log(user.username(), "凭证", "批量记账", &format!("{n} 张"))?;
-    Ok(Json(json!({ "ok": n, "errors": errs })))
+    // 数据范围过滤：仅记账本人可见的凭证，越权 id 直接拒掉并计数
+    let mut allowed: Vec<i64> = Vec::new();
+    let mut denied = 0usize;
+    for id in &req.ids {
+        match vouchers::get(&db, *id)? {
+            Some(v) if user.user.can_see_voucher(&v) => allowed.push(*id),
+            _ => denied += 1,
+        }
+    }
+    let (n, errs) = vouchers::post_many(&db, &allowed, user.username())?;
+    db.log(user.username(), "凭证", "批量记账", &format!("{n} 张（拒绝 {denied} 张越权）"))?;
+    Ok(Json(json!({ "ok": n, "errors": errs, "denied": denied })))
 }
 
 async fn voucher_unpost(
@@ -1422,8 +1589,11 @@ async fn voucher_unpost(
     // 反记账（已记账 → 未记账），修改前需先反记账
     user.require(Perm::VoucherUnpost)?;
     let db = state.db_for(&user.book_key)?;
-    vouchers::get(&db, id)?
+    let v = vouchers::get(&db, id)?
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权反记账该凭证"));
+    }
     vouchers::unpost(&db, id)?;
     Ok(Json(json!({"ok": true, "action": "unposted"})))
 }
@@ -1481,6 +1651,14 @@ async fn voucher_renumber(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherEdit)?;
     let db = state.db_for(&user.book_key)?;
+    // 断号重排会重排该期间全部字号（含他人凭证），数据范围受限的账号不得操作
+    let scope = &user.user.data_scope;
+    if scope.own_voucher_only
+        || !scope.account_from.trim().is_empty()
+        || !scope.account_to.trim().is_empty()
+    {
+        return Err(AppError::forbidden("数据范围受限的账号不能执行断号重排"));
+    }
     let period = if req.period > 0 {
         parse_period(&req.period.to_string()).unwrap_or_else(|| current_period(&state, &user))
     } else {
@@ -1554,8 +1732,8 @@ fn invoice_json(inv: &findb::invoices::Invoice) -> serde_json::Value {
     })
 }
 
-fn invoice_from_req(r: &InvoiceReq) -> findb::invoices::Invoice {
-    findb::invoices::Invoice {
+fn invoice_from_req(r: &InvoiceReq) -> Result<findb::invoices::Invoice, AppError> {
+    Ok(findb::invoices::Invoice {
         id: r.id,
         kind: if r.kind.is_empty() { "in".to_string() } else { r.kind.clone() },
         code: r.code.clone(),
@@ -1563,9 +1741,9 @@ fn invoice_from_req(r: &InvoiceReq) -> findb::invoices::Invoice {
         date: r.date.clone(),
         buyer: r.buyer.clone(),
         seller: r.seller.clone(),
-        amount_tax: parse_money(&r.amount_tax),
-        amount: parse_money(&r.amount),
-        tax: parse_money(&r.tax),
+        amount_tax: parse_money_checked(&r.amount_tax)?,
+        amount: parse_money_checked(&r.amount)?,
+        tax: parse_money_checked(&r.tax)?,
         tax_rate: r.tax_rate.clone(),
         status: if r.status.is_empty() { "pending".to_string() } else { r.status.clone() },
         memo: r.memo.clone(),
@@ -1573,7 +1751,7 @@ fn invoice_from_req(r: &InvoiceReq) -> findb::invoices::Invoice {
         created_by: String::new(),
         created_at: String::new(),
         updated_at: String::new(),
-    }
+    })
 }
 
 async fn list_invoices(
@@ -1622,7 +1800,7 @@ async fn create_invoice(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
-    let inv = invoice_from_req(&req);
+    let inv = invoice_from_req(&req)?;
     let id = findb::invoices::insert(&db, &inv, user.username())?;
     Ok(Json(json!({ "id": id })))
 }
@@ -1635,8 +1813,22 @@ async fn update_invoice(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let mut inv = invoice_from_req(&req);
+    // 归属校验 + 保留服务端字段：普通用户不能改他人发票，
+    // 且表单未提交的 attach_id/created_by/status 不能被覆盖清零
+    let existing = findb::invoices::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("发票不存在"))?;
+    if existing.created_by != user.username() && !user.user.is_admin() {
+        return Err(AppError::forbidden("无权修改他人录入的发票"));
+    }
+    let mut inv = invoice_from_req(&req)?;
     inv.id = id;
+    inv.attach_id = existing.attach_id;
+    inv.created_by = existing.created_by.clone();
+    inv.created_at = existing.created_at.clone();
+    if inv.status != existing.status {
+        // 状态变更走专用接口（带状态机校验），此处不接受表单覆盖
+        inv.status = existing.status.clone();
+    }
     findb::invoices::update(&db, &inv)?;
     db.log(user.username(), "发票", "更新", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
@@ -1649,6 +1841,11 @@ async fn delete_invoice(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
+    let existing = findb::invoices::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("发票不存在"))?;
+    if existing.created_by != user.username() && !user.user.is_admin() {
+        return Err(AppError::forbidden("无权删除他人录入的发票"));
+    }
     findb::invoices::delete(&db, id)?;
     db.log(user.username(), "发票", "删除", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
@@ -1841,7 +2038,11 @@ async fn get_ledger(
         from,
         to,
         posted_only,
-    };
+        prepared_by: None,
+        code_from: None,
+        code_to: None,
+    }
+    .with_user_scope(&user.user);
     let rows = balances::ledger(&db, &chart, &lq)?;
     Ok(Json(rows))
 }
@@ -1875,6 +2076,7 @@ async fn print_voucher_form(
     query.limit = q
         .get("limit")
         .and_then(|s| s.parse::<i64>().ok())
+        .map(|v| v.clamp(1, 1000))
         .or(Some(500));
     let mut list = vouchers::list(&db, &query)?;
     vouchers::fill_entries(&db, &mut list)?;
@@ -1954,14 +2156,18 @@ async fn print_ledger_form(
         from,
         to,
         posted_only,
-    };
+        prepared_by: None,
+        code_from: None,
+        code_to: None,
+    }
+    .with_user_scope(&user.user);
     let acct = chart
         .get(&code)
         .map(|a| format!("{} {}", code, a.name))
         .unwrap_or(code.clone());
 
-    // 期初余额方向
-    let snap = BalanceSnapshot::load(&db, &BalanceQuery::range(from, from))?;
+    // 期初余额
+    let snap = BalanceSnapshot::load(&db, &BalanceQuery::range(from, from).with_user_scope(&user.user))?;
     let (bd, bamt) = fincore::signed_to_dir_amount(snap.for_account(&code, None).begin);
     let begin_dir = if bamt.is_zero() {
         "平".to_string()
@@ -2061,7 +2267,7 @@ fn trial_balance_data(
         .get("to")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(state, user));
-    let bq = BalanceQuery::range(from, to).with_data_scope(&user.user.data_scope);
+    let bq = BalanceQuery::range(from, to).with_user_scope(&user.user);
     let snap = BalanceSnapshot::load(&db, &bq)?;
     let chart = accounts::chart(&db)?;
     let rows = snap.account_table(&chart, &bq);
@@ -2304,7 +2510,7 @@ async fn get_multi_column(
     if !user.user.can_see_account(&main) || cols.iter().any(|c| !user.user.can_see_account(c)) {
         return Err(AppError::forbidden("无权查看该科目"));
     }
-    let rows = advanced::multi_column_table(&db, &main, &cols, from, to)?;
+    let rows = advanced::multi_column_table(&db, &main, &cols, from, to, Some(&user.user))?;
     Ok(Json(serde_json::json!({ "main": main, "cols": cols, "rows": rows })))
 }
 
@@ -2444,7 +2650,7 @@ async fn stock_adjust_endpoint(
     if req.item.trim().is_empty() {
         return Err(AppError::bad_request("缺少存货 item"));
     }
-    let delta = parse_money(&req.delta);
+    let delta = parse_money_checked(&req.delta)?;
     let period = if req.period > 0 {
         period_checked(req.period)?
     } else {
@@ -2561,7 +2767,7 @@ async fn set_unit(
         item: req.item,
         base_unit: req.base_unit,
         alt_unit: req.alt_unit,
-        factor: parse_money(&req.factor),
+        factor: parse_money_checked(&req.factor)?,
     })?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2609,7 +2815,10 @@ async fn assemble_endpoint(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let children: Vec<(String, Money)> = req.children.into_iter().map(|(i, q)| (i, parse_money(&q))).collect();
+    let mut children: Vec<(String, Money)> = Vec::with_capacity(req.children.len());
+    for (i, q) in req.children {
+        children.push((i, parse_money_checked(&q)?));
+    }
     findb::inventory2::assemble(&db, period, date, &req.parent, &children, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2627,7 +2836,10 @@ async fn disassemble_endpoint(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let children: Vec<(String, Money)> = req.children.into_iter().map(|(i, q)| (i, parse_money(&q))).collect();
+    let mut children: Vec<(String, Money)> = Vec::with_capacity(req.children.len());
+    for (i, q) in req.children {
+        children.push((i, parse_money_checked(&q)?));
+    }
     findb::inventory2::disassemble(&db, period, date, &req.parent, &children, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2689,7 +2901,7 @@ async fn add_estimate(
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
-    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money(&req.est_amount))?;
+    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money_checked(&req.est_amount))?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -2774,7 +2986,7 @@ async fn set_quota(
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
-    findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money(&req.quota_qty))?;
+    findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money_checked(&req.quota_qty))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -2859,7 +3071,7 @@ async fn add_po_receipt(
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
     let id = findb::procurement::po_receipt_add(&db, &findb::procurement::PoReceipt {
-        id: 0, po_id: req.po_id, period, date, qty: parse_money(&req.qty), memo: req.memo,
+        id: 0, po_id: req.po_id, period, date, qty: parse_money_checked(&req.qty)?, memo: req.memo,
     })?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
@@ -2877,7 +3089,7 @@ async fn add_po_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money(&req.qty), &req.memo)?;
+    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -2907,7 +3119,7 @@ async fn add_po_payment(
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
     let id = findb::procurement::po_payment_add(&db, &findb::procurement::PoPayment {
-        id: 0, po_id: req.po_id, period, date, amount: parse_money(&req.amount), memo: req.memo,
+        id: 0, po_id: req.po_id, period, date, amount: parse_money_checked(&req.amount)?, memo: req.memo,
     })?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
@@ -3013,7 +3225,7 @@ async fn add_so_shipment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money(&req.qty), &req.memo)?;
+    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3030,7 +3242,7 @@ async fn add_so_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money(&req.qty), &req.memo)?;
+    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3059,7 +3271,7 @@ async fn add_so_payment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money(&req.amount), &req.memo)?;
+    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money_checked(&req.amount), &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3168,9 +3380,9 @@ async fn post_routing(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let ops: Vec<advanced::RoutingOp> = req
-        .into_iter()
-        .map(|d| advanced::RoutingOp {
+    let mut ops: Vec<advanced::RoutingOp> = Vec::with_capacity(req.len());
+    for d in req {
+        ops.push(advanced::RoutingOp {
             id: 0,
             item_code: item.clone(),
             version: String::new(),
@@ -3178,10 +3390,10 @@ async fn post_routing(
             op_code: d.op_code,
             op_name: d.op_name,
             work_center: d.work_center,
-            std_hours: parse_money(&d.std_hours),
-            rate: parse_money(&d.rate),
-        })
-        .collect();
+            std_hours: parse_money_checked(&d.std_hours)?,
+            rate: parse_money_checked(&d.rate)?,
+        });
+    }
     advanced::routing_save(&db, &item, &ops)?;
     Ok(Json(serde_json::json!({ "ok": true, "count": ops.len() })))
 }
@@ -3249,7 +3461,7 @@ async fn report_prod_op(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    advanced::prod_op_report(&db, req.op_id, parse_money(&req.qty), parse_money(&req.hours))?;
+    advanced::prod_op_report(&db, req.op_id, parse_money_checked(&req.qty)?, parse_money_checked(&req.hours)?)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3306,11 +3518,10 @@ async fn run_mrp(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let mut demands: Vec<(String, Money, String)> = req
-        .demands
-        .into_iter()
-        .map(|d| (d.item_code, parse_money(&d.qty), d.source))
-        .collect();
+    let mut demands: Vec<(String, Money, String)> = Vec::with_capacity(req.demands.len());
+    for d in req.demands {
+        demands.push((d.item_code, parse_money_checked(&d.qty)?, d.source));
+    }
     if demands.is_empty() && req.from_sales {
         demands = advanced::mrp_demands_from_sales(&db, current_period(&state, &user))?;
     }
@@ -3696,7 +3907,7 @@ async fn save_bill(
         due_date: parse_date(&req.due_date)?,
         counterpart: req.counterpart,
         bank: req.bank,
-        amount: parse_money(&req.amount),
+        amount: parse_money_checked(&req.amount)?,
         status: req.status,
         handled_date: None,
         memo: req.memo,
@@ -3784,8 +3995,8 @@ async fn save_loan(
         kind: req.kind,
         no: req.no,
         bank: req.bank,
-        principal: parse_money(&req.principal),
-        rate_pct: parse_money(&req.rate_pct),
+        principal: parse_money_checked(&req.principal)?,
+        rate_pct: parse_money_checked(&req.rate_pct)?,
         start_date: parse_date(&req.start_date)?,
         end_date: parse_date(&req.end_date)?,
         status: req.status,
@@ -3892,7 +4103,7 @@ async fn save_cost_method(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    let sc = parse_money(&req.standard_cost);
+    let sc = parse_money_checked(&req.standard_cost)?;
     findb::business::item_cost_method_set(&db, &req.item, Some(&req.method), sc)?;
     db.log(user.username(), "成本", "设置计价方式", &format!("{} → {}", req.item, req.method))?;
     Ok(Json(json!({ "ok": true })))
@@ -3964,11 +4175,17 @@ fn statement_table(
         "balance_sheet" => report_def(db, key, fincore::report::balance_sheet::balance_sheet_def()),
         _ => report_def(db, key, fincore::report::income::income_statement_def()),
     };
-    let mut bq = BalanceQuery::range(from, to);
-    bq = bq.with_data_scope(&user.user.data_scope);
+    // 资产负债表第二列是"年初余额"：取数基准必须从会计年度 1 月起，
+    // 不能用请求里的 from（否则 5 月查表会把 5 月初当成"年初"）。
+    let (bq_from, subtitle) = if key == "balance_sheet" {
+        (Period::new(to.year(), 1).unwrap_or(from), format!("{} 期末", to.label()))
+    } else {
+        (from, format!("{} 至 {}", from.label(), to.label()))
+    };
+    let mut bq = BalanceQuery::range(bq_from, to);
+    bq = bq.with_user_scope(&user.user);
     let snap = BalanceSnapshot::load(db, &bq)?;
     let company = db.options().company;
-    let subtitle = format!("{} 至 {}", from.label(), to.label());
     Ok(fincore::report::render(&def, &snap, &company, &subtitle, kind_maps))
 }
 
@@ -4293,7 +4510,11 @@ async fn list_logs(
 ) -> Result<Json<Vec<fincore::user::AuditLog>>, AppError> {
     user.require(Perm::AuditLog)?;
     let db = state.db_for(&user.book_key)?;
-    let limit: i64 = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let limit: i64 = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        .clamp(1, 1000);
     let logs = match q.get("q") {
         Some(kw) if !kw.trim().is_empty() => db.search_logs(kw.trim(), limit)?,
         _ => db.recent_logs(limit)?,
@@ -4505,11 +4726,10 @@ async fn generate_template(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let t = template::get(&db, id)?.ok_or_else(|| AppError::not_found("模板不存在"))?;
-    let period = req
-        .period
-        .filter(|ym| *ym > 0)
-        .map(Period::from_ymm)
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = match req.period.filter(|ym| *ym > 0) {
+        Some(ym) => period_checked(ym)?,
+        None => current_period(&state, &user),
+    };
     let date = req_date(&req.date, period.last_day())?;
     let word = "记";
     let no = vouchers::next_no(&db, period, word)?;
@@ -4527,11 +4747,10 @@ async fn due_templates(
 ) -> Result<Json<Vec<template::Template>>, AppError> {
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
-    let period = q
-        .get("period")
-        .and_then(|s| s.parse::<i32>().ok())
-        .map(Period::from_ymm)
-        .unwrap_or_else(|| db.options().start_period);
+    let period = match q.get("period").and_then(|s| s.parse::<i32>().ok()) {
+        Some(ym) => period_checked(ym)?,
+        None => db.options().start_period,
+    };
     Ok(Json(template::due_list(&db, period)?))
 }
 
@@ -4664,6 +4883,9 @@ async fn save_payroll(
     if employee.is_empty() {
         return Err(AppError::bad_request("员工编码必填"));
     }
+    if !doc_in_scope(&user, employee) {
+        return Err(AppError::forbidden("数据范围受限，不能录入他人的工资行"));
+    }
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let p = business::payroll_calc(
@@ -4671,13 +4893,13 @@ async fn save_payroll(
         period,
         employee,
         r.dept.trim(),
-        parse_money(&r.gross),
-        parse_money(&r.social),
-        parse_money(&r.housing),
-        parse_money(&r.deduction),
-        parse_money(&r.additional),
-        parse_money(&r.social_co),
-        parse_money(&r.housing_co),
+        parse_money_checked(&r.gross)?,
+        parse_money_checked(&r.social)?,
+        parse_money_checked(&r.housing)?,
+        parse_money_checked(&r.deduction)?,
+        parse_money_checked(&r.additional)?,
+        parse_money_checked(&r.social_co)?,
+        parse_money_checked(&r.housing_co)?,
         r.memo.trim(),
     )?;
     let id = business::payroll_upsert(&db, &p)?;
@@ -4707,29 +4929,32 @@ async fn generate_payroll(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
+    if user.user.data_scope.own_doc_only {
+        return Err(AppError::forbidden("数据范围受限的账号不能批量生成工资表"));
+    }
     let period = req
         .period
         .as_deref()
         .and_then(parse_period)
         .unwrap_or_else(|| current_period(&state, &user));
-    let rows: Vec<(String, String, Money, Money, Money, Money, Money, Money, Money)> = req
-        .rows
-        .iter()
-        .filter(|r| !r.employee.trim().is_empty())
-        .map(|r| {
-            (
-                r.employee.trim().to_string(),
-                r.dept.trim().to_string(),
-                parse_money(&r.gross),
-                parse_money(&r.social),
-                parse_money(&r.housing),
-                parse_money(&r.deduction),
-                parse_money(&r.additional),
-                parse_money(&r.social_co),
-                parse_money(&r.housing_co),
-            )
-        })
-        .collect();
+    let mut rows: Vec<(String, String, Money, Money, Money, Money, Money, Money, Money)> =
+        Vec::with_capacity(req.rows.len());
+    for r in &req.rows {
+        if r.employee.trim().is_empty() {
+            continue;
+        }
+        rows.push((
+            r.employee.trim().to_string(),
+            r.dept.trim().to_string(),
+            parse_money_checked(&r.gross)?,
+            parse_money_checked(&r.social)?,
+            parse_money_checked(&r.housing)?,
+            parse_money_checked(&r.deduction)?,
+            parse_money_checked(&r.additional)?,
+            parse_money_checked(&r.social_co)?,
+            parse_money_checked(&r.housing_co)?,
+        ));
+    }
     if rows.is_empty() {
         return Err(AppError::bad_request("没有可导入的工资行"));
     }
@@ -4746,13 +4971,13 @@ async fn delete_payroll(
     user.require(Perm::VoucherDelete)?;
     let db = state.db_for(&user.book_key)?;
     // 删除前拦截已生成凭证的工资行
-    let existing = business::payroll_get_by_id(&db, id)?;
-    match existing {
-        Some(p) if p.voucher_id.is_some() => {
-            return Err(AppError::bad_request("该工资行已生成凭证，不能删除"));
-        }
-        None => return Err(AppError::not_found("工资行不存在")),
-        _ => {}
+    let p = business::payroll_get_by_id(&db, id)?
+        .ok_or_else(|| AppError::not_found("工资行不存在"))?;
+    if !doc_in_scope(&user, &p.employee) {
+        return Err(AppError::forbidden("无权操作他人的工资行"));
+    }
+    if p.voucher_id.is_some() {
+        return Err(AppError::bad_request("该工资行已生成凭证，不能删除"));
     }
     business::payroll_delete(&db, id)?;
     db.log(user.username(), "工资", "删除工资行", &id.to_string())?;
@@ -4770,6 +4995,9 @@ async fn payroll_ytd(
     let employee = q.get("employee").cloned().unwrap_or_default();
     if employee.trim().is_empty() {
         return Err(AppError::bad_request("缺少 employee 参数"));
+    }
+    if !doc_in_scope(&user, employee.trim()) {
+        return Err(AppError::forbidden("数据范围受限，不能查看他人的年度工资累计"));
     }
     Ok(Json(business::payroll_ytd(&db, period, employee.trim())?))
 }
@@ -4907,15 +5135,16 @@ struct ClaimInput {
     items: Vec<ClaimItemInput>,
 }
 
-fn claim_items(items: &[ClaimItemInput]) -> Vec<business::ClaimItem> {
-    items
-        .iter()
-        .map(|i| business::ClaimItem {
+fn claim_items(items: &[ClaimItemInput]) -> Result<Vec<business::ClaimItem>, AppError> {
+    let mut out = Vec::with_capacity(items.len());
+    for i in items {
+        out.push(business::ClaimItem {
             expense_account: i.expense_account.trim().to_string(),
-            amount: parse_money(&i.amount),
+            amount: parse_money_checked(&i.amount)?,
             memo: i.memo.trim().to_string(),
-        })
-        .collect()
+        });
+    }
+    Ok(out)
 }
 
 async fn list_claims(
@@ -4961,12 +5190,14 @@ async fn create_claim(
     if applicant.is_empty() {
         return Err(AppError::bad_request("申请人必填"));
     }
+    if !doc_in_scope(&user, applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能为他人填报销单"));
+    }
     let db = state.db_for(&user.book_key)?;
-    let period = r
-        .period
-        .filter(|ym| *ym > 0)
-        .map(Period::from_ymm)
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = match r.period.filter(|ym| *ym > 0) {
+        Some(ym) => period_checked(ym)?,
+        None => current_period(&state, &user),
+    };
     let date = req_date(&r.biz_date, period.last_day())?;
     let c = business::Claim {
         id: 0,
@@ -4976,9 +5207,9 @@ async fn create_claim(
         applicant: applicant.to_string(),
         dept: r.dept.trim().to_string(),
         reason: r.reason.trim().to_string(),
-        amount: parse_money(&r.amount),
+        amount: parse_money_checked(&r.amount)?,
         status: business::ClaimStatus::Draft,
-        items: claim_items(&r.items),
+        items: claim_items(&r.items)?,
         approver: String::new(),
         approved_at: None,
         payer: String::new(),
@@ -5001,6 +5232,9 @@ async fn update_claim(
     let db = state.db_for(&user.book_key)?;
     let mut c = business::claim_get(&db, id)?
         .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if !doc_in_scope(&user, &c.applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能修改他人的报销单"));
+    }
     if !c.status.editable() {
         return Err(AppError::bad_request("当前状态不允许修改内容"));
     }
@@ -5010,10 +5244,13 @@ async fn update_claim(
     let date = req_date(&r.biz_date, c.period.last_day())?;
     c.biz_date = date;
     c.applicant = r.applicant.trim().to_string();
+    if !doc_in_scope(&user, &c.applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能改由他人作为申请人"));
+    }
     c.dept = r.dept.trim().to_string();
     c.reason = r.reason.trim().to_string();
-    c.amount = parse_money(&r.amount);
-    c.items = claim_items(&r.items);
+    c.amount = parse_money_checked(&r.amount)?;
+    c.items = claim_items(&r.items)?;
     business::claim_update(&db, &c)?;
     db.log(user.username(), "报销", "修改报销单", &format!("{} {}", c.no, c.amount))?;
     Ok(Json(json!({ "ok": true })))
@@ -5028,6 +5265,9 @@ async fn delete_claim(
     let db = state.db_for(&user.book_key)?;
     let c = business::claim_get(&db, id)?
         .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if !doc_in_scope(&user, &c.applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能删除他人的报销单"));
+    }
     // 预检：引擎的通用错误会映射成 500，这里给出明确的 400
     if c.voucher_id.is_some() {
         return Err(AppError::bad_request("该报销单已生成凭证，请先删除凭证"));
@@ -5053,6 +5293,11 @@ async fn claim_transition(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let to = business::ClaimStatus::parse(&r.status);
+    let c = business::claim_get(&db, id)?
+        .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if !doc_in_scope(&user, &c.applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能操作他人的报销单"));
+    }
     business::claim_transition(&db, id, to, user.username())?;
     db.log(user.username(), "报销", "状态流转", &format!("#{id} → {}", to.label()))?;
     Ok(Json(json!({ "ok": true, "status": to })))
@@ -5079,6 +5324,9 @@ async fn claim_voucher(
     // 预检给出友好的 400（引擎层也有同样拦截，此处避免落到 500）
     let c = business::claim_get(&db, id)?
         .ok_or_else(|| AppError::not_found("报销单不存在"))?;
+    if !doc_in_scope(&user, &c.applicant) {
+        return Err(AppError::forbidden("数据范围受限，不能为他人报销单生成凭证"));
+    }
     if c.voucher_id.is_some() {
         return Err(AppError::bad_request("该报销单已生成过凭证"));
     }

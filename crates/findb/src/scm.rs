@@ -189,8 +189,8 @@ pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
             rusqlite::params![
                 po.period.ymm(), po.date, po.supplier_code, po.supplier_name,
                 serde_json::to_value(&po.status)?.as_str().unwrap(),
-                po.total_amount.to_string(), po.total_tax.to_string(),
-                po.received_amount.to_string(), po.prepared_by, po.memo, now, po.id
+                crate::money_param(po.total_amount), crate::money_param(po.total_tax),
+                crate::money_param(po.received_amount), po.prepared_by, po.memo, now, po.id
             ],
         )?;
         po.id
@@ -202,8 +202,8 @@ pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
             rusqlite::params![
                 po.period.ymm(), po.no, po.date, po.supplier_code, po.supplier_name,
                 serde_json::to_value(&po.status)?.as_str().unwrap(),
-                po.total_amount.to_string(), po.total_tax.to_string(),
-                po.received_amount.to_string(), po.prepared_by, po.memo, now
+                crate::money_param(po.total_amount), crate::money_param(po.total_tax),
+                crate::money_param(po.received_amount), po.prepared_by, po.memo, now
             ],
         )?;
         tx.last_insert_rowid()
@@ -219,8 +219,8 @@ pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
             rusqlite::params![
                 id, line.item_code, line.item_name, crate::exact_param(line.qty_ordered),
                 crate::exact_param(line.qty_received), crate::exact_param(line.unit_price),
-                crate::exact_param(line.tax_rate), line.amount.to_string(),
-                line.tax_amount.to_string(), line.memo
+                crate::exact_param(line.tax_rate), crate::money_param(line.amount),
+                crate::money_param(line.tax_amount), line.memo
             ],
         )?;
     }
@@ -229,8 +229,11 @@ pub fn po_save(db: &Db, po: &mut PurchaseOrder) -> DbResult<i64> {
 }
 
 pub fn po_delete(db: &Db, id: i64) -> DbResult<()> {
-    db.conn().execute("DELETE FROM po_line WHERE po_id=?", [id])?;
-    db.conn().execute("DELETE FROM purchase_order WHERE id=?", [id])?;
+    // 两步删除必须同事务：否则第二步失败会留下没有明细的空壳单据
+    let tx = db.write_tx()?;
+    tx.execute("DELETE FROM po_line WHERE po_id=?", [id])?;
+    tx.execute("DELETE FROM purchase_order WHERE id=?", [id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -318,8 +321,8 @@ pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
             rusqlite::params![
                 so.period.ymm(), so.date, so.customer_code, so.customer_name,
                 serde_json::to_value(&so.status)?.as_str().unwrap(),
-                so.total_amount.to_string(), so.total_tax.to_string(),
-                so.shipped_amount.to_string(), so.prepared_by, so.memo, now, so.id
+                crate::money_param(so.total_amount), crate::money_param(so.total_tax),
+                crate::money_param(so.shipped_amount), so.prepared_by, so.memo, now, so.id
             ],
         )?;
         so.id
@@ -331,8 +334,8 @@ pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
             rusqlite::params![
                 so.period.ymm(), so.no, so.date, so.customer_code, so.customer_name,
                 serde_json::to_value(&so.status)?.as_str().unwrap(),
-                so.total_amount.to_string(), so.total_tax.to_string(),
-                so.shipped_amount.to_string(), so.prepared_by, so.memo, now
+                crate::money_param(so.total_amount), crate::money_param(so.total_tax),
+                crate::money_param(so.shipped_amount), so.prepared_by, so.memo, now
             ],
         )?;
         tx.last_insert_rowid()
@@ -348,8 +351,8 @@ pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
             rusqlite::params![
                 id, line.item_code, line.item_name, crate::exact_param(line.qty_ordered),
                 crate::exact_param(line.qty_shipped), crate::exact_param(line.unit_price),
-                crate::exact_param(line.tax_rate), line.amount.to_string(),
-                line.tax_amount.to_string(), line.memo
+                crate::exact_param(line.tax_rate), crate::money_param(line.amount),
+                crate::money_param(line.tax_amount), line.memo
             ],
         )?;
     }
@@ -358,8 +361,11 @@ pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
 }
 
 pub fn so_delete(db: &Db, id: i64) -> DbResult<()> {
-    db.conn().execute("DELETE FROM so_line WHERE so_id=?", [id])?;
-    db.conn().execute("DELETE FROM sales_order WHERE id=?", [id])?;
+    // 两步删除必须同事务：否则第二步失败会留下没有明细的空壳单据
+    let tx = db.write_tx()?;
+    tx.execute("DELETE FROM so_line WHERE so_id=?", [id])?;
+    tx.execute("DELETE FROM sales_order WHERE id=?", [id])?;
+    tx.commit()?;
     Ok(())
 }
 

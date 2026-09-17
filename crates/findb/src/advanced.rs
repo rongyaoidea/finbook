@@ -261,14 +261,14 @@ pub fn prod_op_list(db: &Db, po_id: i64) -> DbResult<Vec<ProdOp>> {
     Ok(rows)
 }
 
-/// 报工：累加完工数量与工时，自动推进状态
+/// 报工：累加完工数量与工时，自动推进状态（读改写同事务，避免并发报工丢更新）
 pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult<()> {
     if qty.is_negative() || hours.is_negative() {
         return Err(FinError::msg("报工数量与工时不能为负").into());
     }
+    let tx = db.write_tx()?;
     // 定点累加：金额/数量一律在 Rust 侧用 Decimal 运算，绝不走 SQL 的 REAL 浮点
-    let cur = db
-        .conn()
+    let cur = tx
         .query_row(
             "SELECT qty_done, hours FROM prod_op WHERE id=?1",
             rusqlite::params![op_id],
@@ -288,10 +288,11 @@ pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult
     } else {
         "pending"
     };
-    db.conn().execute(
+    tx.execute(
         "UPDATE prod_op SET qty_done=?2, hours=?3, status=?4 WHERE id=?1",
         rusqlite::params![op_id, crate::exact_param(new_qty), crate::exact_param(new_hours), status],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -409,9 +410,9 @@ pub fn item_plan_upsert(db: &Db, p: &ItemPlan) -> DbResult<()> {
             lead_days=excluded.lead_days, lot_size=excluded.lot_size",
         rusqlite::params![
             p.item_code,
-            p.safety_stock.to_string(),
+            crate::exact_param(p.safety_stock),
             p.lead_days,
-            p.lot_size.to_string()
+            crate::exact_param(p.lot_size)
         ],
     )?;
     Ok(())
@@ -609,10 +610,10 @@ pub fn mrp_run(db: &Db, demands: &[(String, Money, String)]) -> DbResult<String>
                 code,
                 name,
                 a.level,
-                a.gross.to_string(),
-                on_hand.to_string(),
-                net.to_string(),
-                planned.to_string(),
+                crate::exact_param(a.gross),
+                crate::exact_param(on_hand),
+                crate::exact_param(net),
+                crate::exact_param(planned),
                 action,
                 a.sources.join(",")
             ],
@@ -1237,17 +1238,40 @@ pub fn multi_column_table(
     columns: &[String],
     from: Period,
     to: Period,
+    user: Option<&fincore::user::User>,
 ) -> DbResult<Vec<MultiColRow>> {
-    // 主科目的全部已过账分录
-    let mut st = db.conn().prepare(
+    // 主科目的全部已过账分录（含数据范围过滤：仅本人凭证 / 科目区间）
+    let mut sql = String::from(
         "SELECT v.date, v.word, v.no, e.summary, e.debit, e.credit, e.voucher_id
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2
-           AND e.account_code LIKE ?3 ESCAPE '\\'
-         ORDER BY v.date, v.id, e.line",
-    )?;
-    let like = format!("{}%", crate::escape_like(main_code));
-    let mut rows = st.query(rusqlite::params![from.ymm(), to.ymm(), like])?;
+           AND e.account_code LIKE ?3 ESCAPE '\\'",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(from.ymm()),
+        Box::new(to.ymm()),
+        Box::new(format!("{}%", crate::escape_like(main_code))),
+    ];
+    if let Some(u) = user {
+        if u.data_scope.own_voucher_only {
+            params.push(Box::new(u.username.clone()));
+            sql.push_str(&format!(" AND v.prepared_by = ?{}", params.len()));
+        }
+        let lo = u.data_scope.account_from.trim();
+        let hi = u.data_scope.account_to.trim();
+        if !lo.is_empty() {
+            params.push(Box::new(lo.to_string()));
+            sql.push_str(&format!(" AND e.account_code >= ?{}", params.len()));
+        }
+        if !hi.is_empty() {
+            params.push(Box::new(hi.to_string()));
+            sql.push_str(&format!(" AND e.account_code <= ?{}", params.len()));
+        }
+    }
+    sql.push_str(" ORDER BY v.date, v.id, e.line");
+    let mut st = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = st.query(refs.as_slice())?;
 
     // 主科目分录：voucher_id -> (date, no, summary, amount)
     struct MainLine {
@@ -2031,7 +2055,7 @@ mod tests {
         assert_eq!(r.credit, m("1300"));
 
         // 多栏账：主科目 6602，栏目 660201
-        let mc = multi_column_table(&db, "6602", &["1002".to_string()], p, p).unwrap();
+        let mc = multi_column_table(&db, "6602", &["1002".to_string()], p, p, None).unwrap();
         assert_eq!(mc.len(), 1);
         assert_eq!(mc[0].amount, m("300"));
         assert_eq!(mc[0].balance, m("300"));

@@ -208,19 +208,25 @@ impl FinBookApp {
                 };
                 // 先断开连接，释放文件句柄
                 ctx.st.detach();
-                match std::fs::copy(&src, &dst) {
-                    Ok(_) => match Db::open(&dst) {
+                match restore_book_atomic(&src, &dst) {
+                    Ok(()) => match Db::open(&dst) {
                         Ok(db) => {
                             let r = ctx.st.attach(Arc::new(db), Some(dst));
                             if let Err(e) = r {
                                 ctx.error(e);
                             }
+                            ctx.info("恢复完成，请重新登录");
                         }
-                        Err(e) => ctx.error(e.to_string()),
+                        Err(e) => ctx.error(format!("恢复后重新打开账套失败：{e}")),
                     },
-                    Err(e) => ctx.error(format!("复制备份文件失败：{e}")),
+                    Err(e) => {
+                        // 失败时把原账套重新挂回，避免用户停留在"没有账套"的状态
+                        if let Ok(db) = Db::open(&dst) {
+                            let _ = ctx.st.attach(Arc::new(db), Some(dst));
+                        }
+                        ctx.error(format!("恢复失败（原账套未受影响）：{e}"));
+                    }
                 }
-                ctx.info("恢复完成，请重新登录");
             }
             ConfirmAction::AutoFillBegin => match views::begin::auto_fill_begin(&mut ctx) {
                 Ok(n) => {
@@ -652,4 +658,48 @@ fn side_bar(st: &mut AppState, ui: &mut Ui) {
 /// 侧栏未展示的辅助核算类型（供以后扩展模块挂接）
 pub fn extra_aux_kinds() -> Vec<AuxKind> {
     vec![AuxKind::CashFlow]
+}
+
+/// 原子恢复账套：校验备份 → 复制到同目录临时文件 → 再次校验 →
+/// 兜底备份当前账套 → rename 原子替换 → 清理旧 WAL/SHM。
+///
+/// 任何一步失败都不会动当前账套文件。
+fn restore_book_atomic(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    // 健康检查：integrity_check 正常时返回 ["ok"]
+    fn check_ok(db: &Db, what: &str) -> Result<(), String> {
+        let v = db
+            .integrity_check()
+            .map_err(|e| format!("{what}完整性检查失败：{e}"))?;
+        if v.iter().any(|m| m.trim() != "ok") {
+            return Err(format!("{what}完整性检查未通过：{}", v.join("；")));
+        }
+        Ok(())
+    }
+
+    let dir = dst.parent().ok_or_else(|| "账套路径无效".to_string())?;
+    let file_name = dst
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("book.fbk");
+    let tmp = dir.join(format!("{file_name}.restore-tmp"));
+    let bak = dir.join(format!("{file_name}.before-restore"));
+
+    // 复制到同目录临时文件（同分区才能 rename 原子替换）
+    std::fs::copy(src, &tmp).map_err(|e| format!("写入临时文件失败：{e}"))?;
+    {
+        let db = Db::open(&tmp).map_err(|e| format!("备份文件无法打开：{e}"))?;
+        check_ok(&db, "备份文件")?;
+    }
+    // 兜底备份当前账套（用户误选文件时还能手工找回）
+    if dst.exists() {
+        std::fs::copy(dst, &bak).map_err(|e| format!("备份当前账套失败：{e}"))?;
+    }
+    // 原子替换
+    std::fs::rename(&tmp, dst).map_err(|e| format!("替换账套失败：{e}"))?;
+    // 清理旧日志侧车文件，避免旧 WAL 帧污染新库
+    for ext in ["-wal", "-shm"] {
+        let p = std::path::PathBuf::from(format!("{}{}", dst.display(), ext));
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
 }

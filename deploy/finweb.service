@@ -36,14 +36,18 @@ Environment=FINWEB_STATIC_DIR=/opt/finbook/static
 # 可选：预置平台管理员口令（否则首次启动自动生成并打印一次）
 # Environment=FINBOOK_ADMIN_USER=admin
 # Environment=FINBOOK_ADMIN_PASS=ChangeMe123
-ExecStart=/usr/bin/env finweb
+# 绝对路径：systemd 默认 PATH 不包含 /opt/finbook
+ExecStart=/opt/finbook/finweb
 Restart=on-failure
 RestartSec=5
 # 加固
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
+# 数据文件默认 0600，避免同机其他用户读到账套
+UMask=0077
+# 仅数据目录可写（二进制/静态资源保持只读）
 ReadWritePaths=/opt/finbook/data
 
 [Install]

@@ -130,7 +130,11 @@ impl Money {
     /// 转为"分"，用于与整数系统对接
     #[inline]
     pub fn cents(self) -> i64 {
-        (self.round2().0 * Decimal::from(100)).to_i64().unwrap_or(0)
+        self.round2()
+            .0
+            .checked_mul(Decimal::from(100))
+            .and_then(|d| d.to_i64())
+            .unwrap_or(0)
     }
 
     /// 转为 f64，仅用于绘图/统计，禁止用于账务计算
@@ -156,7 +160,8 @@ impl Money {
 
     /// 指定小数位 + 千分位
     pub fn fmt_dp(self, dp: u32) -> String {
-        let d = self.0.round_dp(dp);
+        // 与 round2() 的会计口径一致（半值远离零）；Decimal::round_dp 默认是银行家舍入
+        let d = round_half_up(self.0, dp);
         // 四舍五入后若量化为 0（如 -0.004 → -0.00），不应显示负号
         let neg = d.is_sign_negative() && !d.is_zero();
         let s = d.abs().to_string();
@@ -177,7 +182,7 @@ impl Money {
 
     /// 数量格式：最多 6 位小数，去掉无意义的尾随零
     pub fn fmt_qty(self) -> String {
-        let d = self.0.round_dp(QTY_DP).normalize();
+        let d = round_half_up(self.0, QTY_DP).normalize();
         let neg = d.is_sign_negative();
         let s = d.abs().to_string();
         let (ip, fp) = match s.split_once('.') {
@@ -214,7 +219,13 @@ impl Money {
     pub fn to_capital(self) -> String {
         let v = self.round2();
         let neg = v.0.is_sign_negative();
-        let cents = (v.0.abs() * Decimal::from(100)).to_i64().unwrap_or(0);
+        // Decimal 乘法溢出会 panic；超出 i64 分范围的极端值按上限处理，绝不崩溃
+        let cents = v
+            .0
+            .abs()
+            .checked_mul(Decimal::from(100))
+            .and_then(|d| d.to_i64())
+            .unwrap_or(i64::MAX);
         let yuan = cents / 100;
         let jiao = (cents % 100) / 10;
         let fen = cents % 10;

@@ -23,7 +23,7 @@ fn now() -> String {
 pub fn po_estimate_add(db: &Db, po_id: i64, period: Period, item: &str, est_amount: Money) -> DbResult<i64> {
     db.conn().execute(
         "INSERT INTO po_estimate(po_id,period,item,est_amount,settled) VALUES(?1,?2,?3,?4,0)",
-        rusqlite::params![po_id, period.ymm(), item, est_amount.to_string()],
+        rusqlite::params![po_id, period.ymm(), item, crate::money_param(est_amount)],
     )?;
     Ok(db.conn().last_insert_rowid())
 }
@@ -178,7 +178,7 @@ pub fn quota_use(db: &Db, period: Period, supplier: &str, item: &str, qty: Money
     let new_used = used.map(|s| m(&s)).unwrap_or(Money::ZERO) + qty;
     tx.execute(
         "UPDATE supplier_quota SET used_qty=?2 WHERE period=?1 AND supplier_code=?3 AND item=?4",
-        rusqlite::params![period.ymm(), new_used.to_string(), supplier, item],
+        rusqlite::params![period.ymm(), crate::exact_param(new_used), supplier, item],
     )?;
     tx.commit()?;
     Ok(())

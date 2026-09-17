@@ -117,13 +117,12 @@ pub fn kv(ui: &mut Ui, key: &str, value: &str) {
     });
 }
 
-/// 分组卡片
-pub fn card<R>(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui) -> R) -> R {
+/// 分组卡片。折叠时内容不执行（`body_returned` 为 None），因此不返回值；
+/// 业务数据回传请用外部 `&mut`/`Rc<RefCell<_>>` 收集。
+pub fn card<R>(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui) -> R) {
     egui::CollapsingHeader::new(RichText::new(title).strong())
         .default_open(true)
-        .show(ui, content)
-        .body_returned
-        .unwrap_or_else(|| unreachable!())
+        .show(ui, content);
 }
 
 /// 空数据提示

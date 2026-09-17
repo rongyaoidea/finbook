@@ -175,6 +175,7 @@ pub fn export_sheet(sheet: &Sheet, default_name: &str, xlsx: bool) -> Result<Str
 
 /// 生成可打印的 HTML（自带打印样式，自动唤起打印对话框）
 fn sheet_to_html(sheet: &Sheet, title: &str) -> String {
+    let title = escape_html(title);
     let mut rows = String::new();
     for r in &sheet.rows {
         rows.push_str("<tr>");
@@ -213,6 +214,8 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// 打印预览：生成 HTML 用默认浏览器打开并自动弹出打印对话框。

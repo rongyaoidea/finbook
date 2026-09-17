@@ -380,7 +380,8 @@ impl Account {
             return None;
         }
         let len: usize = segs.iter().take(lvl - 1).map(|s| *s as usize).sum();
-        Some(code[..len].to_string())
+        // 非法编码（非 ASCII/长度不在级长边界）不 panic，按"无上级"处理
+        code.get(..len).map(|s| s.to_string())
     }
 
     /// 该级次的编码长度

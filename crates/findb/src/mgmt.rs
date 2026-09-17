@@ -75,19 +75,24 @@ pub fn budget_list_version(db: &Db, period: Option<Period>, version: &str) -> Db
 
 /// 带版本 upsert（UNIQUE(period,account_code,dept,version)）
 pub fn budget_upsert_version(db: &Db, b: &Budget) -> DbResult<i64> {
-    db.conn().execute(
+    budget_upsert_version_on(db.conn(), b)
+}
+
+/// 同 `budget_upsert_version`，但只依赖连接，可在调用方的事务内执行
+pub fn budget_upsert_version_on(conn: &rusqlite::Connection, b: &Budget) -> DbResult<i64> {
+    conn.execute(
         "INSERT INTO budget(period,account_code,dept,amount,memo,version) VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(period,account_code,dept,version) DO UPDATE SET amount=excluded.amount, memo=excluded.memo",
         rusqlite::params![
             b.period.ymm(),
             b.account_code,
             b.dept,
-            b.amount.to_string(),
+            crate::money_param(b.amount),
             b.memo,
             b.version
         ],
     )?;
-    let id: i64 = db.conn().query_row(
+    let id: i64 = conn.query_row(
         "SELECT id FROM budget WHERE period=?1 AND account_code=?2 AND dept=?3 AND version=?4",
         rusqlite::params![b.period.ymm(), b.account_code, b.dept, b.version],
         |r| r.get(0),
@@ -143,6 +148,8 @@ pub fn budget_from_actual(
 ) -> DbResult<usize> {
     let snap = BalanceSnapshot::load(db, &BalanceQuery::period(from_period))?;
     let accounts = crate::accounts::list(db)?;
+    // 整批同事务：中途失败整体回滚，避免生成一半预算
+    let tx = db.write_tx()?;
     let mut n = 0;
     for a in accounts.iter().filter(|a| a.category.is_profit_loss()) {
         let row = snap.for_account(&a.code, None);
@@ -150,8 +157,8 @@ pub fn budget_from_actual(
         if actual.is_zero() {
             continue;
         }
-        budget_upsert(
-            db,
+        budget_upsert_version_on(
+            &tx,
             &Budget {
                 id: 0,
                 period: to_period,
@@ -164,6 +171,7 @@ pub fn budget_from_actual(
         )?;
         n += 1;
     }
+    tx.commit()?;
     Ok(n)
 }
 

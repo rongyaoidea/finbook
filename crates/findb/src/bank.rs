@@ -121,9 +121,9 @@ pub fn insert(c: &impl crate::AsConn, s: &Statement) -> DbResult<i64> {
             s.biz_date.format("%Y-%m-%d").to_string(),
             s.summary,
             s.settle_no,
-            s.debit.to_string(),
-            s.credit.to_string(),
-            s.balance.to_string(),
+            crate::money_param(s.debit),
+            crate::money_param(s.credit),
+            crate::money_param(s.balance),
             s.entry_id,
             s.matched_at,
             s.matched_by

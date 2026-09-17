@@ -650,6 +650,9 @@ fn t08_detail_ledger() {
         from: p1(),
         to: p1(),
         posted_only: true,
+        prepared_by: None,
+        code_from: None,
+        code_to: None,
     };
     let rows = findb::balances::ledger(&db, &chart, &q).unwrap();
     // 银行存款共 4 笔：收 120,000 / 付 113,000 / 付 80,000 / 付 20,000
@@ -690,6 +693,9 @@ fn t09_general_ledger_and_journal() {
         from: p1(),
         to: p1(),
         posted_only: true,
+        prepared_by: None,
+        code_from: None,
+        code_to: None,
     };
     let gl = findb::balances::general_ledger(&db, &q).unwrap();
     assert_eq!(gl.len(), 1);

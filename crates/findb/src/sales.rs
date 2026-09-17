@@ -161,7 +161,7 @@ pub fn so_shipment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
 pub fn so_payment_add(db: &Db, so_id: i64, period: Period, date: NaiveDate, amount: Money, memo: &str) -> DbResult<i64> {
     db.conn().execute(
         "INSERT INTO so_payment(so_id,period,date,amount,memo) VALUES(?1,?2,?3,?4,?5)",
-        rusqlite::params![so_id, period.ymm(), date.format("%Y-%m-%d").to_string(), amount.to_string(), memo],
+        rusqlite::params![so_id, period.ymm(), date.format("%Y-%m-%d").to_string(), crate::money_param(amount), memo],
     )?;
     Ok(db.conn().last_insert_rowid())
 }

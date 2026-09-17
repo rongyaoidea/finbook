@@ -1890,3 +1890,66 @@ async fn backups_isolated_per_book() {
     let own = body_string(resp).await;
     assert!(own.contains(&zname), "自己的备份应可见：{own}");
 }
+
+/// 跨租户口令接管回归：账套管理员不能重置「其他账套归属者」的平台口令。
+///
+/// 历史漏洞：任意自建账套的用户（天然拥有 UserManage）可把受害者平台账号
+/// 拉进自己的账套，再调 `/api/users/:username/reset-password` 改写其全局口令，
+/// 而该口令会被同步覆盖到受害者名下所有账套 → 跨租户锁定/接管。
+#[tokio::test]
+async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let attacker = provision_plain_user(&state, &admin_sid, "att1", "At12345678").await;
+    let victim = provision_plain_user(&state, &admin_sid, "vic1", "Vc12345678").await;
+
+    // 双方各自建账套（此时双方都是自己账套的 Admin）
+    let (st, body) = create_book(&state, &attacker, "攻击者账套").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let akey = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &attacker, &akey).await, StatusCode::OK);
+
+    let (st, body) = create_book(&state, &victim, "受害者账套").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let vkey = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &victim, &vkey).await, StatusCode::OK);
+
+    // 攻击者把受害者账号拉进自己的账套（合法成员邀请，但不应借此重置全局口令）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &attacker,
+            serde_json::json!({
+                "username": "vic1", "display_name": "受害者", "password": "Init123456",
+                "role": "accountant", "must_change_pwd": false,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "邀请成员本身应成功");
+
+    // 重置全局口令必须被拒（受害者拥有自己的账套）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users/vic1/reset-password",
+            &attacker,
+            serde_json::json!({ "new": "Hacked123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "账套管理员不得重置其他账套归属者的平台口令"
+    );
+
+    // 受害者原口令仍可登录（未被改写）
+    let (st, _) = login(&state, "vic1", "Vc12345678x").await;
+    assert_eq!(st, StatusCode::OK, "受害者口令不应被跨租户重置");
+}

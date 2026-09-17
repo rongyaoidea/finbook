@@ -16,6 +16,8 @@
 //! 支持 `+ - * /` 和括号，除法分母为 0 时返回 0 而不是报错——报表里出现 `#DIV/0`
 //! 比显示 0 更让人困惑，因为通常只是当期还没数据。
 
+use rust_decimal::prelude::ToPrimitive;
+
 use crate::money::Money;
 use crate::{FinError, Period};
 
@@ -276,7 +278,9 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Num(n) => {
                     self.bump();
-                    args.push(Some(n.to_string()));
+                    // 保留精确数值：`to_string()` 是金额显示格式（2 位小数 + 千分位），
+                    // 会让期间偏移 `-1` 变成 `-1.00` 而解析失败
+                    args.push(Some(n.fmt_exact()));
                     match self.bump() {
                         Tok::Comma => {}
                         Tok::RParen => break,
@@ -286,7 +290,7 @@ impl<'a> Parser<'a> {
                 // 参数位置也可以是一个表达式（比如 -1）
                 Tok::Minus | Tok::Plus => {
                     let v = self.expr()?;
-                    args.push(Some(v.to_string()));
+                    args.push(Some(v.fmt_exact()));
                     match self.bump() {
                         Tok::Comma => {}
                         Tok::RParen => break,
@@ -303,8 +307,21 @@ impl<'a> Parser<'a> {
         let a = |i: usize| -> Option<String> { args.get(i).cloned().flatten() };
         let code = a(0)
             .ok_or_else(|| FinError::msg(format!("{name}() 缺少科目参数")))?;
+        // 期间偏移：允许 -1 / -12 这类写法，也容忍历史公式里的 "-1.00" 小数写法
         let offset: i32 = match a(1) {
-            Some(s) => s.trim().parse::<i32>().unwrap_or(0),
+            Some(s) => {
+                let t = s.trim().replace(',', "");
+                if t.is_empty() {
+                    0
+                } else {
+                    t.parse::<i32>().ok().or_else(|| {
+                        Money::parse(&t)
+                            .ok()
+                            .and_then(|m| m.inner().trunc().to_i32())
+                    })
+                    .unwrap_or(0)
+                }
+            }
             None => 0,
         };
         let period = self.period.add_months(offset);

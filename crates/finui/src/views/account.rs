@@ -16,6 +16,8 @@ pub struct AccountView {
     /// 正在编辑的科目；None 表示未打开编辑窗
     pub editing: Option<Account>,
     pub editing_new: bool,
+    /// 修改前的原编码：编码不可改，保存时用它核对
+    pub editing_orig: String,
     pub err: String,
 }
 
@@ -29,6 +31,7 @@ impl Default for AccountView {
             dirty: true,
             editing: None,
             editing_new: false,
+            editing_orig: String::new(),
             err: String::new(),
         }
     }
@@ -193,6 +196,7 @@ impl AccountView {
                         if ui.small_button("改").clicked() && can_edit_now {
                             self.editing = Some(a.clone());
                             self.editing_new = false;
+                            self.editing_orig = a.code.clone();
                             self.err.clear();
                         }
                         if ui.small_button("删").clicked() && can_edit_now {
@@ -236,7 +240,12 @@ impl AccountView {
                     .spacing([10.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("科目编码：");
-                        ui.add_sized([200.0, 22.0], egui::TextEdit::singleline(&mut a.code));
+                        ui.add_enabled_ui(is_new, |ui| {
+                            ui.add_sized([200.0, 22.0], egui::TextEdit::singleline(&mut a.code));
+                        });
+                        if !is_new {
+                            ui.label(RichText::new("编码不可修改").weak());
+                        }
                         ui.end_row();
 
                         ui.label("科目名称：");
@@ -340,6 +349,12 @@ impl AccountView {
         if save {
             let a = self.editing.clone().unwrap();
             self.err.clear();
+            // 编码改动会按"新编码"覆盖另一科目的属性（UPDATE ... WHERE code=新编码），
+            // 且凭证/余额仍挂在旧编码上——直接禁止修改既有科目的编码。
+            if !self.editing_new && a.code != self.editing_orig {
+                self.err = "科目编码不可修改；如需更换编码，请新建科目并在期初/凭证中调整".to_string();
+                return;
+            }
             let res = if self.editing_new {
                 let iss = ctx.chart().validate_new(&a);
                 iss.into_result()

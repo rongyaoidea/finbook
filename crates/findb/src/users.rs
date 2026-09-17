@@ -91,7 +91,12 @@ pub fn insert(db: &Db, u: &User) -> DbResult<i64> {
 }
 
 pub fn update(db: &Db, u: &User) -> DbResult<()> {
-    db.conn().execute(
+    update_on(db.conn(), u)
+}
+
+/// 同 `update`，但只依赖连接，可在调用方的事务内执行
+pub fn update_on(conn: &rusqlite::Connection, u: &User) -> DbResult<()> {
+    conn.execute(
         "UPDATE user SET display_name=?2,password_hash=?3,role=?4,disabled=?5,extra_perms=?6,memo=?7,
             pwd_changed_at=?8,must_change_pwd=?9,locked_until=?10,last_login_at=?11,data_scope_json=?12,
             device_id=?13,device_name=?14,deny_perms_json=?15

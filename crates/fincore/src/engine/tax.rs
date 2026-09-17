@@ -137,7 +137,9 @@ pub fn year_schedule(
     let mut withheld = Money::ZERO;
     let mut out = Vec::with_capacity(monthly.len());
 
-    for (i, (inc, sp, ad, ot)) in monthly.iter().enumerate() {
+    // 全年最多 12 个月：多余入参直接截断，否则 months>12 会让 current_tax 返回
+    // Err 被吞成 0，后续月份税额全变成 0（静默错数）。
+    for (i, (inc, sp, ad, ot)) in monthly.iter().take(12).enumerate() {
         income += *inc;
         special += *sp;
         additional += *ad;
@@ -150,7 +152,13 @@ pub fn year_schedule(
             withheld,
             months: (i + 1) as i32,
         };
-        let t = current_tax(&c).unwrap_or(Money::ZERO);
+        let t = match current_tax(&c) {
+            Ok(v) => v,
+            Err(_) => {
+                debug_assert!(false, "months 已限制在 1..=12，current_tax 不应失败");
+                Money::ZERO
+            }
+        };
         withheld += t;
         out.push(t);
     }

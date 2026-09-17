@@ -75,7 +75,10 @@ pub fn balance_sheet_def() -> ReportDef {
         1,
         vec![
             Term::acct(
-                &["1403", "1405", "1406", "1407", "1408", "1411", "5001"],
+                &[
+                    "1401", "1402", "1403", "1404", "1405", "1406", "1407", "1408", "1411", "5001",
+                    "5101",
+                ],
                 AmountKind::End,
             ),
             // 减去存货跌价准备（贷方余额为负，直接相加即扣减）
@@ -88,7 +91,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "8",
         "其他流动资产",
         1,
-        vec![Term::acct(&["1124", "1512"], AmountKind::End)],
+        vec![Term::acct(&["1124"], AmountKind::End)],
     ));
 
     let i_cur_total = lines.len();
@@ -116,7 +119,11 @@ pub fn balance_sheet_def() -> ReportDef {
         "10",
         "长期股权投资",
         1,
-        vec![Term::acct(&["1511"], AmountKind::End)],
+        vec![
+            Term::acct(&["1511"], AmountKind::End),
+            // 长期股权投资减值准备（贷方余额为负，直接相加即扣减）
+            Term::acct(&["1512"], AmountKind::End),
+        ],
     ));
 
     let i_fixed = lines.len();

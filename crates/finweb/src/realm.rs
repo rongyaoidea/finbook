@@ -478,6 +478,37 @@ impl RealmDb {
         )?)
     }
 
+    /// 统计该用户名当前出现在多少个账套的用户表中（含自建账套）。
+    ///
+    /// 供"账套管理员重置成员口令"做越权防护：只有仅属于当前账套的成员
+    /// 才允许由账套管理员重置平台口令，否则可借"邀请 + 重置"接管他人账号。
+    pub fn count_books_containing(&self, books_dir: &Path, username: &str) -> DbResult<usize> {
+        let paths = self.load_all_book_paths()?;
+        let dir = books_dir.canonicalize().ok();
+        let mut n = 0usize;
+        for p in paths {
+            if !p.exists() {
+                continue;
+            }
+            // 与 sync_password_to_books 相同：仅扫描指定目录下的账套
+            if let Some(dir) = &dir {
+                match p.canonicalize() {
+                    Ok(pc) if pc.starts_with(dir) => {}
+                    _ => continue,
+                }
+            }
+            match Db::open(&p) {
+                Ok(db) => {
+                    if matches!(users::get(&db, username), Ok(Some(_))) {
+                        n += 1;
+                    }
+                }
+                Err(e) => eprintln!("[realm] 扫描账套失败 {}: {e}", p.display()),
+            }
+        }
+        Ok(n)
+    }
+
     /// 启动时把目录全量载入（返回 path，供注册进 BookRegistry）
     pub fn load_all_book_paths(&self) -> DbResult<Vec<PathBuf>> {
         let conn = self.inner.lock().unwrap();

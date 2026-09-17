@@ -28,17 +28,19 @@ fn now_str() -> String {
 }
 
 pub fn log_attempt(db: &Db, username: &str, ok: bool) -> DbResult<()> {
-    db.conn().execute(
+    let tx = db.write_tx()?;
+    tx.execute(
         "INSERT INTO login_attempt(username, ts, ok) VALUES(?1,?2,?3)",
         rusqlite::params![username, now_str(), ok as i64],
     )?;
-    // 只保留最近 500 条，避免日志表无限增长
-    db.conn().execute(
+    // 只保留最近 500 条，避免日志表无限增长（与插入同事务，防裁剪失败后表无限涨）
+    tx.execute(
         "DELETE FROM login_attempt WHERE id NOT IN (
             SELECT id FROM login_attempt ORDER BY id DESC LIMIT 500
          )",
         [],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -102,12 +104,17 @@ pub fn attempts(db: &Db, username: Option<&str>, limit: i64) -> DbResult<Vec<Att
 }
 
 pub fn clear_attempts(db: &Db, username: Option<&str>) -> DbResult<usize> {
+    clear_attempts_on(db.conn(), username)
+}
+
+/// 同 `clear_attempts`，但只依赖连接，可在调用方的事务内执行
+pub fn clear_attempts_on(conn: &rusqlite::Connection, username: Option<&str>) -> DbResult<usize> {
     let n = match username {
-        Some(u) => db.conn().execute(
+        Some(u) => conn.execute(
             "DELETE FROM login_attempt WHERE username=?1",
             rusqlite::params![u],
         )?,
-        None => db.conn().execute("DELETE FROM login_attempt", [])?,
+        None => conn.execute("DELETE FROM login_attempt", [])?,
     };
     Ok(n)
 }
@@ -262,11 +269,14 @@ pub fn lock_user(db: &Db, username: &str, minutes: i64) -> DbResult<()> {
 
 /// 解锁
 pub fn unlock_user(db: &Db, username: &str) -> DbResult<()> {
-    db.conn().execute(
+    // 解绑锁定与清失败计数同事务：避免"锁已解、计数没清，下一次失败立即又锁"
+    let tx = db.write_tx()?;
+    tx.execute(
         "UPDATE user SET locked_until=NULL WHERE username=?1",
         rusqlite::params![username],
     )?;
-    clear_attempts(db, Some(username))?;
+    clear_attempts_on(&tx, Some(username))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -292,8 +302,10 @@ pub fn change_password_checked(
         return Ok(Err("新口令不能与旧口令相同".to_string()));
     }
     u.set_password(new);
-    crate::users::update(db, &u)?;
-    clear_attempts(db, Some(username))?;
+    let tx = db.write_tx()?;
+    crate::users::update_on(&tx, &u)?;
+    clear_attempts_on(&tx, Some(username))?;
+    tx.commit()?;
     Ok(Ok(()))
 }
 
@@ -315,8 +327,10 @@ pub fn admin_reset_password(
     u.must_change_pwd = true;
     // 重置口令同时解除锁定，否则用户拿到新口令还是进不来
     u.locked_until = None;
-    crate::users::update(db, &u)?;
-    clear_attempts(db, Some(username))?;
+    let tx = db.write_tx()?;
+    crate::users::update_on(&tx, &u)?;
+    clear_attempts_on(&tx, Some(username))?;
+    tx.commit()?;
     Ok(Ok(()))
 }
 

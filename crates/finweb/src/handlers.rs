@@ -2901,7 +2901,7 @@ async fn add_estimate(
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
-    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money_checked(&req.est_amount))?;
+    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money_checked(&req.est_amount)?)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -2986,7 +2986,7 @@ async fn set_quota(
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
-    findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money_checked(&req.quota_qty))?;
+    findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money_checked(&req.quota_qty)?)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3089,7 +3089,7 @@ async fn add_po_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
+    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3225,7 +3225,7 @@ async fn add_so_shipment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
+    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3242,7 +3242,7 @@ async fn add_so_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money_checked(&req.qty), &req.memo)?;
+    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -3271,7 +3271,7 @@ async fn add_so_payment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money_checked(&req.amount), &req.memo)?;
+    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money_checked(&req.amount)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 

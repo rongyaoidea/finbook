@@ -27,9 +27,14 @@ RUN mkdir -p crates/fincore/src crates/findb/src crates/finui/src crates/finbook
  && echo 'fn main() {}' > crates/finbook/build.rs \
  && echo 'fn main() {}' > crates/finweb/src/main.rs \
  && cargo build --release --locked -p finweb
-# 拷贝真实源码并构建
+# 拷贝真实源码并构建。
+# 注意：预取层留下的空占位库产物与新指纹仍在 target 里，而 COPY 保留源文件
+# 的 mtime（可能比产物更旧），cargo 会误判"无需重编"而复用空库/空 main 的
+# 编译产物，打出一个假 finweb。因此先 clean 掉三个 workspace crate 的产物与
+# 指纹，强制用真实源码重编；外部依赖的编译缓存保留，预取仍有效。
 COPY crates/ crates/
-RUN cargo build --release --locked -p finweb
+RUN cargo clean -p fincore -p findb -p finweb \
+ && cargo build --release --locked -p finweb
 
 # ── 运行阶段 ──────────────────────────────────────────────
 FROM debian:bookworm-slim

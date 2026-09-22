@@ -611,7 +611,12 @@ pub enum AppError {
 
 impl From<DbError> for AppError {
     fn from(e: DbError) -> Self {
-        AppError::Db(e)
+        // 领域错误（状态机/校验/不存在）是客户端可修正的，返回 400 并把引擎提示
+        // 透给用户；SQLite/序列化等基础设施错误仍走 500（详情只进服务端日志）。
+        match e {
+            DbError::Fin(fe) => AppError::BadRequest(fe.to_string()),
+            other => AppError::Db(other),
+        }
     }
 }
 

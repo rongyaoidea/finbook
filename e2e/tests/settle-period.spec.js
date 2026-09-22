@@ -6,7 +6,7 @@ test("往来核销：两笔应收/收款自动核销→账龄→核销记录", a
   await postVoucher(page, {
     date: "2026-01-10",
     rows: [
-      { code: "1122", summary: "销售应收", debit: "100", aux: { customer: "C01" } },
+      { code: "112201", summary: "销售应收", debit: "100", aux: { customer: "C01" } },
       { code: "1001", summary: "销售应收", credit: "100" },
     ],
   });
@@ -14,7 +14,7 @@ test("往来核销：两笔应收/收款自动核销→账龄→核销记录", a
     date: "2026-01-20",
     rows: [
       { code: "1001", summary: "收回货款", debit: "100" },
-      { code: "1122", summary: "收回货款", credit: "100", aux: { customer: "C01" } },
+      { code: "112201", summary: "收回货款", credit: "100", aux: { customer: "C01" } },
     ],
   });
 

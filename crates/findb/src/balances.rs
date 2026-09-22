@@ -555,6 +555,107 @@ pub fn list_begin(db: &Db) -> DbResult<Vec<BeginRow>> {
     Ok(rows)
 }
 
+/// 辅助账行：按辅助核算维度（客户/供应商/部门/职员/项目/存货/银行）汇总
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AuxBalanceRow {
+    pub key: String,
+    pub begin: Money,
+    pub debit: Money,
+    pub credit: Money,
+    pub end: Money,
+}
+
+/// 辅助账：某维度下各单位的期初/发生/期末（金额带符号，正=借）
+pub fn aux_balance(
+    db: &Db,
+    kind: fincore::AuxKind,
+    from: Period,
+    to: Period,
+    user: Option<&fincore::user::User>,
+) -> DbResult<Vec<AuxBalanceRow>> {
+    let mut q = BalanceQuery::range(from, to);
+    if let Some(u) = user {
+        q = q.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &q)?;
+    let mut map: BTreeMap<String, AuxBalanceRow> = BTreeMap::new();
+    for row in snap.raw_rows() {
+        let Some(entity) = row.aux.get(kind).filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let e = map.entry(entity.clone()).or_insert(AuxBalanceRow {
+            key: entity.clone(),
+            begin: Money::ZERO,
+            debit: Money::ZERO,
+            credit: Money::ZERO,
+            end: Money::ZERO,
+        });
+        e.begin += row.begin;
+        e.debit += row.debit;
+        e.credit += row.credit;
+        e.end += row.end();
+    }
+    Ok(map.into_values().collect())
+}
+
+/// 数量金额账行（数量核算科目，数量与金额对照）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QtyBalanceRow {
+    pub account_code: String,
+    pub account_name: String,
+    pub qty_begin: Money,
+    pub qty_in: Money,
+    pub qty_out: Money,
+    pub qty_end: Money,
+    pub amount_begin: Money,
+    pub amount_debit: Money,
+    pub amount_credit: Money,
+    pub amount_end: Money,
+}
+
+/// 数量金额账：数量核算科目的数量与金额对照（按科目汇总，含下级）
+pub fn qty_balance_sheet(
+    db: &Db,
+    from: Period,
+    to: Period,
+    user: Option<&fincore::user::User>,
+) -> DbResult<Vec<QtyBalanceRow>> {
+    let mut q = BalanceQuery::range(from, to);
+    if let Some(u) = user {
+        q = q.with_user_scope(u);
+    }
+    let snap = BalanceSnapshot::load(db, &q)?;
+    let chart = crate::accounts::chart(db)?;
+    let mut map: BTreeMap<String, QtyBalanceRow> = BTreeMap::new();
+    for row in snap.raw_rows() {
+        let Some(qty) = row.qty else { continue };
+        let e = map.entry(row.account_code.clone()).or_insert(QtyBalanceRow {
+            account_code: row.account_code.clone(),
+            account_name: chart
+                .get(&row.account_code)
+                .map(|a| a.name.clone())
+                .unwrap_or_default(),
+            qty_begin: Money::ZERO,
+            qty_in: Money::ZERO,
+            qty_out: Money::ZERO,
+            qty_end: Money::ZERO,
+            amount_begin: Money::ZERO,
+            amount_debit: Money::ZERO,
+            amount_credit: Money::ZERO,
+            amount_end: Money::ZERO,
+        });
+        e.qty_begin += qty.begin;
+        e.qty_in += qty.in_qty;
+        e.qty_out += qty.out_qty;
+        e.qty_end += qty.end();
+        e.amount_begin += row.begin;
+        e.amount_debit += row.debit;
+        e.amount_credit += row.credit;
+        e.amount_end += row.end();
+    }
+    Ok(map.into_values().collect())
+}
+
 /// 写入 / 更新一条期初余额（按 科目+辅助核算 唯一）
 pub fn upsert_begin(db: &Db, r: &BeginRow) -> DbResult<()> {
     upsert_begin_on(db.conn(), r)

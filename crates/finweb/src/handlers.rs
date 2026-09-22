@@ -169,6 +169,16 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/reports/compare", get(get_report_compare))
         .route("/api/reports/daily", get(get_account_daily))
         .route("/api/reports/reconcile", get(get_period_reconcile))
+        // 辅助账 / 数量金额账（与桌面端对齐）
+        .route("/api/reports/aux-balance", get(get_aux_balance))
+        .route("/api/reports/qty-balance", get(get_qty_balance))
+        // 自定义报表（UFO 公式，与桌面端对齐）
+        .route(
+            "/api/custom-reports",
+            get(list_custom_reports).post(save_custom_report),
+        )
+        .route("/api/custom-reports/:key", get(get_custom_report))
+        .route("/api/custom-reports/:key/delete", post(delete_custom_report))
         // 存货核算：成本调整
         .route("/api/inventory/adjust", post(stock_adjust_endpoint))
         // 库存深度：序列号 / 多单位 / 账龄 / ABC / 组装拆卸 / 分仓库
@@ -3315,6 +3325,181 @@ async fn get_period_reconcile(
     let db = state.db_for(&user.book_key)?;
     let items = findb::reports::period_reconcile(&db, period)?;
     Ok(Json(serde_json::json!({ "period": period_to_str(period), "items": items })))
+}
+
+/// 辅助账：按辅助核算维度汇总各单位的期初/发生/期末
+async fn get_aux_balance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let kind_code = q.get("kind").map(String::as_str).unwrap_or("customer");
+    let kind = fincore::AuxKind::from_code(kind_code)
+        .ok_or_else(|| AppError::bad_request("非法辅助核算维度 kind"))?;
+    if kind == fincore::AuxKind::CashFlow {
+        return Err(AppError::bad_request("现金流量项目不是余额维度"));
+    }
+    let (from, to) = report_range(&state, &user, &q);
+    let db = state.db_for(&user.book_key)?;
+    let rows = balances::aux_balance(&db, kind, from, to, Some(&user.user))?;
+    Ok(Json(json!({
+        "kind": kind.code(),
+        "kind_label": kind.label(),
+        "from": period_to_str(from),
+        "to": period_to_str(to),
+        "rows": rows,
+    })))
+}
+
+/// 数量金额账：数量核算科目的数量与金额对照
+async fn get_qty_balance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let db = state.db_for(&user.book_key)?;
+    let rows = balances::qty_balance_sheet(&db, from, to, Some(&user.user))?;
+    Ok(Json(json!({
+        "from": period_to_str(from),
+        "to": period_to_str(to),
+        "rows": rows,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// 自定义报表（UFO 公式）
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct CustomLineReq {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub indent: u8,
+    #[serde(default)]
+    pub formulas: Vec<String>,
+    #[serde(default)]
+    pub bold: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct CustomReportReq {
+    #[serde(default)]
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub lines: Vec<CustomLineReq>,
+}
+
+fn custom_json(r: &findb::mgmt::CustomReport) -> serde_json::Value {
+    json!({
+        "key": r.key,
+        "name": r.name,
+        "columns": r.columns,
+        "lines": r.lines.iter().map(|l| json!({
+            "name": l.name, "indent": l.indent, "formulas": l.formulas, "bold": l.bold,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn list_custom_reports(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows: Vec<serde_json::Value> = findb::mgmt::custom_list(&db)?
+        .iter()
+        .map(custom_json)
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn get_custom_report(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(key): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let r = findb::mgmt::custom_get(&db, &key)?
+        .ok_or_else(|| AppError::not_found("自定义报表不存在"))?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let values = findb::mgmt::custom_report_values(&db, &r, period)?;
+    let matrix: Vec<Vec<String>> = values
+        .iter()
+        .map(|row| row.iter().map(|m| m.fmt_money()).collect())
+        .collect();
+    Ok(Json(json!({
+        "report": custom_json(&r),
+        "period": period_to_str(period),
+        "values": matrix,
+    })))
+}
+
+async fn save_custom_report(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CustomReportReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.name.trim().is_empty() {
+        return Err(AppError::bad_request("报表名称不能为空"));
+    }
+    let key = if req.key.trim().is_empty() {
+        findb::mgmt::custom_next_key(&db)?
+    } else {
+        req.key.trim().to_string()
+    };
+    let r = findb::mgmt::CustomReport {
+        key: key.clone(),
+        name: req.name.trim().to_string(),
+        columns: req.columns.iter().map(|c| c.trim().to_string()).collect(),
+        lines: req
+            .lines
+            .iter()
+            .map(|l| findb::mgmt::CustomLine {
+                name: l.name.trim().to_string(),
+                indent: l.indent,
+                formulas: l.formulas.clone(),
+                bold: l.bold,
+            })
+            .collect(),
+    };
+    let errors: Vec<serde_json::Value> = findb::mgmt::custom_check(&r)
+        .into_iter()
+        .map(|(li, ci, e)| json!({ "line": li, "column": ci, "error": e }))
+        .collect();
+    findb::mgmt::custom_save(&db, &r)?;
+    db.log(
+        user.username(),
+        "报表",
+        "保存自定义报表",
+        &format!("{} {}（{} 行）", key, r.name, r.lines.len()),
+    )?;
+    Ok(Json(json!({ "key": key, "errors": errors })))
+}
+
+async fn delete_custom_report(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::mgmt::custom_delete(&db, &key)?;
+    db.log(user.username(), "报表", "删除自定义报表", &key)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---- 存货核算：成本调整 ----

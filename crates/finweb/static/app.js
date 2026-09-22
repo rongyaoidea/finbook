@@ -372,6 +372,7 @@ const NAV_ITEMS = [
   { id: "compare", label: "报表对比", perm: "report", group: "账簿报表" },
   { id: "daily", label: "科目日报表", perm: "report", group: "账簿报表" },
   { id: "notes", label: "报表附注", perm: "report", group: "账簿报表" },
+  { id: "custom-reports", label: "自定义报表", perm: "report", group: "账簿报表" },
   { id: "period-end", label: "期末处理", perm: "period_close", group: "期末" },
   { id: "assets", label: "固定资产", perm: "account_edit", group: "期末" },
   { id: "bank", label: "银行对账", perm: "voucher_new", group: "期末" },
@@ -436,6 +437,7 @@ const VIEWS = {
   "routing": viewRouting,
   "approval": viewApproval,
   "notes": viewNotes,
+  "custom-reports": viewCustomReports,
   "archive": viewArchive,
   "budget-versions": viewBudgetVersions,
   "budget-alerts": viewBudgetAlerts,
@@ -1570,6 +1572,14 @@ async function viewReports(main) {
       <label>从 <input id="r-from" value="${esc(state.current || "")}" style="width:90px" /></label>
       <label>至 <input id="r-to" value="${esc(state.current || "")}" style="width:90px" /></label>
       <button class="btn sm" id="r-go">生成科目余额表</button>
+      <button class="btn ghost sm" id="r-aux">辅助账</button>
+      <label>维度 <select id="r-auxkind">
+        <option value="customer">客户</option><option value="supplier">供应商</option>
+        <option value="dept">部门</option><option value="employee">职员</option>
+        <option value="project">项目</option><option value="item">存货</option>
+        <option value="bank">银行账户</option>
+      </select></label>
+      <button class="btn ghost sm" id="r-qty">数量金额账</button>
       <span class="spacer"></span>
       ${can("export") ? `<button class="btn ghost sm" id="r-export">导出 CSV</button>
       <button class="btn ghost sm" id="r-pdf">导出 PDF</button>` : `<span class="tag warn" title="无导出权限">无导出权限，仅可打印</span>`}
@@ -1577,13 +1587,37 @@ async function viewReports(main) {
     </div>
     <div class="panel"><table class="grid" id="r-table"><thead><tr>
       <th>科目编码</th><th>科目名称</th><th>方向</th><th class="num">期初</th><th class="num">本期借方</th><th class="num">本期贷方</th><th class="num">期末</th><th class="num">本年累计借方</th><th class="num">本年累计贷方</th>
-    </tr></thead><tbody><tr><td colspan="9" class="muted">点击「生成科目余额表」</td></tr></tbody></table></div>`;
+    </tr></thead><tbody><tr><td colspan="9" class="muted">点击「生成科目余额表」</td></tr></tbody></table></div>
+    <div id="r-extra" style="margin-top:10px"></div>`;
   $("#r-go").addEventListener("click", loadTrial);
   $("#r-print").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.open(`/api/reports/trial-balance/print?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`, "_blank"); });
   if (can("export")) {
     $("#r-export").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.location = `/api/reports/trial-balance/export?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`; });
     $("#r-pdf").addEventListener("click", () => { const f = $("#r-from").value, t = $("#r-to").value; window.location = `/api/reports/trial-balance/pdf?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`; });
   }
+  $("#r-aux").addEventListener("click", async () => {
+    const kind = $("#r-auxkind").value;
+    const qs = new URLSearchParams({ kind, from: $("#r-from").value, to: $("#r-to").value });
+    try {
+      const d = await api(`/reports/aux-balance?${qs.toString()}`);
+      const rows = d.rows || [];
+      $("#r-extra").innerHTML = `<div class="panel"><b>${esc(d.kind_label)}辅助账（${esc(d.from)} ~ ${esc(d.to)}）</b>
+        <button class="btn ghost sm" style="float:right" id="r-aux-print">打印预览</button>
+        <table class="grid" id="r-aux-table" style="margin-top:6px"><thead><tr><th>${esc(d.kind_label)}</th><th class="num">期初</th><th class="num">本期借方</th><th class="num">本期贷方</th><th class="num">期末</th></tr></thead><tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.key)}</td><td class="num">${esc(r.begin)}</td><td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td><td class="num">${esc(r.end)}</td></tr>`).join("") : `<tr><td colspan="5" class="muted">无数据</td></tr>`}</tbody></table></div>`;
+      $("#r-aux-print").onclick = () => printPreview(`${d.kind_label}辅助账`, $("#r-aux-table"));
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#r-qty").addEventListener("click", async () => {
+    const qs = new URLSearchParams({ from: $("#r-from").value, to: $("#r-to").value });
+    try {
+      const d = await api(`/reports/qty-balance?${qs.toString()}`);
+      const rows = d.rows || [];
+      $("#r-extra").innerHTML = `<div class="panel"><b>数量金额账（${esc(d.from)} ~ ${esc(d.to)}）</b>
+        <button class="btn ghost sm" style="float:right" id="r-qty-print">打印预览</button>
+        <table class="grid" id="r-qty-table" style="margin-top:6px"><thead><tr><th>科目编码</th><th>科目名称</th><th class="num">期初数量</th><th class="num">入库数量</th><th class="num">出库数量</th><th class="num">期末数量</th><th class="num">期初金额</th><th class="num">借方金额</th><th class="num">贷方金额</th><th class="num">期末金额</th></tr></thead><tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.account_code)}</td><td>${esc(r.account_name)}</td><td class="num">${esc(r.qty_begin)}</td><td class="num">${esc(r.qty_in)}</td><td class="num">${esc(r.qty_out)}</td><td class="num">${esc(r.qty_end)}</td><td class="num">${esc(r.amount_begin)}</td><td class="num">${esc(r.amount_debit)}</td><td class="num">${esc(r.amount_credit)}</td><td class="num">${esc(r.amount_end)}</td></tr>`).join("") : `<tr><td colspan="10" class="muted">无数量核算科目数据</td></tr>`}</tbody></table></div>`;
+      $("#r-qty-print").onclick = () => printPreview("数量金额账", $("#r-qty-table"));
+    } catch (e) { toast(e.message, "err"); }
+  });
 }
 async function loadTrial() {
   const f = $("#r-from").value, t = $("#r-to").value;
@@ -2935,6 +2969,132 @@ async function viewSettle(main) {
     } catch (e) { toast(e.message, "err"); }
   };
   load();
+}
+
+// ===========================================================================
+// 自定义报表（UFO 公式，与桌面端对齐）
+// ===========================================================================
+async function viewCustomReports(main) {
+  const cur = (state.current || "").replace("-", "");
+  main.innerHTML = `<h2>自定义报表</h2>
+    <div class="toolbar">
+      <label>报表 <select id="cr-list" style="min-width:160px"></select></label>
+      <button class="btn sm" id="cr-load">打开</button>
+      ${can("account_edit") ? `<button class="btn ghost sm" id="cr-new">新建</button>
+      <button class="btn danger sm" id="cr-del">删除</button>` : ""}
+      <div class="spacer"></div>
+      <label>期间 <input id="cr-period" value="${esc(cur)}" style="width:90px" /></label>
+      <button class="btn ghost sm" id="cr-preview">生成</button>
+      <button class="btn ghost sm" id="cr-print">打印预览</button>
+    </div>
+    <div class="panel">
+      <div class="field"><label>名称</label><input id="cr-name" /></div>
+      <div class="field"><label>列标题（逗号分隔）</label><input id="cr-cols" placeholder="本期,本年累计" /></div>
+      <div style="margin-top:6px">
+        ${can("account_edit") ? `<button class="btn ghost sm" id="cr-addrow">+ 行</button>
+        <button class="btn ghost sm" id="cr-addcol">+ 列</button>
+        <button class="btn sm" id="cr-save">保存</button>` : `<span class="muted">无修改权限（需要 account_edit）</span>`}
+        <span id="cr-err" class="muted" style="color:var(--err)"></span>
+      </div>
+      <div id="cr-grid" style="margin-top:8px" class="muted">新建或打开一张报表</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">公式示例：QM("1001") 期末余额、QC("1001") 期初余额、FS("6001",-1,"贷") 上期贷方发生额、LFS("6001") 本年累计；支持 + - * / 与括号。</div>
+    </div>
+    <div id="cr-preview-box" style="margin-top:10px"></div>`;
+  let report = null;
+  async function refreshList() {
+    try {
+      const list = await api("/custom-reports");
+      $("#cr-list", main).innerHTML = list.length
+        ? list.map((r) => `<option value="${esc(r.key)}">${esc(r.key)} ${esc(r.name)}</option>`).join("")
+        : `<option value="">（暂无）</option>`;
+    } catch (e) { toast(e.message, "err"); }
+  }
+  function renderGrid() {
+    const box = $("#cr-grid", main);
+    if (!report) { box.className = "muted"; box.innerHTML = "新建或打开一张报表"; return; }
+    box.className = "";
+    const cols = report.columns || [];
+    const head = `<tr><th>行名称</th>${cols.map((c, i) => `<th>${esc(c)} <button class="btn sm ghost" data-delcol="${i}">×</button></th>`).join("")}<th></th></tr>`;
+    const body = (report.lines || []).map((l, li) => `<tr>
+      <td><input class="cr-lname" data-li="${li}" value="${esc(l.name)}" style="width:130px" /></td>
+      ${cols.map((_, ci) => `<td><input class="cr-f" data-li="${li}" data-ci="${ci}" value="${esc((l.formulas || [])[ci] || "")}" style="width:150px" placeholder='如 QM("1001")' /></td>`).join("")}
+      <td><button class="btn sm ghost" data-delrow="${li}">×</button></td></tr>`).join("");
+    box.innerHTML = `<table class="grid"><thead>${head}</thead><tbody>${body || `<tr><td colspan="${cols.length + 2}" class="muted">暂无行，点「+ 行」新增</td></tr>`}</tbody></table>`;
+    $all(".cr-lname", box).forEach((inp) => inp.oninput = () => { report.lines[+inp.dataset.li].name = inp.value; });
+    $all(".cr-f", box).forEach((inp) => inp.oninput = () => {
+      const l = report.lines[+inp.dataset.li];
+      l.formulas = l.formulas || [];
+      while (l.formulas.length <= +inp.dataset.ci) l.formulas.push("");
+      l.formulas[+inp.dataset.ci] = inp.value;
+    });
+    $all("[data-delrow]", box).forEach((b) => b.onclick = () => { report.lines.splice(+b.dataset.delrow, 1); renderGrid(); });
+    $all("[data-delcol]", box).forEach((b) => b.onclick = () => {
+      const i = +b.dataset.delcol;
+      report.columns.splice(i, 1);
+      report.lines.forEach((l) => (l.formulas || []).splice(i, 1));
+      renderGrid();
+    });
+  }
+  function fillForm() {
+    $("#cr-name", main).value = report ? report.name : "";
+    $("#cr-cols", main).value = report ? (report.columns || []).join(",") : "";
+    renderGrid();
+  }
+  async function open(key) {
+    try { const d = await api(`/custom-reports/${encodeURIComponent(key)}`); report = d.report; fillForm(); }
+    catch (e) { toast(e.message, "err"); }
+  }
+  await refreshList();
+  const first = $("#cr-list", main).value;
+  if (first) await open(first);
+  $("#cr-load", main).onclick = () => { const k = $("#cr-list", main).value; if (k) open(k); };
+  if ($("#cr-new", main)) $("#cr-new", main).onclick = () => {
+    report = { key: "", name: "新报表", columns: ["本期", "本年累计"], lines: [{ name: "", indent: 0, formulas: ["", ""], bold: false }] };
+    fillForm();
+  };
+  if ($("#cr-del", main)) $("#cr-del", main).onclick = async () => {
+    if (!report || !report.key) { toast("请先打开一张已保存的报表", "err"); return; }
+    if (!(await confirmDialog(`删除自定义报表「${report.name}」？`, true))) return;
+    try { await api(`/custom-reports/${encodeURIComponent(report.key)}/delete`, { method: "POST" }); toast("已删除", "ok"); report = null; fillForm(); refreshList(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#cr-addrow", main)) $("#cr-addrow", main).onclick = () => {
+    if (!report) return;
+    report.lines.push({ name: "", indent: 0, formulas: (report.columns || []).map(() => ""), bold: false });
+    renderGrid();
+  };
+  if ($("#cr-addcol", main)) $("#cr-addcol", main).onclick = () => {
+    if (!report) return;
+    report.columns.push(`列${report.columns.length + 1}`);
+    report.lines.forEach((l) => { l.formulas = l.formulas || []; l.formulas.push(""); });
+    fillForm();
+  };
+  if ($("#cr-save", main)) $("#cr-save", main).onclick = async () => {
+    if (!report) return;
+    report.name = $("#cr-name", main).value.trim();
+    report.columns = $("#cr-cols", main).value.split(",").map((s) => s.trim()).filter(Boolean);
+    try {
+      const r = await api("/custom-reports", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) });
+      report.key = r.key;
+      const errs = r.errors || [];
+      $("#cr-err", main).textContent = errs.length ? `公式有误：第 ${errs[0].line + 1} 行第 ${errs[0].column + 1} 列 ${errs[0].error}` : "";
+      toast("已保存", "ok");
+      refreshList();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#cr-preview", main).onclick = async () => {
+    if (!report || !report.key) { toast("请先保存报表", "err"); return; }
+    try {
+      const d = await api(`/custom-reports/${encodeURIComponent(report.key)}?period=${encodeURIComponent($("#cr-period", main).value.trim())}`);
+      const cols = d.report.columns || [];
+      const vals = d.values || [];
+      $("#cr-preview-box", main).innerHTML = `<div class="panel"><b>${esc(d.report.name)}（${esc(d.period)}）</b><table class="grid" id="cr-preview-table" style="margin-top:6px"><thead><tr><th>项目</th>${cols.map((c) => `<th class="num">${esc(c)}</th>`).join("")}</tr></thead><tbody>${vals.length ? vals.map((row, i) => `<tr><td>${esc((d.report.lines[i] || {}).name || "")}</td>${row.map((v) => `<td class="num">${esc(v)}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${cols.length + 1}" class="muted">无数据</td></tr>`}</tbody></table></div>`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#cr-print", main).onclick = () => {
+    const t = $("#cr-preview-table", main);
+    if (!t) { toast("请先生成", "err"); return; }
+    printPreview("自定义报表", t);
+  };
 }
 
 // ===========================================================================

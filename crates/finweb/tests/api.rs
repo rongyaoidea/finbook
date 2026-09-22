@@ -2690,3 +2690,114 @@ async fn web_voucher_attachment_roundtrip() {
     let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "删除附件应成功");
 }
+
+/// Web 辅助账 / 数量金额账 / 自定义报表。
+#[tokio::test]
+async fn web_aux_qty_and_custom_reports() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 应收：借 112201 客户 C01 1000 / 贷 600101 1000
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-06", "word": "记",
+                "no": 1, "attachments": 0, "memo": "应收",
+                "entries": [
+                    { "line": 1, "account_code": "112201", "summary": "销售", "debit": "1000", "credit": "0", "aux": { "customer": "C01" } },
+                    { "line": 2, "account_code": "600101", "summary": "收入", "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let v1 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 存货：借 140301 存货 RM01 5×20=100 / 贷 1001 100
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-07", "word": "记",
+                "no": 2, "attachments": 0, "memo": "入库",
+                "entries": [
+                    { "line": 1, "account_code": "140301", "summary": "入库", "debit": "100", "credit": "0", "aux": { "item": "RM01" }, "qty": "5", "price": "20" },
+                    { "line": 2, "account_code": "1001", "summary": "付款", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let v2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    for vid in [v1, v2] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(&format!("/api/vouchers/{vid}/post"), &sid, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // 辅助账（客户）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/aux-balance?kind=customer&from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(d["rows"][0]["key"], serde_json::json!("C01"), "辅助账应有客户 C01：{d}");
+    assert_eq!(d["rows"][0]["debit"], serde_json::json!("1,000.00"));
+
+    // 数量金额账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/qty-balance?from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let q: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = q["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["account_code"] == serde_json::json!("140301"))
+        .expect("数量金额账应含 140301");
+    assert_eq!(row["qty_in"], serde_json::json!("5.00"), "入库数量应为 5：{row}");
+    assert_eq!(row["qty_end"], serde_json::json!("5.00"), "期末数量应为 5");
+
+    // 自定义报表：QM("1001") 期末余额
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/custom-reports",
+            &sid,
+            serde_json::json!({
+                "key": "", "name": "资金小表",
+                "columns": ["期末"],
+                "lines": [{ "name": "库存现金", "indent": 0, "formulas": ["QM(\"1001\")"], "bold": false }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存自定义报表应成功");
+    let saved: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(saved["errors"].as_array().unwrap().is_empty(), "公式应无语法错误：{saved}");
+    let key = saved["key"].as_str().unwrap();
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/custom-reports/{key}?period=202601"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(got["report"]["name"], serde_json::json!("资金小表"));
+    let cell = got["values"][0][0].as_str().unwrap_or("");
+    assert!(cell.contains("100.00"), "QM(\"1001\") 应算出 -100.00：{got}");
+}

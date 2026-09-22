@@ -1,33 +1,5 @@
 const { test, expect } = require("@playwright/test");
-
-async function newBook(page, company) {
-  await page.goto("/");
-  await expect(page.locator("#u")).toBeVisible({ timeout: 15_000 });
-  await page.fill("#u", "admin");
-  await page.fill("#p", "Admin!2026");
-  await page.click('#login-form button[type="submit"]');
-  await expect(page.locator("#new-book")).toBeVisible({ timeout: 15_000 });
-  await page.click("#new-book");
-  await page.fill("#cb-company", company);
-  await page.fill("#cb-start", "2026-01");
-  await page.click("#cb-save");
-  await expect(page.locator('.nav-item[data-view="vouchers"]')).toBeVisible({ timeout: 15_000 });
-}
-
-async function postVoucher(page, { date, rows }) {
-  await page.click('.nav-item[data-view="vouchers"]');
-  await page.click("#new-v");
-  await page.fill("#v-date", date);
-  const entryRows = page.locator("#v-entries tbody tr:has(select.acct-sel)");
-  for (let i = 0; i < rows.length; i++) {
-    await entryRows.nth(i).locator("select.acct-sel").selectOption(rows[i].code);
-    await entryRows.nth(i).locator(".e-sum").fill(rows[i].summary);
-    if (rows[i].debit) await entryRows.nth(i).locator(".e-d").fill(rows[i].debit);
-    if (rows[i].credit) await entryRows.nth(i).locator(".e-c").fill(rows[i].credit);
-  }
-  await page.click("#v-save");
-  await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
-}
+const { newBook, postVoucher } = require("../helpers");
 
 test("固定资产：建卡→计提折旧→台账出数", async ({ page }) => {
   await newBook(page, `E2E固资${Date.now()}`);

@@ -569,9 +569,15 @@ pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
         |r| r.get(0),
     )?;
     fincore::engine::validate_unpost(&v, closed.map(Period::from_ymm)).into_result()?;
+    // 反记账回到审核前的状态：有审核记录的回「已审核」，否则回「未记账」
+    let back = if v.audited_by.is_some() { "audited" } else { "draft" };
     tx.execute(
-        "UPDATE voucher SET status='draft', posted_by=NULL, updated_at=?2 WHERE id=?1",
-        rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
+        "UPDATE voucher SET status=?3, posted_by=NULL, updated_at=?2 WHERE id=?1",
+        rusqlite::params![
+            id,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            back
+        ],
     )?;
     crate::log_on(
         &tx,

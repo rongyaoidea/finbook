@@ -2286,7 +2286,7 @@ async fn web_foreign_currency_entry_roundtrip() {
     let e0 = &v["entries"][0];
     assert_eq!(e0["currency"], serde_json::json!("USD"), "币种应落库");
     assert_eq!(e0["rate"], serde_json::json!("7.2"), "汇率应落库");
-    assert_eq!(e0["amount_for"], serde_json::json!("100"), "原币金额应落库");
+    assert_eq!(e0["amount_for"], serde_json::json!("100.00"), "原币金额应落库");
 
     // 原币 × 汇率与金额不符时应拒绝
     let resp = handlers::router(state.clone())

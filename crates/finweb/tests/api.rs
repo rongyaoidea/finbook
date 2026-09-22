@@ -3568,7 +3568,8 @@ async fn web_security_boundaries() {
                 serde_json::json!({
                     "username": format!("ghost{i}"),
                     "password": "bad",
-                    "device_id": "dev-xff"
+                    "device_id": "dev-xff",
+                    "device_name": "测试机"
                 })
                 .to_string(),
             ))

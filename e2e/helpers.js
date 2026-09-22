@@ -1,5 +1,9 @@
 const { expect } = require("@playwright/test");
 
+// 本 worker 上一个用例建的账套：下个用例先删掉，避免撞"单账号最多 10 个账套"的上限。
+// Playwright 每个 worker 是独立进程，模块级变量天然按 worker 隔离。
+let lastBookKey = null;
+
 /// 登录 → 建账（起始期间 2026-01）→ 停在可用界面
 async function newBook(page, company) {
   await page.goto("/");
@@ -7,12 +11,26 @@ async function newBook(page, company) {
   await page.fill("#u", "admin");
   await page.fill("#p", "Admin!2026");
   await page.click('#login-form button[type="submit"]');
+
+  if (lastBookKey) {
+    await page.request.delete(`/api/books/${encodeURIComponent(lastBookKey)}`).catch(() => {});
+    lastBookKey = null;
+  }
+
   await expect(page.locator("#new-book")).toBeVisible({ timeout: 15_000 });
   await page.click("#new-book");
   await page.fill("#cb-company", company);
   await page.fill("#cb-start", "2026-01");
   await page.click("#cb-save");
   await expect(page.locator('.nav-item[data-view="vouchers"]')).toBeVisible({ timeout: 15_000 });
+
+  try {
+    const d = await (await page.request.get("/api/books")).json();
+    const b = (d.books || []).find((x) => x.company === company);
+    if (b) lastBookKey = b.key;
+  } catch (e) {
+    // 记录失败只影响清理，不影响用例本身
+  }
 }
 
 /// 录一张凭证并保存（不记账）。rows: [{ code, summary, debit, credit, aux? }]

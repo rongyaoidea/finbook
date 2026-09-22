@@ -454,10 +454,13 @@ const MRP_COLS: &str = "id,run_at,item_code,item_name,level,gross_req,on_hand,ne
 
 /// 查询最近一次 MRP 运算结果
 pub fn mrp_latest(db: &Db) -> DbResult<Vec<MrpRow>> {
+    // 空表时 MAX(run_at) 仍返回一行 NULL：必须按 Option<String> 取值，
+    // 否则 rusqlite 会以 "Invalid column type Null" 报错（页面 500）。
     let latest: Option<String> = db
         .conn()
-        .query_row("SELECT MAX(run_at) FROM mrp_result", [], |r| r.get(0))
-        .optional()?;
+        .query_row("SELECT MAX(run_at) FROM mrp_result", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })?;
     let Some(ts) = latest else {
         return Ok(Vec::new());
     };

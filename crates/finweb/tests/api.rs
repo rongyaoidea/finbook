@@ -3500,7 +3500,11 @@ async fn web_security_boundaries() {
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .body(Body::from(
-            serde_json::json!({ "username": "ghost", "password": "bad", "device_id": "d1" }).to_string(),
+            serde_json::json!({
+                "username": "ghost", "password": "bad",
+                "device_id": "d1", "device_name": "测试机"
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();

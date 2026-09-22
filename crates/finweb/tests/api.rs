@@ -2539,3 +2539,79 @@ async fn web_settle_auto_flow() {
     let open: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(open["rows"].as_array().unwrap().len(), 0, "核销后应无未核销");
 }
+
+/// Web 总账/日记账接口与 CSV 导出。
+#[tokio::test]
+async fn web_ledger_tabs_and_export() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-12", "word": "记",
+                "no": 1, "attachments": 0, "memo": "账簿测试",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收现", "debit": "300", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "借款", "debit": "0", "credit": "300" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 总账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/ledger/general?code=1001&from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let gl: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(gl.as_array().unwrap().len(), 1, "总账应按期间汇总一行：{gl}");
+    assert_eq!(gl[0]["debit"], serde_json::json!("300.00"));
+
+    // 日记账（对方科目）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/ledger/journal?code=1001&from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let jr: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(jr.as_array().unwrap().len(), 1, "日记账应一行");
+    assert!(
+        jr[0]["opposite_accounts"].as_str().unwrap_or("").contains("2001"),
+        "日记账应带对方科目：{jr}"
+    );
+
+    // 导出凭证 CSV
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/export/vouchers?period=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().contains("text/csv"),
+        "应返回 CSV"
+    );
+    let body = body_string(resp).await;
+    assert!(body.contains("凭证号") && body.contains("库存现金"), "CSV 应含表头与科目名：{body}");
+
+    // 导出明细账 CSV（含数量列与否均可）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/export/ledger?code=1001&from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("日期") && body.contains("余额"), "明细账 CSV 应含表头：{body}");
+}

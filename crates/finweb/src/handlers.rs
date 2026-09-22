@@ -121,6 +121,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
+        .route("/api/ledger/general", get(get_general_ledger))
+        .route("/api/ledger/journal", get(get_journal))
         .route("/api/ledger/print-form", get(print_ledger_form))
         .route("/api/vouchers/print-form", get(print_voucher_form))
         .route("/api/reports/trial-balance", get(get_trial_balance))
@@ -136,6 +138,11 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/api/reports/trial-balance/pdf",
             get(export_trial_balance_pdf),
         )
+        // 数据导出（CSV，需 Export 权限）
+        .route("/api/export/vouchers", get(export_vouchers))
+        .route("/api/export/ledger", get(export_ledger))
+        .route("/api/export/payroll", get(export_payroll))
+        .route("/api/export/claims", get(export_claims))
         // 高级功能：多栏账 / 摘要汇总表 / 财务指标
         .route("/api/reports/multi-column", get(get_multi_column))
         .route("/api/reports/summary-table", get(get_summary_table))
@@ -2269,12 +2276,12 @@ async fn import_run(
 // 账簿 / 报表
 // ---------------------------------------------------------------------------
 
-async fn get_ledger(
-    State(state): State<Arc<WebState>>,
-    user: CurrentUser,
-    Query(q): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<fincore::balance::LedgerRow>>, AppError> {
-    user.require(Perm::Report)?;
+/// 账簿查询参数（明细/总账/日记账共用）
+fn ledger_query_from(
+    state: &WebState,
+    user: &CurrentUser,
+    q: &HashMap<String, String>,
+) -> Result<(findb::Db, fincore::Chart, LedgerQuery), AppError> {
     let code = q.get("code").cloned().unwrap_or_default();
     if code.is_empty() {
         return Err(AppError::bad_request("缺少科目编码参数 code"));
@@ -2282,7 +2289,7 @@ async fn get_ledger(
     let from = q
         .get("from")
         .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
+        .unwrap_or_else(|| current_period(state, user));
     let to = q
         .get("to")
         .and_then(|s| parse_period(s))
@@ -2297,7 +2304,6 @@ async fn get_ledger(
         .unwrap_or(false);
     let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
-    // 数据范围：非全量权限用户只能查看自己范围内的科目
     if !user.user.can_see_account(&code) {
         return Err(AppError::forbidden("无权查看该科目"));
     }
@@ -2313,8 +2319,40 @@ async fn get_ledger(
         code_to: None,
     }
     .with_user_scope(&user.user);
+    Ok((db, chart, lq))
+}
+
+async fn get_ledger(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<fincore::balance::LedgerRow>>, AppError> {
+    user.require(Perm::Report)?;
+    let (db, chart, lq) = ledger_query_from(&state, &user, &q)?;
     let rows = balances::ledger(&db, &chart, &lq)?;
     Ok(Json(rows))
+}
+
+/// 总账（按期间汇总）
+async fn get_general_ledger(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<fincore::GeneralLedgerRow>>, AppError> {
+    user.require(Perm::Report)?;
+    let (db, _chart, lq) = ledger_query_from(&state, &user, &q)?;
+    Ok(Json(balances::general_ledger(&db, &lq)?))
+}
+
+/// 日记账（现金/银行）
+async fn get_journal(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<fincore::JournalRow>>, AppError> {
+    user.require(Perm::Report)?;
+    let (db, chart, lq) = ledger_query_from(&state, &user, &q)?;
+    Ok(Json(balances::journal(&db, &chart, &lq)?))
 }
 
 async fn print_voucher_form(
@@ -2628,6 +2666,233 @@ async fn export_trial_balance_pdf(
         bytes,
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// 数据导出（CSV，需 Export 权限；带 BOM 便于 Excel 直接打开中文）
+// ---------------------------------------------------------------------------
+
+fn csv_response(filename: &str, rows: Vec<Vec<String>>) -> Response {
+    fn esc(s: &str) -> String {
+        if s.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out = String::from("\u{feff}");
+    for r in &rows {
+        out.push_str(&r.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
+        out.push_str("\r\n");
+    }
+    let mut resp = out.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{filename}\""
+    )) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
+async fn export_vouchers(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut query = VoucherQuery::default().with_data_scope(&user.user);
+    if let Some(p) = q.get("period").and_then(|s| parse_period(s)) {
+        query.from = Some(p);
+        query.to = Some(p);
+    }
+    if let Some(f) = q.get("from").and_then(|s| parse_period(s)) {
+        query.from = Some(f);
+    }
+    if let Some(t) = q.get("to").and_then(|s| parse_period(s)) {
+        query.to = Some(t);
+    }
+    if let Some(kw) = q.get("q") {
+        let kw = kw.trim().to_string();
+        if !kw.is_empty() {
+            query.keyword = Some(kw);
+        }
+    }
+    if let Some(st) = q.get("status").and_then(|s| parse_voucher_status(s)) {
+        query.status = Some(st);
+    }
+    query.asc = true;
+    query.limit = Some(5000);
+    let mut list = vouchers::list(&db, &query)?;
+    vouchers::fill_entries(&db, &mut list)?;
+    let chart = accounts::chart(&db)?;
+    let mut rows: Vec<Vec<String>> = vec![[
+        "日期", "凭证号", "状态", "摘要", "科目编码", "科目名称", "借方", "贷方", "制单人",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()];
+    let mut n = 0usize;
+    for v in &list {
+        if !user.user.can_see_voucher(v) {
+            continue;
+        }
+        for e in &v.entries {
+            if e.is_blank() {
+                continue;
+            }
+            let name = chart
+                .get(&e.account_code)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            rows.push(vec![
+                v.date.format("%Y-%m-%d").to_string(),
+                v.voucher_no(),
+                v.status.label().to_string(),
+                e.summary.clone(),
+                e.account_code.clone(),
+                name,
+                e.debit.fmt_plain(),
+                e.credit.fmt_plain(),
+                v.prepared_by.clone(),
+            ]);
+            n += 1;
+        }
+    }
+    db.log(user.username(), "导出", "导出凭证", &format!("{n} 行"))?;
+    Ok(csv_response("vouchers.csv", rows))
+}
+
+async fn export_ledger(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let (db, chart, lq) = ledger_query_from(&state, &user, &q)?;
+    let acct = chart
+        .get(&lq.code)
+        .map(|a| format!("{} {}", a.code, a.name))
+        .unwrap_or_else(|| lq.code.clone());
+    let list = balances::ledger(&db, &chart, &lq)?;
+    let has_qty = list.iter().any(|r| r.qty_balance.is_some());
+    let mut header: Vec<String> = ["日期", "凭证号", "摘要", "借方", "贷方", "方向", "余额"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if has_qty {
+        header.push("数量余额".to_string());
+    }
+    let mut rows = vec![header];
+    for r in &list {
+        let mut row = vec![
+            r.date.format("%Y-%m-%d").to_string(),
+            r.voucher_no.clone(),
+            r.summary.clone(),
+            r.debit.fmt_plain(),
+            r.credit.fmt_plain(),
+            r.dir.label().to_string(),
+            r.balance.fmt_plain(),
+        ];
+        if has_qty {
+            row.push(r.qty_balance.map(|q| q.fmt_qty()).unwrap_or_default());
+        }
+        rows.push(row);
+    }
+    db.log(
+        user.username(),
+        "导出",
+        "导出明细账",
+        &format!("{acct} {} 行", rows.len().saturating_sub(1)),
+    )?;
+    Ok(csv_response("ledger.csv", rows))
+}
+
+async fn export_payroll(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let list = business::payroll_list(&db, period)?;
+    let mut rows = vec![[
+        "员工", "部门", "应发", "社保(个人)", "公积金(个人)", "专项附加", "个税", "实发",
+        "社保(单位)", "公积金(单位)",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect::<Vec<_>>()];
+    for p in &list {
+        rows.push(vec![
+            p.employee.clone(),
+            p.dept.clone(),
+            p.gross.fmt_plain(),
+            p.social.fmt_plain(),
+            p.housing.fmt_plain(),
+            p.additional.fmt_plain(),
+            p.tax.fmt_plain(),
+            p.net.fmt_plain(),
+            p.social_co.fmt_plain(),
+            p.housing_co.fmt_plain(),
+        ]);
+    }
+    db.log(
+        user.username(),
+        "导出",
+        "导出工资表",
+        &format!("{} {} 行", period.label(), rows.len().saturating_sub(1)),
+    )?;
+    Ok(csv_response("payroll.csv", rows))
+}
+
+async fn export_claims(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let status = q.get("status").map(|s| business::ClaimStatus::parse(s));
+    let list = business::claim_list(&db, period, status)?;
+    let mut rows = vec![[
+        "单号", "业务日期", "申请人", "部门", "事由", "金额", "状态", "审批人", "付款人",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect::<Vec<_>>()];
+    for c in &list {
+        rows.push(vec![
+            c.no.clone(),
+            c.biz_date.format("%Y-%m-%d").to_string(),
+            c.applicant.clone(),
+            c.dept.clone(),
+            c.reason.clone(),
+            c.amount.fmt_plain(),
+            c.status.label().to_string(),
+            c.approver.clone(),
+            c.payer.clone(),
+        ]);
+    }
+    db.log(
+        user.username(),
+        "导出",
+        "导出报销单",
+        &format!("{} {} 行", period.label(), rows.len().saturating_sub(1)),
+    )?;
+    Ok(csv_response("claims.csv", rows))
 }
 
 // ---------------------------------------------------------------------------

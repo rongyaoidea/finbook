@@ -879,12 +879,14 @@ async function viewVouchers(main) {
       <select id="v-status">
         <option value="">全部状态</option>
         <option value="draft">未记账</option>
+        <option value="audited">已审核</option>
         <option value="posted">已记账</option><option value="void">已作废</option>
       </select>
       <button class="btn ghost sm" id="v-refresh">查询</button>
       ${can("voucher_edit") ? `<button class="btn ghost sm" id="v-renumber">重排断号</button>` : ""}
       ${can("voucher_post") ? `<button class="btn ghost sm" id="v-batch">批量记账</button>` : ""}
       ${can("report") ? `<button class="btn ghost sm" id="v-printform">凭证套打</button>` : ""}
+      ${can("export") ? `<button class="btn ghost sm" id="v-export">导出 CSV</button>` : ""}
       <span class="spacer"></span>
       <span class="muted">期间：${esc(state.current || "")}</span>
     </div>
@@ -899,6 +901,10 @@ async function viewVouchers(main) {
   if ($("#v-batch")) $("#v-batch").addEventListener("click", batchPost);
   if ($("#v-printform")) $("#v-printform").addEventListener("click", () => {
     window.open(`/api/vouchers/print-form?period=${encodeURIComponent(state.current || "")}`, "_blank");
+  });
+  if ($("#v-export")) $("#v-export").addEventListener("click", () => {
+    const qs = new URLSearchParams({ period: (state.current || "").replace("-", ""), q: $("#v-q").value, status: $("#v-status").value });
+    window.open(`/api/export/vouchers?${qs.toString()}`, "_blank");
   });
   if ($("#v-renumber")) $("#v-renumber").addEventListener("click", async () => {
     if (!(await confirmDialog(`将当前期间「记」字凭证的凭证号重排为连续？`, true))) return;
@@ -1446,10 +1452,11 @@ async function viewImports(main) {
 // ===========================================================================
 // 明细账
 // ===========================================================================
+let ledgerTab = "detail";
 async function viewLedger(main) {
   await ensureAccounts();
   main.innerHTML = `
-    <h2>明细账</h2>
+    <h2>账簿查询</h2>
     <div class="toolbar">
       <label>科目 <input id="l-code" list="acct-list" placeholder="科目编码，如 1002" style="width:160px" /></label>
       <datalist id="acct-list">${(state.accounts || []).map((a) => `<option value="${esc(a.code)}">${esc(a.name)}</option>`).join("")}</datalist>
@@ -1458,25 +1465,44 @@ async function viewLedger(main) {
       <label><input type="checkbox" id="l-children" checked /> 含下级</label>
       <label><input type="checkbox" id="l-posted" /> 仅已记账</label>
       <button class="btn sm" id="l-go">查询</button>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" data-ltab="detail">明细账</button>
+      <button class="btn ghost sm" data-ltab="general">总账</button>
+      <button class="btn ghost sm" data-ltab="journal">日记账</button>
       <button class="btn ghost sm" id="l-print">打印预览</button>
-      <button class="btn ghost sm" id="l-printform">账簿套打</button>
+      <button class="btn ghost sm" id="l-printform">套打</button>
+      ${can("export") ? `<button class="btn ghost sm" id="l-export">导出 CSV</button>` : ""}
     </div>
-    <div class="panel"><table class="grid" id="l-table"><thead><tr>
-      <th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th>
-    </tr></thead><tbody><tr><td colspan="7" class="muted">请输入科目后查询</td></tr></tbody></table></div>`;
+    <div class="panel"><table class="grid" id="l-table"><thead></thead><tbody><tr><td class="muted">请输入科目后查询</td></tr></tbody></table></div>`;
+  const setTab = (t) => {
+    ledgerTab = t;
+    $all("[data-ltab]", main).forEach((b) => b.classList.toggle("primary", b.dataset.ltab === t));
+  };
+  setTab("detail");
+  $all("[data-ltab]", main).forEach((b) => b.onclick = () => { setTab(b.dataset.ltab); loadLedger(); });
   $("#l-go").addEventListener("click", loadLedger);
-  $("#l-print").addEventListener("click", () => { const el = $("#l-table").querySelector("table"); printPreview("明细账", el); });
+  $("#l-print").addEventListener("click", () => {
+    const el = $("#l-table").querySelector("table");
+    printPreview(({ detail: "明细账", general: "总账", journal: "日记账" })[ledgerTab] || "账簿", el);
+  });
   $("#l-printform").addEventListener("click", () => {
     const code = $("#l-code").value.trim();
     if (!code) { toast("请先输入科目编码", "err"); return; }
-    const q = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}&type=detail`;
+    const q = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}&type=${ledgerTab}`;
     window.open(`/api/ledger/print-form?${q}`, "_blank");
   });
+  if ($("#l-export")) $("#l-export").onclick = () => {
+    const code = $("#l-code").value.trim();
+    if (!code) { toast("请先输入科目编码", "err"); return; }
+    const q = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}`;
+    window.open(`/api/export/ledger?${q}`, "_blank");
+  };
 }
 async function loadLedger() {
   const code = $("#l-code").value.trim();
   if (!code) { toast("请先输入科目编码", "err"); return; }
-  const url = `/ledger?code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}`;
+  const qs = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}`;
+  const url = ledgerTab === "general" ? `/ledger/general?${qs}` : ledgerTab === "journal" ? `/ledger/journal?${qs}` : `/ledger?${qs}`;
   const tbl = $("#l-table");
   const message = (text, isErr) => {
     tbl.innerHTML = `<tbody><tr><td colspan="8" ${isErr ? 'style="color:var(--err)"' : 'class="muted"'}>${esc(text)}</td></tr></tbody>`;
@@ -1484,6 +1510,14 @@ async function loadLedger() {
   let rows;
   try { rows = await api(url); } catch (e) { message(e.message, true); return; }
   if (!rows.length) { message("该科目在所选期间无记录", false); return; }
+  if (ledgerTab === "general") {
+    tbl.innerHTML = `<thead><tr><th>期间</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.period)}</td><td>${esc(r.summary)}</td><td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td><td>${esc(r.dir === "debit" ? "借" : "贷")}</td><td class="num">${esc(r.balance)}</td></tr>`).join("")}</tbody>`;
+    return;
+  }
+  if (ledgerTab === "journal") {
+    tbl.innerHTML = `<thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th>对方科目</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.summary)}</td><td>${esc(r.opposite_accounts || "")}</td><td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td><td>${esc(r.dir === "debit" ? "借" : "贷")}</td><td class="num">${esc(r.balance)}</td></tr>`).join("")}</tbody>`;
+    return;
+  }
   const hasQty = rows.some((r) => r.qty_balance != null);
   const head = `<tr><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th>${hasQty ? '<th class="num">数量余额</th>' : ""}</tr>`;
   const body = rows.map((r) => `<tr>
@@ -4309,6 +4343,7 @@ async function viewPayroll(main) {
       <label>期间 <input id="py-period" value="${esc(period)}" style="width:90px" /></label>
       <button class="btn ghost sm" id="py-next">下期 ▶</button>
       <button class="btn" id="py-refresh">刷新</button>
+      ${can("export") ? `<button class="btn ghost sm" id="py-export">导出 CSV</button>` : ""}
     </div>
     <div id="py-body" class="muted">加载中…</div>`;
   const body = $("#py-body");
@@ -4321,6 +4356,7 @@ async function viewPayroll(main) {
   $("#py-next").onclick = () => switchPeriod(nextPeriod(period));
   $("#py-refresh").onclick = () => switchPeriod($("#py-period").value.trim() || period);
   $("#py-period").addEventListener("keydown", (e) => { if (e.key === "Enter") switchPeriod($("#py-period").value.trim() || period); });
+  if ($("#py-export")) $("#py-export").onclick = () => window.open(`/api/export/payroll?period=${encodeURIComponent(period)}`, "_blank");
 
   const ymm6 = ymm(period);
   let rows = [], employees = [];
@@ -4527,6 +4563,7 @@ async function viewClaims(main) {
       <label>状态 <select id="cl-status">${CLAIM_STATUS.map((s) => `<option value="${s.code}" ${status === s.code ? "selected" : ""}>${s.label}</option>`).join("")}</select></label>
       <button class="btn" id="cl-refresh">刷新</button>
       <div class="spacer"></div>
+      ${can("export") ? `<button class="btn ghost sm" id="cl-export">导出 CSV</button>` : ""}
       ${can("voucher_new") ? `<button class="btn primary" id="cl-new">新增报销单</button>` : ""}
     </div>
     <div id="cl-body" class="muted">加载中…</div>`;
@@ -4534,6 +4571,10 @@ async function viewClaims(main) {
   $("#cl-prev").onclick = () => switchTo(prevPeriod(period), status);
   $("#cl-next").onclick = () => switchTo(nextPeriod(period), status);
   $("#cl-refresh").onclick = () => switchTo($("#cl-period").value.trim() || period, $("#cl-status").value);
+  if ($("#cl-export")) $("#cl-export").onclick = () => {
+    const qs = new URLSearchParams({ period, status: $("#cl-status").value });
+    window.open(`/api/export/claims?${qs.toString()}`, "_blank");
+  };
   if ($("#cl-new")) $("#cl-new").addEventListener("click", () => openClaimEditor(main, null, period));
 
   const body = $("#cl-body");

@@ -3626,3 +3626,45 @@ async fn web_year_end_carry() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "余额为 0 时年末结转应被拒");
 }
+
+/// Web 导入预检：报告缺失科目 → 带映射导入成功。
+#[tokio::test]
+async fn web_import_analyze_and_map() {
+    let (state, _bd, _dir) = test_state();
+    let (_, sid) = login(&state, "boss", "Admin!2026").await;
+    let _ = select_book(&state, &sid, "b1").await;
+
+    // 预检：9999 不在科目表中，2001 存在
+    let csv = "9999,借,100\n2001,贷,100\n";
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/analyze",
+            &sid,
+            serde_json::json!({ "kind": "begin", "template": "generic", "text": csv }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "导入预检应成功");
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let missing = v["missing"].as_array().unwrap();
+    assert_eq!(missing.len(), 1, "只应报告缺失科目 9999：{v}");
+    assert_eq!(missing[0]["code"], serde_json::json!("9999"));
+    assert_eq!(missing[0]["count"], serde_json::json!(1));
+
+    // 映射 9999→1001 后导入：两行都应写入
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "begin", "template": "generic", "text": csv,
+                "mapping": { "9999": "1001" },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "带映射的导入应成功");
+    let s = body_string(resp).await;
+    assert!(s.contains("\"ok\":2"), "应导入 2 行：{s}");
+    assert!(s.contains("\"skipped\":0"), "不应跳过：{s}");
+}

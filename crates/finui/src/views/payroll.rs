@@ -63,13 +63,13 @@ impl Default for VoucherCfg {
     fn default() -> Self {
         Self {
             date: String::new(),
-            expense: "6602".to_string(),
+            expense: "660201".to_string(),
             wage_payable: "221101".to_string(),
             social_payable: "221103".to_string(),
             housing_payable: "221104".to_string(),
             personal_payable: "2241".to_string(),
             bank: "100201".to_string(),
-            tax_payable: "222103".to_string(),
+            tax_payable: "222107".to_string(),
         }
     }
 }

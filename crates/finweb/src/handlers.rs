@@ -1919,8 +1919,9 @@ async fn voucher_reverse(
     } else {
         current_period(&state, &user)
     };
+    // 缺省用期间末日：红字冲销常发生在已结账的历史期间，用"今天"会与所属期间不一致
     let date = if req.date.is_empty() {
-        chrono::Local::now().date_naive()
+        period.last_day()
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
             .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?

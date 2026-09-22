@@ -3680,3 +3680,40 @@ async fn web_import_analyze_and_map() {
     assert!(s.contains("\"ok\":2"), "应导入 2 行：{s}");
     assert!(s.contains("\"skipped\":0"), "不应跳过：{s}");
 }
+
+/// 红字冲销：未传日期时取期间末日（历史期间冲销不会因"今天"不在期间内而失败）。
+#[tokio::test]
+async fn web_reverse_defaults_to_period_last_day() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let id = post_voucher(
+        &state,
+        &sid,
+        1,
+        serde_json::json!([
+            { "line": 1, "account_code": "1001", "summary": "冲销测试", "debit": "100", "credit": "0" },
+            { "line": 2, "account_code": "2001", "summary": "冲销测试", "debit": "0", "credit": "100" }
+        ]),
+    )
+    .await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{id}/reverse"),
+            &sid,
+            serde_json::json!({ "period": 202601 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "缺省日期红冲应成功");
+    let rid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(rid, id, "红冲应生成新凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{rid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["date"], serde_json::json!("2026-01-31"), "应取期间末日：{v}");
+}

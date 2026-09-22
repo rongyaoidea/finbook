@@ -1155,7 +1155,7 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
-  if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: today() }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: "" }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   async function loadAttachments() {
     const box = $("#v-attach", mask);
@@ -4648,16 +4648,16 @@ async function viewPayroll(main) {
     body.innerHTML = `
       <div class="panel" style="max-width:660px">
         <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
-          <div><label>凭证日期（留空 = 期间末日）</label><input id="pv-date" type="date" value="${esc(today())}" style="width:150px" /></div>
+          <div><label>凭证日期（留空 = 期间末日）</label><input id="pv-date" type="date" value="" style="width:150px" /></div>
         </div>
         <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
-          <div><label>费用科目</label><input id="pv-expense" value="6602" style="width:90px" /></div>
+          <div><label>费用科目</label><input id="pv-expense" value="660201" style="width:90px" /></div>
           <div><label>应付工资</label><input id="pv-wage" value="221101" style="width:90px" /></div>
           <div><label>应付社保</label><input id="pv-social" value="221103" style="width:90px" /></div>
           <div><label>应付公积金</label><input id="pv-housing" value="221104" style="width:90px" /></div>
           <div><label>其他应付款(个人)</label><input id="pv-personal" value="2241" style="width:90px" /></div>
           <div><label>银行存款</label><input id="pv-bank" value="100201" style="width:90px" /></div>
-          <div><label>应交个税</label><input id="pv-tax" value="222103" style="width:90px" /></div>
+          <div><label>应交个税</label><input id="pv-tax" value="222107" style="width:90px" /></div>
         </div>
         <p class="muted" style="font-size:12px">计提凭证按部门拆分借方费用；社保缴纳与工资发放凭证走银行存款；同一期凭证只能生成一次，重复生成由引擎报错拦截。</p>
         <div class="foot" style="margin-top:6px;display:flex;gap:10px">

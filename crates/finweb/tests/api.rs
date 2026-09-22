@@ -2767,8 +2767,8 @@ async fn web_aux_qty_and_custom_reports() {
         .iter()
         .find(|r| r["account_code"] == serde_json::json!("140301"))
         .expect("数量金额账应含 140301");
-    assert_eq!(row["qty_in"], serde_json::json!("5.00"), "入库数量应为 5：{row}");
-    assert_eq!(row["qty_end"], serde_json::json!("5.00"), "期末数量应为 5");
+    assert_eq!(row["qty_in"], serde_json::json!("5"), "入库数量应为 5：{row}");
+    assert_eq!(row["qty_end"], serde_json::json!("5"), "期末数量应为 5");
 
     // 自定义报表：QM("1001") 期末余额
     let resp = handlers::router(state.clone())

@@ -21,13 +21,19 @@ test("会计月度闭环：建账→录凭证→记账→结账→报表", async
   await expect(page.locator('.nav-item[data-view="vouchers"]')).toBeVisible({ timeout: 15_000 });
   await page.click('.nav-item[data-view="vouchers"]');
   await page.click("#new-v");
+  // 日期改到账套期间内（默认是运行当天，可能不属于启用期间）
+  await page.fill("#v-date", "2026-01-15");
   const rows = page.locator("#v-entries tbody tr");
   await expect(rows.first()).toBeVisible();
   await rows.nth(0).locator("select.acct-sel").selectOption("1001");
+  await rows.nth(0).locator(".e-sum").fill("E2E 收款");
   await rows.nth(0).locator(".e-d").fill("100");
   await rows.nth(1).locator("select.acct-sel").selectOption("2001");
+  await rows.nth(1).locator(".e-sum").fill("E2E 借款");
   await rows.nth(1).locator(".e-c").fill("100");
   await page.click("#v-save");
+  // 摘要/日期校验失败时弹窗不会关闭：先确认保存成功
+  await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
 
   // 打开刚保存的凭证并记账
   const openBtn = page.locator("#v-table tbody [data-edit]").first();

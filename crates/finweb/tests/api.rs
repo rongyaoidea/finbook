@@ -1522,6 +1522,14 @@ async fn claim_lifecycle_to_voucher() {
         .unwrap();
     let s = body_string(resp).await;
     assert!(s.contains("BX202601-001"), "已付列表应含该单：{s}");
+
+    // 空状态 = 全部（UI 下拉默认空串），不能退化成只看草稿
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/claims?period=202601&status=", &sid))
+        .await
+        .unwrap();
+    let s = body_string(resp).await;
+    assert!(s.contains("BX202601-001"), "空状态应返回全部单据：{s}");
 }
 
 #[tokio::test]
@@ -3469,6 +3477,25 @@ async fn web_write_endpoints_smoke() {
     ] {
         let (st, text) = post(uri, body).await;
         assert_eq!(st, StatusCode::OK, "{uri} 应成功：{text}");
+    }
+
+    // 列表接口的空筛选值应视为「全部」：UI 下拉默认值就是空串，
+    // 若被当成具体类型去过滤（kind=''）会永远查不到已保存的数据。
+    for uri in [
+        "/api/funds/bills?kind=",
+        "/api/funds/loans?kind=",
+        "/api/archives?period=202601&kind=",
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(uri, &sid))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} 应成功");
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            !v["rows"].as_array().unwrap().is_empty(),
+            "{uri} 空筛选应返回全部数据：{v}"
+        );
     }
 }
 

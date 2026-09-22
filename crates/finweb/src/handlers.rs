@@ -3035,7 +3035,11 @@ async fn export_claims(
         .get("period")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
-    let status = q.get("status").map(|s| business::ClaimStatus::parse(s));
+    // 空串 = 全部状态：UI 下拉默认值为空，直接 parse 会落到 Draft 只显示草稿
+    let status = q
+        .get("status")
+        .filter(|s| !s.is_empty())
+        .map(|s| business::ClaimStatus::parse(s));
     let list = business::claim_list(&db, period, status)?;
     let mut rows = vec![[
         "单号", "业务日期", "申请人", "部门", "事由", "金额", "状态", "审批人", "付款人",
@@ -4665,7 +4669,8 @@ async fn list_archives(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
-    let kind = q.get("kind").map(|s| s.as_str());
+    // 空串表示"全部"：UI 下拉默认值为空，不能当成具体类型去过滤
+    let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
     let db = state.db_for(&user.book_key)?;
     let rows = advanced::archive_list(&db, period, kind)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
@@ -4762,7 +4767,8 @@ async fn list_bills(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
-    let kind = q.get("kind").map(|s| s.as_str());
+    // 空串表示"全部"：UI 下拉默认值为空，不能当成具体类型去过滤
+    let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
     let rows = findb::funds::bill_list(&db, kind)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
@@ -4854,7 +4860,8 @@ async fn list_loans(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
-    let kind = q.get("kind").map(|s| s.as_str());
+    // 空串表示"全部"：UI 下拉默认值为空，不能当成具体类型去过滤
+    let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
     let rows = findb::funds::loan_list(&db, kind)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
@@ -6779,7 +6786,11 @@ async fn list_claims(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
-    let status = q.get("status").map(|s| business::ClaimStatus::parse(s));
+    // 空串 = 全部状态：UI 下拉默认值为空，直接 parse 会落到 Draft 只显示草稿
+    let status = q
+        .get("status")
+        .filter(|s| !s.is_empty())
+        .map(|s| business::ClaimStatus::parse(s));
     let rows = business::claim_list(&db, period, status)?;
     // 「仅看本人经手的业务单据」：报销按申请人匹配当前登录人
     let rows: Vec<business::Claim> = if user.user.data_scope.own_doc_only {

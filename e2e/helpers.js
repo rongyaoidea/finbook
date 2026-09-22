@@ -11,13 +11,15 @@ async function newBook(page, company) {
   await page.fill("#u", "admin");
   await page.fill("#p", "Admin!2026");
   await page.click('#login-form button[type="submit"]');
+  // 必须等登录真正完成（账套选择界面出现）再删旧账套：click 只保证点击已发出，
+  // 立刻用 page.request 会因还没有会话 cookie 而 401。
+  await expect(page.locator("#new-book")).toBeVisible({ timeout: 15_000 });
 
   if (lastBookKey) {
     await page.request.delete(`/api/books/${encodeURIComponent(lastBookKey)}`).catch(() => {});
     lastBookKey = null;
   }
 
-  await expect(page.locator("#new-book")).toBeVisible({ timeout: 15_000 });
   await page.click("#new-book");
   await page.fill("#cb-company", company);
   await page.fill("#cb-start", "2026-01");

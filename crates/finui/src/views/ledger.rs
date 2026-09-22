@@ -8,6 +8,7 @@ use fincore::{
 };
 
 use crate::state::AppCtx;
+use crate::theme::palette;
 use crate::widgets::{self, AccountPickerState, Paging};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

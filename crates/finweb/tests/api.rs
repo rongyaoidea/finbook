@@ -3301,3 +3301,323 @@ async fn web_print_and_pdf_endpoints() {
         .unwrap_or("");
     assert!(ct.contains("application/pdf"), "应返回 PDF：{ct}");
 }
+
+// ---------------------------------------------------------------------------
+// 读接口冒烟（不允许 5xx）/ 写接口冒烟 / 安全边界 / 年末结转
+// ---------------------------------------------------------------------------
+
+/// 全部只读接口冒烟：返回 2xx/4xx 均可，但不得 5xx（5xx = 引擎错误或 panic）。
+#[tokio::test]
+async fn web_read_endpoints_no_5xx() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let uris = [
+        "/api/me",
+        "/api/roles",
+        "/api/dashboard",
+        "/api/overview?period=202601",
+        "/api/periods",
+        "/api/accounts",
+        "/api/vouchers/next-no?period=202601&word=记",
+        "/api/vouchers?period=202601",
+        "/api/invoices?period=202601",
+        "/api/invoices/summary",
+        "/api/ledger?code=1001&from=202601&to=202601",
+        "/api/ledger/general?code=1001&from=202601&to=202601",
+        "/api/ledger/journal?code=1001&from=202601&to=202601",
+        "/api/reports/trial-balance?from=202601&to=202601",
+        "/api/reports/multi-column?main=1001&cols=1002&from=202601&to=202601",
+        "/api/reports/summary-table?from=202601&to=202601",
+        "/api/reports/ratios?period=202601",
+        "/api/reports/balance-sheet?to=202601",
+        "/api/reports/income-statement?from=202601&to=202601",
+        "/api/reports/cash-flow?from=202601&to=202601",
+        "/api/reports/equity?from=202601&to=202601",
+        "/api/reports/compare?report_key=balance_sheet&from=202601&to=202601",
+        "/api/reports/daily?code=1001&from=202601&to=202601",
+        "/api/reports/reconcile?period=202601",
+        "/api/reports/aux-balance?kind=customer&from=202601&to=202601",
+        "/api/reports/qty-balance?from=202601&to=202601",
+        "/api/reports/notes?report_key=balance-sheet",
+        "/api/inventory/aging",
+        "/api/inventory/abc",
+        "/api/inventory/serial?item=RM01",
+        "/api/inventory/unit?item=RM01",
+        "/api/inventory/warehouse-stock?item=RM01",
+        "/api/inventory/transfer?period=202601",
+        "/api/procure/reconcile?period=202601",
+        "/api/procure/quota?supplier=S01&item=140301",
+        "/api/procure/price?item=140301",
+        "/api/procure/track?po_id=1",
+        "/api/procure/stats?period=202601",
+        "/api/procure/req?period=202601",
+        "/api/sales/reconcile?period=202601",
+        "/api/sales/credit?customer=C01&period=202601",
+        "/api/sales/track?so_id=1",
+        "/api/sales/stats?period=202601",
+        "/api/sales/quote?period=202601",
+        "/api/order/change-log?period=202601",
+        "/api/budget/alerts?period=202601",
+        "/api/budget/versions",
+        "/api/budget/analysis?period=202601",
+        "/api/routing/140301",
+        "/api/prod",
+        "/api/mrp/latest",
+        "/api/approvals",
+        "/api/approvals/todo",
+        "/api/archives?period=202601",
+        "/api/funds/bills?period=202601",
+        "/api/funds/loans",
+        "/api/funds/daily?period=202601",
+        "/api/funds/forecast?period=202601",
+        "/api/cost/configs",
+        "/api/logs?limit=10",
+        "/api/templates",
+        "/api/templates/due?period=202601",
+        "/api/payroll?period=202601",
+        "/api/payroll/ytd?employee=E001&period=202601",
+        "/api/claims?period=202601",
+        "/api/claims/next-no?period=202601",
+        "/api/assets?period=202601",
+        "/api/bank?period=202601&account=100201",
+        "/api/settle/open?account=112201&upto=202601",
+        "/api/settle/records?account=112201",
+        "/api/settle/aging?account=112201&upto=202601",
+        "/api/custom-reports",
+    ];
+    let mut bad = Vec::new();
+    for uri in uris {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(uri, &sid))
+            .await
+            .unwrap();
+        let code = resp.status().as_u16();
+        if code >= 500 {
+            bad.push(format!("{uri} → {code}"));
+        }
+    }
+    assert!(bad.is_empty(), "只读接口出现 5xx：{bad:#?}");
+}
+
+/// 写接口冒烟：状态码 <500，并抽查若干返回 200。
+#[tokio::test]
+async fn web_write_endpoints_smoke() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let post = |uri: &'static str, body: serde_json::Value| {
+        let state = state.clone();
+        let sid = sid.clone();
+        async move {
+            let resp = handlers::router(state)
+                .oneshot(authed_post(uri, &sid, body))
+                .await
+                .unwrap();
+            (resp.status(), body_string(resp).await)
+        }
+    };
+
+    // 逐项写入并断言 200（发现引擎错误/500 即为问题）
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("/api/period", serde_json::json!({ "ymm": 202601 })),
+        ("/api/accounts/fill-defaults", serde_json::json!({})),
+        ("/api/inventory/unit", serde_json::json!({ "item": "RM01", "base_unit": "个", "alt_unit": "箱", "factor": "12" })),
+        ("/api/inventory/serial", serde_json::json!({ "item": "RM01", "serials": ["SN001", "SN002"], "batch_no": "B1", "date": "2026-01-10" })),
+        ("/api/inventory/serial/out", serde_json::json!({ "serials": ["SN001"], "date": "2026-01-11" })),
+        ("/api/inventory/adjust", serde_json::json!({ "period": 202601, "date": "2026-01-10", "item": "RM01", "delta": "5", "memo": "t" })),
+        ("/api/inventory/assemble", serde_json::json!({ "parent": "140501", "children": [["140301", "1"]], "date": "2026-01-10", "memo": "t" })),
+        ("/api/inventory/disassemble", serde_json::json!({ "parent": "140501", "children": [["140301", "1"]], "date": "2026-01-10", "memo": "t" })),
+        ("/api/procure/req", serde_json::json!({ "period": 202601, "date": "2026-01-10", "item_code": "140301", "item_name": "原料", "qty": "1", "requester": "admin", "memo": "" })),
+        ("/api/sales/quote", serde_json::json!({ "id": 0, "period": 202601, "date": "2026-01-10", "customer_code": "C01", "customer_name": "客户", "item_code": "140501", "item_name": "成品", "qty": "1", "unit_price": "10", "status": "draft", "memo": "" })),
+        ("/api/routing/140301", serde_json::json!([{ "seq": 1, "op_code": "OP1", "op_name": "车", "work_center": "WC1", "std_hours": "1", "rate": "10" }])),
+        ("/api/mrp/run", serde_json::json!({ "demands": [{ "item_code": "140501", "qty": "10", "source": "手工" }] })),
+        ("/api/budget/versions", serde_json::json!({ "key": "V1", "name": "版本1", "is_current": false, "memo": "" })),
+        ("/api/approvals", serde_json::json!({ "biz_kind": "test", "biz_id": 1, "title": "t", "approvers": ["boss"] })),
+        ("/api/reports/notes", serde_json::json!({ "report_key": "balance-sheet", "period": 202601, "content": "附注" })),
+        ("/api/archives", serde_json::json!({ "period": 202601, "kind": "voucher", "title": "t", "payload": "{}" })),
+        ("/api/funds/bills", serde_json::json!({ "kind": "receivable", "no": "B001", "period": 202601, "issue_date": "2026-01-05", "due_date": "2026-03-05", "counterpart": "客户", "bank": "工行", "amount": "1000", "memo": "" })),
+        ("/api/funds/loans", serde_json::json!({ "kind": "borrow", "no": "L001", "bank": "工行", "principal": "10000", "rate_pct": "4.5", "start_date": "2026-01-01", "end_date": "2026-12-31", "memo": "" })),
+        ("/api/cost/configs", serde_json::json!({ "item": "140501", "method": "fifo", "standard_cost": "0" })),
+        ("/api/templates", serde_json::json!({ "id": 0, "name": "月度模板", "memo": "", "entries": [] })),
+    ];
+    let mut bad = Vec::new();
+    for (uri, body) in cases {
+        let (st, text) = post(uri, body).await;
+        if st.as_u16() >= 500 {
+            bad.push(format!("{uri} → {st} {text}"));
+        }
+    }
+    assert!(bad.is_empty(), "写接口出现 5xx：{bad:#?}");
+
+    // 抽查关键写接口确实成功（避免上面只证明"没炸"）
+    for (uri, body) in [
+        ("/api/inventory/unit", serde_json::json!({ "item": "RM02", "base_unit": "个", "alt_unit": "箱", "factor": "6" })),
+        ("/api/funds/bills", serde_json::json!({ "kind": "payable", "no": "B002", "period": 202601, "issue_date": "2026-01-05", "due_date": "2026-03-05", "counterpart": "供应商", "bank": "工行", "amount": "500", "memo": "" })),
+        ("/api/cost/configs", serde_json::json!({ "item": "140502", "method": "moving_average", "standard_cost": "0" })),
+    ] {
+        let (st, text) = post(uri, body).await;
+        assert_eq!(st, StatusCode::OK, "{uri} 应成功：{text}");
+    }
+}
+
+/// 安全边界：CSRF 跨站拒绝、退出登录、强制改密拦截、来源 IP 限流。
+#[tokio::test]
+async fn web_security_boundaries() {
+    let (state, _bd, _dir) = test_state();
+
+    // CSRF：跨站 Origin 拒绝（需带 Host 才能比较）
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://evil.example")
+        .body(Body::from(
+            serde_json::json!({ "username": "x", "password": "y", "device_id": "d1" }).to_string(),
+        ))
+        .unwrap();
+    let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "跨站 Origin 应被拒");
+
+    // CSRF：Sec-Fetch-Site 跨站拒绝
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::from(
+            serde_json::json!({ "username": "x", "password": "y", "device_id": "d1" }).to_string(),
+        ))
+        .unwrap();
+    let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "跨站请求应被拒");
+
+    // 同源 Origin 放行（凭据错误应为 401，而不是被 CSRF 拦成 403）
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .body(Body::from(
+            serde_json::json!({ "username": "ghost", "password": "bad", "device_id": "d1" }).to_string(),
+        ))
+        .unwrap();
+    let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "同源请求应进入登录校验");
+
+    // 退出登录后会话失效
+    let (_, sid) = login(&state, "boss", "Admin!2026").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/logout", &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/me", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "退出后旧会话应失效");
+
+    // 强制改密：未改密前除改密/退出外一律 401
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &admin_sid,
+            serde_json::json!({ "username": "mc1", "display_name": "待改密", "password": "Init123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (st, mc_sid) = login(&state, "mc1", "Init123456").await;
+    assert_eq!(st, StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/books", &mc_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "未改密应被拦截");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &mc_sid,
+            serde_json::json!({ "old": "Init123456", "new": "Init654321" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改密应放行");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/books", &mc_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改密后应可访问");
+
+    // 来源 IP 限流：同一 XFF 连续失败 50 次后 429（用户名各不相同，避开账号维度）
+    let mut last = StatusCode::UNAUTHORIZED;
+    for i in 0..51 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-for", "10.9.9.9")
+            .body(Body::from(
+                serde_json::json!({
+                    "username": format!("ghost{i}"),
+                    "password": "bad",
+                    "device_id": "dev-xff"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+        last = resp.status();
+        if last == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS, "同一来源连续失败应被限流");
+}
+
+/// 年末结转：本年利润 → 未分配利润。
+#[tokio::test]
+async fn web_year_end_carry() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 借 6401 100 / 贷 1001 100，并结转损益（生成 4103 贷方 100）
+    post_voucher(&state, &sid, 1, serde_json::json!([
+        { "line": 1, "account_code": "6401", "summary": "成本", "debit": "100", "credit": "0" },
+        { "line": 2, "account_code": "1001", "summary": "付", "debit": "0", "credit": "100" }
+    ])).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/periods/202601/carry-forward", &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "结转损益应成功");
+    let cid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{cid}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 年末结转：4103 余额 -100 → 转入未分配利润
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/periods/202601/year-end", &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "年末结转应成功：{}",
+        body_string(resp).await
+    );
+    // 幂等性：第二次调用 4103 已清零，应 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/periods/202601/year-end", &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "余额为 0 时年末结转应被拒");
+}

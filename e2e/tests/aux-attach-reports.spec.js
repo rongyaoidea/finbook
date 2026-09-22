@@ -20,18 +20,19 @@ test("辅助/数量凭证、附件上传与数量金额账", async ({ page }) =>
   await page.click('.nav-item[data-view="vouchers"]');
   await page.click("#new-v");
   await page.fill("#v-date", "2026-01-15");
-  const rows = page.locator("#v-entries tbody tr");
-  await expect(rows.first()).toBeVisible();
-  await rows.nth(0).locator("select.acct-sel").selectOption("140301");
-  await rows.nth(0).locator(".e-sum").fill("E2E 入库");
-  await rows.nth(0).locator(".e-d").fill("100");
-  await rows.nth(0).locator(".e-aux").click();
+  // 只匹配"分录行"：辅助面板展开后会插入一行明细 tr，用 :has 排除它
+  const entryRows = page.locator("#v-entries tbody tr:has(select.acct-sel)");
+  await expect(entryRows.first()).toBeVisible();
+  await entryRows.nth(0).locator("select.acct-sel").selectOption("140301");
+  await entryRows.nth(0).locator(".e-sum").fill("E2E 入库");
+  await entryRows.nth(0).locator(".e-d").fill("100");
+  await entryRows.nth(1).locator("select.acct-sel").selectOption("1001");
+  await entryRows.nth(1).locator(".e-sum").fill("E2E 付款");
+  await entryRows.nth(1).locator(".e-c").fill("100");
+  await entryRows.nth(0).locator(".e-aux").click();
   await page.fill('.aux-in[data-k="item"]', "RM01");
   await page.fill('.aux-in[data-k="qty"]', "5");
   await page.fill('.aux-in[data-k="price"]', "20");
-  await rows.nth(1).locator("select.acct-sel").selectOption("1001");
-  await rows.nth(1).locator(".e-sum").fill("E2E 付款");
-  await rows.nth(1).locator(".e-c").fill("100");
   await page.click("#v-save");
   await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
 

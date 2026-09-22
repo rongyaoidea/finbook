@@ -2380,3 +2380,162 @@ async fn web_assets_depreciate_flow() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "资产清理应成功");
 }
+
+/// Web 银行对账：导入对账单 → 自动勾对 → 余额调节表平衡。
+#[tokio::test]
+async fn web_bank_reconcile_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 账面：借 100201 1000 / 贷 2001 1000
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-10", "word": "记",
+                "no": 1, "attachments": 0, "memo": "银行收款",
+                "entries": [
+                    { "line": 1, "account_code": "100201", "summary": "收款", "debit": "1000", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "借款", "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 导入对账单（余额与账面一致，便于验证调节表勾稽）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bank/import",
+            &sid,
+            serde_json::json!({
+                "ymm": 202601, "account": "100201",
+                "text": "日期,摘要,结算号,借方,贷方,余额\n2026-01-10,收款,SN001,1000.00,0.00,1000.00\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "导入对账单应成功");
+    let imp: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(imp["imported"], serde_json::json!(1));
+
+    // 自动勾对
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bank/auto-match",
+            &sid,
+            serde_json::json!({ "ymm": 202601, "account": "100201", "tolerance": 31 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let m: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(m["matched"].as_u64().unwrap_or(0) >= 1, "应至少勾对一对：{m}");
+
+    // 调节表：银行与账面调节后一致
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/bank?period=202601&account=100201", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(d["statements"][0]["entry_id"].as_i64(), Some(
+        d["book"][0]["entry_id"].as_i64().unwrap()
+    ), "对账单应挂到账面分录");
+    assert_eq!(d["reconcile"]["balanced"], serde_json::json!(true), "调节表应平衡：{}", d["reconcile"]);
+}
+
+/// Web 往来核销：自动核销等额的一借一贷。
+#[tokio::test]
+async fn web_settle_auto_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 借 112201（客户 C01）1000 / 贷 1001 1000
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05", "word": "记",
+                "no": 1, "attachments": 0, "memo": "应收",
+                "entries": [
+                    { "line": 1, "account_code": "112201", "summary": "销售", "debit": "1000", "credit": "0", "aux": { "customer": "C01" } },
+                    { "line": 2, "account_code": "600101", "summary": "收入", "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v1_body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "应收凭证应保存：{v1_body}");
+    let v1 = serde_json::from_str::<serde_json::Value>(&v1_body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    // 收款：借 1001 / 贷 112201（客户 C01）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-20", "word": "记",
+                "no": 2, "attachments": 0, "memo": "收款",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收款", "debit": "1000", "credit": "0" },
+                    { "line": 2, "account_code": "112201", "summary": "核销", "debit": "0", "credit": "1000", "aux": { "customer": "C01" } }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    for vid in [v1, v2] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(&format!("/api/vouchers/{vid}/post"), &sid, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "凭证 {vid} 应能记账");
+    }
+
+    // 核销前：两笔未核销
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/open?account=112201&upto=202601", &sid))
+        .await
+        .unwrap();
+    let open: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(open["rows"].as_array().unwrap().len(), 2, "核销前应有两笔未核销");
+
+    // 自动核销
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/auto",
+            &sid,
+            serde_json::json!({ "account": "112201", "ymm": 202601, "tolerance": "0.01" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["pairs"], serde_json::json!(1), "应核销一对：{r}");
+
+    // 核销后：无未核销
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/open?account=112201&upto=202601", &sid))
+        .await
+        .unwrap();
+    let open: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(open["rows"].as_array().unwrap().len(), 0, "核销后应无未核销");
+}

@@ -243,6 +243,20 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/assets/:id/dispose", post(dispose_asset))
         .route("/api/assets/depreciate", post(depreciate_assets))
         .route("/api/assets/depreciations/delete-period", post(delete_asset_deps_period))
+        // 银行对账（与桌面端对齐）
+        .route("/api/bank", get(get_bank))
+        .route("/api/bank/import", post(import_bank))
+        .route("/api/bank/auto-match", post(auto_match_bank))
+        .route("/api/bank/link", post(link_bank))
+        .route("/api/bank/unlink", post(unlink_bank))
+        .route("/api/bank/clear", post(clear_bank))
+        // 往来核销（与桌面端对齐）
+        .route("/api/settle/open", get(get_settle_open))
+        .route("/api/settle/auto", post(auto_settle_endpoint))
+        .route("/api/settle/run", post(manual_settle_endpoint))
+        .route("/api/settle/records", get(list_settle_records))
+        .route("/api/settle/unsettle", post(unsettle_endpoint))
+        .route("/api/settle/aging", get(get_settle_aging))
         // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
         .route("/api/accounts", post(create_account).put(update_account))
         .route("/api/accounts/:code", delete(delete_account))
@@ -4718,6 +4732,426 @@ async fn delete_asset_deps_period(
         &format!("{} 共 {removed} 条", period_to_str(period)),
     )?;
     Ok(Json(json!({ "removed": removed })))
+}
+
+// ---------------------------------------------------------------------------
+// 银行对账（与桌面端对齐）
+// ---------------------------------------------------------------------------
+
+fn stmt_json(s: &findb::bank::Statement) -> serde_json::Value {
+    json!({
+        "id": s.id,
+        "period": period_to_str(s.period),
+        "account": s.account_code,
+        "date": s.biz_date.format("%Y-%m-%d").to_string(),
+        "summary": s.summary,
+        "settle_no": s.settle_no,
+        "debit": s.debit.fmt_money(),
+        "credit": s.credit.fmt_money(),
+        "balance": s.balance.fmt_money(),
+        "entry_id": s.entry_id,
+        "matched_by": s.matched_by,
+    })
+}
+
+fn book_entry_json(b: &findb::bank::BookEntry) -> serde_json::Value {
+    json!({
+        "entry_id": b.entry_id,
+        "voucher_id": b.voucher_id,
+        "date": b.date.format("%Y-%m-%d").to_string(),
+        "voucher_no": b.voucher_label(),
+        "summary": b.summary,
+        "settle_no": b.settle_no,
+        "debit": b.debit.fmt_money(),
+        "credit": b.credit.fmt_money(),
+    })
+}
+
+fn reconcile_json(r: &findb::bank::Reconciliation) -> serde_json::Value {
+    json!({
+        "period": period_to_str(r.period),
+        "account": r.account_code,
+        "bank_balance": r.bank_balance.fmt_money(),
+        "book_balance": r.book_balance.fmt_money(),
+        "bank_adjusted": r.bank_adjusted.fmt_money(),
+        "book_adjusted": r.book_adjusted.fmt_money(),
+        "balanced": r.balanced(),
+        "diff": r.diff().fmt_money(),
+        "book_only_in": r.book_only_in.iter().map(book_entry_json).collect::<Vec<_>>(),
+        "book_only_out": r.book_only_out.iter().map(book_entry_json).collect::<Vec<_>>(),
+        "bank_only_in": r.bank_only_in.iter().map(stmt_json).collect::<Vec<_>>(),
+        "bank_only_out": r.bank_only_out.iter().map(stmt_json).collect::<Vec<_>>(),
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct BankImportReq {
+    pub ymm: i32,
+    pub account: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Deserialize)]
+struct BankAutoReq {
+    pub ymm: i32,
+    pub account: String,
+    #[serde(default)]
+    pub tolerance: i64,
+}
+
+#[derive(Deserialize)]
+struct BankLinkReq {
+    pub stmt_id: i64,
+    pub entry_id: i64,
+}
+
+#[derive(Deserialize)]
+struct BankStmtIdReq {
+    pub stmt_id: i64,
+}
+
+async fn get_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let account = q.get("account").cloned().unwrap_or_default();
+    if account.trim().is_empty() {
+        return Err(AppError::bad_request("缺少银行科目 account"));
+    }
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let db = state.db_for(&user.book_key)?;
+    let statements = findb::bank::list(&db, period, account.trim())?;
+    let book = findb::bank::book_side(&db, period, account.trim())?;
+    let recon = findb::bank::reconcile(&db, period, account.trim())?;
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "account": account.trim(),
+        "statements": statements.iter().map(stmt_json).collect::<Vec<_>>(),
+        "book": book.iter().map(book_entry_json).collect::<Vec<_>>(),
+        "reconcile": reconcile_json(&recon),
+    })))
+}
+
+async fn import_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankImportReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let period = period_checked(req.ymm)?;
+    let account = req.account.trim().to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少银行科目 account"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let (n, warnings) = findb::bank::import_csv(&db, period, &account, &req.text)?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "导入对账单",
+        &format!("{account} {n} 条"),
+    )?;
+    Ok(Json(json!({ "imported": n, "warnings": warnings })))
+}
+
+async fn auto_match_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankAutoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let period = period_checked(req.ymm)?;
+    let account = req.account.trim().to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少银行科目 account"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let r = findb::bank::auto_match(&db, period, &account, req.tolerance, user.username())?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "自动勾对",
+        &format!("{account} 成功 {} 对", r.matched),
+    )?;
+    Ok(Json(json!({
+        "matched": r.matched,
+        "by_no": r.by_no,
+        "by_amount_date": r.by_amount_date,
+        "by_amount": r.by_amount,
+        "ambiguous": r.ambiguous,
+    })))
+}
+
+async fn link_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankLinkReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::bank::link(&db, req.stmt_id, req.entry_id, user.username())?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "手工勾对",
+        &format!("流水#{} ↔ 分录#{}", req.stmt_id, req.entry_id),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn unlink_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankStmtIdReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::bank::unlink(&db, req.stmt_id)?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "取消勾对",
+        &format!("流水#{}", req.stmt_id),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn clear_bank(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankAutoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let period = period_checked(req.ymm)?;
+    let account = req.account.trim().to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少银行科目 account"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let n = findb::bank::clear(&db, period, &account)?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "清空对账单",
+        &format!("{account} {} 条", period_to_str(period)),
+    )?;
+    Ok(Json(json!({ "removed": n })))
+}
+
+// ---------------------------------------------------------------------------
+// 往来核销（与桌面端对齐）
+// ---------------------------------------------------------------------------
+
+fn open_entry_json(e: &findb::settle::OpenEntry) -> serde_json::Value {
+    json!({
+        "entry_id": e.entry_id,
+        "voucher_id": e.voucher_id,
+        "period": period_to_str(e.period),
+        "date": e.date.format("%Y-%m-%d").to_string(),
+        "voucher_no": format!("{}-{:04}", e.word, e.no),
+        "line": e.line,
+        "summary": e.summary,
+        "account_code": e.account_code,
+        "aux_key": e.aux_key,
+        "settle_no": e.settle_no,
+        "debit": e.debit.fmt_money(),
+        "credit": e.credit.fmt_money(),
+        "settled": e.settled.fmt_money(),
+        "open": e.open().fmt_money(),
+        "dir": e.dir_label(),
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct SettleAutoReq {
+    pub account: String,
+    #[serde(default)]
+    pub ymm: i32,
+    #[serde(default)]
+    pub tolerance: String,
+}
+
+#[derive(Deserialize)]
+struct SettleRunReq {
+    pub from_entry: i64,
+    pub to_entry: i64,
+    pub amount: String,
+}
+
+#[derive(Deserialize)]
+struct UnsettleReq {
+    pub id: i64,
+}
+
+async fn get_settle_open(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let account = q.get("account").cloned().unwrap_or_default();
+    if account.trim().is_empty() {
+        return Err(AppError::bad_request("缺少往来科目 account"));
+    }
+    let upto = q
+        .get("upto")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let include_all = q.get("all").map(|s| s == "1" || s == "true").unwrap_or(false);
+    let db = state.db_for(&user.book_key)?;
+    let mut rows = findb::settle::open_entries(&db, account.trim(), upto, include_all)?;
+    if !include_all {
+        rows.retain(|e| e.is_open());
+    }
+    Ok(Json(json!({
+        "account": account.trim(),
+        "upto": period_to_str(upto),
+        "rows": rows.iter().map(open_entry_json).collect::<Vec<_>>(),
+    })))
+}
+
+async fn auto_settle_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SettleAutoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let account = req.account.trim().to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少往来科目 account"));
+    }
+    let upto = if req.ymm > 0 {
+        period_checked(req.ymm)?
+    } else {
+        current_period(&state, &user)
+    };
+    let tolerance = if req.tolerance.trim().is_empty() {
+        Money::parse("0.01").unwrap_or(Money::ZERO)
+    } else {
+        parse_money_checked(&req.tolerance)?
+    };
+    let db = state.db_for(&user.book_key)?;
+    let r = findb::settle::auto_settle(&db, &account, upto, tolerance, user.username())?;
+    db.log(
+        user.username(),
+        "往来",
+        "自动核销",
+        &format!("{account} {} 对 {}", r.pairs, r.amount.fmt_money()),
+    )?;
+    Ok(Json(json!({
+        "pairs": r.pairs,
+        "amount": r.amount.fmt_money(),
+        "exact": r.exact,
+        "written_off": r.written_off,
+    })))
+}
+
+async fn manual_settle_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SettleRunReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let amount = parse_money_checked(&req.amount)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = findb::settle::settle(&db, req.from_entry, req.to_entry, amount, user.username())?;
+    db.log(
+        user.username(),
+        "往来",
+        "手工核销",
+        &format!("分录#{} ↔ 分录#{} {}", req.from_entry, req.to_entry, amount.fmt_money()),
+    )?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn list_settle_records(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let account = q.get("account").cloned().unwrap_or_default();
+    if account.trim().is_empty() {
+        return Err(AppError::bad_request("缺少往来科目 account"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let rows: Vec<serde_json::Value> = findb::settle::list(&db, account.trim())?
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id, "period": period_to_str(r.period), "account": r.account_code,
+                "aux_key": r.aux_key, "from_entry": r.from_entry, "to_entry": r.to_entry,
+                "amount": r.amount.fmt_money(), "settled_by": r.settled_by, "settled_at": r.settled_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "rows": rows })))
+}
+
+async fn unsettle_endpoint(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<UnsettleReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::settle::unsettle(&db, req.id)?;
+    db.log(user.username(), "往来", "取消核销", &format!("记录#{}", req.id))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_settle_aging(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let account = q.get("account").cloned().unwrap_or_default();
+    if account.trim().is_empty() {
+        return Err(AppError::bad_request("缺少往来科目 account"));
+    }
+    let upto = q
+        .get("upto")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let as_of = q
+        .get("as_of")
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .unwrap_or_else(|| chrono::Local::now().date_naive());
+    let by_year = q.get("scheme").map(|s| s == "year").unwrap_or(false);
+    let buckets = if by_year {
+        fincore::engine::aging::buckets_by_year()
+    } else {
+        fincore::engine::aging::buckets_by_days()
+    };
+    let db = state.db_for(&user.book_key)?;
+    let lines = findb::settle::aging(&db, account.trim(), upto, as_of, &buckets)?;
+    let labels: Vec<&str> = buckets.iter().map(|b| b.label).collect();
+    let rows: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| {
+            json!({
+                "key": l.key,
+                "amounts": l.amounts.iter().map(|m| m.fmt_money()).collect::<Vec<_>>(),
+                "total": l.total.fmt_money(),
+                "credit_total": l.credit_total.fmt_money(),
+                "net": l.net().fmt_money(),
+                "max_days": l.max_days,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "account": account.trim(),
+        "as_of": as_of.format("%Y-%m-%d").to_string(),
+        "buckets": labels,
+        "rows": rows,
+    })))
 }
 
 // ---------------------------------------------------------------------------

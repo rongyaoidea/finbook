@@ -374,6 +374,8 @@ const NAV_ITEMS = [
   { id: "notes", label: "报表附注", perm: "report", group: "账簿报表" },
   { id: "period-end", label: "期末处理", perm: "period_close", group: "期末" },
   { id: "assets", label: "固定资产", perm: "account_edit", group: "期末" },
+  { id: "bank", label: "银行对账", perm: "voucher_new", group: "期末" },
+  { id: "settle", label: "往来核销", perm: "voucher_new", group: "期末" },
   { id: "reconcile", label: "期末对账", perm: "report", group: "期末" },
   { id: "mrp", label: "MRP 运算", perm: "account_edit", group: "生产制造" },
   { id: "routing", label: "工艺路线", perm: "account_edit", group: "生产制造" },
@@ -427,6 +429,8 @@ const VIEWS = {
   "daily": viewDaily,
   "period-end": viewPeriodEnd,
   "assets": viewAssets,
+  "bank": viewBank,
+  "settle": viewSettle,
   "reconcile": viewReconcile,
   "mrp": viewMrp,
   "routing": viewRouting,
@@ -2690,6 +2694,180 @@ async function viewAssets(main) {
     const p = periodOf();
     if (!(await confirmDialog(`删除 ${p} 的全部折旧明细（不改凭证）？删除后可重新计提。`, true))) return;
     try { const r = await post("/assets/depreciations/delete-period", { ymm: parseInt(p, 10) }); toast(`已删除 ${r.removed} 条`, "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  load();
+}
+
+// ===========================================================================
+// 银行对账（与桌面端对齐：导入 → 自动勾对 → 手工补勾 → 余额调节表）
+// ===========================================================================
+async function viewBank(main) {
+  const cur = (state.current || "").replace("-", "");
+  main.innerHTML = `<h2>银行对账</h2>
+    <div class="toolbar">
+      <label>期间 <input id="bk-period" value="${esc(cur)}" style="width:90px" /></label>
+      <label>银行科目 <input id="bk-acct" value="1002" style="width:100px" /></label>
+      <button class="btn" id="bk-load">查询</button>
+      <div class="spacer"></div>
+      <label>日期容差 <input id="bk-tol" type="number" value="3" style="width:56px" /> 天</label>
+      ${can("voucher_new") ? `<button class="btn ghost" id="bk-auto">自动勾对</button>` : ""}
+      ${can("voucher_new") ? `<button class="btn ghost" id="bk-import">导入对账单</button>` : ""}
+      ${can("voucher_new") ? `<button class="btn ghost" id="bk-link">手工勾对</button>` : ""}
+      ${can("voucher_new") ? `<button class="btn danger" id="bk-clear">清空对账单</button>` : ""}
+    </div>
+    <div class="muted" id="bk-sum" style="margin-bottom:8px">加载中…</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="panel"><b>银行对账单</b><div id="bk-stmts"></div></div>
+      <div class="panel"><b>账面银行分录（已记账）</b><div id="bk-book"></div></div>
+    </div>
+    <div class="panel" id="bk-recon" style="margin-top:10px"></div>`;
+  let data = null, selStmt = null, selBook = null;
+  const periodOf = () => $("#bk-period", main).value.trim();
+  const accountOf = () => $("#bk-acct", main).value.trim();
+  const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+
+  function render() {
+    if (!data) return;
+    const stmts = data.statements || [], book = data.book || [];
+    $("#bk-sum", main).innerHTML = `银行流水 <b>${stmts.length}</b> 条（已勾 <b>${stmts.filter((s) => s.entry_id).length}</b>）　账面分录 <b>${book.length}</b> 条`;
+    $("#bk-stmts", main).innerHTML = `<table class="grid"><thead><tr><th>日期</th><th>摘要</th><th>结算号</th><th class="num">进账</th><th class="num">支出</th><th class="num">余额</th><th></th></tr></thead><tbody>${stmts.length ? stmts.map((s) => `<tr class="${selStmt === s.id ? "row-sel" : ""}" data-stmt="${s.id}"><td>${esc(s.date)}</td><td>${esc(s.summary)}</td><td>${esc(s.settle_no || "")}</td><td class="num">${s.debit === "0.00" ? "" : esc(s.debit)}</td><td class="num">${s.credit === "0.00" ? "" : esc(s.credit)}</td><td class="num">${esc(s.balance)}</td><td>${s.entry_id ? `<button class="btn sm ghost" data-unlink="${s.id}">取消</button>` : `<span class="muted">未勾</span>`}</td></tr>`).join("") : `<tr><td colspan="7" class="muted">暂无对账单，请先导入</td></tr>`}</tbody></table>`;
+    $("#bk-book", main).innerHTML = `<table class="grid"><thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借</th><th class="num">贷</th><th></th></tr></thead><tbody>${book.length ? book.map((b) => `<tr class="${selBook === b.entry_id ? "row-sel" : ""}" data-book="${b.entry_id}"><td>${esc(b.date)}</td><td>${esc(b.voucher_no)}</td><td>${esc(b.summary)}</td><td class="num">${b.debit === "0.00" ? "" : esc(b.debit)}</td><td class="num">${b.credit === "0.00" ? "" : esc(b.credit)}</td><td></td></tr>`).join("") : `<tr><td colspan="6" class="muted">该科目本期无已记账分录</td></tr>`}</tbody></table>`;
+    const r = data.reconcile || {};
+    const list = (arr, f) => (arr || []).length ? `<ul style="margin:4px 0 0 16px">${arr.map((x) => `<li>${f(x)}</li>`).join("")}</ul>` : `<span class="muted">无</span>`;
+    $("#bk-recon", main).innerHTML = `<b>余额调节表</b>　${r.balanced ? '<span class="tag ok">调节后一致</span>' : `<span class="tag err">差额 ${esc(r.diff)}</span>`}
+      <table class="grid" style="margin-top:6px"><thead><tr><th>口径</th><th class="num">余额</th><th class="num">调节后</th></tr></thead><tbody>
+      <tr><td>银行对账单</td><td class="num">${esc(r.bank_balance || "0.00")}</td><td class="num">${esc(r.bank_adjusted || "0.00")}</td></tr>
+      <tr><td>企业账面</td><td class="num">${esc(r.book_balance || "0.00")}</td><td class="num">${esc(r.book_adjusted || "0.00")}</td></tr>
+      </tbody></table>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px;font-size:13px">
+        <div><b>企业已收、银行未收</b>${list(r.book_only_in, (x) => `${x.voucher_no} ${x.summary} ${x.debit}`)}<b>企业已付、银行未付</b>${list(r.book_only_out, (x) => `${x.voucher_no} ${x.summary} ${x.credit}`)}</div>
+        <div><b>银行已收、企业未记</b>${list(r.bank_only_in, (x) => `${x.date} ${x.summary} ${x.debit}`)}<b>银行已付、企业未记</b>${list(r.bank_only_out, (x) => `${x.date} ${x.summary} ${x.credit}`)}</div>
+      </div>`;
+    $all("[data-stmt]", main).forEach((tr) => tr.onclick = (ev) => { if (ev.target.dataset.unlink) return; selStmt = parseInt(tr.dataset.stmt, 10); render(); });
+    $all("[data-book]", main).forEach((tr) => tr.onclick = () => { selBook = parseInt(tr.dataset.book, 10); render(); });
+    $all("[data-unlink]", main).forEach((b) => b.onclick = async (ev) => {
+      ev.stopPropagation();
+      try { await post("/bank/unlink", { stmt_id: parseInt(b.dataset.unlink, 10) }); toast("已取消勾对", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+    });
+  }
+
+  async function load() {
+    const p = periodOf(), acct = accountOf();
+    if (!/^\d{6}$/.test(p) || !acct) { $("#bk-sum", main).textContent = "请填写期间与银行科目"; return; }
+    try { data = await api(`/bank?period=${encodeURIComponent(p)}&account=${encodeURIComponent(acct)}`); }
+    catch (e) { $("#bk-sum", main).textContent = e.message; return; }
+    selStmt = selBook = null;
+    render();
+  }
+
+  $("#bk-load", main).onclick = load;
+  if ($("#bk-auto", main)) $("#bk-auto", main).onclick = async () => {
+    const p = periodOf(), acct = accountOf(), tol = parseInt($("#bk-tol", main).value, 10) || 0;
+    try {
+      const r = await post("/bank/auto-match", { ymm: parseInt(p, 10), account: acct, tolerance: tol });
+      toast(`自动勾对 ${r.matched} 对（结算号 ${r.by_no}、金额+日期 ${r.by_amount_date}、金额 ${r.by_amount}；存疑 ${r.ambiguous}）`, "ok");
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#bk-link", main)) $("#bk-link", main).onclick = async () => {
+    if (!selStmt || !selBook) { toast("请分别在左右两表各选一行", "err"); return; }
+    try { await post("/bank/link", { stmt_id: selStmt, entry_id: selBook }); toast("已勾对", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#bk-import", main)) $("#bk-import", main).onclick = () => {
+    const m = modal(`<h3>导入银行对账单</h3>
+      <div class="muted" style="font-size:12px;margin-bottom:6px">每行一条，逗号/制表符/分号分隔。支持：日期,摘要,结算号,借方,贷方,余额 或 日期,摘要,结算号,金额,余额（负数支出）。首行表头自动跳过。</div>
+      <textarea id="bi-text" style="width:100%;height:220px;font-family:monospace" placeholder="2026-01-06,收到货款,SN001,1000.00,0.00,101000.00"></textarea>
+      <div class="foot"><button class="btn primary" id="bi-ok">导入</button><button class="btn ghost" id="bi-cancel">取消</button></div>`);
+    $("#bi-cancel", m).onclick = closeModal;
+    $("#bi-ok", m).onclick = async () => {
+      try {
+        const r = await post("/bank/import", { ymm: parseInt(periodOf(), 10), account: accountOf(), text: $("#bi-text", m).value });
+        toast(`已导入 ${r.imported} 条`, "ok");
+        (r.warnings || []).slice(0, 3).forEach((w) => toast(w, "err"));
+        closeModal(); load();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  if ($("#bk-clear", main)) $("#bk-clear", main).onclick = async () => {
+    if (!(await confirmDialog(`清空 ${periodOf()} 期 ${accountOf()} 的全部对账单流水？`, true))) return;
+    try { const r = await post("/bank/clear", { ymm: parseInt(periodOf(), 10), account: accountOf(), tolerance: 0 }); toast(`已清空 ${r.removed} 条`, "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  load();
+}
+
+// ===========================================================================
+// 往来核销（与桌面端对齐：未核销清单 / 自动核销 / 手工核销 / 账龄）
+// ===========================================================================
+async function viewSettle(main) {
+  const cur = (state.current || "").replace("-", "");
+  main.innerHTML = `<h2>往来核销</h2>
+    <div class="toolbar">
+      <label>往来科目 <input id="st-acct" value="1122" style="width:100px" /></label>
+      <label>截止期间 <input id="st-upto" value="${esc(cur)}" style="width:90px" /></label>
+      <button class="btn" id="st-load">查询未核销</button>
+      <div class="spacer"></div>
+      <label>尾差 <input id="st-tol" value="0.01" style="width:60px" /></label>
+      ${can("voucher_new") ? `<button class="btn ghost" id="st-auto">自动核销</button>` : ""}
+      ${can("voucher_new") ? `<button class="btn ghost" id="st-manual">手工核销</button>` : ""}
+      <button class="btn ghost" id="st-aging">账龄分析</button>
+      <button class="btn ghost" id="st-records">核销记录</button>
+    </div>
+    <div class="muted" id="st-sum" style="margin-bottom:8px">加载中…</div>
+    <div class="panel"><div id="st-table"></div></div>
+    <div id="st-extra" style="margin-top:10px"></div>`;
+  let selFrom = null, selTo = null, rows = [];
+  const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const acct = () => $("#st-acct", main).value.trim();
+  const upto = () => $("#st-upto", main).value.trim();
+
+  function render() {
+    const totalOpen = rows.reduce((a, r) => a + (parseFloat(String(r.open).replace(/,/g, "")) || 0), 0);
+    $("#st-sum", main).innerHTML = `未核销 <b>${rows.length}</b> 笔，合计 <b>${totalOpen.toFixed(2)}</b>`;
+    $("#st-table", main).innerHTML = `<table class="grid"><thead><tr><th>日期</th><th>凭证号</th><th>往来对象</th><th>摘要</th><th>方向</th><th class="num">发生额</th><th class="num">已核销</th><th class="num">未核销</th><th>选择</th></tr></thead><tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.aux_key || "—")}</td><td>${esc(r.summary)}</td><td>${esc(r.dir)}</td><td class="num">${esc(r.debit === "0.00" ? r.credit : r.debit)}</td><td class="num">${esc(r.settled)}</td><td class="num">${esc(r.open)}</td><td>
+      <button class="btn sm ${selFrom === r.entry_id ? "primary" : "ghost"}" data-from="${r.entry_id}">原单</button>
+      <button class="btn sm ${selTo === r.entry_id ? "primary" : "ghost"}" data-to="${r.entry_id}">收/付</button></td></tr>`).join("") : `<tr><td colspan="9" class="muted" style="text-align:center;padding:16px">没有未核销分录</td></tr>`}</tbody></table>`;
+    $all("[data-from]", main).forEach((b) => b.onclick = () => { selFrom = parseInt(b.dataset.from, 10); render(); });
+    $all("[data-to]", main).forEach((b) => b.onclick = () => { selTo = parseInt(b.dataset.to, 10); render(); });
+  }
+
+  async function load() {
+    const a = acct(), u = upto();
+    try {
+      const d = await api(`/settle/open?account=${encodeURIComponent(a)}&upto=${encodeURIComponent(u)}`);
+      rows = d.rows || [];
+      selFrom = selTo = null;
+      $("#st-extra", main).innerHTML = "";
+      render();
+    } catch (e) { $("#st-sum", main).textContent = e.message; }
+  }
+
+  $("#st-load", main).onclick = load;
+  if ($("#st-auto", main)) $("#st-auto", main).onclick = async () => {
+    const p = /^\d{6}$/.test(upto()) ? parseInt(upto(), 10) : 0;
+    if (!(await confirmDialog(`对 ${acct()} 自动核销（等额优先，保守不勾错）？`, false))) return;
+    try { const r = await post("/settle/auto", { account: acct(), ymm: p, tolerance: $("#st-tol", main).value.trim() }); toast(`核销 ${r.pairs} 对，金额 ${r.amount}（精确 ${r.exact}、尾差抹平 ${r.written_off}）`, "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#st-manual", main)) $("#st-manual", main).onclick = async () => {
+    if (!selFrom || !selTo) { toast("请分别选择「原单」与「收/付」两行", "err"); return; }
+    const amt = prompt("核销金额", "");
+    if (amt === null) return;
+    try { await post("/settle/run", { from_entry: selFrom, to_entry: selTo, amount: amt }); toast("已核销", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#st-aging", main)) $("#st-aging", main).onclick = async () => {
+    try {
+      const d = await api(`/settle/aging?account=${encodeURIComponent(acct())}&upto=${encodeURIComponent(upto())}`);
+      $("#st-extra", main).innerHTML = `<div class="panel"><b>账龄分析（${esc(d.as_of)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>往来对象</th>${d.buckets.map((b) => `<th class="num">${esc(b)}</th>`).join("")}<th class="num">借方合计</th><th class="num">贷方合计</th><th class="num">净额</th><th class="num">最老天数</th></tr></thead><tbody>${(d.rows || []).length ? d.rows.map((r) => `<tr><td>${esc(r.key || "—")}</td>${r.amounts.map((x) => `<td class="num">${esc(x)}</td>`).join("")}<td class="num">${esc(r.total)}</td><td class="num">${esc(r.credit_total)}</td><td class="num">${esc(r.net)}</td><td class="num">${r.max_days}</td></tr>`).join("") : `<tr><td colspan="${d.buckets.length + 5}" class="muted">无数据</td></tr>`}</tbody></table></div>`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#st-records", main)) $("#st-records", main).onclick = async () => {
+    try {
+      const d = await api(`/settle/records?account=${encodeURIComponent(acct())}`);
+      const rows2 = d.rows || [];
+      $("#st-extra", main).innerHTML = `<div class="panel"><b>核销记录</b><table class="grid" style="margin-top:6px"><thead><tr><th>期间</th><th>往来对象</th><th class="num">金额</th><th>操作人</th><th>时间</th><th></th></tr></thead><tbody>${rows2.length ? rows2.map((r) => `<tr><td>${esc(r.period)}</td><td>${esc(r.aux_key || "—")}</td><td class="num">${esc(r.amount)}</td><td>${esc(r.settled_by)}</td><td>${esc(r.settled_at)}</td><td>${can("voucher_new") ? `<button class="btn sm ghost" data-unsettle="${r.id}">取消核销</button>` : ""}</td></tr>`).join("") : `<tr><td colspan="6" class="muted">暂无记录</td></tr>`}</tbody></table></div>`;
+      $all("[data-unsettle]", main).forEach((b) => b.onclick = async () => {
+        try { await post("/settle/unsettle", { id: parseInt(b.dataset.unsettle, 10) }); toast("已取消", "ok"); $("#st-records", main).click(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { toast(e.message, "err"); }
   };
   load();
 }

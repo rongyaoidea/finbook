@@ -4331,6 +4331,7 @@ async function viewBackup(main) {
 
 // ---------------- 凭证模板 ----------------
 async function viewTemplates(main) {
+  await ensureAccounts();
   main.innerHTML = `
     <h2>凭证模板</h2>
     <div class="toolbar">
@@ -4743,6 +4744,7 @@ function empNameIn(employees, code) { const e = (employees || []).find((x) => x.
 // 费用报销（草稿 → 提交 → 审批 → 支付 → 生成凭证）
 // ===========================================================================
 async function viewClaims(main) {
+  await ensureAccounts();
   const period = state.clmPeriod || state.current || today().slice(0, 7);
   const status = state.clmStatus == null ? "" : state.clmStatus;
   main.innerHTML = `

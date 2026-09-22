@@ -42,10 +42,13 @@ fn map_rec(r: &rusqlite::Row) -> rusqlite::Result<SettleRecord> {
 
 const COLS: &str = "id,period,account_code,aux_key,from_entry,to_entry,amount,settled_by,settled_at";
 
-/// 某科目的全部核销记录
+/// 某科目（含下级）的全部核销记录
+///
+/// 口径与 [`open_entries`]、[`aging`] 一致：父级科目能查到下级科目的记录，
+/// 否则界面默认按 1122 查询时会出现"未核销已清、记录却为空"的矛盾。
 pub fn list(db: &Db, account: &str) -> DbResult<Vec<SettleRecord>> {
     let mut st = db.conn().prepare(&format!(
-        "SELECT {COLS} FROM settle_record WHERE account_code=?1 ORDER BY period, id"
+        "SELECT {COLS} FROM settle_record WHERE (account_code=?1 OR account_code LIKE ?1||'%') ORDER BY period, id"
     ))?;
     let rows = st
         .query_map(rusqlite::params![account], map_rec)?

@@ -3229,6 +3229,18 @@ async fn web_settle_manual_records_aging() {
     let recs: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(recs["rows"].as_array().unwrap().len(), 1, "应有 1 条核销记录");
 
+    // 父级科目查询口径应与未核销/账龄一致（1122 含 112201 的记录）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/records?account=1122", &sid))
+        .await
+        .unwrap();
+    let recs_parent: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        recs_parent["rows"].as_array().unwrap().len(),
+        1,
+        "父级科目应能查到下级核销记录"
+    );
+
     let resp = handlers::router(state.clone())
         .oneshot(authed_get("/api/settle/aging?account=112201&upto=202601", &sid))
         .await

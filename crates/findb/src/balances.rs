@@ -627,7 +627,8 @@ pub fn qty_balance_sheet(
     let snap = BalanceSnapshot::load(db, &q)?;
     let chart = crate::accounts::chart(db)?;
     let mut map: BTreeMap<String, QtyBalanceRow> = BTreeMap::new();
-    for row in snap.raw_rows() {
+    // 数量挂在 filtered() 里合并（raw_rows 只有金额），因此这里走 filtered
+    for row in snap.filtered(&chart, &q) {
         let Some(qty) = row.qty else { continue };
         let e = map.entry(row.account_code.clone()).or_insert(QtyBalanceRow {
             account_code: row.account_code.clone(),

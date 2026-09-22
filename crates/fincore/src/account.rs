@@ -665,7 +665,8 @@ pub struct BookOptions {
     pub enable_qty: bool,
     /// 启用外币核算
     pub enable_foreign: bool,
-    /// 凭证需要出纳签字
+    /// （已废弃）出纳签字环节已移除：出纳不使用本软件，记账不再要求签字。
+    /// 字段仅为兼容旧账套序列化而保留，不再生效。
     pub require_cashier: bool,
     /// （已废弃）审核环节已移除：未记账凭证核对后直接记账。
     /// 字段仅为兼容旧账套序列化而保留，不再生效。

@@ -576,27 +576,6 @@ pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
-/// 出纳签字
-pub fn cashier_sign(db: &Db, id: i64, who: &str) -> DbResult<()> {
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    let mut iss = Issues::new();
-    if v.status != VoucherStatus::Draft && v.status != VoucherStatus::Audited {
-        iss.push(format!("凭证当前状态为「{}」，不能签字", v.status.label()));
-    }
-    if !v.entries.iter().any(|e| !e.is_blank()) {
-        iss.push("凭证无内容".to_string());
-    }
-    iss.into_result()?;
-    let tx = db.write_tx()?;
-    tx.execute(
-        "UPDATE voucher SET cashier=?2 WHERE id=?1",
-        rusqlite::params![id, who],
-    )?;
-    crate::log_on(&tx, who, "凭证", "出纳签字", &v.voucher_no())?;
-    tx.commit()?;
-    Ok(())
-}
-
 /// 作废 / 恢复。作废与取消作废都会记入操作日志。
 pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
     let tx = db.write_tx()?;
@@ -691,10 +670,7 @@ fn post_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbE
     if !v.balanced() {
         return Err(FinError::state("凭证借贷不平衡，不能记账").into());
     }
-    let opts = crate::options_of(tx);
-    if opts.require_cashier && v.cashier.is_none() {
-        return Err(FinError::state("该账套要求出纳签字后才能记账").into());
-    }
+    // 出纳签字已移除（出纳不使用本软件）：记账不再受 require_cashier 影响
     let closed: Option<i32> = tx.query_row(
         "SELECT MAX(period) FROM period_state WHERE closed=1",
         [],

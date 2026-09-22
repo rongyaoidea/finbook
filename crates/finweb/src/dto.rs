@@ -254,8 +254,8 @@ pub struct BatchPostReq {
     pub ids: Vec<i64>,
 }
 
-/// 凭证分录（前端提交的最小字段）
-#[derive(Deserialize)]
+/// 凭证分录（前端提交的字段；可选要素不传则沿用原行，避免 Web 编辑丢桌面录入的数据）
+#[derive(Deserialize, Default)]
 pub struct VoucherEntryDto {
     pub line: i32,
     pub summary: String,
@@ -264,6 +264,18 @@ pub struct VoucherEntryDto {
     pub debit: String,
     /// 贷方金额（十进制字符串）
     pub credit: String,
+    /// 辅助核算（客户/供应商/部门/职员/项目/存货/银行）
+    #[serde(default)]
+    pub aux: Option<fincore::AuxRef>,
+    /// 数量（数量核算科目）
+    #[serde(default)]
+    pub qty: Option<fincore::Money>,
+    /// 单价
+    #[serde(default)]
+    pub price: Option<fincore::Money>,
+    /// 现金流量项目编码（现金/银行科目）
+    #[serde(default)]
+    pub cf: Option<String>,
 }
 
 /// 保存凭证请求

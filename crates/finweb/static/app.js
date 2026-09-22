@@ -372,6 +372,7 @@ const NAV_ITEMS = [
   { id: "compare", label: "报表对比", perm: "report", group: "账簿报表" },
   { id: "daily", label: "科目日报表", perm: "report", group: "账簿报表" },
   { id: "notes", label: "报表附注", perm: "report", group: "账簿报表" },
+  { id: "period-end", label: "期末处理", perm: "period_close", group: "期末" },
   { id: "reconcile", label: "期末对账", perm: "report", group: "期末" },
   { id: "mrp", label: "MRP 运算", perm: "account_edit", group: "生产制造" },
   { id: "routing", label: "工艺路线", perm: "account_edit", group: "生产制造" },
@@ -423,6 +424,7 @@ const VIEWS = {
   "equity": viewEquity,
   "compare": viewCompare,
   "daily": viewDaily,
+  "period-end": viewPeriodEnd,
   "reconcile": viewReconcile,
   "mrp": viewMrp,
   "routing": viewRouting,
@@ -944,7 +946,10 @@ async function batchPost() {
 // seedEntries：可选，凭证模板生成凭证时预填分录 [{account_code, summary, dir, amount}]
 async function openVoucherEditor(id, seedEntries) {
   await ensureAccounts();
-  const blank = { line: 1, account_code: "", summary: "", debit: "0", credit: "0" };
+  // 辅助核算维度（与后端 AuxKind::bit 对齐）；cashflow 单独用现金流量项目输入
+  const AUX_DEFS = [["customer", 1, "客户"], ["supplier", 2, "供应商"], ["dept", 4, "部门"],
+    ["employee", 8, "职员"], ["project", 16, "项目"], ["item", 32, "存货"], ["bank", 128, "银行账户"]];
+  const blank = { line: 1, account_code: "", summary: "", debit: "0", credit: "0", aux: {}, cf: "", qty: "", price: "" };
   let v = {
     id: 0, period: state.current, date: today(), word: "记", no: 0, attachments: 0, memo: "",
     entries: (seedEntries && seedEntries.length ? seedEntries.map((e, i) => ({
@@ -959,6 +964,21 @@ async function openVoucherEditor(id, seedEntries) {
   } else {
     try { const n = await api(`/vouchers/next-no?period=${encodeURIComponent(state.current || "")}&word=记`); v.no = n.no; } catch (e) {}
   }
+  // 规范化分录：辅助/数量/单价/现金流量统一成表单形态（后端返回 aux.cash_flow）
+  v.entries = (v.entries || []).map((e, i) => {
+    const aux = Object.assign({}, e.aux || {});
+    const cf = aux.cash_flow || "";
+    delete aux.cash_flow;
+    return {
+      line: i + 1, account_code: e.account_code || "", summary: e.summary || "",
+      debit: e.debit != null ? String(e.debit) : "0",
+      credit: e.credit != null ? String(e.credit) : "0",
+      aux, cf,
+      qty: e.qty != null ? String(e.qty) : "",
+      price: e.price != null ? String(e.price) : "",
+    };
+  });
+  if (!v.entries.length) v.entries = [Object.assign({}, blank, { line: 1 }), Object.assign({}, blank, { line: 2 })];
   // 可编辑状态与后端 can_edit() 对齐：未记账（含历史"已审核"）可改；已记账需先反记账
   const editable = (id === 0) || status === "draft" || status === "audited";
   const canPost = status === "draft" || status === "audited";
@@ -972,7 +992,7 @@ async function openVoucherEditor(id, seedEntries) {
       <label>附单据 <input id="v-att" type="number" value="${v.attachments}" style="width:60px" ${editable ? "" : "disabled"} /></label>
     </div>
     <table class="grid" id="v-entries">
-      <thead><tr><th style="width:40px">行</th><th>科目</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th></th></tr></thead>
+      <thead><tr><th style="width:40px">行</th><th>科目</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th style="width:64px">辅助</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     ${editable ? `<button class="btn ghost sm" id="v-add">+ 增加分录</button>` : ""}
@@ -988,20 +1008,66 @@ async function openVoucherEditor(id, seedEntries) {
   `, true);
 
   const tbody = $("#v-entries tbody", mask);
+  let expanded = -1;
+  function acctOf(code) { return (state.accounts || []).find((a) => a.code === code); }
+  function auxMissing(e) {
+    const a = acctOf(e.account_code);
+    if (!a) return false;
+    for (const [k, bit] of AUX_DEFS) {
+      if ((a.aux & bit) && !(e.aux && e.aux[k])) return true;
+    }
+    if (a.has_qty && !e.qty) return true;
+    return false;
+  }
+  function auxDetailHtml(e, i) {
+    const a = acctOf(e.account_code);
+    const mask = (a && a.aux) || 0;
+    const parts = [];
+    for (const [k, bit, label] of AUX_DEFS) {
+      if (!(mask & bit)) continue;
+      parts.push(`<label>${label}* <input class="aux-in" data-i="${i}" data-k="${k}" value="${esc((e.aux || {})[k] || "")}" style="width:140px" /></label>`);
+    }
+    if (a && a.has_qty) {
+      parts.push(`<label>数量 <input class="aux-in" data-i="${i}" data-k="qty" value="${esc(e.qty)}" style="width:90px" /></label>`);
+      parts.push(`<label>单价 <input class="aux-in" data-i="${i}" data-k="price" value="${esc(e.price)}" style="width:90px" /></label>`);
+    }
+    if (a && (a.is_cash || a.is_bank)) {
+      parts.push(`<label>现金流量项目 <input class="aux-in" data-i="${i}" data-k="cf" value="${esc(e.cf)}" placeholder="如 0101" style="width:100px" /></label>`);
+    }
+    if (!parts.length) parts.push(`<span class="muted">该科目无需辅助核算/数量</span>`);
+    return `<div class="muted" style="padding:6px 2px"><span style="font-size:12px">${parts.join(" ")}</span>${editable ? ` <button class="btn ghost sm" id="v-aux-close">收起</button>` : ""}</div>`;
+  }
   function renderRows() {
-    tbody.innerHTML = v.entries.map((e, i) => `<tr>
+    tbody.innerHTML = v.entries.map((e, i) => {
+      const miss = auxMissing(e);
+      const hasAux = (e.aux && Object.keys(e.aux).some((k) => e.aux[k])) || e.qty || e.cf;
+      const detail = expanded === i ? `<tr><td colspan="7" style="background:rgba(0,0,0,0.03)">${auxDetailHtml(e, i)}</td></tr>` : "";
+      return `<tr>
       <td>${e.line}</td>
       <td>${accountOptions()}</td>
       <td><input class="e-sum" value="${esc(e.summary)}" style="width:100%" ${editable ? "" : "disabled"} /></td>
       <td class="num"><input class="e-d num" value="${esc(e.debit)}" style="width:110px;text-align:right" ${editable ? "" : "disabled"} /></td>
       <td class="num"><input class="e-c num" value="${esc(e.credit)}" style="width:110px;text-align:right" ${editable ? "" : "disabled"} /></td>
+      <td><button class="btn ghost sm e-aux" title="辅助核算/数量/现金流量" ${editable ? "" : "disabled"} style="${miss ? "color:var(--err)" : ""}">${miss ? "补录!" : (hasAux ? "已填" : "⋯")}</button></td>
       <td>${editable ? `<button class="btn ghost sm e-del">×</button>` : ""}</td>
-    </tr>`).join("");
-    $all("select.acct-sel", tbody).forEach((sel, i) => { sel.value = v.entries[i].account_code; sel.onchange = () => v.entries[i].account_code = sel.value; });
+    </tr>${detail}`;
+    }).join("");
+    $all("select.acct-sel", tbody).forEach((sel, i) => { sel.value = v.entries[i].account_code; sel.onchange = () => { v.entries[i].account_code = sel.value; renderRows(); }; });
     $all(".e-sum", tbody).forEach((inp, i) => inp.oninput = () => v.entries[i].summary = inp.value);
     $all(".e-d", tbody).forEach((inp, i) => inp.oninput = () => { v.entries[i].debit = inp.value; recalc(); });
     $all(".e-c", tbody).forEach((inp, i) => inp.oninput = () => { v.entries[i].credit = inp.value; recalc(); });
-    $all(".e-del", tbody).forEach((b, i) => b.onclick = () => { v.entries.splice(i, 1); v.entries.forEach((e, k) => e.line = k + 1); renderRows(); recalc(); });
+    $all(".e-del", tbody).forEach((b, i) => b.onclick = () => { v.entries.splice(i, 1); v.entries.forEach((e, k) => e.line = k + 1); expanded = -1; renderRows(); recalc(); });
+    $all(".e-aux", tbody).forEach((b, i) => b.onclick = () => { expanded = (expanded === i ? -1 : i); renderRows(); });
+    $all(".aux-in", tbody).forEach((inp) => {
+      inp.oninput = () => {
+        const i = parseInt(inp.dataset.i, 10), k = inp.dataset.k;
+        const e = v.entries[i];
+        if (k === "qty" || k === "price" || k === "cf") { e[k] = inp.value; }
+        else { e.aux = e.aux || {}; e.aux[k] = inp.value; }
+      };
+    });
+    const closeAux = $("#v-aux-close", tbody);
+    if (closeAux) closeAux.onclick = () => { expanded = -1; renderRows(); };
     recalc();
   }
   function recalc() {
@@ -1012,7 +1078,7 @@ async function openVoucherEditor(id, seedEntries) {
     $("#v-diff", mask).textContent = (dt - ct).toFixed(2);
   }
   renderRows();
-  if (editable) $("#v-add", mask).onclick = () => { v.entries.push({ line: v.entries.length + 1, account_code: "", summary: "", debit: "0", credit: "0" }); renderRows(); };
+  if (editable) $("#v-add", mask).onclick = () => { v.entries.push(Object.assign({}, blank, { line: v.entries.length + 1 })); renderRows(); };
   if (editable && $("#v-today", mask)) $("#v-today", mask).onclick = () => { $("#v-date", mask).value = today(); updateDateHint(); };
   // 跨期提示：所选日期与当前期间不一致时提前告知（保存时会按日期归入对应期间）
   function updateDateHint() {
@@ -1039,7 +1105,16 @@ async function openVoucherEditor(id, seedEntries) {
       no: parseInt($("#v-no", mask).value, 10) || 0,
       attachments: parseInt($("#v-att", mask).value, 10) || 0,
       memo: "",
-      entries: v.entries.map((e, i) => ({ line: i + 1, account_code: e.account_code, summary: e.summary, debit: String(parseFloat(e.debit) || 0), credit: String(parseFloat(e.credit) || 0) })),
+      entries: v.entries.map((e, i) => {
+        const o = { line: i + 1, account_code: e.account_code, summary: e.summary, debit: String(parseFloat(e.debit) || 0), credit: String(parseFloat(e.credit) || 0) };
+        const aux = {};
+        for (const k of Object.keys(e.aux || {})) { if (e.aux[k]) aux[k] = e.aux[k]; }
+        if (Object.keys(aux).length) o.aux = aux;
+        if (e.qty) o.qty = String(e.qty);
+        if (e.price) o.price = String(e.price);
+        if (e.cf) o.cf = e.cf;
+        return o;
+      }),
     };
     if (!payload.entries.some((e) => e.account_code)) { toast("请至少选择一条科目", "err"); return; }
     try {
@@ -2390,6 +2465,63 @@ async function viewBudgetAlerts(main) {
         : `<div class="muted">无预警科目</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
+}
+
+// ===========================================================================
+// 期末处理（与桌面端对齐：结转损益 / 年末结转 / 结账 / 反结账）
+// ===========================================================================
+async function viewPeriodEnd(main) {
+  const cur = (state.current || "").replace("-", "");
+  main.innerHTML = `<h2>期末处理</h2>
+    <div class="toolbar">
+      <label>期间 <input id="pe-period" value="${esc(cur)}" style="width:90px" placeholder="YYYYMM" /></label>
+      <label><input type="checkbox" id="pe-reqcarry" checked /> 要求先结转损益</label>
+      <button class="btn" id="pe-check">重新检查</button>
+      <div class="spacer"></div>
+      ${can("carry_forward") ? `<button class="btn ghost" id="pe-carry">结转损益</button>` : ""}
+      ${can("carry_forward") ? `<button class="btn ghost" id="pe-yearend">年末结转</button>` : ""}
+      ${can("period_close") ? `<button class="btn primary" id="pe-close">结账</button>` : ""}
+      ${can("period_close") ? `<button class="btn danger" id="pe-unclose">反结账</button>` : ""}
+    </div>
+    <div class="muted" id="pe-status" style="margin-bottom:8px">加载中…</div>
+    <div id="pe-issues"></div>`;
+  const periodOf = () => $("#pe-period", main).value.trim();
+  const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  async function refresh() {
+    const p = periodOf();
+    if (!/^\d{6}$/.test(p)) { $("#pe-status", main).textContent = "期间格式应为 YYYYMM"; return; }
+    try {
+      const chk = await api(`/periods/${encodeURIComponent(p)}/precheck`);
+      const issues = chk.issues || [];
+      $("#pe-status", main).innerHTML = `期间 <b>${esc(chk.period)}</b>　已结账至：<b>${esc(chk.closed_upto || "—")}</b>　损益科目：<b>${chk.pl_count}</b> 个　本年利润余额：<b>${esc(chk.profit_balance)}</b>`;
+      $("#pe-issues", main).innerHTML = issues.length
+        ? `<div class="panel"><b>待处理问题：</b><ul style="margin:6px 0 0 18px">${issues.map((s) => `<li>${esc(s)}</li>`).join("")}</ul></div>`
+        : `<div class="panel" style="color:var(--ok,#2e7d32)">✔ 未发现阻断项（是否要求先结转以左侧选项为准）</div>`;
+    } catch (e) { $("#pe-status", main).textContent = e.message; $("#pe-issues", main).innerHTML = ""; }
+  }
+  $("#pe-check", main).onclick = refresh;
+  if ($("#pe-carry", main)) $("#pe-carry", main).onclick = async () => {
+    const p = periodOf();
+    if (!(await confirmDialog(`为 ${p} 生成结转损益凭证（转入本年利润）？生成的凭证为未记账状态，需到凭证列表记账。`, false))) return;
+    try { const r = await post(`/periods/${encodeURIComponent(p)}/carry-forward`); toast(`已生成结转凭证 ${r.voucher_no || r.id}（未记账）`, "ok"); refresh(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#pe-yearend", main)) $("#pe-yearend", main).onclick = async () => {
+    const p = periodOf();
+    if (!(await confirmDialog(`将 ${p} 的「本年利润」余额转入未分配利润？一般在 12 期结账后执行。`, false))) return;
+    try { const r = await post(`/periods/${encodeURIComponent(p)}/year-end`); toast(`已生成年末结转凭证 ${r.voucher_no || r.id}（未记账）`, "ok"); refresh(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#pe-close", main)) $("#pe-close", main).onclick = async () => {
+    const p = periodOf();
+    const req = $("#pe-reqcarry", main).checked;
+    if (!(await confirmDialog(`确定对 ${p} 结账？结账后该期间不能再录入/修改凭证。`, true))) return;
+    try { await post(`/periods/${encodeURIComponent(p)}/close`, { require_carry: req }); toast(`${p} 已结账`, "ok"); refresh(); } catch (e) { toast(e.message, "err"); refresh(); }
+  };
+  if ($("#pe-unclose", main)) $("#pe-unclose", main).onclick = async () => {
+    const p = periodOf();
+    if (!(await confirmDialog(`确定对 ${p} 反结账？反结账后该期间可以重新录入凭证。`, true))) return;
+    try { await post(`/periods/${encodeURIComponent(p)}/unclose`); toast(`${p} 已反结账`, "ok"); refresh(); } catch (e) { toast(e.message, "err"); }
+  };
+  refresh();
 }
 
 // ===========================================================================

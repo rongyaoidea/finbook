@@ -88,6 +88,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/overview", get(get_overview))
         .route("/api/periods", get(get_periods))
         .route("/api/period", post(post_period))
+        // 期末处理（与桌面端对齐）：预检 / 结转损益 / 年末结转 / 结账 / 反结账
+        .route("/api/periods/:ymm/precheck", get(period_precheck))
+        .route("/api/periods/:ymm/carry-forward", post(period_carry_forward))
+        .route("/api/periods/:ymm/year-end", post(period_year_end))
+        .route("/api/periods/:ymm/close", post(period_close))
+        .route("/api/periods/:ymm/unclose", post(period_unclose))
         // 科目 / 凭证
         .route("/api/accounts", get(list_accounts))
         .route("/api/accounts/fill-defaults", post(fill_default_accounts))
@@ -1261,6 +1267,152 @@ async fn post_period(
     Ok(Json(json!({"ok": true, "period": period_to_str(period_checked(req.ymm)?)})))
 }
 
+/// 期末结账请求
+#[derive(Deserialize, Default)]
+struct ClosePeriodReq {
+    /// 是否要求先结转损益才能结账
+    #[serde(default)]
+    pub require_carry: bool,
+}
+
+/// 期末预检：返回结账前需要处理的问题清单与损益概况
+async fn period_precheck(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(ymm): Path<i32>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::PeriodClose)?;
+    let period = period_checked(ymm)?;
+    let db = state.db_for(&user.book_key)?;
+    let issues = periods::precheck(&db, period, true)?;
+    let chart = accounts::chart(&db)?;
+    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    let pl_rows = snap.profit_loss_rows(&chart);
+    let profit = snap
+        .for_account(fincore::engine::period_end::PROFIT_ACCOUNT, None)
+        .end();
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "issues": issues,
+        "pl_count": pl_rows.len(),
+        "profit_balance": profit.fmt_money(),
+        "closed_upto": periods::closed_upto(&db)?.map(period_to_str),
+    })))
+}
+
+/// 结转损益：生成一张把损益类科目净额转入「本年利润」的凭证
+async fn period_carry_forward(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(ymm): Path<i32>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CarryForward)?;
+    let period = period_checked(ymm)?;
+    let db = state.db_for(&user.book_key)?;
+    let chart = accounts::chart(&db)?;
+    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    let rows = snap.profit_loss_rows(&chart);
+    if rows.is_empty() {
+        return Err(AppError::bad_request("本期损益类科目没有发生额，无需结转"));
+    }
+    let date = period.last_day();
+    let word = db
+        .voucher_words()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "记".to_string());
+    let no = vouchers::next_no(&db, period, &word)?;
+    let mut v = fincore::engine::period_end::generate_carry_forward(
+        period,
+        date,
+        &word,
+        no,
+        &rows,
+        &chart,
+        fincore::engine::period_end::PROFIT_ACCOUNT,
+        user.username(),
+    )?;
+    let id = vouchers::save(&db, &mut v)?;
+    db.log(
+        user.username(),
+        "期末",
+        "结转损益",
+        &format!("{} 凭证 #{}", period.label(), id),
+    )?;
+    Ok(Json(json!({ "id": id, "voucher_no": v.voucher_no() })))
+}
+
+/// 年末结转：把「本年利润」余额转入「利润分配—未分配利润」
+async fn period_year_end(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(ymm): Path<i32>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CarryForward)?;
+    let period = period_checked(ymm)?;
+    let db = state.db_for(&user.book_key)?;
+    let chart = accounts::chart(&db)?;
+    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    let profit = snap
+        .for_account(fincore::engine::period_end::PROFIT_ACCOUNT, None)
+        .end();
+    let date = period.last_day();
+    let word = db
+        .voucher_words()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "记".to_string());
+    let no = vouchers::next_no(&db, period, &word)?;
+    let mut v = fincore::engine::period_end::generate_year_end_carry(
+        period,
+        date,
+        &word,
+        no,
+        profit,
+        fincore::engine::period_end::UNDISTRIBUTED_ACCOUNT,
+        &chart,
+        user.username(),
+    )?;
+    let id = vouchers::save(&db, &mut v)?;
+    db.log(
+        user.username(),
+        "期末",
+        "年末结转",
+        &format!("{} 凭证 #{}", period.label(), id),
+    )?;
+    Ok(Json(json!({ "id": id, "voucher_no": v.voucher_no() })))
+}
+
+/// 期末结账：有未处理问题时返回 400 + 问题清单
+async fn period_close(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(ymm): Path<i32>,
+    Json(req): Json<ClosePeriodReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::PeriodClose)?;
+    let period = period_checked(ymm)?;
+    let db = state.db_for(&user.book_key)?;
+    let issues = periods::close(&db, period, user.username(), req.require_carry)?;
+    if !issues.is_empty() {
+        return Err(AppError::bad_request(issues.join("；")));
+    }
+    Ok(Json(json!({ "ok": true, "closed": period_to_str(period) })))
+}
+
+/// 反结账
+async fn period_unclose(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(ymm): Path<i32>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::PeriodClose)?;
+    let period = period_checked(ymm)?;
+    let db = state.db_for(&user.book_key)?;
+    periods::unclose(&db, period, user.username())?;
+    Ok(Json(json!({ "ok": true, "unclosed": period_to_str(period) })))
+}
+
 // ---------------------------------------------------------------------------
 // 科目 / 凭证
 // ---------------------------------------------------------------------------
@@ -1463,6 +1615,8 @@ async fn save_voucher(
         req.word.clone()
     };
 
+    // 修改时保留原分录的未提交要素（辅助核算/数量/外币/结算号等）
+    let mut prev_entries: Vec<Entry> = Vec::new();
     let mut v = if req.id > 0 {
         let mut existing = vouchers::get(&db, req.id)?
             .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
@@ -1487,6 +1641,7 @@ async fn save_voucher(
         existing.word = word.clone();
         existing.attachments = req.attachments;
         existing.memo = req.memo.clone();
+        prev_entries = existing.entries.clone();
         existing.entries.clear();
         existing
     } else {
@@ -1510,15 +1665,38 @@ async fn save_voucher(
     v.prepared_by = user.username().to_string();
     // 加载科目表：银行尾号简写需要按科目表解析为完整编码
     let chart = accounts::chart(&db)?;
-    for e in &req.entries {
+    for (i, e) in req.entries.iter().enumerate() {
         let account_code = normalize_bank_account(&chart, &e.account_code)
             .unwrap_or_else(|| e.account_code.clone());
         let mut en = Entry::new(e.line, account_code.clone(), e.summary.clone());
         en.debit = parse_money_checked(&e.debit)?;
         en.credit = parse_money_checked(&e.credit)?;
-        en.aux = AuxRef::default();
-        // 如果是银行科目，将尾号存入辅助核算银行字段
-        if en.account_code.starts_with("1002") {
+        // 未提交的要素沿用原行：Web 编辑桌面录入的凭证时，辅助/数量/外币/结算号不丢
+        if let Some(prev) = prev_entries.get(i) {
+            en.aux = prev.aux.clone();
+            en.qty = prev.qty;
+            en.price = prev.price;
+            en.currency = prev.currency.clone();
+            en.rate = prev.rate;
+            en.amount_for = prev.amount_for;
+            en.settle_type = prev.settle_type.clone();
+            en.settle_no = prev.settle_no.clone();
+            en.biz_date = prev.biz_date;
+        }
+        if let Some(aux) = &e.aux {
+            en.aux = aux.clone();
+        }
+        if let Some(q) = e.qty {
+            en.qty = Some(q);
+        }
+        if let Some(p) = e.price {
+            en.price = Some(p);
+        }
+        if let Some(cf) = e.cf.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            en.aux.cash_flow = Some(cf.to_string());
+        }
+        // 银行科目：尾号存入辅助核算银行字段（仅在未显式提供时兜底）
+        if en.account_code.starts_with("1002") && en.aux.bank.is_none() {
             en.aux.bank = Some(account_code);
         }
         v.entries.push(en);

@@ -252,14 +252,12 @@ pub fn validate_entry(
 }
 
 /// 记账前校验（无审核环节：未记账凭证核对无误后直接记账）
-pub fn validate_post(v: &Voucher, opts: &BookOptions) -> Issues {
+pub fn validate_post(v: &Voucher, _opts: &BookOptions) -> Issues {
     let mut iss = Issues::new();
     if !v.status.can_post() {
         iss.push(format!("凭证当前状态为「{}」，不能记账", v.status.label()));
     }
-    if opts.require_cashier && v.cashier.is_none() {
-        iss.push("该账套要求出纳签字后才能记账".to_string());
-    }
+    // 出纳签字环节已移除：出纳不使用本软件，require_cashier 不再作为记账前置条件
     iss
 }
 

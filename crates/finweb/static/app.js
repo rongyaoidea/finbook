@@ -976,6 +976,9 @@ async function openVoucherEditor(id, seedEntries) {
       aux, cf,
       qty: e.qty != null ? String(e.qty) : "",
       price: e.price != null ? String(e.price) : "",
+      currency: e.currency || "",
+      rate: e.rate != null ? String(e.rate) : "",
+      amount_for: e.amount_for != null ? String(e.amount_for) : "",
     };
   });
   if (!v.entries.length) v.entries = [Object.assign({}, blank, { line: 1 }), Object.assign({}, blank, { line: 2 })];
@@ -983,7 +986,7 @@ async function openVoucherEditor(id, seedEntries) {
   const editable = (id === 0) || status === "draft" || status === "audited";
   const canPost = status === "draft" || status === "audited";
   const mask = modal(`
-    <h3>记账凭证 ${esc(voucher_no)}</h3>
+    <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}</span></h3>
     <div class="toolbar">
       <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} />${editable ? `<button class="btn ghost sm" id="v-today">今天</button>` : ""}</label>
       <span id="v-date-hint" class="muted" style="font-size:12px"></span>
@@ -999,6 +1002,8 @@ async function openVoucherEditor(id, seedEntries) {
     <div style="margin-top:10px" class="muted">合计：借 <b id="v-dt">0.00</b> 　贷 <b id="v-ct">0.00</b> 　差额 <b id="v-diff">0.00</b></div>
     <div class="foot">
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
+      ${can("voucher_audit") && id > 0 && status === "draft" ? `<button class="btn ghost" id="v-audit">审核</button>` : ""}
+      ${can("voucher_unaudit") && id > 0 && status === "audited" ? `<button class="btn ghost" id="v-unaudit">反审核</button>` : ""}
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
       ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
       ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
@@ -1034,6 +1039,11 @@ async function openVoucherEditor(id, seedEntries) {
     if (a && (a.is_cash || a.is_bank)) {
       parts.push(`<label>现金流量项目 <input class="aux-in" data-i="${i}" data-k="cf" value="${esc(e.cf)}" placeholder="如 0101" style="width:100px" /></label>`);
     }
+    if (a && a.currency) {
+      parts.push(`<label>币种 <input class="aux-in" data-i="${i}" data-k="currency" value="${esc(e.currency || a.currency)}" style="width:64px" /></label>`);
+      parts.push(`<label>汇率 <input class="aux-in" data-i="${i}" data-k="rate" value="${esc(e.rate)}" placeholder="1 外币=?" style="width:90px" /></label>`);
+      parts.push(`<label>原币金额 <input class="aux-in" data-i="${i}" data-k="amount_for" value="${esc(e.amount_for)}" style="width:100px" /></label>`);
+    }
     if (!parts.length) parts.push(`<span class="muted">该科目无需辅助核算/数量</span>`);
     return `<div class="muted" style="padding:6px 2px"><span style="font-size:12px">${parts.join(" ")}</span>${editable ? ` <button class="btn ghost sm" id="v-aux-close">收起</button>` : ""}</div>`;
   }
@@ -1062,7 +1072,7 @@ async function openVoucherEditor(id, seedEntries) {
       inp.oninput = () => {
         const i = parseInt(inp.dataset.i, 10), k = inp.dataset.k;
         const e = v.entries[i];
-        if (k === "qty" || k === "price" || k === "cf") { e[k] = inp.value; }
+        if (k === "qty" || k === "price" || k === "cf" || k === "currency" || k === "rate" || k === "amount_for") { e[k] = inp.value; }
         else { e.aux = e.aux || {}; e.aux[k] = inp.value; }
       };
     });
@@ -1112,6 +1122,9 @@ async function openVoucherEditor(id, seedEntries) {
         if (Object.keys(aux).length) o.aux = aux;
         if (e.qty) o.qty = String(e.qty);
         if (e.price) o.price = String(e.price);
+        if (e.currency) o.currency = String(e.currency);
+        if (e.rate) o.rate = String(e.rate);
+        if (e.amount_for) o.amount_for = String(e.amount_for);
         if (e.cf) o.cf = e.cf;
         return o;
       }),
@@ -1125,6 +1138,8 @@ async function openVoucherEditor(id, seedEntries) {
   if (editable) $("#v-save", mask).onclick = save;
   if ($("#v-post", mask)) $("#v-post", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/post`, { method: "POST" }); toast("已记账", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: today() }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   $("#v-close", mask).onclick = closeModal;
@@ -1456,15 +1471,22 @@ async function loadLedger() {
   const code = $("#l-code").value.trim();
   if (!code) { toast("请先输入科目编码", "err"); return; }
   const url = `/ledger?code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}`;
-  const tb = $("#l-table tbody");
+  const tbl = $("#l-table");
+  const message = (text, isErr) => {
+    tbl.innerHTML = `<tbody><tr><td colspan="8" ${isErr ? 'style="color:var(--err)"' : 'class="muted"'}>${esc(text)}</td></tr></tbody>`;
+  };
   let rows;
-  try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="7" style="color:var(--err)">${esc(e.message)}</td></tr>`; return; }
-  if (!rows.length) { tb.innerHTML = `<tr><td colspan="7" class="muted">该科目在所选期间无记录</td></tr>`; return; }
-  tb.innerHTML = rows.map((r) => `<tr>
+  try { rows = await api(url); } catch (e) { message(e.message, true); return; }
+  if (!rows.length) { message("该科目在所选期间无记录", false); return; }
+  const hasQty = rows.some((r) => r.qty_balance != null);
+  const head = `<tr><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th>${hasQty ? '<th class="num">数量余额</th>' : ""}</tr>`;
+  const body = rows.map((r) => `<tr>
     <td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.summary)}</td>
     <td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td>
     <td>${esc(r.dir === "debit" ? "借" : "贷")}</td><td class="num">${esc(r.balance)}</td>
+    ${hasQty ? `<td class="num" style="color:var(--err,#c62828)">${r.qty_balance != null ? esc(fmt(r.qty_balance)) : ""}</td>` : ""}
   </tr>`).join("");
+  tbl.innerHTML = `<thead>${head}</thead><tbody>${body}</tbody>`;
 }
 
 // ===========================================================================
@@ -3649,9 +3671,9 @@ async function viewOptions(main) {
       <div class="field"><label>科目编码级长（逗号分隔，如 4,2,2,2,2）</label><input id="op-scheme" value="${esc((o.code_scheme || []).join(","))}" /></div>
       <div class="field"><label>凭证字方案（逗号分隔，如 记,收,付,转）</label><input id="op-words" value="${esc((o.voucher_words || []).join(","))}" /></div>
       <div class="field" style="display:flex;gap:24px;flex-wrap:wrap">
+        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-audit" ${o.enable_audit ? "checked" : ""} />启用审核环节（未审核不能记账）</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-qty" ${o.enable_qty ? "checked" : ""} />启用数量核算</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-foreign" ${o.enable_foreign ? "checked" : ""} />启用外币核算</label>
-        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-cashier" ${o.require_cashier ? "checked" : ""} />凭证需出纳签字</label>
       </div>
       <p class="muted" style="font-size:12px">启用期间与科目级长影响科目编码校验与凭证编号，修改请谨慎；已开账后不建议改动。</p>
       ${can("sys_option") ? `<div class="foot" style="margin-top:10px"><button class="btn primary" id="op-save">保存参数</button></div>` : `<p class="muted">无修改权限（需要 sys_option）</p>`}
@@ -3668,9 +3690,9 @@ async function viewOptions(main) {
       start_period: /^\d{6}$/.test(start) ? parseInt(start, 10) : o.start_period,
       code_scheme: scheme.length ? scheme : o.code_scheme,
       voucher_words: words.length ? words : o.voucher_words,
+      enable_audit: $("#op-audit").checked,
       enable_qty: $("#op-qty").checked,
       enable_foreign: $("#op-foreign").checked,
-      require_cashier: $("#op-cashier").checked,
     });
     try { await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存账套参数", "ok"); }
     catch (e) { toast(e.message, "err"); }

@@ -351,6 +351,10 @@ fn save_on(tx: &rusqlite::Connection, v: &mut Voucher) -> DbResult<i64> {
             ))
             .into());
         }
+        // 启用审核环节的账套：已审核凭证不能直接改，须先反审核
+        if old_status == VoucherStatus::Audited && crate::options_of(tx).enable_audit {
+            return Err(FinError::state("已审核凭证不能修改，请先反审核").into());
+        }
     } else if v.status == VoucherStatus::Void {
         return Err(FinError::state("新增凭证不能直接标记为「已作废」".to_string()).into());
     }
@@ -469,6 +473,10 @@ fn save_on(tx: &rusqlite::Connection, v: &mut Voucher) -> DbResult<i64> {
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
     // 持久层最后防线：状态与结账线在这里再校验一次，UI/Web 漏检也删不掉
     let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    // 启用审核环节的账套：已审核凭证须先反审核才能删除
+    if v.status == VoucherStatus::Audited && db.options().enable_audit {
+        return Err(FinError::state("已审核凭证不能删除，请先反审核").into());
+    }
     fincore::engine::validate_delete(&v, crate::periods::closed_upto(db)?).into_result()?;
     let files: Vec<String> = crate::attach::list(db, id)?
         .into_iter()
@@ -576,6 +584,57 @@ pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 审核（未记账 → 已审核）。幂等：已审核时直接返回成功。
+pub fn audit(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    if v.status == VoucherStatus::Audited {
+        return Ok(());
+    }
+    if v.status != VoucherStatus::Draft {
+        return Err(FinError::state(format!("状态为「{}」，不能审核", v.status.label())).into());
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "UPDATE voucher SET status='audited', audited_by=?2, updated_at=?3 WHERE id=?1",
+        rusqlite::params![id, who, now],
+    )?;
+    crate::log_on(&tx, who, "凭证", "审核", &v.voucher_no())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 反审核（已审核 → 未记账）
+pub fn unaudit(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    if v.status != VoucherStatus::Audited {
+        return Err(FinError::state("只有已审核凭证才能反审核").into());
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "UPDATE voucher SET status='draft', audited_by=NULL, updated_at=?2 WHERE id=?1",
+        rusqlite::params![id, now],
+    )?;
+    crate::log_on(&tx, who, "凭证", "反审核", &v.voucher_no())?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// 作废 / 恢复。作废与取消作废都会记入操作日志。
 pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
     let tx = db.write_tx()?;
@@ -670,7 +729,11 @@ fn post_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbE
     if !v.balanced() {
         return Err(FinError::state("凭证借贷不平衡，不能记账").into());
     }
-    // 出纳签字已移除（出纳不使用本软件）：记账不再受 require_cashier 影响
+    // 启用审核环节的账套：必须先审核才能记账
+    let opts = crate::options_of(tx);
+    if opts.enable_audit && v.status != VoucherStatus::Audited {
+        return Err(FinError::state("该账套启用了审核环节，请先审核凭证再记账").into());
+    }
     let closed: Option<i32> = tx.query_row(
         "SELECT MAX(period) FROM period_state WHERE closed=1",
         [],

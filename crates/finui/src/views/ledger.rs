@@ -248,7 +248,9 @@ impl LedgerView {
 
     fn show_detail(&mut self, ui: &mut Ui) {
         let page = self.paging.slice(&self.detail).to_vec();
-        let cols = [
+        // 数量核算科目：追加数量余额列（数据在 LedgerRow 里已带，原先不展示）
+        let show_qty = self.detail.iter().any(|r| r.qty_balance.is_some());
+        let mut cols = vec![
             widgets::TCol::new("日期", 92.0).fixed(),
             widgets::TCol::new("凭证号", 88.0).fixed(),
             widgets::TCol::new("摘要", 260.0),
@@ -257,6 +259,9 @@ impl LedgerView {
             widgets::TCol::new("方向", 44.0).fixed(),
             widgets::TCol::new("余额", 140.0).right(),
         ];
+        if show_qty {
+            cols.push(widgets::TCol::new("数量余额", 120.0).right());
+        }
         widgets::grid(ui, "ledger_detail", &cols, page.len(), 24.0, |i, c, ui| {
             let r = &page[i];
             match c {
@@ -280,6 +285,15 @@ impl LedgerView {
                 }
                 6 => {
                     widgets::amount_label(ui, r.balance);
+                }
+                7 => {
+                    if let Some(q) = r.qty_balance {
+                        ui.label(
+                            RichText::new(q.fmt_qty())
+                                .color(palette::CREDIT)
+                                .monospace(),
+                        );
+                    }
                 }
                 _ => {}
             }

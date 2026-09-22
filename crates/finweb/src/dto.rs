@@ -273,6 +273,15 @@ pub struct VoucherEntryDto {
     /// 单价
     #[serde(default)]
     pub price: Option<fincore::Money>,
+    /// 原币币种（如 USD）
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// 汇率（1 外币 = ? 本位币）
+    #[serde(default)]
+    pub rate: Option<rust_decimal::Decimal>,
+    /// 原币金额
+    #[serde(default)]
+    pub amount_for: Option<fincore::Money>,
     /// 现金流量项目编码（现金/银行科目）
     #[serde(default)]
     pub cf: Option<String>,

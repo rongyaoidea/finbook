@@ -2127,3 +2127,186 @@ async fn web_period_carry_close_unclose_flow() {
         serde_json::from_str(&body_string(resp).await).unwrap();
     assert!(periods["closed_upto"].is_null(), "反结账后不应有结账线");
 }
+
+/// 可选审核环节：启用后 未记账→已审核→已记账；未审核不能记账、已审核不能改/删。
+#[tokio::test]
+async fn web_optional_audit_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 启用审核环节（先读回 options 再改，避免覆盖其他字段）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &sid))
+        .await
+        .unwrap();
+    let mut opts: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).unwrap();
+    opts["enable_audit"] = serde_json::json!(true);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &sid, opts))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "启用审核环节应成功");
+
+    // 保存一张凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-10", "word": "记",
+                "no": 1, "attachments": 0, "memo": "审核流",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收款", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "借款", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 未审核不能记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未审核不应允许记账");
+
+    // 审核
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/audit"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "审核应成功");
+
+    // 已审核不能直接修改
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": id, "period": 202601, "date": "2026-01-10", "word": "记",
+                "no": 1, "attachments": 0, "memo": "改一下",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "改", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "改", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已审核凭证不应允许修改");
+
+    // 审核后可以记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "审核后应能记账");
+
+    // 已记账不能反审核
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/unaudit"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已记账不应允许反审核");
+
+    // 反记账 → 反审核 → 可修改
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/unpost"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/unaudit"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "反审核应成功");
+}
+
+/// Web 外币分录：币种/汇率/原币金额可存取（引擎校验 原币×汇率≈本位币）。
+#[tokio::test]
+async fn web_foreign_currency_entry_roundtrip() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 新建一个美元科目（8888，不能与内置科目冲突）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/accounts",
+            &sid,
+            serde_json::json!({
+                "account": {
+                    "code": "8888", "name": "美元户", "category": "asset", "dir": "debit",
+                    "aux": 0, "unit": null, "currency": "USD", "has_qty": false,
+                    "is_cash": false, "is_bank": false, "cash_flow_item": null,
+                    "bs_item": null, "pl_item": null, "disabled": false, "memo": ""
+                },
+                "aux_kinds": []
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增美元科目应成功");
+
+    // 借 8888 原币 100 × 7.2 = 720；贷 2001 720
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-18", "word": "记",
+                "no": 1, "attachments": 0, "memo": "外币收款",
+                "entries": [
+                    {
+                        "line": 1, "account_code": "8888", "summary": "美元收款",
+                        "debit": "720", "credit": "0",
+                        "currency": "USD", "rate": "7.2", "amount_for": "100"
+                    },
+                    { "line": 2, "account_code": "2001", "summary": "借款", "debit": "0", "credit": "720" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "外币凭证应可保存");
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{id}"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let e0 = &v["entries"][0];
+    assert_eq!(e0["currency"], serde_json::json!("USD"), "币种应落库");
+    assert_eq!(e0["rate"], serde_json::json!("7.2"), "汇率应落库");
+    assert_eq!(e0["amount_for"], serde_json::json!("100"), "原币金额应落库");
+
+    // 原币 × 汇率与金额不符时应拒绝
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-19", "word": "记",
+                "no": 2, "attachments": 0, "memo": "错汇率",
+                "entries": [
+                    {
+                        "line": 1, "account_code": "8888", "summary": "美元收款",
+                        "debit": "700", "credit": "0",
+                        "currency": "USD", "rate": "7.2", "amount_for": "100"
+                    },
+                    { "line": 2, "account_code": "2001", "summary": "借款", "debit": "0", "credit": "700" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "原币×汇率不符应被拒");
+}

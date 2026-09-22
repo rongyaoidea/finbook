@@ -665,6 +665,10 @@ pub struct BookOptions {
     pub enable_qty: bool,
     /// 启用外币核算
     pub enable_foreign: bool,
+    /// 启用审核环节（未记账 → 已审核 → 已记账）。默认关闭：录入核对后直接记账。
+    /// 旧账套没有该字段时按关闭处理。
+    #[serde(default)]
+    pub enable_audit: bool,
     /// （已废弃）出纳签字环节已移除：出纳不使用本软件，记账不再要求签字。
     /// 字段仅为兼容旧账套序列化而保留，不再生效。
     pub require_cashier: bool,
@@ -685,6 +689,7 @@ impl Default for BookOptions {
             tax_no: String::new(),
             enable_qty: false,
             enable_foreign: false,
+            enable_audit: false,
             require_cashier: false,
             require_audit: true,
             voucher_words: vec!["记".to_string()],

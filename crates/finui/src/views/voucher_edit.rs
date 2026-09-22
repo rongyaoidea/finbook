@@ -29,6 +29,12 @@ pub struct Row {
     pub aux: AuxRef,
     pub qty: String,
     pub price: String,
+    /// 原币币种（如 USD）
+    pub currency: String,
+    /// 汇率（1 外币 = ? 本位币）
+    pub rate: String,
+    /// 原币金额
+    pub amount_for: String,
     /// 现金流量项目编码（现金/银行科目）
     pub cf: String,
 }
@@ -139,6 +145,9 @@ impl VoucherEdit {
             r.credit.hash(&mut h);
             r.qty.hash(&mut h);
             r.price.hash(&mut h);
+            r.currency.hash(&mut h);
+            r.rate.hash(&mut h);
+            r.amount_for.hash(&mut h);
             r.cf.hash(&mut h);
             r.aux.key().hash(&mut h);
         }
@@ -204,6 +213,9 @@ impl VoucherEdit {
                             aux: e.aux.clone(),
                             qty: e.qty.map(|q| q.fmt_plain()).unwrap_or_default(),
                             price: e.price.map(|q| q.fmt_plain()).unwrap_or_default(),
+                            currency: e.currency.clone().unwrap_or_default(),
+                            rate: e.rate.map(|r| r.to_string()).unwrap_or_default(),
+                            amount_for: e.amount_for.map(|m| m.fmt_plain()).unwrap_or_default(),
                             cf: e.aux.cash_flow.clone().unwrap_or_default(),
                         });
                     }
@@ -299,6 +311,16 @@ impl VoucherEdit {
             }
             if !r.price.trim().is_empty() {
                 e.price = Some(Money::parse_or_zero(&r.price));
+            }
+            // 外币要素（科目启用外币时由引擎校验原币×汇率≈本位币金额）
+            if !r.currency.trim().is_empty() {
+                e.currency = Some(r.currency.trim().to_ascii_uppercase());
+            }
+            if !r.rate.trim().is_empty() {
+                e.rate = Some(Money::parse_or_zero(&r.rate).inner());
+            }
+            if !r.amount_for.trim().is_empty() {
+                e.amount_for = Some(Money::parse_or_zero(&r.amount_for));
             }
             v.push_entry(e);
         }
@@ -642,7 +664,26 @@ impl VoucherEdit {
                 self.balance(ctx);
             }
             ui.separator();
-            // 与 Web 端一致：无审核环节，未记账凭证核对后手动记账确认入账
+            // 审核环节（可选）：启用后未记账 → 已审核 → 已记账；未启用时可直接记账
+            if ui.button("审核").clicked()
+                && self.id > 0
+                && self.status == VoucherStatus::Draft
+            {
+                if ctx.can(Perm::VoucherAudit) {
+                    do_status(ctx, self.id, "audit");
+                    self.reload_after(ctx);
+                }
+            }
+            if ui.button("反审核").clicked()
+                && self.id > 0
+                && self.status == VoucherStatus::Audited
+            {
+                if ctx.can(Perm::VoucherUnaudit) {
+                    do_status(ctx, self.id, "unaudit");
+                    self.reload_after(ctx);
+                }
+            }
+            // 与 Web 端一致：未审核（或未启用审核）的凭证核对后手动记账确认入账
             if ui.button("记账").clicked() && self.status.can_post() {
                 if ctx.can(Perm::VoucherPost) {
                     do_status(ctx, self.id, "post");
@@ -1120,6 +1161,40 @@ impl VoucherEdit {
                         );
                     });
                 }
+                // 外币核算：科目配置了币种，或账套启用了外币
+                let has_cur = acct.as_ref().map(|a| a.currency.is_some()).unwrap_or(false)
+                    || ctx.db().options().enable_foreign;
+                if has_cur {
+                    if self.rows[i].currency.trim().is_empty() {
+                        if let Some(c) = acct.as_ref().and_then(|a| a.currency.clone()) {
+                            self.rows[i].currency = c;
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("币种");
+                        ui.add_sized(
+                            [70.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.rows[i].currency).hint_text("USD"),
+                        );
+                        ui.label("汇率");
+                        ui.add_sized(
+                            [90.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.rows[i].rate)
+                                .hint_text("1 外币 = ?"),
+                        );
+                        ui.label("原币金额");
+                        ui.add_sized(
+                            [110.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.rows[i].amount_for),
+                        );
+                    });
+                    ui.label(
+                        RichText::new("原币金额 × 汇率 应等于本行本位币金额（允许 0.01 舍入差）")
+                            .weak()
+                            .size(12.0),
+                    );
+                }
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1239,6 +1314,8 @@ pub fn do_status(ctx: &mut AppCtx<'_>, id: i64, what: &str) {
     let r = match what {
         "post" => findb::vouchers::post(ctx.db(), id, &who),
         "unpost" => findb::vouchers::unpost(ctx.db(), id),
+        "audit" => findb::vouchers::audit(ctx.db(), id, &who),
+        "unaudit" => findb::vouchers::unaudit(ctx.db(), id, &who),
         _ => return,
     };
     match r {
@@ -1246,6 +1323,8 @@ pub fn do_status(ctx: &mut AppCtx<'_>, id: i64, what: &str) {
             let label: &str = match what {
                 "post" => "记账",
                 "unpost" => "反记账",
+                "audit" => "审核",
+                "unaudit" => "反审核",
                 _ => "状态变更",
             };
             ctx.log("凭证", label, &format!("凭证 #{id}"));

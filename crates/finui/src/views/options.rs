@@ -121,8 +121,8 @@ impl OptionsView {
         ui.separator();
         ui.label(RichText::new("业务控制").strong());
         ui.horizontal_wrapped(|ui| {
-            // 审核环节已移除（无审核，未记账→记账两态），不再提供 require_audit 开关
             // 出纳签字环节已移除（出纳不使用本软件），不再提供 require_cashier 开关
+            ui.checkbox(&mut o.enable_audit, "启用审核环节（未审核不能记账）");
             ui.checkbox(&mut o.enable_qty, "启用数量核算");
             ui.checkbox(&mut o.enable_foreign, "启用外币核算");
         });
@@ -212,6 +212,9 @@ impl OptionsView {
 pub fn options_hint(o: &BookOptions) -> String {
     let mut s = Vec::new();
     // require_cashier 已废弃（出纳不使用本软件）：不再提示
+    if o.enable_audit {
+        s.push("需审核");
+    }
     if o.enable_qty {
         s.push("数量核算");
     }

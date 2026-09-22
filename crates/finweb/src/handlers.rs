@@ -103,6 +103,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
+        .route("/api/vouchers/:id/audit", post(voucher_audit))
+        .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
         .route("/api/vouchers/:id/reverse", post(voucher_reverse))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
         .route("/api/vouchers/renumber", post(voucher_renumber))
@@ -1629,6 +1631,10 @@ async fn save_voucher(
                 "该凭证已记账或已作废，不能修改（已记账请先反记账）",
             ));
         }
+        // 启用审核环节的账套：已审核凭证须先反审核（预检给 400，避免落到引擎错误的 500）
+        if existing.status == VoucherStatus::Audited && db.options().enable_audit {
+            return Err(AppError::bad_request("已审核凭证不能修改，请先反审核"));
+        }
         // 日期不能漂移到凭证期间之外（期间本身不可改，改的是日期）
         if (date.year(), date.month()) != (existing.period.year(), existing.period.month()) {
             return Err(AppError::bad_request(format!(
@@ -1692,6 +1698,20 @@ async fn save_voucher(
         if let Some(p) = e.price {
             en.price = Some(p);
         }
+        if let Some(cur) = e
+            .currency
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            en.currency = Some(cur.to_ascii_uppercase());
+        }
+        if let Some(r) = e.rate {
+            en.rate = Some(r);
+        }
+        if let Some(a) = e.amount_for {
+            en.amount_for = Some(a);
+        }
         if let Some(cf) = e.cf.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             en.aux.cash_flow = Some(cf.to_string());
         }
@@ -1734,7 +1754,54 @@ async fn voucher_post(
     if v.status == VoucherStatus::Void {
         return Err(AppError::bad_request("该凭证不参与账簿汇总"));
     }
+    // 启用审核环节的账套：先审核再记账（预检给 400，避免落到引擎错误的 500）
+    if db.options().enable_audit && v.status != VoucherStatus::Audited {
+        return Err(AppError::bad_request("该账套启用了审核环节，请先审核凭证再记账"));
+    }
     vouchers::post(&db, id, user.username())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 审核（未记账 → 已审核）
+async fn voucher_audit(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherAudit)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权审核该凭证"));
+    }
+    if v.status == VoucherStatus::Posted {
+        return Err(AppError::bad_request("已记账凭证不能审核"));
+    }
+    if v.status == VoucherStatus::Void {
+        return Err(AppError::bad_request("已作废凭证不能审核"));
+    }
+    vouchers::audit(&db, id, user.username())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 反审核（已审核 → 未记账）
+async fn voucher_unaudit(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherUnaudit)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权反审核该凭证"));
+    }
+    if v.status != VoucherStatus::Audited {
+        return Err(AppError::bad_request("只有已审核凭证才能反审核"));
+    }
+    vouchers::unaudit(&db, id, user.username())?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -1863,6 +1930,10 @@ async fn voucher_delete(
         .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
     if !user.user.can_see_voucher(&v) {
         return Err(AppError::forbidden("无权删除该凭证"));
+    }
+    // 启用审核环节的账套：已审核凭证须先反审核
+    if v.status == VoucherStatus::Audited && db.options().enable_audit {
+        return Err(AppError::bad_request("已审核凭证不能删除，请先反审核"));
     }
     // 已记账凭证需先反记账才能删除（未记账凭证可直接删除）
     if v.status == VoucherStatus::Posted {

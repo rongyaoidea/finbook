@@ -18,6 +18,7 @@ fn main() {
         tax_no: "91110000123456789X".into(),
         enable_qty: false,
         enable_foreign: false,
+        enable_audit: false,
         require_cashier: false,
         require_audit: false, // 审核环节已移除（未记账 → 记账两态）
         voucher_words: fincore::chart::default_voucher_words(),

@@ -236,6 +236,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
         .route("/api/cost/period-end", get(run_period_end_cost).post(run_period_end_cost))
+        // 固定资产（与桌面端对齐）：卡片 / 折旧计划 / 计提 / 清理
+        .route("/api/assets", get(list_assets).post(create_asset))
+        .route("/api/assets/:id", put(update_asset).delete(delete_asset))
+        .route("/api/assets/:id/depreciations", get(list_asset_deps))
+        .route("/api/assets/:id/dispose", post(dispose_asset))
+        .route("/api/assets/depreciate", post(depreciate_assets))
+        .route("/api/assets/depreciations/delete-period", post(delete_asset_deps_period))
         // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
         .route("/api/accounts", post(create_account).put(update_account))
         .route("/api/accounts/:code", delete(delete_account))
@@ -4387,6 +4394,330 @@ async fn run_period_end_cost(
     }
     let rows = findb::business::period_end_cost(&db, period, apply)?;
     Ok(Json(serde_json::json!({ "period": period.label(), "rows": rows, "apply": apply })))
+}
+
+// ---------------------------------------------------------------------------
+// 固定资产（与桌面端对齐：卡片 / 折旧计划 / 计提 / 清理）
+// ---------------------------------------------------------------------------
+
+fn asset_json(a: &findb::assets::Asset) -> serde_json::Value {
+    json!({
+        "id": a.id,
+        "code": a.code,
+        "name": a.name,
+        "category": a.category,
+        "spec": a.spec,
+        "dept": a.dept,
+        "asset_account": a.asset_account,
+        "dep_account": a.dep_account,
+        "expense_account": a.expense_account,
+        "original_value": a.original_value.fmt_money(),
+        "residual_rate": (a.residual_rate * Money::from_i64(100)).fmt_plain(),
+        "life_months": a.life_months,
+        "method": a.method.code(),
+        "method_label": a.method.label(),
+        "start_period": period_to_str(a.start_period),
+        "disposed_period": a.disposed_period.map(period_to_str),
+        "dispose_amount": a.dispose_amount.map(|m| m.fmt_money()),
+        "status": a.status.code(),
+        "status_label": a.status.label(),
+        "voucher_id": a.voucher_id,
+        "memo": a.memo,
+    })
+}
+
+#[derive(Deserialize)]
+struct AssetReq {
+    #[serde(default)]
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub spec: String,
+    #[serde(default)]
+    pub dept: String,
+    pub asset_account: String,
+    pub dep_account: String,
+    pub expense_account: String,
+    pub original_value: String,
+    /// 残值率按百分数录入（5 = 5%）
+    #[serde(default)]
+    pub residual_rate: String,
+    pub life_months: i32,
+    #[serde(default)]
+    pub method: String,
+    /// 启用期间 YYYYMM
+    pub start_period: i32,
+    #[serde(default)]
+    pub memo: String,
+}
+
+#[derive(Deserialize, Default)]
+struct AssetDisposeReq {
+    pub ymm: i32,
+    #[serde(default)]
+    pub amount: String,
+}
+
+fn asset_from_req(r: &AssetReq) -> Result<findb::assets::Asset, AppError> {
+    if r.code.trim().is_empty() {
+        return Err(AppError::bad_request("资产编码不能为空"));
+    }
+    if r.name.trim().is_empty() {
+        return Err(AppError::bad_request("资产名称不能为空"));
+    }
+    let start = period_checked(r.start_period)?;
+    let original = parse_money_checked(&r.original_value)?;
+    if !original.is_positive() {
+        return Err(AppError::bad_request("资产原值必须大于 0"));
+    }
+    let rate = if r.residual_rate.trim().is_empty() {
+        Money::parse("0.05").unwrap_or(Money::ZERO)
+    } else {
+        parse_money_checked(&r.residual_rate)? / rust_decimal::Decimal::from(100)
+    };
+    if rate.is_negative() || rate > Money::ONE {
+        return Err(AppError::bad_request("残值率必须在 0% ~ 100% 之间"));
+    }
+    Ok(findb::assets::Asset {
+        id: r.id,
+        code: r.code.trim().to_string(),
+        name: r.name.trim().to_string(),
+        category: r.category.trim().to_string(),
+        spec: r.spec.trim().to_string(),
+        dept: r.dept.trim().to_string(),
+        asset_account: r.asset_account.trim().to_string(),
+        dep_account: r.dep_account.trim().to_string(),
+        expense_account: r.expense_account.trim().to_string(),
+        original_value: original,
+        residual_rate: rate,
+        life_months: r.life_months,
+        method: fincore::engine::depreciation::DepMethod::parse(&r.method),
+        start_period: start,
+        disposed_period: None,
+        dispose_amount: None,
+        status: findb::assets::AssetStatus::InUse,
+        voucher_id: None,
+        memo: r.memo.trim().to_string(),
+    })
+}
+
+async fn list_assets(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let cards: Vec<serde_json::Value> = findb::assets::list(&db)?.iter().map(asset_json).collect();
+    let ledger: Vec<serde_json::Value> = findb::assets::ledger(&db, period)?
+        .iter()
+        .map(|r| {
+            json!({
+                "asset": asset_json(&r.asset),
+                "accum": r.accum.fmt_money(),
+                "net": r.net.fmt_money(),
+                "months": r.months,
+            })
+        })
+        .collect();
+    let plan: Vec<serde_json::Value> = findb::assets::dep_plan(&db, period)?
+        .iter()
+        .map(|p| {
+            json!({
+                "asset_id": p.asset_id, "code": p.code, "name": p.name, "dept": p.dept,
+                "expense_account": p.expense_account, "dep_account": p.dep_account,
+                "amount": p.amount.fmt_money(), "accum": p.accum.fmt_money(), "net": p.net.fmt_money(),
+            })
+        })
+        .collect();
+    let deps: Vec<serde_json::Value> = findb::assets::dep_list_period(&db, period)?
+        .iter()
+        .map(|d| {
+            json!({
+                "asset_id": d.asset_id, "period": period_to_str(d.period),
+                "amount": d.amount.fmt_money(), "accum": d.accum.fmt_money(),
+                "net_value": d.net_value.fmt_money(), "voucher_id": d.voucher_id,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "cards": cards,
+        "ledger": ledger,
+        "plan": plan,
+        "deps": deps,
+    })))
+}
+
+async fn create_asset(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AssetReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = asset_from_req(&req)?;
+    if findb::assets::get_by_code(&db, &a.code)?.is_some() {
+        return Err(AppError::bad_request("资产编码已存在"));
+    }
+    let id = findb::assets::insert(&db, &a)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "新增卡片",
+        &format!("{} {}", a.code, a.name),
+    )?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn update_asset(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<AssetReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let existing = findb::assets::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("资产卡片不存在"))?;
+    if existing.status == findb::assets::AssetStatus::Disposed {
+        return Err(AppError::bad_request("已清理的卡片不能修改"));
+    }
+    let mut a = asset_from_req(&req)?;
+    a.id = id;
+    a.status = existing.status;
+    a.disposed_period = existing.disposed_period;
+    a.dispose_amount = existing.dispose_amount;
+    a.voucher_id = existing.voucher_id;
+    // 已计提过折旧：影响计价的字段冻结，避免历史折旧与台账对不上
+    if !findb::assets::dep_list(&db, id)?.is_empty() {
+        let frozen = a.original_value != existing.original_value
+            || a.residual_rate != existing.residual_rate
+            || a.life_months != existing.life_months
+            || a.start_period != existing.start_period
+            || a.method != existing.method;
+        if frozen {
+            return Err(AppError::bad_request(
+                "已计提折旧的卡片不能修改原值/残值率/年限/启用期间/折旧方法",
+            ));
+        }
+    }
+    findb::assets::update(&db, &a)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "修改卡片",
+        &format!("{} {}", a.code, a.name),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_asset(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = findb::assets::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("资产卡片不存在"))?;
+    findb::assets::delete(&db, id)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "删除卡片",
+        &format!("{} {}", a.code, a.name),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_asset_deps(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows: Vec<serde_json::Value> = findb::assets::dep_list(&db, id)?
+        .iter()
+        .map(|d| {
+            json!({
+                "period": period_to_str(d.period),
+                "amount": d.amount.fmt_money(),
+                "accum": d.accum.fmt_money(),
+                "net_value": d.net_value.fmt_money(),
+                "voucher_id": d.voucher_id,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "rows": rows })))
+}
+
+async fn dispose_asset(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<AssetDisposeReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = period_checked(req.ymm)?;
+    let amount = if req.amount.trim().is_empty() {
+        Money::ZERO
+    } else {
+        parse_money_checked(&req.amount)?
+    };
+    findb::assets::dispose(&db, id, period, amount)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "资产清理",
+        &format!("#{id} {} 金额 {}", period_to_str(period), amount.fmt_money()),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn depreciate_assets(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<PeriodReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = period_checked(req.ymm)?;
+    let res = findb::assets::depreciate_period(&db, period, user.username())?;
+    Ok(Json(json!({
+        "already": res.already,
+        "count": res.count,
+        "total": res.total.fmt_money(),
+        "voucher_id": res.voucher_id,
+        "voucher_no": res.voucher_no,
+    })))
+}
+
+async fn delete_asset_deps_period(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<PeriodReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = period_checked(req.ymm)?;
+    let removed = findb::assets::dep_delete_period(&db, period)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "删除本期折旧",
+        &format!("{} 共 {removed} 条", period_to_str(period)),
+    )?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 // ---------------------------------------------------------------------------

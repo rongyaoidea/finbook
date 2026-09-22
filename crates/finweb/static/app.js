@@ -373,6 +373,7 @@ const NAV_ITEMS = [
   { id: "daily", label: "科目日报表", perm: "report", group: "账簿报表" },
   { id: "notes", label: "报表附注", perm: "report", group: "账簿报表" },
   { id: "period-end", label: "期末处理", perm: "period_close", group: "期末" },
+  { id: "assets", label: "固定资产", perm: "account_edit", group: "期末" },
   { id: "reconcile", label: "期末对账", perm: "report", group: "期末" },
   { id: "mrp", label: "MRP 运算", perm: "account_edit", group: "生产制造" },
   { id: "routing", label: "工艺路线", perm: "account_edit", group: "生产制造" },
@@ -425,6 +426,7 @@ const VIEWS = {
   "compare": viewCompare,
   "daily": viewDaily,
   "period-end": viewPeriodEnd,
+  "assets": viewAssets,
   "reconcile": viewReconcile,
   "mrp": viewMrp,
   "routing": viewRouting,
@@ -2544,6 +2546,152 @@ async function viewPeriodEnd(main) {
     try { await post(`/periods/${encodeURIComponent(p)}/unclose`); toast(`${p} 已反结账`, "ok"); refresh(); } catch (e) { toast(e.message, "err"); }
   };
   refresh();
+}
+
+// ===========================================================================
+// 固定资产（与桌面端对齐：卡片 / 折旧计划 / 计提 / 清理）
+// ===========================================================================
+async function viewAssets(main) {
+  const cur = (state.current || "").replace("-", "");
+  const METHODS = [["straight", "直线法"], ["ddb", "双倍余额递减法"], ["sum_of_years", "年数总和法"], ["one_time", "一次性摊销法"], ["fifty_fifty", "五五摊销法"]];
+  main.innerHTML = `<h2>固定资产</h2>
+    <div class="toolbar">
+      <label>期间 <input id="as-period" value="${esc(cur)}" style="width:90px" placeholder="YYYYMM" /></label>
+      <button class="btn" id="as-load">查询</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="as-print">打印预览</button>
+      ${can("voucher_new") ? `<button class="btn ghost" id="as-accrue">计提本期折旧</button>` : ""}
+      ${can("account_edit") ? `<button class="btn ghost" id="as-deldep">删除本期折旧</button>` : ""}
+      ${can("account_edit") ? `<button class="btn primary" id="as-new">新增卡片</button>` : ""}
+    </div>
+    <div class="muted" id="as-summary" style="margin-bottom:8px">加载中…</div>
+    <div class="panel"><table class="grid" id="as-table"><thead><tr>
+      <th>编码</th><th>名称</th><th>部门</th><th class="num">原值</th><th class="num">累计折旧</th><th class="num">净值</th><th>状态</th><th>操作</th>
+    </tr></thead><tbody><tr><td colspan="8" class="muted">加载中…</td></tr></tbody></table></div>
+    <div id="as-plan" style="margin-top:10px"></div>`;
+  const periodOf = () => $("#as-period", main).value.trim();
+  const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+
+  async function load() {
+    const p = periodOf();
+    if (!/^\d{6}$/.test(p)) { $("#as-summary", main).textContent = "期间格式应为 YYYYMM"; return; }
+    let d;
+    try { d = await api(`/assets?period=${encodeURIComponent(p)}`); }
+    catch (e) { $("#as-summary", main).textContent = e.message; return; }
+    const planTotal = (d.plan || []).reduce((a, x) => a + (parseFloat(String(x.amount).replace(/,/g, "")) || 0), 0);
+    $("#as-summary", main).innerHTML = `共 <b>${(d.cards || []).length}</b> 张卡片　本期应计提 <b>${planTotal.toFixed(2)}</b>　本期已计提记录 <b>${(d.deps || []).length}</b> 条`;
+    const rows = d.ledger || [];
+    $("#as-table tbody", main).innerHTML = rows.length ? rows.map((r) => {
+      const a = r.asset;
+      const disposed = a.status === "disposed";
+      return `<tr>
+        <td>${esc(a.code)}</td><td>${esc(a.name)}</td><td>${esc(a.dept || "—")}</td>
+        <td class="num">${esc(a.original_value)}</td><td class="num">${esc(r.accum)}</td><td class="num">${esc(r.net)}</td>
+        <td>${disposed ? `<span class="tag err">已清理</span>` : `<span class="tag ok">在用</span>`} ${esc(a.method_label || "")}</td>
+        <td class="row-actions">
+          ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="edit" data-id="${a.id}">改</button>` : ""}
+          ${can("account_edit") ? `<button class="btn sm ghost" data-as="deps" data-id="${a.id}">折旧</button>` : ""}
+          ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="dispose" data-id="${a.id}">清理</button>` : ""}
+          ${can("account_edit") ? `<button class="btn sm ghost" data-as="del" data-id="${a.id}">删</button>` : ""}
+        </td></tr>`;
+    }).join("") : `<tr><td colspan="8" class="muted" style="text-align:center;padding:16px">暂无固定资产卡片</td></tr>`;
+    const plan = d.plan || [];
+    $("#as-plan", main).innerHTML = plan.length ? `<div class="panel"><b>本期折旧计划（未生成凭证前可核对）：</b><table class="grid" style="margin-top:6px"><thead><tr><th>编码</th><th>名称</th><th>部门</th><th class="num">本期应提</th><th class="num">提后累计</th><th class="num">提后净值</th></tr></thead><tbody>${plan.map((x) => `<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td>${esc(x.dept || "—")}</td><td class="num">${esc(x.amount)}</td><td class="num">${esc(x.accum)}</td><td class="num">${esc(x.net)}</td></tr>`).join("")}</tbody></table></div>` : "";
+    $all("[data-as]", main).forEach((b) => b.onclick = async () => {
+      const id = parseInt(b.dataset.id, 10);
+      const card = (d.cards || []).find((x) => x.id === id);
+      if (b.dataset.as === "edit" && card) openAssetEditor(card);
+      else if (b.dataset.as === "deps") showAssetDeps(card, id);
+      else if (b.dataset.as === "dispose") {
+        if (!(await confirmDialog(`确定对「${card ? card.name : id}」做资产清理？清理当月仍计提，次月停提。`, true))) return;
+        const amt = prompt("清理金额（可留空）", "");
+        if (amt === null) return;
+        try { await post(`/assets/${id}/dispose`, { ymm: parseInt(periodOf(), 10), amount: amt || "" }); toast("已清理", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      } else if (b.dataset.as === "del") {
+        if (!(await confirmDialog("确定删除该资产卡片？（已计提过折旧的卡片不能删除）", true))) return;
+        try { await api(`/assets/${id}`, { method: "DELETE" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      }
+    });
+  }
+
+  function showAssetDeps(card, id) {
+    const m = modal(`<h3>折旧明细 — ${esc(card ? card.name : id)}</h3><div id="ad-body" class="muted">加载中…</div>
+      <div class="foot"><button class="btn ghost" id="ad-close">关闭</button></div>`);
+    $("#ad-close", m).onclick = closeModal;
+    api(`/assets/${id}/depreciations`).then((r) => {
+      const rows = r.rows || [];
+      $("#ad-body", m).innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>期间</th><th class="num">本期折旧</th><th class="num">累计折旧</th><th class="num">净值</th><th>凭证</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.period)}</td><td class="num">${esc(x.amount)}</td><td class="num">${esc(x.accum)}</td><td class="num">${esc(x.net_value)}</td><td>${x.voucher_id ? "#" + x.voucher_id : "—"}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无折旧记录</div>`;
+    }).catch((e) => { $("#ad-body", m).textContent = e.message; });
+  }
+
+  function openAssetEditor(card) {
+    const isNew = !card;
+    const c = card || { code: "", name: "", category: "", spec: "", dept: "", asset_account: "160101", dep_account: "1602", expense_account: "660201", original_value: "", residual_rate: "5", life_months: 36, method: "straight", start_period: cur, memo: "" };
+    const m = modal(`<h3>${isNew ? "新增" : "修改"}资产卡片</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <label>编码 <input id="ae-code" value="${esc(c.code)}" ${isNew ? "" : "disabled"} /></label>
+        <label>名称 <input id="ae-name" value="${esc(c.name)}" /></label>
+        <label>类别 <input id="ae-cat" value="${esc(c.category || "")}" placeholder="如 电子设备" /></label>
+        <label>规格 <input id="ae-spec" value="${esc(c.spec || "")}" /></label>
+        <label>使用部门 <input id="ae-dept" value="${esc(c.dept || "")}" /></label>
+        <label>启用期间 <input id="ae-start" value="${esc(c.start_period)}" placeholder="YYYYMM" /></label>
+        <label>原值 <input id="ae-orig" value="${esc(c.original_value)}" /></label>
+        <label>残值率% <input id="ae-residual" value="${esc(c.residual_rate)}" /></label>
+        <label>使用月数 <input id="ae-life" type="number" value="${c.life_months}" /></label>
+        <label>折旧方法 <select id="ae-method">${METHODS.map(([k, v]) => `<option value="${k}" ${c.method === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+        <label>资产科目 <input id="ae-acct" value="${esc(c.asset_account)}" /></label>
+        <label>累计折旧科目 <input id="ae-depacct" value="${esc(c.dep_account)}" /></label>
+        <label>费用科目 <input id="ae-expacct" value="${esc(c.expense_account)}" /></label>
+        <label>备注 <input id="ae-memo" value="${esc(c.memo || "")}" /></label>
+      </div>
+      <div class="foot"><button class="btn primary" id="ae-save">保存</button><button class="btn ghost" id="ae-cancel">取消</button></div>`);
+    $("#ae-cancel", m).onclick = closeModal;
+    $("#ae-save", m).onclick = async () => {
+      const body = {
+        id: c.id || 0,
+        code: $("#ae-code", m).value.trim(),
+        name: $("#ae-name", m).value.trim(),
+        category: $("#ae-cat", m).value.trim(),
+        spec: $("#ae-spec", m).value.trim(),
+        dept: $("#ae-dept", m).value.trim(),
+        asset_account: $("#ae-acct", m).value.trim(),
+        dep_account: $("#ae-depacct", m).value.trim(),
+        expense_account: $("#ae-expacct", m).value.trim(),
+        original_value: $("#ae-orig", m).value.trim(),
+        residual_rate: $("#ae-residual", m).value.trim(),
+        life_months: parseInt($("#ae-life", m).value, 10) || 0,
+        method: $("#ae-method", m).value,
+        start_period: parseInt($("#ae-start", m).value.trim(), 10) || 0,
+        memo: $("#ae-memo", m).value.trim(),
+      };
+      try {
+        if (isNew) await post("/assets", body);
+        else await api(`/assets/${c.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        toast("已保存", "ok"); closeModal(); load();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  }
+
+  $("#as-load", main).onclick = load;
+  $("#as-print", main).onclick = () => printPreview("固定资产台账", $("#as-table", main).querySelector("table"));
+  if ($("#as-new", main)) $("#as-new", main).onclick = () => openAssetEditor(null);
+  if ($("#as-accrue", main)) $("#as-accrue", main).onclick = async () => {
+    const p = periodOf();
+    if (!(await confirmDialog(`按部门/费用科目汇总生成 ${p} 折旧凭证？同一期间重复点击不会重复生成。`, false))) return;
+    try {
+      const r = await post("/assets/depreciate", { ymm: parseInt(p, 10) });
+      toast(r.already ? `本期已计提过（凭证 ${r.voucher_no || "—"}）` : `已生成折旧凭证 ${r.voucher_no}，共 ${r.count} 项 ${r.total}`, "ok");
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#as-deldep", main)) $("#as-deldep", main).onclick = async () => {
+    const p = periodOf();
+    if (!(await confirmDialog(`删除 ${p} 的全部折旧明细（不改凭证）？删除后可重新计提。`, true))) return;
+    try { const r = await post("/assets/depreciations/delete-period", { ymm: parseInt(p, 10) }); toast(`已删除 ${r.removed} 条`, "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  load();
 }
 
 // ===========================================================================

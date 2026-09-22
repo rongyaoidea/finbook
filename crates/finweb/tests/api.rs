@@ -2310,3 +2310,73 @@ async fn web_foreign_currency_entry_roundtrip() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "原币×汇率不符应被拒");
 }
+
+/// Web 固定资产：建卡 → 计提折旧生成凭证 → 幂等 → 清理。
+#[tokio::test]
+async fn web_assets_depreciate_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets",
+            &sid,
+            serde_json::json!({
+                "code": "GD0001", "name": "台式电脑", "category": "电子设备", "spec": "",
+                "dept": "财务部", "asset_account": "160101", "dep_account": "1602",
+                "expense_account": "660201", "original_value": "12000",
+                "residual_rate": "5", "life_months": 36, "method": "straight",
+                "start_period": 202601, "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增资产卡片应成功");
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 计提 2026-01 折旧：12000 × 95% / 36 = 316.67
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/assets/depreciate", &sid, serde_json::json!({ "ymm": 202601 })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "计提折旧应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["already"], serde_json::json!(false));
+    assert_eq!(r["total"], serde_json::json!("316.67"));
+    let vid = r["voucher_id"].as_i64().expect("应返回折旧凭证 id");
+
+    // 折旧凭证借贷平衡
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    let sum = |k: &str| entries.iter().map(|e| e[k].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0)).sum::<f64>();
+    assert!(
+        (sum("debit") - sum("credit")).abs() < 0.005,
+        "折旧凭证应借贷平衡"
+    );
+
+    // 幂等：再次计提不生成新凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/assets/depreciate", &sid, serde_json::json!({ "ymm": 202601 })))
+        .await
+        .unwrap();
+    let r2: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r2["already"], serde_json::json!(true), "重复计提应幂等");
+    assert_eq!(r2["voucher_id"].as_i64(), Some(vid), "幂等应返回原凭证");
+
+    // 清理后再计提不再包含该资产
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/assets/{id}/dispose"),
+            &sid,
+            serde_json::json!({ "ymm": 202601, "amount": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "资产清理应成功");
+}

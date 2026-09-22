@@ -5,10 +5,12 @@
 
 use chrono::NaiveDate;
 use fincore::engine::depreciation::{DepInput, DepMethod};
-use fincore::{Money, Period};
+use fincore::{AuxKind, Chart, Entry, Money, Period, Voucher, VoucherSource};
 use rusqlite::OptionalExtension;
 
 use crate::{Db, DbResult};
+
+use std::collections::BTreeMap;
 
 /// 资产状态
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -352,7 +354,12 @@ pub fn dep_of(db: &Db, asset_id: i64, period: Period) -> DbResult<Option<DepReco
 
 /// 写入 / 覆盖某期折旧（幂等，重复计提不会产生两条）
 pub fn dep_upsert(db: &Db, r: &DepRecord) -> DbResult<()> {
-    db.conn().execute(
+    dep_upsert_on(db.conn(), r)
+}
+
+/// 同 `dep_upsert`，但只依赖连接，可在调用方的事务内执行
+pub fn dep_upsert_on(conn: &rusqlite::Connection, r: &DepRecord) -> DbResult<()> {
+    conn.execute(
         "INSERT INTO asset_depreciation(asset_id,period,amount,accum,net_value,voucher_id)
          VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(asset_id,period) DO UPDATE SET
@@ -402,6 +409,204 @@ pub fn planned_dep(a: &Asset, period: Period) -> DbResult<Option<Money>> {
     let seq = a.elapsed_months(period);
     let rows = fincore::engine::depreciation::schedule(&input)?;
     Ok(rows.get((seq - 1) as usize).map(|r| r.amount))
+}
+
+/// 某期折旧计划行（生成凭证与两端界面共用）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DepPlanRow {
+    pub asset_id: i64,
+    pub code: String,
+    pub name: String,
+    pub dept: String,
+    pub expense_account: String,
+    pub dep_account: String,
+    pub amount: Money,
+    pub accum: Money,
+    pub net: Money,
+}
+
+/// 计提折旧结果
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DepAccrual {
+    pub count: usize,
+    pub total: Money,
+    pub voucher_id: Option<i64>,
+    pub voucher_no: Option<String>,
+    /// true = 本期已计提过（幂等返回，未生成新凭证）
+    pub already: bool,
+}
+
+/// 计算某期折旧计划（不改库）。已落库的按落库值，没落库的按"前期累计 + 本期应提"推算。
+pub fn dep_plan(db: &Db, period: Period) -> DbResult<Vec<DepPlanRow>> {
+    let mut plan = Vec::new();
+    for a in list(db)? {
+        let amount = planned_dep(&a, period)?.unwrap_or(Money::ZERO);
+        let booked = dep_of(db, a.id, period)?;
+        let accum = match booked {
+            Some(r) => r.accum,
+            None => accum_before(db, a.id, period)? + amount,
+        };
+        if amount.is_zero() && !a.should_depreciate(period) {
+            continue;
+        }
+        plan.push(DepPlanRow {
+            asset_id: a.id,
+            code: a.code.clone(),
+            name: a.name.clone(),
+            dept: a.dept.clone(),
+            expense_account: a.expense_account.clone(),
+            dep_account: a.dep_account.clone(),
+            amount,
+            accum,
+            net: a.original_value - accum,
+        });
+    }
+    Ok(plan)
+}
+
+/// 计提某期折旧：折旧明细与折旧凭证在同一事务内落库；本期已计提则幂等返回。
+pub fn depreciate_period(db: &Db, period: Period, who: &str) -> DbResult<DepAccrual> {
+    // 幂等：本期已有折旧记录就不再生成新凭证（重算请先删除本期折旧）
+    let existing = dep_list_period(db, period)?;
+    if !existing.is_empty() {
+        let voucher_id = existing.iter().find_map(|r| r.voucher_id);
+        let voucher_no = match voucher_id {
+            Some(id) => db
+                .conn()
+                .query_row(
+                    "SELECT word, no FROM voucher WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| {
+                        let w: String = r.get(0)?;
+                        let n: i32 = r.get(1)?;
+                        Ok(format!("{w}-{n:04}"))
+                    },
+                )
+                .optional()?,
+            None => None,
+        };
+        return Ok(DepAccrual {
+            count: existing.len(),
+            total: existing.iter().map(|r| r.amount).sum(),
+            voucher_id,
+            voucher_no,
+            already: true,
+        });
+    }
+
+    let plan = dep_plan(db, period)?;
+    let total: Money = plan.iter().map(|r| r.amount).sum();
+    if total.is_zero() {
+        return Err(fincore::FinError::msg("本期折旧额为 0，无需计提").into());
+    }
+    let chart = crate::accounts::chart(db)?;
+    let word = db
+        .voucher_words()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "记".to_string());
+
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, &word)?;
+    let mut v = Voucher::new(period, period.last_day(), word, no);
+    v.prepared_by = who.to_string();
+    v.source = VoucherSource::Business;
+    v.memo = format!("{}计提固定资产折旧", period.label());
+
+    // 借方按「部门 + 费用科目」汇总；贷方按累计折旧科目汇总
+    let mut debits: BTreeMap<(String, String), Money> = BTreeMap::new();
+    let mut credits: BTreeMap<String, Money> = BTreeMap::new();
+    let mut count = 0usize;
+    for r in &plan {
+        if r.amount.is_zero() {
+            continue;
+        }
+        count += 1;
+        *debits
+            .entry((r.dept.clone(), r.expense_account.clone()))
+            .or_insert(Money::ZERO) += r.amount;
+        *credits.entry(r.dep_account.clone()).or_insert(Money::ZERO) += r.amount;
+    }
+
+    let summary = format!("计提{}折旧", period.label());
+    let mut line = 1i32;
+    for ((dept, code), amt) in &debits {
+        let mut e = Entry::new(line, code.clone(), &summary);
+        e.debit = *amt;
+        fill_dep_aux(&chart, &mut e, code, dept)?;
+        v.push_entry(e);
+        line += 1;
+    }
+    for (code, amt) in &credits {
+        let mut e = Entry::new(line, code.clone(), &summary);
+        e.credit = *amt;
+        fill_dep_aux(&chart, &mut e, code, "")?;
+        v.push_entry(e);
+        line += 1;
+    }
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    for r in &plan {
+        if r.amount.is_zero() {
+            continue;
+        }
+        dep_upsert_on(
+            &tx,
+            &DepRecord {
+                id: 0,
+                asset_id: r.asset_id,
+                period,
+                amount: r.amount,
+                accum: r.accum,
+                net_value: r.net,
+                voucher_id: Some(vid),
+            },
+        )?;
+    }
+    crate::log_on(
+        &tx,
+        who,
+        "固定资产",
+        "计提折旧",
+        &format!("{} 凭证#{} 金额 {}", period.label(), vid, total.fmt_money()),
+    )?;
+    tx.commit()?;
+    Ok(DepAccrual {
+        count,
+        total,
+        voucher_id: Some(vid),
+        voucher_no: Some(v.voucher_no()),
+        already: false,
+    })
+}
+
+/// 折旧凭证的辅助核算填充：只支持部门（其余维度无法自动确定）
+fn fill_dep_aux(chart: &Chart, e: &mut Entry, code: &str, dept: &str) -> DbResult<()> {
+    let acct = chart.get(code).ok_or_else(|| {
+        fincore::FinError::msg(format!("科目 {code} 不存在，请先在科目表里维护"))
+    })?;
+    for k in acct.aux.list() {
+        match k {
+            AuxKind::Dept => {
+                if dept.trim().is_empty() {
+                    return Err(fincore::FinError::msg(format!(
+                        "科目 {code} {} 要求核算部门，请先填写资产卡片的「使用部门」",
+                        acct.name
+                    ))
+                    .into());
+                }
+                e.aux.dept = Some(dept.to_string());
+            }
+            other => {
+                return Err(fincore::FinError::msg(format!(
+                    "科目 {code} {} 要求核算{}，折旧凭证无法自动填写，请手工制单",
+                    acct.name,
+                    other.label()
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 资产台账：卡片 + 累计折旧 + 净值

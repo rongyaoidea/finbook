@@ -3,12 +3,11 @@
 //! 卡片只存静态属性（原值、年限、方法、开始期间），每月该提多少由 `planned_dep` 现算，
 //! 所以这里任何一页都不缓存"月折旧额"这种派生值，改了卡片立刻就能看到新结果。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use egui::{RichText, Ui};
 use fincore::engine::depreciation::DepMethod;
-use fincore::voucher::{Entry, Voucher, VoucherSource};
-use fincore::{AuxKind, Money, Period, Perm};
+use fincore::{Money, Period, Perm};
 use findb::assets::{Asset, AssetLedgerRow, AssetStatus, DepRecord};
 
 use crate::state::{AppCtx, ConfirmAction};
@@ -380,97 +379,29 @@ impl AssetsView {
     }
 
     fn do_accrue(&mut self, ctx: &mut AppCtx<'_>, p: Period) {
-        let word = ctx
-            .db()
-            .voucher_words()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "记".to_string());
-        let no = match findb::vouchers::next_no(ctx.db(), p, &word) {
-            Ok(n) => n,
-            Err(e) => {
-                ctx.error(e.to_string());
-                return;
-            }
-        };
         let who = ctx.user().display_name.clone();
-        let mut v = Voucher::new(p, p.last_day(), word, no);
-        v.prepared_by = who.clone();
-        v.source = VoucherSource::Business;
-        v.memo = format!("{}计提固定资产折旧", p.label());
-
-        // 借方按"部门 + 费用科目"汇总：同一部门可能既摊管理费用又摊制造费用，
-        // 只按部门合并会把两个科目的折旧混在一起，费用归集就失真了。
-        let mut debits: BTreeMap<(String, String), Money> = BTreeMap::new();
-        // 贷方按累计折旧科目汇总（绝大多数账套只有一个 1602）
-        let mut credits: BTreeMap<String, Money> = BTreeMap::new();
-        for r in &self.plan {
-            if r.amount.is_zero() {
-                continue;
+        match findb::assets::depreciate_period(ctx.db(), p, &who) {
+            Ok(res) if res.already => {
+                ctx.info(format!(
+                    "本期已计提过折旧（凭证 {}），如需重算请先删除本期折旧",
+                    res.voucher_no.unwrap_or_default()
+                ));
             }
-            *debits
-                .entry((r.dept.clone(), r.expense.clone()))
-                .or_insert(Money::ZERO) += r.amount;
-            *credits.entry(r.dep_account.clone()).or_insert(Money::ZERO) += r.amount;
-        }
-        let total: Money = debits.values().copied().sum();
-        if total.is_zero() {
-            ctx.error("本期折旧额为 0，无需生成凭证");
-            return;
-        }
-
-        let summary = format!("计提{}折旧", p.label());
-        let mut line = 1i32;
-        for ((dept, code), amt) in &debits {
-            let mut e = Entry::new(line, code.clone(), &summary);
-            e.debit = *amt;
-            if let Err(msg) = fill_aux(ctx, &mut e, code, dept) {
-                ctx.error(msg);
-                return;
-            }
-            v.push_entry(e);
-            line += 1;
-        }
-        for (code, amt) in &credits {
-            let mut e = Entry::new(line, code.clone(), &summary);
-            e.credit = *amt;
-            if let Err(msg) = fill_aux(ctx, &mut e, code, "") {
-                ctx.error(msg);
-                return;
-            }
-            v.push_entry(e);
-            line += 1;
-        }
-
-        match findb::vouchers::save(ctx.db(), &mut v) {
-            Ok(id) => {
-                // 折旧明细同时落库，折旧明细页与台账才有据可查；dep_upsert 幂等，重复计提不会写重
-                for r in &self.plan {
-                    if r.amount.is_zero() {
-                        continue;
-                    }
-                    let rec = DepRecord {
-                        id: 0,
-                        asset_id: r.asset_id,
-                        period: p,
-                        amount: r.amount,
-                        accum: r.accum,
-                        net_value: r.net,
-                        voucher_id: Some(id),
-                    };
-                    if let Err(e) = findb::assets::dep_upsert(ctx.db(), &rec) {
-                        ctx.error(e.to_string());
-                    }
-                }
+            Ok(res) => {
                 ctx.log(
                     "固定资产",
                     "计提折旧",
-                    &format!("{} 凭证#{} 金额 {}", p.label(), id, total.fmt_money()),
+                    &format!(
+                        "{} 凭证#{} 金额 {}",
+                        p.label(),
+                        res.voucher_id.unwrap_or(0),
+                        res.total.fmt_money()
+                    ),
                 );
                 ctx.info(format!(
                     "已生成折旧凭证 {}（{}）",
-                    v.voucher_no(),
-                    total.fmt_money()
+                    res.voucher_no.unwrap_or_default(),
+                    res.total.fmt_money()
                 ));
                 self.dirty = true;
             }
@@ -840,34 +771,4 @@ impl AssetsView {
     }
 }
 
-/// 补齐分录的辅助核算。
-///
-/// 折旧凭证能自动填的只有部门（来自卡片的「使用部门」），其余维度无从推断——
-/// 与其生成一张存不进去的凭证，不如提前把缺什么告诉用户。
-fn fill_aux(ctx: &AppCtx<'_>, e: &mut Entry, code: &str, dept: &str) -> Result<(), String> {
-    let acct = match ctx.chart().get(code) {
-        Some(a) => a,
-        None => return Err(format!("科目 {code} 不存在，请先在科目表里维护")),
-    };
-    for k in acct.aux.list() {
-        match k {
-            AuxKind::Dept => {
-                if dept.trim().is_empty() {
-                    return Err(format!(
-                        "科目 {code} {} 要求核算部门，请先填写资产卡片的「使用部门」",
-                        acct.name
-                    ));
-                }
-                e.aux.dept = Some(dept.to_string());
-            }
-            other => {
-                return Err(format!(
-                    "科目 {code} {} 要求核算{}，折旧凭证无法自动填写，请手工制单",
-                    acct.name,
-                    other.label()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
+

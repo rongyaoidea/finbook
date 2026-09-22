@@ -2615,3 +2615,78 @@ async fn web_ledger_tabs_and_export() {
     let body = body_string(resp).await;
     assert!(body.contains("日期") && body.contains("余额"), "明细账 CSV 应含表头：{body}");
 }
+
+/// Web 凭证附件：multipart 上传 → 列表 → 下载 → 删除。
+#[tokio::test]
+async fn web_voucher_attachment_roundtrip() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-08", "word": "记",
+                "no": 1, "attachments": 0, "memo": "附件测试",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收", "debit": "50", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "借", "debit": "0", "credit": "50" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // multipart 上传
+    let boundary = "----finbooktest";
+    let payload = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"receipt.txt\"\r\nContent-Type: text/plain\r\n\r\nhello attachment\r\n--{b}--\r\n",
+        b = boundary
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vouchers/{id}/attachments"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header(header::COOKIE, &sid)
+        .body(Body::from(payload))
+        .unwrap();
+    let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "上传附件应成功");
+    let aid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 列表
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{id}/attachments"), &sid))
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "应有 1 个附件：{list}");
+    assert_eq!(list[0]["name"], serde_json::json!("receipt.txt"));
+
+    // 下载
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/attachments/{aid}"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await, "hello attachment");
+
+    // 删除
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/attachments/{aid}"))
+        .header(header::COOKIE, &sid)
+        .body(Body::empty())
+        .unwrap();
+    let resp = handlers::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "删除附件应成功");
+}

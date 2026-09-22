@@ -108,6 +108,15 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id/reverse", post(voucher_reverse))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
         .route("/api/vouchers/renumber", post(voucher_renumber))
+        // 凭证附件（上传/下载/删除）
+        .route(
+            "/api/vouchers/:id/attachments",
+            get(list_voucher_attachments).post(upload_voucher_attachment),
+        )
+        .route(
+            "/api/attachments/:id",
+            get(download_attachment).delete(delete_attachment),
+        )
         // 发票管理
         .route("/api/invoices", get(list_invoices).post(create_invoice))
         .route("/api/invoices/summary", get(invoice_summary))
@@ -292,6 +301,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
         .layer(axum::middleware::from_fn(csrf_guard))
+        // 附件上传最大 10MB（引擎限制），请求体留一点余量
+        .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -1981,6 +1992,154 @@ async fn voucher_delete(
     vouchers::delete(&db, id)?;
     db.log(user.username(), "凭证", "删除", &v.voucher_no())?;
     Ok(Json(json!({"ok": true})))
+}
+
+// ---------------------------------------------------------------------------
+// 凭证附件（上传/下载/删除；数据超过阈值落 .attachments 目录，否则入库）
+// ---------------------------------------------------------------------------
+
+fn attachment_json(a: &findb::attach::Attachment) -> serde_json::Value {
+    json!({
+        "id": a.id,
+        "voucher_id": a.voucher_id,
+        "name": a.name,
+        "kind": a.kind,
+        "size": a.size,
+        "size_text": a.size_text(),
+        "is_image": a.is_image(),
+        "added_by": a.added_by,
+        "added_at": a.added_at,
+    })
+}
+
+async fn list_voucher_attachments(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权查看该凭证的附件"));
+    }
+    let list: Vec<serde_json::Value> = findb::attach::list(&db, id)?
+        .iter()
+        .map(attachment_json)
+        .collect();
+    Ok(Json(list))
+}
+
+async fn upload_voucher_attachment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权为该凭证上传附件"));
+    }
+    let mut name = String::new();
+    let mut data: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(format!("上传解析失败：{e}")))?
+    {
+        if field.name() == Some("file") {
+            name = field.file_name().unwrap_or("attachment").to_string();
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::bad_request(format!("读取上传内容失败：{e}")))?;
+            data = Some(bytes.to_vec());
+            break;
+        }
+    }
+    let data = data.ok_or_else(|| AppError::bad_request("缺少文件字段 file"))?;
+    if data.is_empty() {
+        return Err(AppError::bad_request("上传文件为空"));
+    }
+    if data.len() > findb::attach::MAX_FILE_SIZE {
+        return Err(AppError::bad_request("文件超过 10MB 上限"));
+    }
+    let aid = findb::attach::add(&db, id, &name, &data, user.username())?;
+    db.log(
+        user.username(),
+        "凭证",
+        "上传附件",
+        &format!("{} 附件#{} {}", v.voucher_no(), aid, name),
+    )?;
+    Ok(Json(json!({ "id": aid })))
+}
+
+async fn download_attachment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = findb::attach::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("附件不存在".to_string()))?;
+    let v = vouchers::get(&db, a.voucher_id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权查看该附件"));
+    }
+    let data = findb::attach::read(&db, id)?;
+    let ctype = match a.kind.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    };
+    let encoded: String = a.name.bytes().map(|b| format!("%{b:02X}")).collect();
+    let mut resp = data.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(ctype),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+        "inline; filename=\"{}\"; filename*=UTF-8''{}",
+        a.name.replace('"', ""),
+        encoded
+    )) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
+}
+
+async fn delete_attachment(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let a = findb::attach::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("附件不存在".to_string()))?;
+    let v = vouchers::get(&db, a.voucher_id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权删除该附件"));
+    }
+    findb::attach::delete(&db, id)?;
+    db.log(
+        user.username(),
+        "凭证",
+        "删除附件",
+        &format!("{} 附件#{} {}", v.voucher_no(), id, a.name),
+    )?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------------

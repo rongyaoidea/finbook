@@ -1012,6 +1012,7 @@ async function openVoucherEditor(id, seedEntries) {
     </table>
     ${editable ? `<button class="btn ghost sm" id="v-add">+ 增加分录</button>` : ""}
     <div style="margin-top:10px" class="muted">合计：借 <b id="v-dt">0.00</b> 　贷 <b id="v-ct">0.00</b> 　差额 <b id="v-diff">0.00</b></div>
+    <div id="v-attach" class="muted" style="margin-top:8px">附件加载中…</div>
     <div class="foot">
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
       ${can("voucher_audit") && id > 0 && status === "draft" ? `<button class="btn ghost" id="v-audit">审核</button>` : ""}
@@ -1154,6 +1155,36 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: today() }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  async function loadAttachments() {
+    const box = $("#v-attach", mask);
+    if (!box) return;
+    if (!v.id) { box.innerHTML = `<span class="muted">保存凭证后可上传附件（单据影像等）</span>`; return; }
+    let list = [];
+    try { list = await api(`/vouchers/${v.id}/attachments`); }
+    catch (e) { box.innerHTML = `<span class="muted">${esc(e.message)}</span>`; return; }
+    const canEdit = can("voucher_edit");
+    box.innerHTML = `<b>附件</b> ${list.length
+      ? `<ul style="margin:6px 0 0 16px">${list.map((a) => `<li>${esc(a.name)} <span class="muted">(${esc(a.size_text)} ${esc(a.added_by || "")})</span> <a href="/api/attachments/${a.id}" target="_blank">下载</a> ${canEdit ? `<button class="btn sm ghost" data-attdel="${a.id}">删除</button>` : ""}</li>`).join("")}</ul>`
+      : `<span class="muted">暂无附件</span>`}
+      ${canEdit ? `<div style="margin-top:6px"><input type="file" id="v-attfile" /> <button class="btn sm" id="v-attup">上传</button> <span class="muted" style="font-size:12px">单文件 ≤ 10MB</span></div>` : ""}`;
+    if ($("#v-attup", box)) $("#v-attup", box).onclick = async () => {
+      const f = $("#v-attfile", box).files[0];
+      if (!f) { toast("请选择文件", "err"); return; }
+      if (f.size > 10 * 1024 * 1024) { toast("文件超过 10MB 上限", "err"); return; }
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      try {
+        const resp = await fetch(`/api/vouchers/${v.id}/attachments`, { method: "POST", body: fd });
+        if (!resp.ok) { let msg = resp.statusText; try { msg = (await resp.json()).error || msg; } catch (e) {} throw new Error(msg); }
+        toast("已上传", "ok"); loadAttachments();
+      } catch (e) { toast(e.message, "err"); }
+    };
+    $all("[data-attdel]", box).forEach((b) => b.onclick = async () => {
+      if (!(await confirmDialog("删除该附件？", true))) return;
+      try { await api(`/attachments/${b.dataset.attdel}`, { method: "DELETE" }); toast("已删除", "ok"); loadAttachments(); } catch (e) { toast(e.message, "err"); }
+    });
+  }
+  loadAttachments();
   $("#v-close", mask).onclick = closeModal;
 }
 function today() { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }

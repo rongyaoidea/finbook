@@ -20,7 +20,7 @@ serde_json = "1"
 thiserror = "2"
 
 # Web 服务端
-axum = { version = "0.7" }
+axum = { version = "0.7", features = ["multipart"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"

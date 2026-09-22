@@ -2589,7 +2589,7 @@ async fn web_ledger_tabs_and_export() {
     let jr: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(jr.as_array().unwrap().len(), 1, "日记账应一行");
     assert!(
-        jr[0]["opposite_accounts"].as_str().unwrap_or("").contains("2001"),
+        jr[0]["opposite_accounts"].as_str().unwrap_or("").contains("短期借款"),
         "日记账应带对方科目：{jr}"
     );
 

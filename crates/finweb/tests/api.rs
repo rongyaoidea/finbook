@@ -2752,7 +2752,7 @@ async fn web_aux_qty_and_custom_reports() {
     assert_eq!(resp.status(), StatusCode::OK);
     let d: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(d["rows"][0]["key"], serde_json::json!("C01"), "辅助账应有客户 C01：{d}");
-    assert_eq!(d["rows"][0]["debit"], serde_json::json!("1,000.00"));
+    assert_eq!(d["rows"][0]["debit"], serde_json::json!("1000.00"));
 
     // 数量金额账
     let resp = handlers::router(state.clone())

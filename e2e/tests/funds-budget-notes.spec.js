@@ -53,5 +53,6 @@ test("电子档案：归档→列表", async ({ page }) => {
   await page.fill("#ar-new-payload", '{"vouchers":1}');
   await page.click("#ar-save");
   await expect(page.locator("#ar-list")).toContainText("2026-01 凭证册", { timeout: 15_000 });
-  await expect(page.locator("#ar-list")).toContainText("未封存");
+  // 归档即封存（后端 archive_create 固定 sealed=1）
+  await expect(page.locator("#ar-list")).toContainText("封存");
 });

@@ -209,7 +209,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "18",
         "短期借款",
         1,
-        vec![Term::acct(&["2001"], AmountKind::End)],
+        vec![Term::acct(&["2001"], AmountKind::End).neg()],
     ));
 
     let i_note_pay = lines.len();
@@ -217,7 +217,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "19",
         "应付票据",
         1,
-        vec![Term::acct(&["2201"], AmountKind::End)],
+        vec![Term::acct(&["2201"], AmountKind::End).neg()],
     ));
 
     let i_ap = lines.len();
@@ -226,8 +226,8 @@ pub fn balance_sheet_def() -> ReportDef {
         "应付账款",
         1,
         vec![
-            Term::acct(&["2202"], AmountKind::End).credit_only(),
-            Term::acct(&["1123"], AmountKind::End).credit_only(),
+            Term::acct(&["2202"], AmountKind::End).credit_only().neg(),
+            Term::acct(&["1123"], AmountKind::End).credit_only().neg(),
         ],
     ));
 
@@ -237,8 +237,8 @@ pub fn balance_sheet_def() -> ReportDef {
         "预收款项",
         1,
         vec![
-            Term::acct(&["2203"], AmountKind::End).credit_only(),
-            Term::acct(&["1122"], AmountKind::End).credit_only(),
+            Term::acct(&["2203"], AmountKind::End).credit_only().neg(),
+            Term::acct(&["1122"], AmountKind::End).credit_only().neg(),
         ],
     ));
 
@@ -247,7 +247,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "22",
         "应付职工薪酬",
         1,
-        vec![Term::acct(&["2211"], AmountKind::End)],
+        vec![Term::acct(&["2211"], AmountKind::End).neg()],
     ));
 
     let i_tax = lines.len();
@@ -255,7 +255,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "23",
         "应交税费",
         1,
-        vec![Term::acct(&["2221"], AmountKind::End)],
+        vec![Term::acct(&["2221"], AmountKind::End).neg()],
     ));
 
     let i_other_pay = lines.len();
@@ -263,7 +263,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "24",
         "其他应付款",
         1,
-        vec![Term::acct(&["2241", "2231", "2232"], AmountKind::End)],
+        vec![Term::acct(&["2241", "2231", "2232"], AmountKind::End).neg()],
     ));
 
     let i_other_cur_liab = lines.len();
@@ -271,7 +271,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "25",
         "其他流动负债",
         1,
-        vec![Term::acct(&["2401"], AmountKind::End)],
+        vec![Term::acct(&["2401"], AmountKind::End).neg()],
     ));
 
     let i_cur_liab_total = lines.len();
@@ -299,7 +299,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "27",
         "长期借款",
         1,
-        vec![Term::acct(&["2501"], AmountKind::End)],
+        vec![Term::acct(&["2501"], AmountKind::End).neg()],
     ));
 
     let i_deferred_tax_liab = lines.len();
@@ -307,7 +307,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "28",
         "递延所得税负债",
         1,
-        vec![Term::acct(&["2901"], AmountKind::End)],
+        vec![Term::acct(&["2901"], AmountKind::End).neg()],
     ));
 
     let i_ncur_liab_total = lines.len();
@@ -339,7 +339,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "31",
         "实收资本（或股本）",
         1,
-        vec![Term::acct(&["4001"], AmountKind::End)],
+        vec![Term::acct(&["4001"], AmountKind::End).neg()],
     ));
 
     let i_reserve = lines.len();
@@ -347,7 +347,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "32",
         "资本公积",
         1,
-        vec![Term::acct(&["4002"], AmountKind::End)],
+        vec![Term::acct(&["4002"], AmountKind::End).neg()],
     ));
 
     let i_surplus = lines.len();
@@ -355,7 +355,7 @@ pub fn balance_sheet_def() -> ReportDef {
         "33",
         "盈余公积",
         1,
-        vec![Term::acct(&["4101"], AmountKind::End)],
+        vec![Term::acct(&["4101"], AmountKind::End).neg()],
     ));
 
     let i_undistributed = lines.len();
@@ -365,9 +365,9 @@ pub fn balance_sheet_def() -> ReportDef {
         1,
         vec![
             // 已结转部分：本年利润 + 利润分配（年末结转后落到这里）
-            Term::acct(&["4103", "4104"], AmountKind::End),
+            Term::acct(&["4103", "4104"], AmountKind::End).neg(),
             // 未结转部分：本期盈亏还挂在损益类科目上，必须并入，否则资产负债表不平
-            Term::profit_loss_net(AmountKind::End),
+            Term::profit_loss_net(AmountKind::End).neg(),
         ],
     ));
 

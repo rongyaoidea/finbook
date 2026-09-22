@@ -805,8 +805,8 @@ fn t12_balance_sheet() {
     let assets = table.rows[at].values[0];
     let lieq = table.rows[lt].values[0];
     assert_eq!(assets, m("1658000.00"), "资产总计");
-    assert_eq!(lieq, m("-1658000.00"), "负债和所有者权益总计（贷方，故为负）");
-    assert_eq!(assets, -lieq, "资产 = -(负债+权益)（符号约定：借正贷负）");
+    assert_eq!(lieq, m("1658000.00"), "负债和所有者权益总计（贷方为正）");
+    assert_eq!(assets, lieq, "资产 = 负债+权益");
 
     // 结转前本期盈亏必须体现在「未分配利润」里，否则表会不平
     let undistributed = table
@@ -814,7 +814,7 @@ fn t12_balance_sheet() {
         .iter()
         .find(|r| r.name == "未分配利润")
         .expect("未分配利润行");
-    assert_eq!(undistributed.values[0], m("55000.00"), "未分配利润（本期亏损 55,000）");
+    assert_eq!(undistributed.values[0], m("-55000.00"), "未分配利润（本期亏损 55,000，权益减少为负）");
 
     // 年初列 = 期初
     let assets_begin = table.rows[at].values[1];

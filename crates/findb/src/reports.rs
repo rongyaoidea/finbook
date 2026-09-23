@@ -365,7 +365,10 @@ pub fn report_compare(
         let rate = if prev.is_zero() {
             Money::ZERO
         } else {
-            ((diff.abs() * Money::from_i64(100)) / prev.abs().inner()).round2()
+            ((diff.abs() * Money::from_i64(100)))
+                .checked_div(prev.abs().inner())
+                .expect("prev 已判非零")
+                .round2()
         };
         out.push(CompareRow {
             no: r.no.clone(),

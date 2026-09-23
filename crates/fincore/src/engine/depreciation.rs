@@ -186,8 +186,10 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
     let n = input.life_months;
     match input.method {
         DepMethod::Straight => {
-            // 每月等额
-            (total / Money::from_i64(n as i64)).round2()
+            // 每月等额（life_months 已在 DepInput 校验中要求 > 0）
+            total.checked_div(Money::from_i64(n as i64))
+                .expect("life_months 已校验 > 0")
+                .round2()
         }
         DepMethod::DoubleDeclining => {
             // 前 n-24 期按净值双倍摊销，最后 24 期改直线
@@ -195,7 +197,9 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
             let switch = (n - 24).max(0);
             if i <= switch {
                 let net = input.original - accum;
-                let rate = Money::from_i64(2) / Money::from_i64(n as i64);
+                let rate = Money::from_i64(2)
+                    .checked_div(Money::from_i64(n as i64))
+                    .expect("life_months 已校验 > 0");
                 (net * rate).round2()
             } else {
                 // 剩余期数内把剩余可提额摊完（不扣残值之外的部分）
@@ -204,7 +208,10 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
                     return Money::ZERO;
                 }
                 let remain = total - accum;
-                (remain / Money::from_i64(remain_months as i64)).round2()
+                remain
+                    .checked_div(Money::from_i64(remain_months as i64))
+                    .expect("remain_months 已判 > 0")
+                    .round2()
             }
         }
         DepMethod::SumOfYears => {
@@ -217,10 +224,16 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
             // 当前处于第几年（1-based）
             let y = ((i - 1) / 12 + 1).min(years);
             let remain_years = years as i64 - y as i64 + 1;
-            let year_amount = (total * Money::from_i64(remain_years) / Money::from_i64(sum)).round2();
+            let year_amount = (total * Money::from_i64(remain_years))
+                .checked_div(Money::from_i64(sum))
+                .expect("sum 已判非零")
+                .round2();
             // 该年内的月数（最后一年可能不满 12 个月）
             let months_in_year = (n - (y - 1) * 12).clamp(1, 12);
-            (year_amount / Money::from_i64(months_in_year as i64)).round2()
+            year_amount
+                .checked_div(Money::from_i64(months_in_year as i64))
+                .expect("months_in_year 已 clamp 到 [1,12]")
+                .round2()
         }
         DepMethod::OneTime => {
             // 一次性摊销：启用当期全额计提，其余各期 0
@@ -236,7 +249,9 @@ fn raw_amount(input: &DepInput, i: i32, accum: Money, total: Money) -> Money {
                 return total;
             }
             if i == 1 || i == n {
-                (total / Money::from_i64(2)).round2()
+                total.checked_div(Money::from_i64(2))
+                    .expect("字面量除数 2 非零")
+                    .round2()
             } else {
                 Money::ZERO
             }

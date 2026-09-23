@@ -196,7 +196,10 @@ impl BudgetView {
                 self.sum_rate = if self.sum_budget.is_zero() {
                     Money::ZERO
                 } else {
-                    (self.sum_actual.abs() * Money::from_i64(100) / self.sum_budget.abs()).round2()
+                    (self.sum_actual.abs() * Money::from_i64(100))
+                        .checked_div(self.sum_budget.abs())
+                        .expect("sum_budget 已判非零")
+                        .round2()
                 };
             }
         }

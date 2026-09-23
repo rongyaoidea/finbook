@@ -239,7 +239,10 @@ pub fn budget_vs_actual(
         let rate = if b.amount.is_zero() {
             Money::ZERO
         } else {
-            ((actual.abs() * Money::parse("100").unwrap()) / b.amount.abs().inner()).round2()
+            ((actual.abs() * Money::parse("100").unwrap()))
+                .checked_div(b.amount.abs().inner())
+                .expect("b.amount 已判非零")
+                .round2()
         };
         out.push(BudgetRow {
             account_name: chart
@@ -287,7 +290,10 @@ pub fn budget_alerts(
         if r.budget.is_zero() {
             continue;
         }
-        let pct = ((r.actual.abs() * Money::from_i64(100)) / r.budget.abs().inner()).round2();
+        let pct = ((r.actual.abs() * Money::from_i64(100)))
+            .checked_div(r.budget.abs().inner())
+            .expect("budget 已判非零")
+            .round2();
         if pct.to_f64() >= threshold_pct as f64 {
             out.push(BudgetAlert {
                 account_code: r.account_code,
@@ -381,7 +387,10 @@ pub fn budget_analysis(
             let rate = if budget.is_zero() {
                 Money::ZERO
             } else {
-                ((actual.abs() * Money::from_i64(100)) / budget.abs().inner()).round2()
+                ((actual.abs() * Money::from_i64(100)))
+                    .checked_div(budget.abs().inner())
+                    .expect("budget 已判非零")
+                    .round2()
             };
             out.push(BudgetAnalysisRow {
                 period,
@@ -439,7 +448,10 @@ pub fn budget_analysis_summary(
         let rate = if budget.is_zero() {
             Money::ZERO
         } else {
-            ((actual.abs() * Money::from_i64(100)) / budget.abs().inner()).round2()
+            ((actual.abs() * Money::from_i64(100)))
+                .checked_div(budget.abs().inner())
+                .expect("budget 已判非零")
+                .round2()
         };
         out.push(BudgetAnalysisSummary {
             account_code: code.clone(),

@@ -228,7 +228,10 @@ pub fn so_execution_track(db: &Db, period: Period) -> DbResult<Vec<SoTrack>> {
         let rate = if ordered.is_zero() {
             Money::ZERO
         } else {
-            ((shipped.abs() * Money::from_i64(100)) / ordered.abs().inner()).round2()
+            ((shipped.abs() * Money::from_i64(100)))
+                .checked_div(ordered.abs().inner())
+                .expect("ordered 已判非零")
+                .round2()
         };
         out.push(SoTrack {
             so_id: o.id,

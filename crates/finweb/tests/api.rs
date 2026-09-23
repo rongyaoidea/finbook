@@ -204,6 +204,70 @@ async fn unauthenticated_me_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// M-9：未登录探测不能区分"接口是否存在 / 方法是否注册"（401/404/405 统一 401）
+#[tokio::test]
+async fn m9_unauthenticated_probe_uniform_401() {
+    let (state, _bd, _dir) = test_state();
+
+    // 真实接口未登录 → 401（既有行为，取其响应作为基准）
+    let resp_me = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp_me.status(), StatusCode::UNAUTHORIZED);
+    let body_me = body_string(resp_me).await;
+
+    // 不存在的接口 → 401 且响应与真实接口逐字一致（而不是 404）
+    let resp_fake = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/definitely-not-a-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_fake.status(),
+        StatusCode::UNAUTHORIZED,
+        "不存在的接口对未登录探测也应 401"
+    );
+    assert_eq!(body_string(resp_fake).await, body_me);
+
+    // 存在但方法未注册 → 401（而不是 405）
+    let resp_method = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::PUT)
+                .uri("/api/books")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_method.status(),
+        StatusCode::UNAUTHORIZED,
+        "方法不匹配对未登录探测也应 401"
+    );
+
+    // 已登录并选定账套后：不存在的接口回 404（功能可见性对登录用户不隐藏）
+    let (_, sid) = login(&state, "boss", "Admin!2026").await;
+    assert_eq!(select_book(&state, &sid, "b1").await, StatusCode::OK);
+    let resp_authed = handlers::router(state.clone())
+        .oneshot(authed_get("/api/definitely-not-a-route", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp_authed.status(), StatusCode::NOT_FOUND);
+
+    // 公开门露：健康检查无需会话
+    let resp_health = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp_health.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn wrong_password_rejected() {
     let (state, _bd, _dir) = test_state();

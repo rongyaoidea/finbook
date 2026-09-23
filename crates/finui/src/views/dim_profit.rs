@@ -252,7 +252,10 @@ impl DimProfitView {
                     if self.sum_profit.is_zero() {
                         ui.label(RichText::new("—").weak());
                     } else {
-                        let rate = (r.profit * Money::from_i64(100) / self.sum_profit).round2();
+                        let rate = (r.profit * Money::from_i64(100))
+                            .checked_div(self.sum_profit)
+                            .expect("sum_profit 已判非零")
+                            .round2();
                         ui.label(format!("{}%", rate.fmt_money()));
                     }
                 }

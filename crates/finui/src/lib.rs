@@ -270,7 +270,14 @@ impl FinBookApp {
             }
             ConfirmAction::DeleteDepreciation(period_ymm) => {
                 let p = if period_ymm > 0 {
-                    fincore::Period::from_ymm(period_ymm as i32)
+                    // L-2：确认框回传的期间也要校验，非法值不能静默构造成脏 Period 去删数据
+                    match fincore::Period::from_ymm_checked(period_ymm as i32) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            ctx.error(e.to_string());
+                            return;
+                        }
+                    }
                 } else {
                     ctx.st.period
                 };
@@ -563,7 +570,8 @@ fn period_selector(st: &mut AppState, views: &mut views::Views, ui: &mut Ui) {
     };
     let closed = findb::periods::closed_upto(&db).unwrap_or(None);
     let cur = st.period;
-    let label = if cur.is_closed(closed.unwrap_or(Period::from_ymm(0))) {
+    // L-2：哨兵值用命名常量 Period::ZERO（等价于 ymm=0，"从未结账"），不再走未校验构造
+    let label = if cur.is_closed(closed.unwrap_or(Period::ZERO)) {
         format!("🔒 {}", cur.label())
     } else {
         cur.label()

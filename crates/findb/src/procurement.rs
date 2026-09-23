@@ -279,7 +279,10 @@ pub fn po_execution_track(db: &Db, period: Period) -> DbResult<Vec<PoTrack>> {
         let rate = if ordered.is_zero() {
             Money::ZERO
         } else {
-            ((received.abs() * Money::from_i64(100)) / ordered.abs().inner()).round2()
+            ((received.abs() * Money::from_i64(100)))
+                .checked_div(ordered.abs().inner())
+                .expect("ordered 已判非零")
+                .round2()
         };
         out.push(PoTrack {
             po_id: o.id,

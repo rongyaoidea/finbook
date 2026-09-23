@@ -316,7 +316,10 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 if denom.is_zero() {
                     Money::ZERO
                 } else {
-                    ((opening_state.amount + in_amount) / denom).round_dp(6)
+                    (opening_state.amount + in_amount)
+                        .checked_div(denom)
+                        .expect("denom 已判非零")
+                        .round_dp(6)
                 }
             };
             // 出库成本按统一单价（口径与 run_month_average 一致）
@@ -364,7 +367,10 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                         if s.out_qty.is_zero() {
                             Money::ZERO
                         } else {
-                            (c / r.qty.abs()).round2()
+                            // 数量为 0 时单位成本按 0（原"除零返 0"口径显式化，守卫与旧行为一致）
+                            c.checked_div(r.qty.abs())
+                                .unwrap_or(Money::ZERO)
+                                .round2()
                         },
                         c,
                     )?;

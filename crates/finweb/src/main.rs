@@ -10,7 +10,6 @@ use std::path::PathBuf;
 
 use axum::Router;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use fincore::user::PasswordPolicy;
@@ -86,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         asset_version(),
     );
 
-    let app = build_app(state.clone(), state.static_dir.clone());
+    let app = build_app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     let book_count = state.books.list().len();
@@ -114,15 +113,16 @@ fn default_period() -> i32 {
     (now.year() as i32) * 100 + now.month() as i32
 }
 
-/// 组装应用：API 路由 + 访问日志 + 静态资源（前端 SPA）
-fn build_app(state: std::sync::Arc<WebState>, static_dir: PathBuf) -> Router {
-    // handlers::router 内部已带 /api 前缀，这里用 merge 而不是 nest，避免变成 /api/api/...
-    // 访问日志：先挂 TraceLayer 再补 fallback，API 与静态资源请求均留痕
-    let api = handlers::router(state);
-    api.layer(TraceLayer::new_for_http())
+/// 组装应用：API 路由 + 访问日志 + panic 兜底
+///
+/// 静态资源 fallback 已内聚进 `handlers::router`（spa_fallback）：/api/* 未匹配
+/// 的请求必须按登录态回 401/404（M-9），不能落到静态 404 泄露"路径不存在"；
+/// handlers::router 先于本函数的 layer 拿到 fallback，访问日志对静态资源同样生效。
+fn build_app(state: std::sync::Arc<WebState>) -> Router {
+    handlers::router(state)
+        .layer(TraceLayer::new_for_http())
         // 最外层兜 panic：即使某条请求路径上的 unwrap 触发，也只返回 500，不拖垮进程
         .layer(CatchPanicLayer::new())
-        .fallback_service(ServeDir::new(static_dir))
 }
 
 /// 定位静态资源目录：优先环境变量，其次可执行文件同级的 static/，最后当前目录的 static/

@@ -716,7 +716,7 @@ impl AssetsView {
         };
         // 界面按百分数录入（5 = 5%），库里存小数
         e.residual_rate = match Money::parse(&self.f_residual) {
-            Ok(v) => (v / 100).round_dp(4),
+            Ok(v) => v.checked_div(100).expect("字面量 100 非零").round_dp(4),
             Err(x) => {
                 self.err = x.to_string();
                 return;

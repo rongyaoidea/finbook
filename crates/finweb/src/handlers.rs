@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
@@ -33,6 +33,53 @@ use crate::state::{
 const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
 /// 单账号最多可自建账套数（防无限建账占满磁盘）
 const MAX_BOOKS_PER_USER: i64 = 10;
+
+/// M-9 会话门禁：在路由匹配前把未认证的 /api/* 统一拦成 401——
+/// 否则未登录探测者可用 401（真实接口）/ 404（不存在）/ 405（方法未注册）
+/// 的差异枚举出全部接口清单。公开接口放行；只做令牌校验且文案与
+/// RealmUser/CurrentUser 提取器共用 session_of 逐字一致；完整身份对账
+/// 仍由各接口自己的提取器完成，不改变任何既有授权语义。
+async fn api_auth_gate(
+    State(state): State<Arc<WebState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, AppError> {
+    let path = req.uri().path();
+    if path.starts_with("/api/")
+        && path != "/api/health"
+        && path != "/api/login"
+        && path != "/api/logout"
+        && path != "/api/setup/status"
+    {
+        crate::state::session_of(req.headers(), &state)?;
+    }
+    Ok(next.run(req).await)
+}
+
+/// 统一 fallback：/api/* 未匹配 → 已登录回 404、未登录回 401（M-9）；
+/// 其余路径走静态资源（SPA 资产；"/" 已由 serve_index 路由处理）。
+/// 静态服务从 main::build_app 移入此处，正是为了让 /api/* 不再落到
+/// 静态 404——门禁与本 fallback 双重覆盖，对 axum 的 layer/fallback
+/// 包裹顺序不敏感。
+async fn spa_fallback(
+    State(state): State<Arc<WebState>>,
+    req: axum::extract::Request,
+) -> Response {
+    if req.uri().path().starts_with("/api/") {
+        let (mut parts, _body) = req.into_parts();
+        return match CurrentUser::from_request_parts(&mut parts, &state).await {
+            Ok(_) => AppError::not_found("接口不存在").into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+    use tower::ServiceExt;
+    tower_http::services::ServeDir::new(state.static_dir.clone())
+        .oneshot(req)
+        .await
+        // tower-http 的响应体类型映射为 axum Body
+        .map(|resp| resp.map(axum::body::Body::new))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
 
 /// 组装路由
 pub fn router(state: Arc<WebState>) -> Router {
@@ -313,6 +360,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .layer(axum::middleware::from_fn(csrf_guard))
         // 附件上传最大 10MB（引擎限制），请求体留一点余量
         .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
+        // M-9 会话门禁：路由匹配前统一 401 未认证的 /api/*（公开接口除外）
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api_auth_gate,
+        ))
+        // M-9 统一 fallback：/api/* 未匹配 → 已登录 404 / 未登录 401；其余走静态资源
+        .fallback(spa_fallback)
         .with_state(state)
 }
 
@@ -5124,7 +5178,9 @@ fn asset_from_req(r: &AssetReq) -> Result<findb::assets::Asset, AppError> {
     let rate = if r.residual_rate.trim().is_empty() {
         Money::parse("0.05").unwrap_or(Money::ZERO)
     } else {
-        parse_money_checked(&r.residual_rate)? / rust_decimal::Decimal::from(100)
+        parse_money_checked(&r.residual_rate)?
+            .checked_div(rust_decimal::Decimal::from(100))
+            .expect("字面量 100 非零")
     };
     if rate.is_negative() || rate > Money::ONE {
         return Err(AppError::bad_request("残值率必须在 0% ~ 100% 之间"));

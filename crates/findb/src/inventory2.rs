@@ -125,7 +125,10 @@ pub fn unit_set(db: &Db, u: &ItemUnit) -> DbResult<()> {
 /// 主单位数量 → 辅助单位数量
 pub fn unit_to_alt(db: &Db, item: &str, base_qty: Money) -> DbResult<Money> {
     match unit_get(db, item)? {
-        Some(u) => Ok((base_qty / u.factor.inner()).round_dp(fincore::money::QTY_DP)),
+        Some(u) => Ok(base_qty
+            .checked_div(u.factor.inner())
+            .expect("换算系数已校验 > 0（保存入口 inventory2.rs:115）")
+            .round_dp(fincore::money::QTY_DP)),
         None => Ok(base_qty),
     }
 }
@@ -198,7 +201,14 @@ pub fn abc_analysis(db: &Db, upto: Period) -> DbResult<Vec<AbcRow>> {
     let mut cum = Money::ZERO;
     for r in rows.iter_mut() {
         cum += r.amount;
-        let pct = if total.is_zero() { Money::ZERO } else { (cum * Money::from_i64(100) / total.inner()).round2() };
+        let pct = if total.is_zero() {
+            Money::ZERO
+        } else {
+            (cum * Money::from_i64(100))
+                .checked_div(total.inner())
+                .expect("total 已判非零")
+                .round2()
+        };
         r.cum_pct = pct;
         r.class = if pct <= Money::parse("80").unwrap() {
             "A"

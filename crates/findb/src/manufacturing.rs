@@ -250,7 +250,12 @@ pub fn overhead_allocate_with(
         let share = if i == n - 1 {
             amount - assigned // 尾差给最后一单
         } else {
-            ((b * amount.inner()) / base_sum.inner()).round2()
+            // 分摊基数合计为 0 → 按 0 分摊，差额全部由最后一单吸收
+            //（原"除零返 0"口径显式化，行为不变）
+            ((b * amount.inner()))
+                .checked_div(base_sum.inner())
+                .unwrap_or(Money::ZERO)
+                .round2()
         };
         assigned += share;
         out.push((w.po_id, share));
@@ -564,7 +569,9 @@ pub fn prod_complete(
     let (mat, lab, oh) = get_prod_cost_of(&tx, po_id)?;
     let total_cost = mat + lab + oh;
     let unit_cost = if completed_qty > Money::ZERO {
-        total_cost / completed_qty
+        total_cost
+            .checked_div(completed_qty)
+            .expect("completed_qty 已判 > 0")
     } else {
         Money::ZERO
     };

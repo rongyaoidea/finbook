@@ -14,7 +14,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::iter::Sum;
-use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 use std::str::FromStr;
 
 use crate::error::FinError;
@@ -382,35 +382,15 @@ impl Mul<Decimal> for Money {
         Money(self.0 * rhs)
     }
 }
-impl Div<Decimal> for Money {
-    type Output = Money;
-    fn div(self, rhs: Decimal) -> Money {
-        if rhs.is_zero() {
-            Money::ZERO
-        } else {
-            Money(self.0 / rhs)
-        }
-    }
-}
 /// Money × Money
 ///
 /// 维度上不严谨，但本项目把**比率**（残值率、税率、折旧率）和**计数**（月数、数量）
 /// 也统一用 Money 承载，避免为标量再引入一套类型。典型用法：
-/// `原值 * 残值率`、`折旧总额 / 总月数`、`数量 * 单价`。
+/// `原值 * 残值率`、`数量 * 单价`。
 impl Mul<Money> for Money {
     type Output = Money;
     fn mul(self, rhs: Money) -> Money {
         Money(self.0 * rhs.0)
-    }
-}
-impl Div<Money> for Money {
-    type Output = Money;
-    fn div(self, rhs: Money) -> Money {
-        if rhs.is_zero() {
-            Money::ZERO
-        } else {
-            Money(self.0 / rhs.0)
-        }
     }
 }
 /// 整数倍率（月数、份数），避免调用处手写 `Money::from_i64(n)`
@@ -420,13 +400,45 @@ impl Mul<i64> for Money {
         Money(self.0 * Decimal::from(rhs))
     }
 }
-impl Div<i64> for Money {
-    type Output = Money;
-    fn div(self, rhs: i64) -> Money {
-        if rhs == 0 {
-            Money::ZERO
+
+/// 除数抽象：统一 `Money` 的三种除数（`Money` / `Decimal` / `i64`），
+/// 仅作为 [`Money::checked_div`] 的参数约束使用（inherent 方法，调用点无需引入本 trait）。
+pub trait Divisor {
+    fn divisor_dec(self) -> Decimal;
+}
+impl Divisor for Money {
+    fn divisor_dec(self) -> Decimal {
+        self.0
+    }
+}
+impl Divisor for Decimal {
+    fn divisor_dec(self) -> Decimal {
+        self
+    }
+}
+impl Divisor for i64 {
+    fn divisor_dec(self) -> Decimal {
+        Decimal::from(self)
+    }
+}
+
+impl Money {
+    /// 除法（L-1 定案）：**不再静默返回 0**——除数为 0 返回 `None`。
+    ///
+    /// 语义决策下放到每个调用点：
+    /// - 数据入口/计算链 → 传播错误（`?` / `ok_or`）；
+    /// - 展示类（比率、均值）→ 显式 `.unwrap_or(Money::ZERO)`（"无数据按 0 显示"）；
+    /// - 能前置校验的除数（月数、份数）→ 在录入/校验处拦截。
+    ///
+    /// 原先 `a / 0 == 0` 会把"除数缺失"伪装成合法金额，是金额类静默错误
+    /// 的高危来源（SECURITY_TODO L-1）。`{Money, Decimal, i64} / …` 的除法
+    /// 一律改用本方法；`Money * …` 仍是运算符。
+    pub fn checked_div<R: Divisor>(self, rhs: R) -> Option<Money> {
+        let d = rhs.divisor_dec();
+        if d.is_zero() {
+            None
         } else {
-            Money(self.0 / Decimal::from(rhs))
+            Some(Money(self.0 / d))
         }
     }
 }
@@ -481,6 +493,24 @@ impl FromStr for Money {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_div_zero_is_none() {
+        // L-1：除零不再静默返 0——三种除数一律 None；正常值语义与原 / 运算符一致
+        let a = Money::parse("10").unwrap();
+        assert!(a.checked_div(Money::ZERO).is_none());
+        assert!(a.checked_div(Decimal::ZERO).is_none());
+        assert!(a.checked_div(0_i64).is_none());
+        assert_eq!(
+            a.checked_div(Money::parse("4").unwrap()).unwrap(),
+            Money::parse("2.5").unwrap()
+        );
+        assert_eq!(
+            a.checked_div(Decimal::from(100)).unwrap(),
+            Money::parse("0.1").unwrap()
+        );
+        assert_eq!(a.checked_div(4_i64).unwrap(), Money::parse("2.5").unwrap());
+    }
 
     #[test]
     fn no_float_error() {

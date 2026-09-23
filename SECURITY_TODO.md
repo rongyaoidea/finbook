@@ -1,7 +1,7 @@
 # FinBook 安全加固待办事项
 
 > 本文件反映**当前代码真实状态**（2026-09 核实，逐项带代码证据）。
-> 结论：20 项历史修复中 18 项已核实完成、2 项部分完成；H-3/M-15 两项产品决策已定案并落地。
+> 结论：20 项历史修复**全部核实完成**；三项遗留（L-1 除零 / L-2 期间构造 / M-9 路径泄露）已于 2026-09 本轮清零。H-3/M-15 产品决策已定案并落地。
 
 ## 一、已完成并核实（18 项）
 
@@ -50,12 +50,13 @@
 - 用例：`fincore/voucher.rs::balanced_quantizes_per_entry`、`fincore/balance.rs::trial_balance_quantized_tolerance`；`finweb/tests/api.rs::unbalanced_voucher_rejected_m15`。
 - 文档：README §5「借贷平衡（M-15 定案）」行。
 
-## 三、部分完成（2 项）
+## 三、原部分完成 / 待办项已全部收尾 ✅（2026-09 本轮）
 
-| ID | 问题 | 现状 | 剩余工作 | 预估 |
-|----|------|------|----------|------|
-| M-9 | 未认证接口路径泄露 | **已修一半**：账套路径不外泄（`dto.rs:156` skip、`handlers.rs:390` 只进日志、`:425-427` 不返回 path）。缺：无统一认证中间件，未登录访问不存在的 `/api/*` 返 404、真实受保护路由返 401，仍可区分路径存在性 | 加路由层统一 401（或 404 归一） | 小 |
-| L-2 | Period::from_ymm 异常值 | **部分缓解**：存在 `from_ymm_checked`（`fincore/src/period.rs:35`），Web 主入口已走 checked（`handlers.rs:1170/1179/2427`）。缺：桌面端 `finui/src/lib.rs:273`（及 `:566`）仍 unchecked | 桌面端换 checked | 小 |
+| ID | 问题 | 现状 | 证据 |
+|----|------|------|------|
+| M-9 | 未认证接口路径泄露 | **已修复**：路由匹配前统一 401 未认证 `/api/*`（公开接口 health/login/logout/setup.status 放行）；未匹配路径由统一 fallback 回「已登录 404 / 未登录 401」，静态资源不再吞 `/api/*`；404/405/401 三路探测不可区分 | `finweb/src/handlers.rs::api_auth_gate`、`::spa_fallback`、`state.rs::session_of`（与提取器共用文案）；用例 `finweb/tests/api.rs::m9_unauthenticated_probe_uniform_401` |
+| L-2 | Period::from_ymm 异常值 | **已修复**：Web 入口早已走 checked；桌面端删除折旧确认改 `from_ymm_checked`（非法期间报错中止、不落脏数据），"从未结账"哨兵改用命名常量 `Period::ZERO` | `finui/src/lib.rs::run_action`（DeleteDepreciation 分支）、`period_selector`（`Period::ZERO`）；Web 侧 `handlers.rs:1170/1179/2427` |
+| L-1 | Money 除零返回 0 | **已修复**：三个 `impl Div`（Money/Decimal/i64 除数）删除，改为 `Money::checked_div -> Option`（除零返 `None`，不再静默 0）；全仓 31 处除法点显式化——有判零守卫处 `expect`（守卫与除数同源）、展示类/原"除零=0"语义处 `unwrap_or(Money::ZERO)` 带注释、**公式引擎除零改报错**（金额公式不再把 0 当合法结果）、无守卫处传播错误 | `fincore/src/money.rs::checked_div`/`Divisor`；调用点分布：fincore 12（costing/depreciation/formula）、findb 14、finui 4、finweb 1 |
 
 ## 四、待后续迭代
 
@@ -65,7 +66,6 @@
 |----|------|------|----------|------|
 | M-4 | 设备绑定可伪造 | 未完成：device_id 由客户端上报，可伪造换绑 | 首次绑定后禁改，服务端生成 device_hash | 中 |
 | — | DataScope 未逐模块接入 | DataScope 默认收紧 + Web 凭证查询已接（HIGH-1/5），但其余模块查询未逐一走 scope | 逐模块排查接入 | 中 |
-| L-1 | Money 除零返回 0 | 未完成：`fincore/src/money.rs:388/409/426` 除零静默返 0 | 改 Result 或 checked_div | 中（调用点多） |
 
 ### 低优先级
 
@@ -76,12 +76,12 @@
 ## 五、推荐修复顺序
 
 ```
-1. L-1 Money 除零改 Result（数据正确性隐患最大）
-2. M-9 统一 401（补完一半的路径泄露修复）
-3. L-2 桌面端换 from_ymm_checked
-4. M-4 设备绑定强化
-5. DataScope 逐模块接入 + L-3~L-14 渐进优化
+1. M-4 设备绑定强化（服务端 device_hash）
+2. DataScope 逐模块接入
+3. L-3~L-14 渐进优化
 ```
+
+> 原顺序中的 L-1 / M-9 / L-2 已于 2026-09 本轮完成（见第三节）。
 
 ## 六、CI 保障
 

@@ -336,7 +336,10 @@ pub fn prod_progress(db: &Db, po_id: i64) -> DbResult<ProdProgress> {
     let percent = if total == 0 {
         Money::ZERO
     } else {
-        (Money::from_i64(done as i64) * Money::from_i64(100) / Money::from_i64(total as i64)).round2()
+        (Money::from_i64(done as i64) * Money::from_i64(100))
+            .checked_div(Money::from_i64(total as i64))
+            .expect("total 已判非零")
+            .round2()
     };
     Ok(ProdProgress {
         po_id,

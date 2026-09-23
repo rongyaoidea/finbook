@@ -399,7 +399,7 @@ impl InventoryDeepView {
                 self.unit_conv = if factor.is_zero() {
                     "请先填写有效系数".to_string()
                 } else {
-                    format!("50 {} = {} {}", self.unit_base, (Money::from_i64(50) / factor.inner()).round_dp(fincore::money::QTY_DP).fmt_qty(), self.unit_alt)
+                    format!("50 {} = {} {}", self.unit_base, Money::from_i64(50).checked_div(factor.inner()).expect("factor 已判非零").round_dp(fincore::money::QTY_DP).fmt_qty(), self.unit_alt)
                 };
             }
             if !self.unit_conv.is_empty() {

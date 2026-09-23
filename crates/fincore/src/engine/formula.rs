@@ -13,8 +13,9 @@
 //! 第二个参数是期间偏移（`0` 本期、`-1` 上期、留空同 `0`），
 //! 第三个参数是方向（`借` / `贷`，留空取科目默认方向的余额）。
 //!
-//! 支持 `+ - * /` 和括号，除法分母为 0 时返回 0 而不是报错——报表里出现 `#DIV/0`
-//! 比显示 0 更让人困惑，因为通常只是当期还没数据。
+//! 支持 `+ - * /` 和括号。**除法分母为 0 时报错**（L-1 定案，错误信息「公式除零」）：
+//! 此前静默返回 0 会把"当期没数据/除数缺失"伪装成合法金额——对凭证金额公式尤其危险；
+//! 展示类报表需要"无数据按 0"语义时，应在公式侧显式规避除零。
 
 use rust_decimal::prelude::ToPrimitive;
 
@@ -215,7 +216,8 @@ impl<'a> Parser<'a> {
                 Tok::Slash => {
                     self.bump();
                     let d = self.factor()?;
-                    v = if d.is_zero() { Money::ZERO } else { v / d.inner() };
+                    // L-1：公式除零不再静默置 0——金额公式会把 0 当合法结果算下去
+                    v = v.checked_div(d).ok_or_else(|| FinError::msg("公式除零：除数为 0"))?;
                 }
                 _ => break,
             }
@@ -465,8 +467,10 @@ mod tests {
     }
 
     #[test]
-    fn div_by_zero_is_zero() {
-        assert_eq!(e("100/(3-3)"), Money::ZERO);
+    fn div_by_zero_is_error() {
+        // L-1：公式除零不再静默返回 0——金额公式会把 0 当合法结果算下去
+        let err = eval("100/(3-3)", &ctx(), p()).unwrap_err();
+        assert!(err.to_string().contains("除零"), "应报除零错误：{err}");
     }
 
     #[test]

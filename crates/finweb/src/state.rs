@@ -394,6 +394,26 @@ impl SessionStore {
 // 鉴权提取器
 // ---------------------------------------------------------------------------
 
+/// 取出会话令牌与会话信息（与 RealmUser/CurrentUser 提取器的前两步共用）。
+///
+/// M-9：无 cookie / 已过期时返回的 401 文案必须与提取器**逐字一致**——
+/// 门禁 `handlers::api_auth_gate` 靠它让"真实接口"与"不存在的接口"不可区分。
+pub(crate) fn session_of(
+    headers: &axum::http::HeaderMap,
+    state: &WebState,
+) -> Result<(String, SessionInfo), AppError> {
+    let jar = CookieJar::from_headers(headers);
+    let token = jar
+        .get("finbook_sid")
+        .map(|c| c.value().to_string())
+        .ok_or_else(|| AppError::unauthorized("未登录或会话已失效"))?;
+    let info = state
+        .sessions
+        .get(&token, state.policy.idle_minutes)
+        .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
+    Ok((token, info))
+}
+
 /// 平台级登录用户（不绑定具体账套）：用于登录、账套列表、建账、平台用户管理等。
 pub struct RealmUser {
     pub username: String,
@@ -412,15 +432,7 @@ impl FromRequestParts<Arc<WebState>> for RealmUser {
         parts: &mut Parts,
         state: &Arc<WebState>,
     ) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_headers(&parts.headers);
-        let token = jar
-            .get("finbook_sid")
-            .map(|c| c.value().to_string())
-            .ok_or_else(|| AppError::unauthorized("未登录或会话已失效"))?;
-        let info = state
-            .sessions
-            .get(&token, state.policy.idle_minutes)
-            .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
+        let (token, info) = session_of(&parts.headers, state)?;
         let ru = state
             .realm
             .get_user(&info.username)?
@@ -500,15 +512,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
         parts: &mut Parts,
         state: &Arc<WebState>,
     ) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_headers(&parts.headers);
-        let token = jar
-            .get("finbook_sid")
-            .map(|c| c.value().to_string())
-            .ok_or_else(|| AppError::unauthorized("未登录或会话已失效"))?;
-        let info = state
-            .sessions
-            .get(&token, state.policy.idle_minutes)
-            .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
+        let (token, info) = session_of(&parts.headers, state)?;
 
         // 1) 平台账号存在且未停用
         let ru: RealmAccount = state

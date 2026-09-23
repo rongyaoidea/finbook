@@ -146,17 +146,28 @@ impl StockState {
                     let share = if Some(i) == residual_idx {
                         remaining
                     } else {
-                        let ratio = (lot.qty * lot.unit_cost).round2() / old_total;
+                        let ratio = (lot.qty * lot.unit_cost)
+                            .round2()
+                            .checked_div(old_total)
+                            .expect("old_total 已判非零");
                         let s = (delta * ratio).round2();
                         remaining -= s;
                         s
                     };
-                    lot.unit_cost += share / lot.qty;
+                    lot.unit_cost += share
+                        .checked_div(lot.qty)
+                        .expect("批次数量已在循环头判非零");
                 }
             }
-            self.last_price = (new_amount / self.qty).round_dp(QTY_DP + 2);
+            self.last_price = new_amount
+                .checked_div(self.qty)
+                .expect("self.qty 已判非零")
+                .round_dp(QTY_DP + 2);
         } else if !self.qty.is_zero() {
-            self.last_price = (new_amount / self.qty).round_dp(QTY_DP + 2);
+            self.last_price = new_amount
+                .checked_div(self.qty)
+                .expect("self.qty 已判非零")
+                .round_dp(QTY_DP + 2);
         }
         Ok(delta.round2())
     }
@@ -166,7 +177,10 @@ impl StockState {
         if self.qty.is_zero() {
             return Money::ZERO;
         }
-        (self.amount / self.qty).round_dp(QTY_DP + 2)
+        self.amount
+            .checked_div(self.qty)
+            .expect("数量已判非零")
+            .round_dp(QTY_DP + 2)
     }
 
     /// 应用一条流水，返回本次出库成本（入库返回 None）
@@ -369,7 +383,10 @@ pub fn run_month_average(
     let unit = if denom.is_zero() {
         st.unit_cost()
     } else {
-        ((opening.amount + in_amount) / denom).round_dp(QTY_DP + 2)
+        (opening.amount + in_amount)
+            .checked_div(denom)
+            .expect("denom 已判非零")
+            .round_dp(QTY_DP + 2)
     };
     let mut out = Vec::with_capacity(moves.len());
     for mv in moves {

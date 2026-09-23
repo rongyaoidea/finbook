@@ -1,7 +1,7 @@
 const { test, expect } = require("@playwright/test");
 const { newBook, postVoucher } = require("../helpers");
 
-// 两张凭证：现金收付 + 管理费用，保证各报表都有数
+// 两张凭证：现金收付 + 管理费用；账簿（多栏账/摘要汇总）只统计已记账，故一并记账
 async function seed(page) {
   await postVoucher(page, {
     date: "2026-01-15",
@@ -17,6 +17,11 @@ async function seed(page) {
       { code: "1001", summary: "办公费", credit: "30" },
     ],
   });
+  const list = await (await page.request.get("/api/vouchers?period=202601")).json();
+  const resp = await page.request.post("/api/vouchers/batch-post", {
+    data: { ids: list.map((v) => v.id) },
+  });
+  expect(resp.ok(), "批量记账应成功").toBeTruthy();
 }
 
 test("报表中心：科目余额表→辅助账→数量金额账", async ({ page }) => {

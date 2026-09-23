@@ -27,6 +27,8 @@ test("期初建账：录入→试算平衡→保存", async ({ page }) => {
   await rows.last().locator(".bg-dir").selectOption("credit");
   await rows.last().locator(".bg-yb").fill("1000");
 
+  // 试算卡片只在重绘时更新：再加一行空行触发重绘（空行保存时会被过滤）
+  await page.click("#bg-add");
   await expect(page.getByText("✓ 平衡")).toBeVisible({ timeout: 15_000 });
   await page.click("#bg-save");
   await expect(page.locator("#main table.grid tbody")).toContainText("已有", { timeout: 15_000 });

@@ -487,6 +487,28 @@ mod tests {
         assert_eq!(v.diff(), Money::parse("10").unwrap());
     }
 
+    /// M-15 定案：逐条量化到分（2 位）后严格判平，与落库 `money_param` 口径一致。
+    /// 两侧同值的分位尾差同进同出 → 判平；异值尾差 100.015 / 100.010 → 判不平，
+    /// 不能用"差额再 round2"的容差放过（入库后会真的差 0.01）。
+    #[test]
+    fn balanced_quantizes_per_entry() {
+        // 同值尾差：两侧逐条 round2 后相等 → 判平
+        let mut same = v();
+        same.entries[0].debit = Money::parse("100.015").unwrap();
+        same.entries[1].credit = Money::parse("100.015").unwrap();
+        assert!(same.balanced(), "两侧同值的分位尾差应判平");
+        // 异值尾差：原始差额只有 0.005，但量化后借 100.02 ≠ 贷 100.01 → 判不平
+        let mut diff = v();
+        diff.entries[0].debit = Money::parse("100.015").unwrap();
+        diff.entries[1].credit = Money::parse("100.010").unwrap();
+        assert!(!diff.balanced(), "量化后差 0.01 必须判不平");
+        // 整分级差异一律判不平
+        let mut big = v();
+        big.entries[0].debit = Money::parse("100.01").unwrap();
+        big.entries[1].credit = Money::parse("100.02").unwrap();
+        assert!(!big.balanced());
+    }
+
     #[test]
     fn aux_key_stable() {
         let mut a = AuxRef::default();

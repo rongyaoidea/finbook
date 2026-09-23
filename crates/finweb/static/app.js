@@ -1502,7 +1502,7 @@ async function viewLedger(main) {
       <label>从 <input id="l-from" value="${esc(state.current || "")}" style="width:90px" /></label>
       <label>至 <input id="l-to" value="${esc(state.current || "")}" style="width:90px" /></label>
       <label><input type="checkbox" id="l-children" checked /> 含下级</label>
-      <label><input type="checkbox" id="l-posted" /> 仅已记账</label>
+      <label><input type="checkbox" id="l-posted" checked /> 仅已记账</label>
       <button class="btn sm" id="l-go">查询</button>
       <div class="spacer"></div>
       <button class="btn ghost sm" data-ltab="detail">明细账</button>

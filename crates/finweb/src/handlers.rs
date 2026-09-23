@@ -1337,7 +1337,9 @@ async fn period_precheck(
     let db = state.db_for(&user.book_key)?;
     let issues = periods::precheck(&db, period, true)?;
     let chart = accounts::chart(&db)?;
-    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    // 预检展示与【结转】按钮同口径：结转按含草稿取数（见 period_carry_forward）
+    let snap =
+        BalanceSnapshot::load(&db, &BalanceQuery::period(period).with_posted_only(false))?;
     let pl_rows = snap.profit_loss_rows(&chart);
     let profit = snap
         .for_account(fincore::engine::period_end::PROFIT_ACCOUNT, None)
@@ -1361,7 +1363,12 @@ async fn period_carry_forward(
     let period = period_checked(ymm)?;
     let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
-    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    // 结转是"操作"不是报表：按含未记账（排除作废）取数。结转生成的凭证本身是草稿，
+    // 若按已记账口径取数，草稿看不见 → 第二次调用时损益仍未清零 → 重复结转。
+    // 结账前 checklist 要求全部记账，届时两种口径结果相同（H-3 定案的已记账口径
+    // 用于余额表/报表/账簿，不用于本操作的幂等判定）。
+    let snap =
+        BalanceSnapshot::load(&db, &BalanceQuery::period(period).with_posted_only(false))?;
     let rows = snap.profit_loss_rows(&chart);
     if rows.is_empty() {
         return Err(AppError::bad_request("本期损益类科目没有发生额，无需结转"));
@@ -1403,7 +1410,10 @@ async fn period_year_end(
     let period = period_checked(ymm)?;
     let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
-    let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+    // 同 period_carry_forward：含草稿取数，保证第一次生成的结转草稿能清零 4103，
+    // 第二次调用（余额 0）才会被拒，否则同一笔利润会被结转两次。
+    let snap =
+        BalanceSnapshot::load(&db, &BalanceQuery::period(period).with_posted_only(false))?;
     let profit = snap
         .for_account(fincore::engine::period_end::PROFIT_ACCOUNT, None)
         .end();
@@ -2468,10 +2478,11 @@ fn ledger_query_from(
         .get("include_children")
         .map(|s| s == "1" || s == "true")
         .unwrap_or(true);
+    // H-3 定案：缺省即"仅已记账"，与余额表/报表口径一致
     let posted_only = q
         .get("posted_only")
         .map(|s| s == "1" || s == "true")
-        .unwrap_or(false);
+        .unwrap_or(true);
     let db = state.db_for(&user.book_key)?;
     let chart = accounts::chart(&db)?;
     if !user.user.can_see_account(&code) {

@@ -265,4 +265,31 @@ mod tests {
         assert!(t.is_balanced());
         assert!(t.problems().is_empty());
     }
+
+    /// M-15 定案：试算平衡差额按 round2（分）判定——
+    /// 不足 1 分的尾差视为平衡，满 1 分即不平衡。
+    #[test]
+    fn trial_balance_quantized_tolerance() {
+        let mk = |bd: &str| TrialBalance {
+            begin_debit: Money::parse(bd).unwrap(),
+            begin_credit: Money::parse("1000").unwrap(),
+            period_debit: Money::parse("100").unwrap(),
+            period_credit: Money::parse("100").unwrap(),
+            end_debit: Money::parse("1100").unwrap(),
+            end_credit: Money::parse("1100").unwrap(),
+        };
+        // 差 0.004：round2 后为 0 → 平衡
+        let t = mk("1000.004");
+        assert!(t.begin_balanced(), "不足 1 分的尾差应视为平衡");
+        assert!(t.is_balanced());
+        // 差 0.01：满 1 分 → 不平衡，且 problems 描述包含期初不平衡
+        let t2 = mk("1000.01");
+        assert!(!t2.begin_balanced());
+        assert!(!t2.is_balanced());
+        assert!(
+            t2.problems().iter().any(|s| s.contains("期初不平衡")),
+            "{:?}",
+            t2.problems()
+        );
+    }
 }

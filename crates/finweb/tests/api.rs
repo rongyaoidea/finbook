@@ -2854,6 +2854,93 @@ async fn post_voucher(
     id
 }
 
+/// H-3 定案：试算平衡默认只含已记账——草稿凭证不入账，记账后进入。
+#[tokio::test]
+async fn trial_balance_default_posted_only_h3() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 只保存、不记账（草稿）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-10", "word": "记",
+                "no": 1, "attachments": 0, "memo": "草稿口径",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "草稿", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "草稿", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "草稿凭证应可保存");
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 草稿状态：本期发生额不含它
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/reports/trial-balance?from=202601&to=202601",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tb: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let d = money_num(tb["totals"]["debit"].as_str().unwrap());
+    assert!((d - 0.0).abs() < 0.005, "H-3：草稿不应进试算平衡，本期借方 {d}：{tb}");
+
+    // 记账后进入
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{id}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/reports/trial-balance?from=202601&to=202601",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let tb: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let d = money_num(tb["totals"]["debit"].as_str().unwrap());
+    assert!((d - 100.0).abs() < 0.005, "H-3：记账后应进试算平衡，本期借方 {d}：{tb}");
+}
+
+/// M-15 定案：借贷不平衡的凭证 Web 端必须 400 拒绝，错误信息说明借贷不平衡。
+#[tokio::test]
+async fn unbalanced_voucher_rejected_m15() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-11", "word": "记",
+                "no": 1, "attachments": 0, "memo": "不平衡",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "借", "debit": "0", "credit": "99.99" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "借贷不平衡必须被拒");
+    let body = body_string(resp).await;
+    assert!(body.contains("借贷不平衡"), "{body}");
+}
+
 /// 三大报表勾稽：试算平衡、资产=负债+权益、利润表净利。
 #[tokio::test]
 async fn web_statements_tie() {

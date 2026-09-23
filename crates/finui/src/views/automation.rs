@@ -289,9 +289,10 @@ impl AutomationView {
         self.dep_count = count;
     }
 
-    /// 本期损益净额，和【期末处理】口径一致（正数为净亏损）
+    /// 本期损益净额，和【期末处理】口径一致（正数为净亏损）——含草稿，
+    /// 见 period_end.rs 的口径说明
     fn load_pl(&mut self, ctx: &mut AppCtx<'_>, p: Period) {
-        let q = BalanceQuery::period(p);
+        let q = BalanceQuery::period(p).with_posted_only(false);
         match findb::balances::BalanceSnapshot::load(ctx.db(), &q) {
             Ok(s) => {
                 let rows = s.profit_loss_rows(ctx.chart());

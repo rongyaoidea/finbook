@@ -86,7 +86,12 @@ impl PeriodEndView {
             findb::periods::precheck(ctx.db(), p, self.require_carry).unwrap_or_default();
         self.reconcile = findb::reports::period_reconcile(ctx.db(), p).unwrap_or_default();
 
-        let snap = findb::balances::BalanceSnapshot::load(ctx.db(), &BalanceQuery::period(p));
+        // 含草稿取数：与 Web 结转一致——结转凭证本身是草稿，年末结转靠
+        // "4103 已清零"判重，按已记账口径会重复生成结转凭证（H-3 口径适用于报表）
+        let snap = findb::balances::BalanceSnapshot::load(
+            ctx.db(),
+            &BalanceQuery::period(p).with_posted_only(false),
+        );
         match snap {
             Ok(s) => {
                 let chart = ctx.chart();

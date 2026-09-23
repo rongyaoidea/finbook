@@ -38,7 +38,8 @@ pub struct BalanceQuery {
     pub non_zero_only: bool,
     /// 只显示到第几级科目（None 表示全部级次）
     pub max_level: Option<u8>,
-    /// 只统计已记账凭证（默认含草稿，即"记录即进表"口径）
+    /// 只统计已记账凭证（**H-3 定案：默认 true**——草稿与已审核未记账一律不入余额；
+    /// 显式传 false 时为"含未记账（排除作废）"的临时查看口径）
     pub posted_only: bool,
     /// 只统计某人填制的凭证（数据范围 own_voucher_only）
     pub prepared_by: Option<String>,
@@ -55,7 +56,7 @@ impl BalanceQuery {
             only_leaf: false,
             non_zero_only: false,
             max_level: None,
-            posted_only: false,
+            posted_only: true,
             prepared_by: None,
         }
     }
@@ -78,7 +79,7 @@ impl BalanceQuery {
         self.max_level = lv;
         self
     }
-    /// 只统计已记账凭证（账簿"只含已记账"勾选项）
+    /// 只统计已记账凭证（账簿"只含已记账"勾选项；false = 含未记账、排除作废）
     pub fn with_posted_only(mut self, on: bool) -> Self {
         self.posted_only = on;
         self
@@ -775,13 +776,20 @@ pub fn ledger(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<LedgerRow
     } else {
         crate::escape_like(&q.code)
     };
-    // 记录即进表：无论是否勾选"只含已记账"，账簿都只排除作废凭证
-    let mut sql = String::from(
+    // 行集与期初快照同一口径（H-3 定案）：仅已记账 → 只出已记账行；
+    // 取消勾选 → "含未记账（排除作废）"。此前行集恒为非作废、期初却按
+    // posted_only 算，勾上"只含已记账"后草稿行仍会滚进余额，两边打架。
+    let status_cond = if q.posted_only {
+        "v.status = 'posted'"
+    } else {
+        "v.status != 'void'"
+    };
+    let mut sql = format!(
         "SELECT v.period, v.date, v.id, v.word, v.no, e.line, e.summary, e.account_code,
                 e.aux_json, e.debit, e.credit, e.qty, v.status
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
          WHERE e.period BETWEEN ?1 AND ?2 AND e.account_code LIKE ?3 ESCAPE '\\'
-           AND v.status != 'void'",
+           AND {status_cond}",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
         Box::new(q.from.ymm()),
@@ -879,12 +887,17 @@ pub fn general_ledger(db: &Db, q: &LedgerQuery) -> DbResult<Vec<GeneralLedgerRow
     } else {
         crate::escape_like(&q.code)
     };
-    // 按期间聚合，金额在 Rust 侧累加
+    // 按期间聚合，金额在 Rust 侧累加；行集与期初快照同口径（H-3 定案）
     let mut acc: BTreeMap<i32, (Money, Money)> = BTreeMap::new();
-    let mut sql = String::from(
+    let status_cond = if q.posted_only {
+        "v.status = 'posted'"
+    } else {
+        "v.status != 'void'"
+    };
+    let mut sql = format!(
         "SELECT e.period, e.debit, e.credit, e.aux_json
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+         WHERE {status_cond} AND e.period BETWEEN ?1 AND ?2
            AND e.account_code LIKE ?3 ESCAPE '\\'",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
@@ -1016,7 +1029,7 @@ pub fn multi_column(
     let mut stmt = db.conn().prepare(
         "SELECT e.period, v.date, e.summary, e.account_code, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+         WHERE v.status = 'posted' AND e.period BETWEEN ?1 AND ?2
            AND e.account_code IN (
                SELECT value FROM json_each(?3)
            )
@@ -1081,7 +1094,8 @@ mod tests {
         }
     }
 
-    fn post_voucher(db: &Db, period: Period, day: u32, entries: Vec<(&str, &str, &str)>) -> i64 {
+    /// 保存一张草稿凭证（不记账）——H-3 口径测试需要区分草稿与已记账
+    fn save_draft(db: &Db, period: Period, day: u32, entries: Vec<(&str, &str, &str)>) -> i64 {
         let d = NaiveDate::from_ymd_opt(period.year(), period.month(), day).unwrap();
         let mut v = Voucher::new(period, d, "记", vouchers::next_no(db, period, "记").unwrap());
         v.prepared_by = "张三".to_string();
@@ -1098,9 +1112,124 @@ mod tests {
             fill_required(db, &mut e);
             v.push_entry(e);
         }
-        let id = vouchers::save(db, &mut v).unwrap();
+        vouchers::save(db, &mut v).unwrap()
+    }
+
+    fn post_voucher(db: &Db, period: Period, day: u32, entries: Vec<(&str, &str, &str)>) -> i64 {
+        let id = save_draft(db, period, day, entries);
         vouchers::post(db, id, "王五").unwrap();
         id
+    }
+
+    /// H-3 定案：余额默认只统计已记账；显式 posted_only=false 才按
+    /// "含未记账（排除作废）"；作废凭证在两种口径下都不入余额。
+    #[test]
+    fn balance_scope_h3_default_posted_only() {
+        let db = mem();
+        let p1 = Period::new(2026, 1).unwrap();
+        // 草稿 1000（不记账）
+        let draft_id = save_draft(
+            &db,
+            p1,
+            5,
+            vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
+        );
+        // 已记账 500
+        post_voucher(
+            &db,
+            p1,
+            10,
+            vec![("1001", "借", "500"), ("2001", "贷", "500")],
+        );
+        // 作废只能针对未记账凭证（已记账须先反记账），故用草稿演示作废
+        let void_id = save_draft(
+            &db,
+            p1,
+            15,
+            vec![("1001", "借", "300"), ("100201", "贷", "300")],
+        );
+        vouchers::set_void(&db, void_id, true, "王五").unwrap();
+
+        // 默认口径：只有已记账的 500
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p1)).unwrap();
+        assert_eq!(
+            snap.for_account("1001", None).debit,
+            Money::parse("500").unwrap(),
+            "H-3 默认口径应只含已记账，草稿与作废都不入余额"
+        );
+        // 显式含未记账：草稿进（1500），作废仍排除
+        let snap2 =
+            BalanceSnapshot::load(&db, &BalanceQuery::period(p1).with_posted_only(false)).unwrap();
+        assert_eq!(
+            snap2.for_account("1001", None).debit,
+            Money::parse("1500").unwrap(),
+            "含未记账口径应含草稿、排除作废"
+        );
+        // 草稿记账后进入默认口径
+        vouchers::post(&db, draft_id, "王五").unwrap();
+        let snap3 = BalanceSnapshot::load(&db, &BalanceQuery::period(p1)).unwrap();
+        assert_eq!(
+            snap3.for_account("1001", None).debit,
+            Money::parse("1500").unwrap(),
+            "草稿记账后应进入默认余额"
+        );
+    }
+
+    /// H-3：账簿行集与期初/余额快照必须同口径——勾"仅已记账"不出草稿行，
+    /// 滚动余额末行 = 快照期末。此前行集恒含非作废、期初却按 posted 算，
+    /// 勾选后草稿行会把滚动余额滚出快照之外（口径打架的回归防护）。
+    #[test]
+    fn ledger_rows_follow_posted_flag() {
+        let db = mem();
+        let p1 = Period::new(2026, 1).unwrap();
+        save_draft(
+            &db,
+            p1,
+            5,
+            vec![("1001", "借", "1000"), ("100201", "贷", "1000")],
+        );
+        post_voucher(&db, p1, 10, vec![("1001", "借", "500"), ("2001", "贷", "500")]);
+        let chart = crate::accounts::chart(&db).unwrap();
+        let mk = |posted: bool| LedgerQuery {
+            code: "1001".into(),
+            include_children: false,
+            aux: None,
+            from: p1,
+            to: p1,
+            posted_only: posted,
+            prepared_by: None,
+            code_from: None,
+            code_to: None,
+        };
+
+        // 仅已记账：只出行账，滚动余额与默认快照期末一致
+        let rows = ledger(&db, &chart, &mk(true)).unwrap();
+        assert_eq!(rows.len(), 1, "仅已记账口径不应出现草稿行");
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(p1)).unwrap();
+        assert_eq!(
+            rows.last().unwrap().signed_balance,
+            Money::parse("500").unwrap()
+        );
+        assert_eq!(
+            rows.last().unwrap().signed_balance,
+            snap.for_account("1001", None).end(),
+            "滚动余额末行必须等于快照期末"
+        );
+
+        // 含未记账：两行都在，滚动余额与 posted_only=false 快照一致
+        let rows2 = ledger(&db, &chart, &mk(false)).unwrap();
+        assert_eq!(rows2.len(), 2, "含未记账口径应出现草稿行");
+        let snap2 =
+            BalanceSnapshot::load(&db, &BalanceQuery::period(p1).with_posted_only(false)).unwrap();
+        assert_eq!(
+            rows2.last().unwrap().signed_balance,
+            Money::parse("1500").unwrap()
+        );
+        assert_eq!(
+            rows2.last().unwrap().signed_balance,
+            snap2.for_account("1001", None).end(),
+            "含未记账口径下行集与快照也必须一致"
+        );
     }
 
     #[test]

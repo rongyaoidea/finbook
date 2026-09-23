@@ -86,4 +86,6 @@
 ## 六、CI 保障
 
 - `.github/workflows/ci.yml` 已含 **cargo-audit** 任务（读 Cargo.lock，发现未修复 RUSTSEC 漏洞公告即失败）。
+- 仓库 `.cargo/audit.toml` 记录 3 条**有据可依的忽略项**（lopdf 仅写不读、quick-xml 0.30 被 accesskit/zbus 上游锁死），并注明解除条件；其余公告一律拦截。
+- 2026-09 依赖加固：rust_decimal 1.42→1.43（rkyv 0.7 可选边移出锁，RUSTSEC-2026-0235 消除）；calamine 0.26→0.36（quick-xml 0.31 移除，xlsx 导入攻击面修复，RUSTSEC-2026-0194/0195 可达实例消除）。
 - 本地验证：fincore 99 / findb 172+21+7 / finweb 54 全部通过（2026-09）。

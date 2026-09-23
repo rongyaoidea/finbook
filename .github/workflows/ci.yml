@@ -48,6 +48,19 @@ jobs:
       - name: clippy（全 workspace）
         run: cargo clippy --workspace --all-targets
 
+  # ── 依赖漏洞扫描（cargo-audit 读 Cargo.lock，不编译，秒级） ───────────
+  audit:
+    name: Security audit (cargo-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      # 默认即"发现未修复的 RUSTSEC 漏洞公告 → 失败"；yanked/警告不拦
+      - name: cargo audit
+        run: cargo audit
+
   # ── Docker 镜像烟雾测试（防止预取层空占位产物被打进镜像） ────────────
   docker:
     name: Docker image smoke test

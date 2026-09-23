@@ -18,6 +18,8 @@ fn m(s: &str) -> Money {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Quotation {
+    /// 0 = 新增（客户端可省略）
+    #[serde(default)]
     pub id: i64,
     /// 单号：可由服务端按期间自动生成，允许客户端省略
     #[serde(default)]

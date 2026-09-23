@@ -62,6 +62,9 @@ test("自定义报表：建表保存→按期间生成取数", async ({ page }) 
       { code: "2001", summary: "报表取数", credit: "100" },
     ],
   });
+  // H-3：自定义报表 QM/LFS 按已记账取数，先记账
+  const list = await (await page.request.get("/api/vouchers?period=202601")).json();
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`)).status()).toBe(200);
 
   await page.click('.nav-item[data-view="custom-reports"]');
   await page.click("#cr-new");

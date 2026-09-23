@@ -180,7 +180,7 @@ pub fn cash_flow_amounts(
     let mut sql = format!(
         "SELECT e.cf_item, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+         WHERE v.status = 'posted' AND e.period BETWEEN ?1 AND ?2
            AND e.account_code IN ({placeholders})"
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
@@ -397,18 +397,25 @@ pub fn account_daily_report(
     from: fincore::Period,
     to: fincore::Period,
     scope: Option<&fincore::user::User>,
+    posted_only: bool,
 ) -> DbResult<Vec<DailyRow>> {
-    let mut bq = BalanceQuery::range(from, to);
+    // 期初快照与逐日行集必须同口径（H-3）：都按 posted_only 过滤
+    let mut bq = BalanceQuery::range(from, to).with_posted_only(posted_only);
     if let Some(u) = scope {
         bq = bq.with_user_scope(u);
     }
     let snap = BalanceSnapshot::load(db, &bq)?;
     let begin = snap.for_account(code, None).begin;
     let pattern = format!("{}%", crate::escape_like(code));
-    let mut sql = String::from(
+    let status_cond = if posted_only {
+        "v.status = 'posted'"
+    } else {
+        "v.status != 'void'"
+    };
+    let mut sql = format!(
         "SELECT v.date, e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON e.voucher_id=v.id
-         WHERE v.status != 'void' AND e.period BETWEEN ?1 AND ?2
+         WHERE {status_cond} AND e.period BETWEEN ?1 AND ?2
            AND e.account_code LIKE ?3 ESCAPE '\\'",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -800,7 +807,7 @@ mod tests {
         let p = Period::new(2026, 1).unwrap();
         cash_voucher(&db, p, 5, vec![("1001", "借", "1000", Some("0101")), ("600101", "贷", "1000", None)]);
         cash_voucher(&db, p, 9, vec![("1001", "借", "500", Some("0103")), ("6301", "贷", "500", None)]);
-        let rows = account_daily_report(&db, "1001", p, p, None).unwrap();
+        let rows = account_daily_report(&db, "1001", p, p, None, true).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].balance, Money::parse("1000").unwrap());
         assert_eq!(rows[1].balance, Money::parse("1500").unwrap());

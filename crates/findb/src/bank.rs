@@ -185,7 +185,7 @@ pub fn book_side(c: &impl crate::AsConn, period: Period, account: &str) -> DbRes
         "SELECT e.id, v.id, v.date, v.word, v.no, e.summary,
                 COALESCE(e.settle_no,''), e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON v.id = e.voucher_id
-         WHERE e.account_code = ?1 AND v.period = ?2 AND v.status != 'void'
+         WHERE e.account_code = ?1 AND v.period = ?2 AND v.status = 'posted'
            AND (e.debit <> '0' OR e.credit <> '0')
          ORDER BY v.date, v.no, e.line",
     )?;

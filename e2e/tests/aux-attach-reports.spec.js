@@ -47,6 +47,10 @@ test("辅助/数量凭证、附件上传与数量金额账", async ({ page }) =>
   await expect(page.locator("#v-attach")).toContainText("receipt.txt", { timeout: 10_000 });
   await page.click("#v-close");
 
+  // H-3：数量金额账只统计已记账，先记账再查报表
+  const list = await (await page.request.get("/api/vouchers?period=202601")).json();
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`)).status()).toBe(200);
+
   // 数量金额账能出数
   await page.click('.nav-item[data-view="reports"]');
   await page.click("#r-qty");

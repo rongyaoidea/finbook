@@ -3327,7 +3327,13 @@ async fn get_account_daily(
     if !user.user.can_see_account(&code) {
         return Err(AppError::forbidden("无权查看该科目"));
     }
-    let rows = findb::reports::account_daily_report(&db, &code, from, to, Some(&user.user))?;
+    // H-3：科目日报默认只统计已记账，与账簿「只含已记账」开关同参
+    let posted_only = q
+        .get("posted_only")
+        .map(|s| s == "1" || s == "true")
+        .unwrap_or(true);
+    let rows =
+        findb::reports::account_daily_report(&db, &code, from, to, Some(&user.user), posted_only)?;
     Ok(Json(serde_json::json!({ "code": code, "rows": rows })))
 }
 

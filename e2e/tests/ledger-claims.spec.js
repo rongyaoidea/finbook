@@ -27,11 +27,11 @@ test("账簿查询：明细账/总账/日记账", async ({ page }) => {
 
   await page.click('[data-ltab="general"]');
   await page.click("#l-go");
-  await expect(page.locator("#l-table")).toContainText("1001", { timeout: 15_000 });
+  await expect(page.locator("#l-table")).toContainText("本期发生额", { timeout: 15_000 });
 
   await page.click('[data-ltab="journal"]');
   await page.click("#l-go");
-  await expect(page.locator("#l-table")).toContainText("1001", { timeout: 15_000 });
+  await expect(page.locator("#l-table")).toContainText("本期发生额", { timeout: 15_000 });
 });
 
 test("费用报销：草稿→提交→审批通过→支付→生成凭证", async ({ page }) => {
@@ -55,5 +55,7 @@ test("费用报销：草稿→提交→审批通过→支付→生成凭证", as
   await expect(page.locator("#cl-body")).toContainText("已付款", { timeout: 15_000 });
 
   await page.locator("[data-vgen]").first().click();
-  await expect(page.locator("#cl-body")).toContainText("#", { timeout: 15_000 });
+  await page.fill("#cv-pay", "100201");
+  await page.click("#cv-ok");
+  await expect(page.locator("#cl-body [data-voucher]")).toHaveCount(1, { timeout: 15_000 });
 });

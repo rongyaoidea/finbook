@@ -19,6 +19,19 @@ test("资金管理：票据新增→贴现→资金预测", async ({ page }) => 
 
   await page.click("#ft-forecast");
   await expect(page.locator("#funds-body")).toContainText("预计资金头寸", { timeout: 15_000 });
+
+  // 融资：新增借款 → 结清
+  await page.click("#ft-loan");
+  await page.click("#loan-new");
+  await page.fill("#l-no", "LN001");
+  await page.fill("#l-bank", "工商银行");
+  await page.fill("#l-pr", "100000");
+  await page.fill("#l-rate", "4.5");
+  await page.click("#l-save");
+  await expect(page.locator("#loan-list")).toContainText("LN001", { timeout: 15_000 });
+  await page.locator("[data-loan-settle]").first().click();
+  await page.click("#cf-ok");
+  await expect(page.locator("#loan-list")).toContainText("已结清", { timeout: 15_000 });
 });
 
 test("预算版本：新建版本→设为当前", async ({ page }) => {

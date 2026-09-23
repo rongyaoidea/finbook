@@ -471,6 +471,12 @@ const VIEWS = {
   "claims": viewClaims,
 };
 
+/// 异步回调里的整页重绘守卫：请求返回时用户可能已切到别的视图，
+/// 直接用旧视图覆盖会打断当前界面（表现为新视图一直停在"加载中…"）。
+function rerenderView(id, main) {
+  if (state.view === id) VIEWS[id](main);
+}
+
 let shellBuilt = false;
 
 // 骨架只渲染一次；切换视图只更新 .main，不再重建 topbar/sidebar
@@ -1294,16 +1300,16 @@ function renderInvoices(main, d) {
         if (inv) openInvoiceEditor(main, inv);
       } else if (act === "verify") {
         const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "verified" }) });
-        if (up) { toast("已认证", "ok"); renderInvoices(main, await loadInvoices()); }
+        if (up) { toast("已认证", "ok"); if (state.view === "invoices") renderInvoices(main, await loadInvoices()); }
       } else if (act === "reject") {
         if (!(await confirmDialog("确定作废该发票？", true))) return;
         const up = await api(`/invoices/${id}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "rejected" }) });
-        if (up) { toast("已作废", "ok"); renderInvoices(main, await loadInvoices()); }
+        if (up) { toast("已作废", "ok"); if (state.view === "invoices") renderInvoices(main, await loadInvoices()); }
       } else if (act === "del") {
         if (!(await confirmDialog("确定删除该发票？", true))) return;
         await api(`/invoices/${id}`, { method: "DELETE" });
         toast("已删除", "ok");
-        renderInvoices(main, await loadInvoices());
+        if (state.view === "invoices") renderInvoices(main, await loadInvoices());
       }
     } catch (e) { toast(e.message, "err"); }
   }));
@@ -1362,7 +1368,7 @@ function openInvoiceEditor(main, inv) {
         toast("已新增", "ok");
       }
       closeModal();
-      renderInvoices(main, await loadInvoices());
+      if (state.view === "invoices") renderInvoices(main, await loadInvoices());
     } catch (e) { toast(e.message, "err"); }
   });
 }
@@ -3874,7 +3880,7 @@ async function openCostConfig(item) {
     if (!it) { toast("存货编码必填", "err"); return; }
     try {
       await api("/cost/configs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ item: it, method: $("#c-method", mask).value, standard_cost: $("#c-std", mask).value.trim() || "0" }) });
-      toast("已保存", "ok"); closeModal(); viewCost($("#main"));
+      toast("已保存", "ok"); closeModal(); rerenderView("cost", $("#main"));
     } catch (e) { toast(e.message, "err"); }
   };
 }
@@ -4165,7 +4171,7 @@ function renderAux(main, rows, kind) {
       if (e) openAuxEditor(main, e, kind);
     } else {
       if (!(await confirmDialog("确定删除该档案？", true))) return;
-      try { await api(`/aux/${id}`, { method: "DELETE" }); toast("已删除", "ok"); viewAux(main); }
+      try { await api(`/aux/${id}`, { method: "DELETE" }); toast("已删除", "ok"); rerenderView("aux", main); }
       catch (e2) { toast(e2.message, "err"); }
     }
   }));
@@ -4202,7 +4208,7 @@ function openAuxEditor(main, ent, kind) {
     try {
       if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       else await api("/aux", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      toast("已保存", "ok"); closeModal(); viewAux(main);
+      toast("已保存", "ok"); closeModal(); rerenderView("aux", main);
     } catch (err) { toast(err.message, "err"); }
   });
 }
@@ -4345,7 +4351,7 @@ async function viewTemplates(main) {
   const tab = state.tplTab || "list";
   $("#tpl-tab-list").onclick = () => { state.tplTab = "list"; viewTemplates(main); };
   $("#tpl-tab-due").onclick = () => { state.tplTab = "due"; viewTemplates(main); };
-  const refresh = () => viewTemplates(main);
+  const refresh = () => rerenderView("templates", main);
 
   if (tab === "list") {
     let rows;
@@ -4607,7 +4613,7 @@ async function viewPayroll(main) {
     }));
     $all("[data-del]", body).forEach((b) => b.addEventListener("click", async () => {
       if (!(await confirmDialog("确定删除该工资行？", true))) return;
-      try { await api(`/payroll/${b.dataset.del}`, { method: "DELETE" }); toast("已删除", "ok"); viewPayroll(main); }
+      try { await api(`/payroll/${b.dataset.del}`, { method: "DELETE" }); toast("已删除", "ok"); rerenderView("payroll", main); }
       catch (e) { toast(e.message, "err"); }
     }));
   } else if (tab === "tax") {
@@ -4734,7 +4740,7 @@ function openPayrollEditor(main, row, period, employees) {
     try {
       const out = await api(`/payroll?period=${ymm(period)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       toast(`已保存：个税 ${fmt(out.tax)}，实发 ${fmt(out.net)}`, "ok");
-      closeModal(); viewPayroll(main);
+      closeModal(); rerenderView("payroll", main);
     } catch (e) { toast(e.message, "err"); }
   });
 }
@@ -4818,7 +4824,7 @@ async function viewClaims(main) {
       </table>
     </div>
     ${rows.length ? `<div class="muted" style="margin-top:10px">本期报销金额合计 <b>${fmt(total.toFixed(2))}</b></div>` : ""}`;
-  const reload = () => viewClaims(main);
+  const reload = () => rerenderView("claims", main);
   $all("[data-view]", body).forEach((a) => a.addEventListener("click", (e) => {
     e.preventDefault();
     const r = rows.find((x) => x.id === parseInt(a.dataset.view, 10));
@@ -4940,9 +4946,9 @@ function openClaimEditor(main, claim, period) {
       else {
         const out = await api("/claims", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
         toast(`已创建草稿 ${out.no}`, "ok");
-        closeModal(); viewClaims(main); return;
+        closeModal(); rerenderView("claims", main); return;
       }
-      toast("已保存", "ok"); closeModal(); viewClaims(main);
+      toast("已保存", "ok"); closeModal(); rerenderView("claims", main);
     } catch (e) { toast(e.message, "err"); }
   });
 }

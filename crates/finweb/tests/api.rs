@@ -3474,6 +3474,9 @@ async fn web_write_endpoints_smoke() {
         ("/api/inventory/unit", serde_json::json!({ "item": "RM02", "base_unit": "个", "alt_unit": "箱", "factor": "6" })),
         ("/api/funds/bills", serde_json::json!({ "kind": "payable", "no": "B002", "period": 202601, "issue_date": "2026-01-05", "due_date": "2026-03-05", "counterpart": "供应商", "bank": "工行", "amount": "500", "memo": "" })),
         ("/api/cost/configs", serde_json::json!({ "item": "140502", "method": "moving_average", "standard_cost": "0" })),
+        // 单号可省略（服务端自动生成）：UI 就是这么发的，缺 no 不能 422
+        ("/api/procure/req", serde_json::json!({ "period": 202601, "date": "2026-01-10", "item_code": "140301", "item_name": "原料", "qty": "3", "status": "draft", "requester": "admin", "memo": "" })),
+        ("/api/sales/quote", serde_json::json!({ "id": 0, "period": 202601, "date": "2026-01-10", "customer_code": "C01", "customer_name": "客户", "item_code": "140501", "item_name": "成品", "qty": "1", "unit_price": "10", "status": "draft", "prepared_by": "", "memo": "" })),
     ] {
         let (st, text) = post(uri, body).await;
         assert_eq!(st, StatusCode::OK, "{uri} 应成功：{text}");

@@ -675,15 +675,15 @@ function barChartSvg(labels, groups, height) {
     grid += `<line x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="var(--z-200)" stroke-width="1"/>`;
     yticks += `<text x="${padL - 8}" y="${gy + 4}" text-anchor="end" class="ctick">${moneyFmt(v)}</text>`;
   }
+  const g = groups.length;
+  const slot = iw / n;
+  const bw = Math.min(18, (slot * 0.7) / g);
   let xlabels = "";
   const step = Math.ceil(n / 12);
   for (let i = 0; i < n; i += step) {
     xlabels += `<text x="${barX(i)}" y="${H - 8}" text-anchor="middle" class="ctick">${esc(labels[i])}</text>`;
   }
 
-  const g = groups.length;
-  const slot = iw / n;
-  const bw = Math.min(18, (slot * 0.7) / g);
   let bars = "";
   groups.forEach((grp, gi) => {
     grp.values.forEach((v, i) => {
@@ -2528,6 +2528,14 @@ function prevPeriod(p) {
   const [y, m] = String(p).split("-").map(Number);
   const pm = m - 1 < 1 ? 12 : m - 1, py = m - 1 < 1 ? y - 1 : y;
   return `${py}-${String(pm).padStart(2, "0")}`;
+}
+
+// 某期间的末日（YYYY-MM-DD）：新建业务单据时默认日期用当前浏览期间，
+// 用 today() 会在跨期浏览时与所属期间不一致，生成凭证被引擎拒绝。
+function periodLastDay(p) {
+  const [y, m] = String(p).split("-").map(Number);
+  const last = new Date(y, m, 0).getDate();
+  return `${y}-${String(m).padStart(2, "0")}-${String(last).padStart(2, "0")}`;
 }
 
 // ===========================================================================
@@ -4888,7 +4896,7 @@ function showClaimDetail(c) {
 function openClaimEditor(main, claim, period) {
   const isEdit = !!claim;
   const c = claim ? JSON.parse(JSON.stringify(claim)) : {
-    biz_date: today(), applicant: "", dept: "", reason: "", amount: "",
+    biz_date: periodLastDay(period), applicant: "", dept: "", reason: "", amount: "",
     items: [{ expense_account: "", amount: "", memo: "" }],
   };
   const mask = modal(`

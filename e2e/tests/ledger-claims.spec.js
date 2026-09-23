@@ -31,7 +31,7 @@ test("账簿查询：明细账/总账/日记账", async ({ page }) => {
 
   await page.click('[data-ltab="journal"]');
   await page.click("#l-go");
-  await expect(page.locator("#l-table")).toContainText("本期发生额", { timeout: 15_000 });
+  await expect(page.locator("#l-table")).toContainText("账簿取数", { timeout: 15_000 });
 });
 
 test("费用报销：草稿→提交→审批通过→支付→生成凭证", async ({ page }) => {

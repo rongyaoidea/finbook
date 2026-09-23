@@ -1429,7 +1429,8 @@ async fn claim_lifecycle_to_voucher() {
             serde_json::json!({
                 "period": 202601, "biz_date": "2026-01-15", "applicant": "张三",
                 "dept": "销售部", "reason": "差旅费", "amount": "500",
-                "items": [ { "expense_account": "660201", "amount": "500", "memo": "机票" } ]
+                // 明细备注留空：生成凭证时应回退用事由做摘要，不能因摘要为空被拒
+                "items": [ { "expense_account": "660201", "amount": "500", "memo": "" } ]
             }),
         ))
         .await

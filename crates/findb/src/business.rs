@@ -1429,6 +1429,13 @@ pub fn claim_voucher(
     v.memo = format!("报销 {}", c.no);
     let mut i = 1;
     for it in &c.items {
+        // 明细备注为空时用事由兜底：凭证引擎要求摘要必填，
+        // 报销单的"备注"在界面上是可选项，直接用它会导致生成凭证被拒。
+        let summary = if it.memo.trim().is_empty() {
+            if c.reason.trim().is_empty() { "报销" } else { c.reason.trim() }
+        } else {
+            it.memo.trim()
+        };
         v.push_entry(Entry {
             debit: it.amount,
             aux: AuxRef {
@@ -1436,7 +1443,7 @@ pub fn claim_voucher(
                 employee: Some(c.applicant.clone()),
                 ..Default::default()
             },
-            ..Entry::new(i, &it.expense_account, &it.memo)
+            ..Entry::new(i, &it.expense_account, summary)
         });
         i += 1;
     }

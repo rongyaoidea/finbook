@@ -394,8 +394,10 @@ pub struct User {
 
 impl User {
     pub fn new(username: &str, display_name: &str, role: Role) -> Self {
-        // 非管理员默认只可见本人凭证（防御性默认），管理员保持全量权限
-        let own_voucher_only = role != Role::Admin;
+        // 多岗位协作（订单/仓管/会计/出纳同账套）默认放开：只看本人会让各会计
+        // 互相看不见对方分录、余额与试算口径碎裂。需要收紧时由管理员在「用户
+        // 编辑 → 数据范围」按账号勾选 own_voucher_only（过滤机制保留）。
+        let own_voucher_only = false;
         Self {
             id: 0,
             username: username.to_string(),
@@ -766,13 +768,13 @@ mod tests {
 
     #[test]
     fn normal_user_default_own_voucher_only() {
-        // 普通账户默认只能看自己填制的凭证；管理员不受限
+        // 多岗位协作：默认放开（可见全账套凭证与一致的余额口径）；
+        // 过滤机制保留，管理员可按账号在数据范围里勾选收紧。
         let mut acc = User::new("acc1", "会计一", Role::Accountant);
-        // 模拟 finweb/finui 建号时的默认范围设置
-        if !acc.is_admin() {
-            acc.data_scope.own_voucher_only = true;
-        }
+        assert!(!acc.data_scope.own_voucher_only, "非管理员默认应放开");
+        acc.data_scope.own_voucher_only = true; // 按账号收紧仍然生效
         assert!(acc.data_scope.own_voucher_only);
+        assert!(!acc.data_scope.is_unrestricted());
 
         let admin = User::new("admin", "管理员", Role::Admin);
         assert!(!admin.data_scope.own_voucher_only);

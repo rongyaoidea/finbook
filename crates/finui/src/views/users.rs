@@ -400,10 +400,7 @@ impl UsersView {
                 u.set_password(&pwd);
                 // 管理员开的号应强制首次登录改密（与 Web 一致）
                 u.must_change_pwd = true;
-                // 普通账户默认只能看自己填制的凭证；管理员可看全部
-                if !u.is_admin() {
-                    u.data_scope.own_voucher_only = true;
-                }
+                // 凭证可见性默认放开（多岗位协作）；按账号收紧在数据范围勾选
                 match findb::users::insert(ctx.db(), &u) {
                     Ok(_) => {
                         ctx.log("用户", "新增用户", &u.username);

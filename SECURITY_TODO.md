@@ -14,7 +14,7 @@
 | HIGH-2 | voucher_unaudit 权限校验 | `crates/finweb/src/handlers.rs:1853` `require(Perm::VoucherUnaudit)` |
 | HIGH-3 | 凭证删除守卫 | `crates/finweb/src/handlers.rs:1999-2002` 已记账 400；`:1995` 已审核拦截；`:2005` 结账期间拦截 |
 | HIGH-4 | prepared_by 统一 username | `crates/finweb/src/handlers.rs:1730`；桌面 `crates/finui/src/views/voucher_edit.rs:484` |
-| HIGH-5 | DataScope 默认收紧 | `crates/fincore/src/user.rs:336` `own_voucher_only = role != Admin`；建号 `handlers.rs:901-903` 强制置 true |
+| HIGH-5 | DataScope 默认收紧 | ⚠️ 策略调整（多岗位协作，2026-09）：默认已改回**放开**——只看本人会让各会计互相看不见分录、余额/试算口径碎裂；过滤机制保留，管理员在「用户编辑 → 数据范围」按账号勾选「仅看本人填制的凭证」收紧（原收紧方案见 SECURITY_FIX_SUMMARY） |
 | HIGH-6 | must_change_pwd 服务端拦截 | `crates/finweb/src/state.rs:443-450`、`state.rs:575-582` 白名单外一律 401 |
 | HIGH-7 | Cookie Secure 标志 | `crates/finweb/src/state.rs:717-728`（HttpOnly; SameSite=Lax，`FINWEB_SECURE_COOKIE=true` 时追加 Secure） |
 

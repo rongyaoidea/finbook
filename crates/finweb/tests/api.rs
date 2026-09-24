@@ -5612,6 +5612,117 @@ async fn fin_report_vs_business_report() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员应能看资产负债表");
 }
 
+/// 凭证可见性默认放开（多岗位协作）：非管理员默认见全账套；按 data_scope 可按账号收紧。
+#[tokio::test]
+async fn own_voucher_scope_default_open() {
+    let (state, _bd, _dir) = test_state();
+    let boss = boss_in_b1(&state).await;
+
+    // boss 先录一张
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &boss,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05", "word": "记",
+                "no": 91, "attachments": 0, "memo": "老板录的",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "收", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "注", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "boss 录凭证");
+
+    // 邀请会计 acct1 并进账套
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss,
+            serde_json::json!({ "username": "acct1", "display_name": "会计甲", "password": "Test12345" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss,
+            serde_json::json!({ "username": "acct1", "display_name": "会计甲", "password": "", "role": "accountant", "must_change_pwd": false }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "邀请会计");
+    let (st, sid1) = login(&state, "acct1", "Test12345").await;
+    assert_eq!(st, StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sid1,
+            serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(select_book(&state, &sid1, "b1").await, StatusCode::OK);
+
+    // 会计自己再录一张
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid1,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-06", "word": "记",
+                "no": 92, "attachments": 0, "memo": "会计录的",
+                "entries": [
+                    { "line": 1, "account_code": "660201", "summary": "费", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "1001", "summary": "付", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "会计录凭证");
+
+    // 默认放开：会计能看到全账套2张（含老板录的）
+    async fn count_vouchers(state: &Arc<WebState>, sid: &str) -> usize {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get("/api/vouchers?from=202601&to=202601", sid))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let empty = Vec::<serde_json::Value>::new();
+        let arr = v["rows"]
+            .as_array()
+            .or_else(|| v.as_array())
+            .unwrap_or(&empty);
+        arr.len()
+    }
+    let n = count_vouchers(&state, &sid1).await;
+    assert!(n >= 2, "默认放开：会计应能看到全账套凭证（含他人录入），实际 {n}");
+
+    // 管理员按账号收紧 → 只剩自己的1张
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/acct1",
+            &boss,
+            serde_json::json!({
+                "data_scope": {
+                    "depts": [], "account_from": "", "account_to": "",
+                    "own_voucher_only": true, "own_doc_only": false
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "按账号收紧应成功");
+    let n2 = count_vouchers(&state, &sid1).await;
+    assert!(n2 == 1, "收紧后应只剩本人1张，实际 {n2}");
+}
+
 /// 打印/导出端点冒烟（均返回 200 且内容类型正确）。
 #[tokio::test]
 async fn web_print_and_pdf_endpoints() {

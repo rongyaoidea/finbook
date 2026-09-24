@@ -987,11 +987,8 @@ async fn create_user(
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     u.must_change_pwd = req.must_change_pwd;
     u.memo = req.memo;
-    // 普通账户默认只能看自己填制的凭证（防越权翻看他人/全盘数据）；
-    // 管理员不受此限制，可看到所有账套数据
-    if !u.is_admin() {
-        u.data_scope.own_voucher_only = true;
-    }
+    // 凭证可见性默认放开（多岗位协作）：需要收紧的账号由管理员在「用户编辑 →
+    // 数据范围」逐账号勾选「仅看本人填制的凭证」（过滤机制见 DataScope）
     // 角色基础上的逐项覆盖（管理员角色忽略，避免把自己锁在门外）
     if !u.is_admin() {
         u.extra_perms = req.extra_perms;
@@ -3591,7 +3588,7 @@ async fn list_custom_reports(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let rows: Vec<serde_json::Value> = findb::mgmt::custom_list(&db)?
         .iter()
@@ -3606,7 +3603,7 @@ async fn get_custom_report(
     Path(key): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let r = findb::mgmt::custom_get(&db, &key)?
         .ok_or_else(|| AppError::not_found("自定义报表不存在"))?;

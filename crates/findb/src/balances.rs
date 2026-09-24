@@ -1550,8 +1550,9 @@ mod tests {
             )
             .unwrap();
 
-        // 非管理员默认 own_voucher_only：快照只应统计本人填制的凭证
-        let u = User::new("张三", "张三", Role::Accountant);
+        // 仅本人过滤（机制保留；默认已放开为多岗位协作，这里显式开启来验证过滤本身）
+        let mut u = User::new("张三", "张三", Role::Accountant);
+        u.data_scope.own_voucher_only = true;
         let bq = BalanceQuery::period(p).with_user_scope(&u);
         let snap = BalanceSnapshot::load(&db, &bq).unwrap();
         let chart = crate::accounts::chart(&db).unwrap();

@@ -3930,8 +3930,15 @@ async fn add_estimate(
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
-    let id = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money_checked(&req.est_amount)?)?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    // 登记暂估即同事务生成暂估凭证（借 存货 / 贷 应付-订单供应商）
+    let (est_id, vid) = findb::scm2::po_estimate_add(&db, req.po_id, period, &req.item, parse_money_checked(&req.est_amount)?, user.username())?;
+    db.log(
+        user.username(),
+        "采购",
+        "登记暂估",
+        &format!("PO#{} {} {} 凭证 #{vid}", req.po_id, req.item, req.est_amount),
+    )?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": est_id, "voucher_id": vid })))
 }
 
 async fn list_estimates(
@@ -3956,11 +3963,33 @@ async fn settle_estimate(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
     Path(id): Path<i64>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::AccountEdit)?;
     let db = state.db_for(&user.book_key)?;
-    findb::scm2::po_estimate_settle(&db, id)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    let today = chrono::Local::now().date_naive();
+    let date = if body.is_empty() {
+        today
+    } else {
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        match v.get("date").and_then(|d| d.as_str()) {
+            Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+            None => today,
+        }
+    };
+    // 冲回同事务生成反向凭证（借 应付 / 贷 存货）
+    let vid = findb::scm2::po_estimate_settle(&db, id, date, user.username())?;
+    db.log(
+        user.username(),
+        "采购",
+        "暂估冲回",
+        &format!(
+            "#{id}{}",
+            vid.map(|v| format!("，冲回凭证 #{v}")).unwrap_or_default()
+        ),
+    )?;
+    Ok(Json(serde_json::json!({ "ok": true, "voucher_id": vid })))
 }
 
 async fn get_po_reconcile(

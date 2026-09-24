@@ -695,6 +695,8 @@ pub struct BizAccounts {
     pub income: String,
     /// 销项税额
     pub tax_sales: String,
+    /// 暂估借方（材料/库存商品）默认科目：存货编码不在科目表时的回退
+    pub material: String,
     /// 默认资金账户（银行/现金）
     pub fund: String,
 }
@@ -706,6 +708,7 @@ impl Default for BizAccounts {
             ap: "220201".to_string(),
             income: "600101".to_string(),
             tax_sales: "22210102".to_string(),
+            material: "140301".to_string(),
             fund: "100201".to_string(),
         }
     }

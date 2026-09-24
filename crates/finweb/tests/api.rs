@@ -3181,6 +3181,85 @@ async fn receipt_doc_api_flow() {
     assert_eq!(resp.status(), StatusCode::OK, "凭证删除后单据可删");
 }
 
+/// 采购暂估自动出凭证：登记（借存货/贷应付-供应商）+ 冲回反向 + 幂等。
+#[tokio::test]
+async fn estimate_auto_voucher() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建采购订单（S01，140301 30×9）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "30", "unit_price": "9", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let pid = r["id"].as_i64().unwrap();
+
+    // 登记暂估 800 → 借140301 / 贷220201(S01)
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/estimate",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "item": "140301", "est_amount": "800" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "登记暂估应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let est_id = r["id"].as_i64().unwrap();
+    let vid = r["voucher_id"].as_i64().expect("登记暂估应生成凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["entries"][0]["account_code"], "140301");
+    assert_eq!(money_num(v["entries"][0]["debit"].as_str().unwrap()), 800.0);
+    assert_eq!(v["entries"][1]["account_code"], "220201");
+    assert_eq!(v["entries"][1]["aux"]["supplier"], "S01");
+
+    // 冲回 → 反向凭证；幂等
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/estimate/{est_id}/settle"),
+            &sid,
+            serde_json::json!({ "date": "2026-01-20" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "冲回应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rvid = r["voucher_id"].as_i64().expect("冲回应生成凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{rvid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["entries"][0]["account_code"], "220201");
+    assert_eq!(money_num(v["entries"][0]["debit"].as_str().unwrap()), 800.0);
+    assert_eq!(v["entries"][1]["account_code"], "140301");
+    assert_eq!(money_num(v["entries"][1]["credit"].as_str().unwrap()), 800.0);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/estimate/{est_id}/settle"),
+            &sid,
+            serde_json::json!({ "date": "2026-01-21" }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["voucher_id"].is_null(), "重复冲回应幂等：{r}");
+}
+
 /// 发货 → 收入确认凭证（比例法）+ 退货冲回 + 订单状态联动。
 #[tokio::test]
 async fn sales_ship_income_voucher() {

@@ -19,19 +19,145 @@ fn now() -> String {
 // 采购暂估
 // ===========================================================================
 
-/// 暂估：入库未到票，先按估计金额挂账
-pub fn po_estimate_add(db: &Db, po_id: i64, period: Period, item: &str, est_amount: Money) -> DbResult<i64> {
-    db.conn().execute(
+/// 暂估借方科目：存货编码本身在科目表 → 直接当科目用（请购/暂估惯例 140301）；
+/// 否则回退账套配置的暂估材料科目（biz_accounts.material）。
+fn estimate_account(db: &Db, item: &str) -> String {
+    match crate::accounts::chart(db) {
+        Ok(ch) if ch.get(item).is_some() => item.to_string(),
+        _ => db.options().biz_accounts.material.clone(),
+    }
+}
+
+/// 暂估分录（条目）：数量科目带数量/单价（与金额自洽）、启用存货辅助的科目带 item
+/// （编码即档案值，presence-only 校验通过）；on_debit=false 时金额落在贷方（冲回用）。
+fn estimate_item_entry(
+    db: &Db,
+    item: &str,
+    amount: Money,
+    memo: &str,
+    line: i32,
+    on_debit: bool,
+) -> fincore::Entry {
+    let dr = estimate_account(db, item);
+    let mut e = fincore::Entry::new(line, dr.as_str(), memo);
+    if on_debit {
+        e.debit = amount;
+    } else {
+        e.credit = amount;
+    }
+    if let Ok(ch) = crate::accounts::chart(db) {
+        if let Some(a) = ch.get(dr.as_str()) {
+            if a.aux.list().contains(&fincore::AuxKind::Item) {
+                e.aux = fincore::AuxRef {
+                    item: Some(item.to_string()),
+                    ..Default::default()
+                };
+            }
+            if a.has_qty {
+                e.qty = Some(Money::ONE);
+                e.price = Some(amount);
+            }
+        }
+    }
+    e
+}
+
+/// 暂估：入库未到票，先按估计金额挂账。
+/// 同事务生成暂估凭证（借 存货材料科目 / 贷 应付账款-订单供应商），返回（暂估 id，凭证 id）。
+pub fn po_estimate_add(
+    db: &Db,
+    po_id: i64,
+    period: Period,
+    item: &str,
+    est_amount: Money,
+    who: &str,
+) -> DbResult<(i64, i64)> {
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::not_found("采购订单"))?;
+    let biz = db.options().biz_accounts.clone();
+    let memo = format!("暂估入库 {} {}", po.no, item);
+    let dr = estimate_item_entry(db, item, est_amount, memo.as_str(), 1, true);
+    let cr = fincore::Entry {
+        credit: est_amount,
+        aux: fincore::AuxRef {
+            supplier: Some(po.supplier_code.clone()),
+            ..Default::default()
+        },
+        ..fincore::Entry::new(2, biz.ap.as_str(), memo.as_str())
+    };
+    let tx = db.write_tx()?;
+    let date = period.first_day();
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = fincore::Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = fincore::VoucherSource::Business;
+    v.memo = memo;
+    v.push_entry(dr);
+    v.push_entry(cr);
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.execute(
         "INSERT INTO po_estimate(po_id,period,item,est_amount,settled) VALUES(?1,?2,?3,?4,0)",
         rusqlite::params![po_id, period.ymm(), item, crate::money_param(est_amount)],
     )?;
-    Ok(db.conn().last_insert_rowid())
+    let est_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok((est_id, vid))
 }
 
-/// 暂估冲回：发票到票后标记 settled
-pub fn po_estimate_settle(db: &Db, id: i64) -> DbResult<()> {
-    db.conn().execute("UPDATE po_estimate SET settled=1 WHERE id=?1", [id])?;
-    Ok(())
+/// 暂估冲回：发票到票后标记 settled，并同事务生成反向冲回凭证（借 应付 / 贷 存货）。
+/// 返回冲回凭证 id；已冲回或并发重复冲回返回 None（幂等）。
+pub fn po_estimate_settle(
+    db: &Db,
+    id: i64,
+    date: NaiveDate,
+    who: &str,
+) -> DbResult<Option<i64>> {
+    let row: (i64, String, String, bool) = db
+        .conn()
+        .query_row(
+            "SELECT po_id, item, est_amount, settled FROM po_estimate WHERE id=?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| fincore::FinError::not_found("暂估记录"))?;
+    let (po_id, item, amount_s, settled) = row;
+    if settled {
+        return Ok(None);
+    }
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::not_found("采购订单"))?;
+    let amount = Money::parse_or_zero(&amount_s);
+    let biz = db.options().biz_accounts.clone();
+    let memo = format!("暂估冲回 {} {}", po.no, item);
+    let dr_ap = fincore::Entry {
+        debit: amount,
+        aux: fincore::AuxRef {
+            supplier: Some(po.supplier_code.clone()),
+            ..Default::default()
+        },
+        ..fincore::Entry::new(1, biz.ap.as_str(), memo.as_str())
+    };
+    let cr_item = estimate_item_entry(db, &item, amount, memo.as_str(), 2, false);
+    let period = Period::from_date(date);
+    let tx = db.write_tx()?;
+    let affected = tx.execute(
+        "UPDATE po_estimate SET settled=1 WHERE id=?1 AND settled=0",
+        [id],
+    )?;
+    if affected == 0 {
+        return Ok(None);
+    }
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = fincore::Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = fincore::VoucherSource::Business;
+    v.memo = memo;
+    v.push_entry(dr_ap);
+    v.push_entry(cr_item);
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
+    Ok(Some(vid))
 }
 
 /// 未冲回的暂估合计
@@ -240,11 +366,36 @@ mod tests {
             tax_rate: m("0"), amount: m("1000"), tax_amount: m("0"), memo: String::new(),
         });
         let po_id = crate::scm::po_save(&db, &mut po).unwrap();
-        // 暂估 800
-        let est_id = po_estimate_add(&db, po_id, p, "140301", m("800")).unwrap();
+        // 暂估 800（自动出凭证：借 140301 / 贷 220201 供应商 S01）
+        let (est_id, evid) = po_estimate_add(&db, po_id, p, "140301", m("800"), "u").unwrap();
         assert_eq!(po_estimate_open_sum(&db, po_id).unwrap(), m("800"));
-        po_estimate_settle(&db, est_id).unwrap();
+        let v = crate::vouchers::get(&db, evid).unwrap().unwrap();
+        assert_eq!(v.entries[0].account_code, "140301");
+        assert_eq!(v.entries[0].debit, m("800"));
+        assert!(v.entries[0].qty.is_some(), "数量科目应带数量");
+        assert_eq!(v.entries[1].account_code, "220201");
+        assert_eq!(v.entries[1].aux.supplier.as_deref(), Some("S01"));
+        // 冲回 → 反向凭证 + 幂等
+        let rvid = po_estimate_settle(
+            &db,
+            est_id,
+            NaiveDate::from_ymd_opt(2026, 1, 20).unwrap(),
+            "u",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(po_estimate_open_sum(&db, po_id).unwrap(), m("0"));
+        let v = crate::vouchers::get(&db, rvid).unwrap().unwrap();
+        assert_eq!(v.entries[0].account_code, "220201");
+        assert_eq!(v.entries[0].debit, m("800"));
+        assert_eq!(v.entries[1].account_code, "140301");
+        assert_eq!(v.entries[1].credit, m("800"));
+        assert!(
+            po_estimate_settle(&db, est_id, NaiveDate::from_ymd_opt(2026, 1, 21).unwrap(), "u")
+                .unwrap()
+                .is_none(),
+            "重复冲回应幂等"
+        );
         // 付款 600 → 对账未付 400
         crate::procurement::po_payment_add(&db, &crate::procurement::PoPayment {
             id: 0, po_id, period: p, date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),

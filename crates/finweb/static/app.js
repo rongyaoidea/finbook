@@ -3358,7 +3358,7 @@ async function viewPoEstimate(main) {
       <span class="grow"></span>
     </div>
     <div class="toolbar">
-      <label>存货 <input id="pe-item" style="width:140px" /></label>
+      <label>存货(科目) <input id="pe-item" style="width:140px" placeholder="如 140301" /></label>
       <label>暂估金额 <input id="pe-amount" style="width:110px" /></label>
       <button class="btn" id="pe-add">登记暂估</button>
     </div>
@@ -3375,7 +3375,7 @@ async function viewPoEstimate(main) {
           <tbody>${rows.map((x) => `<tr><td>${x.id}</td><td>${esc(x.item)}</td><td class="r">${fmt(x.est_amount)}</td><td>${x.settled ? "已冲回" : "未冲回"}</td><td>${x.settled ? "" : `<button class="btn sm" data-settle="${x.id}">冲回</button>`}</td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">无暂估记录</div>`);
       $all("[data-settle]", $("#pe-result")).forEach((b) => b.onclick = async () => {
-        try { await postJson(`/procure/estimate/${b.dataset.settle}/settle`, {}); toast("已冲回", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+        try { const x = await postJson(`/procure/estimate/${b.dataset.settle}/settle`, {}); toast(x.voucher_id ? `已冲回，冲回凭证 #${x.voucher_id}` : "已冲回", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
     } catch (e) { toast(e.message, "err"); }
   };
@@ -3384,8 +3384,8 @@ async function viewPoEstimate(main) {
     const po_id = parseInt($("#pe-poid").value.trim(), 10);
     if (!po_id) { toast("请填写采购订单ID", "err"); return; }
     try {
-      await postJson("/procure/estimate", { po_id, item: $("#pe-item").value.trim(), est_amount: $("#pe-amount").value.trim() });
-      toast("已登记暂估", "ok");
+      const r = await postJson("/procure/estimate", { po_id, item: $("#pe-item").value.trim(), est_amount: $("#pe-amount").value.trim() });
+      toast(r.voucher_id ? `已登记暂估，凭证 #${r.voucher_id}` : "已登记暂估", "ok");
       $("#pe-amount").value = "";
       load();
     } catch (e) { toast(e.message, "err"); }
@@ -4736,6 +4736,7 @@ async function viewOptions(main) {
         <div><label>应付科目(供应商)</label><input id="op-biz-ap" value="${esc((o.biz_accounts || {}).ap || "220201")}" style="width:90px" /></div>
         <div><label>收入科目</label><input id="op-biz-income" value="${esc((o.biz_accounts || {}).income || "600101")}" style="width:90px" /></div>
         <div><label>销项税科目</label><input id="op-biz-tax" value="${esc((o.biz_accounts || {}).tax_sales || "22210102")}" style="width:90px" /></div>
+        <div><label>暂估材料科目</label><input id="op-biz-mat" value="${esc((o.biz_accounts || {}).material || "140301")}" style="width:90px" /></div>
         <div><label>默认资金账户</label><input id="op-biz-fund" value="${esc((o.biz_accounts || {}).fund || "100201")}" style="width:90px" /></div>
       </div>
       <p class="muted" style="font-size:12px">业务凭证自动生成的默认科目（收付款单/发货收入/暂估等），须为末级科目编码。</p>
@@ -4769,6 +4770,7 @@ async function viewOptions(main) {
         ap: $("#op-biz-ap").value.trim() || "220201",
         income: $("#op-biz-income").value.trim() || "600101",
         tax_sales: $("#op-biz-tax").value.trim() || "22210102",
+        material: $("#op-biz-mat").value.trim() || "140301",
         fund: $("#op-biz-fund").value.trim() || "100201",
       },
     });

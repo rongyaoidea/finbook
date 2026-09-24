@@ -142,6 +142,11 @@ impl OptionsView {
             ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.income));
             ui.label("销项税");
             ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.tax_sales));
+            ui.label("暂估材料");
+            ui.add_sized(
+                [86.0, 22.0],
+                egui::TextEdit::singleline(&mut o.biz_accounts.material),
+            );
             ui.label("资金");
             ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.fund));
         });

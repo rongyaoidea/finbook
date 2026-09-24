@@ -753,10 +753,15 @@ impl ScmDeepView {
             }
         });
         if let Some(id) = settle {
-            match scm2::po_estimate_settle(ctx.db(), id) {
-                Ok(()) => {
+            let who = ctx.user().username.clone();
+            let date = chrono::Local::now().date_naive();
+            match scm2::po_estimate_settle(ctx.db(), id, date, &who) {
+                Ok(vid) => {
                     ctx.log("采购深度", "暂估冲回", &format!("#{id}"));
-                    ctx.info("已冲回暂估");
+                    ctx.info(match vid {
+                        Some(v) => format!("已冲回暂估，冲回凭证 #{v}"),
+                        None => "已冲回暂估".to_string(),
+                    });
                     self.reload_estimates(ctx);
                 }
                 Err(e) => ctx.error(e.to_string()),
@@ -780,10 +785,11 @@ impl ScmDeepView {
             return;
         }
         let p = self.period(ctx);
-        match scm2::po_estimate_add(ctx.db(), self.est_po_id, p, &self.est_item, amount) {
-            Ok(id) => {
-                ctx.log("采购深度", "登记暂估", &format!("#{id} {amount}"));
-                ctx.info("已登记暂估");
+        let who = ctx.user().username.clone();
+        match scm2::po_estimate_add(ctx.db(), self.est_po_id, p, &self.est_item, amount, &who) {
+            Ok((est_id, vid)) => {
+                ctx.log("采购深度", "登记暂估", &format!("#{est_id} {amount} 凭证 #{vid}"));
+                ctx.info(format!("已登记暂估，生成凭证 #{vid}"));
                 self.est_amount.clear();
                 self.reload_estimates(ctx);
             }

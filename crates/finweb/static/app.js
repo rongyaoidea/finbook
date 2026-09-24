@@ -22,7 +22,11 @@ async function api(path, opts = {}) {
     if (path !== "/setup/status" && path !== "/login") { session.user = null; render(); }
     throw new Error((data && data.error) || "未登录");
   }
-  if (!r.ok) throw new Error((data && data.error) || ("请求失败 " + r.status));
+  if (!r.ok) {
+    let msg = (data && data.error) || ("请求失败 " + r.status);
+    if (r.status === 403) msg += "（权限不足，请联系管理员开通该权限或调整岗位）";
+    throw new Error(msg);
+  }
   return data;
 }
 
@@ -1841,7 +1845,7 @@ async function loadUsers() {
   try { users = await api("/users"); } catch (e) { tb.innerHTML = `<tr><td colspan="9" style="color:var(--err)">${esc(e.message)} <button class="btn ghost sm" id="u-retry">重试</button></td></tr>`; const rb = $("#u-retry", tb); if (rb) rb.addEventListener("click", loadUsers); return; }
   users = users.filter((u) => {
     if (kw && !((u.username || "").toLowerCase().includes(kw) || (u.display_name || "").toLowerCase().includes(kw))) return false;
-    if (roleF && u.role !== roleF) return false;
+    if (roleF && u.role !== roleF && !(u.roles || []).includes(roleF)) return false;
     return true;
   });
   // 列排序（账号 / 最近登录）
@@ -1914,9 +1918,11 @@ async function openNewUser() {
     <div class="foot"><button class="btn" id="nu-save">创建</button><button class="btn ghost" id="nu-cancel">取消</button></div>`);
   // 切换角色时重新生成矩阵（跟随角色的默认勾选随角色变化）
   const refreshMatrix = () => {
-    $("#nu-perm-box", mask).innerHTML = permMatrixHtml(roles, { role: $("#nu-r", mask).value, extra_perms: [], deny_perms: [] });
+    const checkedRoles = $all(".nu-rr", mask).filter((c) => c.checked).map((c) => c.value);
+    $("#nu-perm-box", mask).innerHTML = permMatrixHtml(roles, { role: $("#nu-r", mask).value, roles: checkedRoles, extra_perms: [], deny_perms: [] });
   };
   $("#nu-r", mask).addEventListener("change", refreshMatrix);
+  $all(".nu-rr", mask).forEach((cb) => cb.addEventListener("change", refreshMatrix));
   $("#nu-cancel", mask).onclick = closeModal;
   $("#nu-save", mask).onclick = async () => {
     const extra = [], deny = [];
@@ -1947,7 +1953,10 @@ function permMatrixHtml(roles, u) {
   });
   const stateOf = (code) => (denySet.has(code) ? "off" : extraSet.has(code) ? "on" : "role");
   const rows = allPerms.map((p) => {
-    const base = roleCodes.has(p.code) ? "（角色默认 ✔）" : "（角色默认 ✖）";
+    const granters = [u.role, ...(u.roles || [])].filter((rc) =>
+      ((roles.find((x) => x.role === rc) || {}).perms || []).some((pp) => pp.code === p.code)
+    ).map((rc) => ((roles.find((x) => x.role === rc) || {}).label) || rc);
+    const base = granters.length ? `（来自：${granters.join(" + ")}）` : "（无岗位默认）";
     const cur = stateOf(p.code);
     return `<tr><td>${esc(p.label)}</td><td><select data-perm="${esc(p.code)}">
       <option value="role" ${cur === "role" ? "selected" : ""}>跟随角色 ${base}</option>
@@ -3457,7 +3466,7 @@ async function viewPoDoc(main) {
       <button class="btn" id="pd-return">退货</button>
       <button class="btn" id="pd-pay">付款</button>
     </div>
-    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">采购订单</h4><span class="grow"></span><button class="btn ghost sm" id="po-print">打印所选</button><button class="btn ghost sm" id="po-printcfg">打印设置</button><button class="btn primary sm" id="po-new">新建采购订单</button></div><div id="po-list" class="muted" style="margin-top:8px">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">采购订单</h4><span class="grow"></span>${sizeSel("po-size")}<button class="btn ghost sm" id="po-print">打印所选</button><button class="btn ghost sm" id="po-deli">送货单(跟车)</button><button class="btn ghost sm" id="po-printcfg">打印设置</button><button class="btn primary sm" id="po-new">新建采购订单</button></div><div id="po-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>请购单</h4><div id="pd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>采购订单执行跟踪</h4><div id="pd-track">加载中…</div></div>`;
 
@@ -3474,14 +3483,10 @@ async function viewPoDoc(main) {
       $all("[data-po-exec]").forEach((b) => b.onclick = () => { $("#pd-poid").value = b.dataset.poExec; toast(`已填入订单ID ${b.dataset.poExec}，可到货/付款`, "ok"); });
       $all("[data-po-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该采购订单？", true))) return; try { await api(`/procure/po/${b.dataset.poDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#po-chkall")) $("#po-chkall").onclick = (e) => { $all(".po-chk").forEach((c) => { c.checked = e.target.checked; }); };
-      $("#po-print").onclick = () => {
-        let ids = $all(".po-chk").filter((c) => c.checked).map((c) => c.value);
-        if (!ids.length) ids = $all(".po-chk").map((c) => c.value);
-        if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
-        const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
-        window.open(`/api/procure/po/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
-      };
+      $("#po-print").onclick = () => runPrint("/api/procure/po/print-form", ".po-chk", "order", PRINT_ORDER_FIELDS);
+      $("#po-deli").onclick = () => runPrint("/api/procure/po/print-form", ".po-chk", "order", PRINT_ORDER_FIELDS, DELIVERY_FIELDS);
       $("#po-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
+      bindSize($("#po-size"), "order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#po-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/procure/req?period=${period}`);
@@ -3545,7 +3550,7 @@ async function viewSoDoc(main) {
       <button class="btn" id="sd-credit">信用检查</button>
     </div>
     <div id="sd-credit-result" class="muted" style="margin-top:6px"></div>
-    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span><button class="btn ghost sm" id="so-print">打印所选</button><button class="btn ghost sm" id="so-printcfg">打印设置</button><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span>${sizeSel("so-size")}<button class="btn ghost sm" id="so-print">打印所选</button><button class="btn ghost sm" id="so-deli">送货单(跟车)</button><button class="btn ghost sm" id="so-printcfg">打印设置</button><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>报价单</h4><div id="sd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>销售订单执行跟踪</h4><div id="sd-track">加载中…</div></div>`;
 
@@ -3562,14 +3567,10 @@ async function viewSoDoc(main) {
       $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
       $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#so-chkall")) $("#so-chkall").onclick = (e) => { $all(".so-chk").forEach((c) => { c.checked = e.target.checked; }); };
-      $("#so-print").onclick = () => {
-        let ids = $all(".so-chk").filter((c) => c.checked).map((c) => c.value);
-        if (!ids.length) ids = $all(".so-chk").map((c) => c.value);
-        if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
-        const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
-        window.open(`/api/sales/so/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
-      };
+      $("#so-print").onclick = () => runPrint("/api/sales/so/print-form", ".so-chk", "order", PRINT_ORDER_FIELDS);
+      $("#so-deli").onclick = () => runPrint("/api/sales/so/print-form", ".so-chk", "order", PRINT_ORDER_FIELDS, DELIVERY_FIELDS);
       $("#so-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
+      bindSize($("#so-size"), "order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#so-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/sales/quote?period=${period}`);
@@ -3663,12 +3664,40 @@ const PRINT_PRESETS = {
   full: null,
   delivery: ["no", "date", "party", "memo", "prepared", "code", "name", "qty", "linememo", "sign", "pack"],
 };
+// 送货单固定字段集（跟车联）：不读用户保存的字段配置，杜绝「上次送货单设置污染普通打印」
+const DELIVERY_FIELDS = PRINT_PRESETS.delivery.filter((t) => t !== "pack").join(",");
+// 统一打印入口：勾选优先、未勾选 = 全部；fieldsForced（送货单）强制覆盖保存的字段配置
+function runPrint(base, cls, scope, tokens, fieldsForced) {
+  let ids = $all(cls).filter((c) => c.checked).map((c) => c.value);
+  if (!ids.length) ids = $all(cls).map((c) => c.value);
+  if (!ids.length) { toast("当前没有可打印的单据", "err"); return; }
+  const cfg = loadPrintCfg(scope, tokens);
+  const fields = fieldsForced || printFieldsParam(cfg);
+  window.open(`${base}?ids=${ids.join(",")}&fields=${fields}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
+}
+// 纸张直选下拉（高频切换不用进设置弹窗）：change 即写回本机设置，与设置弹窗同一数据源
+function sizeSel(id) {
+  return `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">纸张<select id="${id}" style="width:92px"><option value="">自定义</option><option value="a4">A4</option><option value="a5">A5二等分</option><option value="third">三等分</option></select></label>`;
+}
+function bindSize(sel, scope, tokens) {
+  if (!sel) return;
+  const cfg = loadPrintCfg(scope, tokens);
+  sel.value = ["a4", "a5", "third"].includes(cfg.size) ? cfg.size : "";
+  sel.onchange = () => {
+    if (!sel.value) return;
+    const c = loadPrintCfg(scope, tokens);
+    c.size = sel.value;
+    savePrintCfg(scope, c);
+    toast(`纸张已切换为 ${sel.options[sel.selectedIndex].text}`, "ok");
+  };
+}
 function openPrintConfig(scope, tokens) {
   const cfg = loadPrintCfg(scope, tokens);
   const isCustom = /^\d{2,3}x\d{2,3}$/.test(cfg.size);
   const showPresets = scope === "order";
+  const deliveryMode = !cfg.set.has("price") && !cfg.set.has("amount") && !cfg.set.has("totals");
   const mask = modal(`
-    <h3>打印设置（纸张 · 字段可选）</h3>
+    <h3>打印设置 · 模式：<span class="tag ${deliveryMode ? "warn" : "ok"}">${deliveryMode ? "送货单（无价格）" : "默认全单"}</span></h3>
     <div class="field" style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
       <div><label>纸张</label>
         <select id="pc-size">
@@ -4048,20 +4077,13 @@ async function renderReceipts(body) {
       <label>金额 <input id="rc-amt" style="width:110px" /></label>
       <label>备注 <input id="rc-memo" style="width:130px" /></label>
       <button class="btn primary" id="rc-new">新增收付款</button>
-      <button class="btn ghost sm" id="rc-print">批量打印</button>
-      <button class="btn ghost sm" id="rc-printcfg">打印设置</button>
     </div>
     <div class="muted" style="font-size:12px;margin-bottom:6px">保存即生成记账凭证草稿（会计记账后入账，H-3 草稿不入余额），并按往来单位对未清挂账 FIFO 自动核销；往来单位选凭证辅助编码（C01/S01…）。</div>
-    <div id="rc-list" class="muted">加载中…</div>`;
+    <div class="panel"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">收付款单</h4><span class="grow"></span>${sizeSel("rc-size")}<button class="btn ghost sm" id="rc-print">批量打印</button><button class="btn ghost sm" id="rc-printcfg">打印设置</button></div><div id="rc-list" class="muted" style="margin-top:8px">加载中…</div></div>`;
   $("#rc-kind").onchange = () => loadParties();
-  $("#rc-print").onclick = () => {
-    let ids = $all(".rc-chk").filter((c) => c.checked).map((c) => c.value);
-    if (!ids.length) ids = $all(".rc-chk").map((c) => c.value);
-    if (!ids.length) { toast("没有可打印的收付款单", "err"); return; }
-    const cfg = loadPrintCfg("receipt", PRINT_RECEIPT_FIELDS);
-    window.open(`/api/funds/receipts/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
-  };
+  $("#rc-print").onclick = () => runPrint("/api/funds/receipts/print-form", ".rc-chk", "receipt", PRINT_RECEIPT_FIELDS);
   $("#rc-printcfg").onclick = () => openPrintConfig("receipt", PRINT_RECEIPT_FIELDS);
+  bindSize($("#rc-size"), "receipt", PRINT_RECEIPT_FIELDS);
   $("#rc-new").onclick = async () => {
     if (!$("#rc-party").value) { toast("请选择往来单位", "err"); return; }
     try {

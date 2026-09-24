@@ -625,20 +625,31 @@ tr.l{height:21px;}
 .dsign{display:flex;border:1px solid #000;border-top:none;font-size:11px;}
 .dsign div{flex:1;padding:5px 8px;border-right:1px dotted #999;}
 .dsign div:last-child{border-right:none;}
+.pbar{position:sticky;top:0;z-index:9;display:flex;gap:14px;align-items:center;background:#1a1a1a;
+  color:#fff;padding:8px 14px;font-family:system-ui,sans-serif;font-size:12px;}
+.pbar button{background:#fff;color:#111;border:0;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;}
+@media print{.pbar{display:none;}}
 @media print{body{font-size:11px;}}
 "#;
 
-fn doc_shell(title: &str, body: &str, size: &str) -> String {
+fn doc_shell(title: &str, body: &str, size: &str, auto_print: bool) -> String {
     let (page, _, extra) = page_setup(size);
+    // 默认渲染顶部「打印本页」工具条（先看后打、省纸）；auto=1 时进页自动弹打印对话框
+    let js = if auto_print {
+        "<script>window.onload=function(){setTimeout(function(){window.print();},300);};</script>"
+            .to_string()
+    } else {
+        r#"<div class="pbar"><button onclick="window.print()">🖨 打印本页</button><span>纸张 / 份数在打印对话框中选择；关闭本页即取消</span></div>"#.to_string()
+    };
     format!(
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>{title}</title>
 <style>{page}{DOC_CSS}{extra}</style>
-<script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>
-</head><body>{body}</body></html>"#,
+</head><body>{js}{body}</body></html>"#,
         title = esc(title),
         page = page,
         extra = extra,
+        js = js,
         body = body,
     )
 }
@@ -663,16 +674,18 @@ fn order_units(f: &DocPrintFields, o: &OrderPrint) -> i32 {
 
 /// 订单套打 HTML（默认 A4；多尺寸见 [`order_forms_sized_html`]）
 pub fn order_forms_html(company: &str, orders: &[OrderPrint], f: &DocPrintFields) -> String {
-    order_forms_sized_html(company, orders, f, "a4")
+    order_forms_sized_html(company, orders, f, "a4", false)
 }
 
 /// 订单套打 HTML（指定纸张）：`fields` 控制显示字段/列；`pack` 时按**该纸张的
 /// 行单位预算**把多张单据紧凑排进同页（放不下才换页；单张超一页自然续页）。
+/// `auto_print=false` 渲染顶部「打印本页」工具条（先看后打）。
 pub fn order_forms_sized_html(
     company: &str,
     orders: &[OrderPrint],
     f: &DocPrintFields,
     size: &str,
+    auto_print: bool,
 ) -> String {
     let budget = page_setup(size).1;
     let mut pages: Vec<Vec<&OrderPrint>> = Vec::new();
@@ -703,10 +716,11 @@ pub fn order_forms_sized_html(
             let docs: String = ps.iter().map(|o| one_order_doc(o, f)).collect();
             format!(
                 r#"<div class="page">
-<div class="cbar"><span class="co">{company}</span><span>单据套打</span><span>第 {p} / 共 {t} 页 · {today}</span></div>
+<div class="cbar"><span class="co">{company}</span><span>单据套打</span><span>共 {n} 单 · 第 {p} / 共 {t} 页 · {today}</span></div>
 {docs}
 </div>"#,
                 company = esc(company),
+                n = orders.len(),
                 p = i + 1,
                 t = total,
                 today = esc(&today),
@@ -714,7 +728,7 @@ pub fn order_forms_sized_html(
             )
         })
         .collect();
-    doc_shell("单据套打", &body, size)
+    doc_shell("单据套打", &body, size, auto_print)
 }
 
 fn one_order_doc(o: &OrderPrint, f: &DocPrintFields) -> String {
@@ -827,7 +841,7 @@ fn one_order_doc(o: &OrderPrint, f: &DocPrintFields) -> String {
 
 /// 收付款单套打 HTML（默认 A4；多尺寸见 [`receipt_forms_sized_html`]）
 pub fn receipt_forms_html(company: &str, docs: &[ReceiptPrint], f: &DocPrintFields) -> String {
-    receipt_forms_sized_html(company, docs, f, "a4")
+    receipt_forms_sized_html(company, docs, f, "a4", false)
 }
 
 /// 收付款单套打 HTML（指定纸张）：信息双列 + 金额大写 + 签章；`pack` 紧凑分页同订单
@@ -836,6 +850,7 @@ pub fn receipt_forms_sized_html(
     docs: &[ReceiptPrint],
     f: &DocPrintFields,
     size: &str,
+    auto_print: bool,
 ) -> String {
     const UNITS: i32 = DOC_OVERHEAD + 3;
     let budget = page_setup(size).1;
@@ -866,10 +881,11 @@ pub fn receipt_forms_sized_html(
             let blocks: String = ps.iter().map(|d| one_receipt_doc(d, f)).collect();
             format!(
                 r#"<div class="page">
-<div class="cbar"><span class="co">{company}</span><span>单据套打</span><span>第 {p} / 共 {t} 页 · {today}</span></div>
+<div class="cbar"><span class="co">{company}</span><span>单据套打</span><span>共 {n} 单 · 第 {p} / 共 {t} 页 · {today}</span></div>
 {blocks}
 </div>"#,
                 company = esc(company),
+                n = docs.len(),
                 p = i + 1,
                 t = total,
                 today = esc(&today),
@@ -877,7 +893,7 @@ pub fn receipt_forms_sized_html(
             )
         })
         .collect();
-    doc_shell("收付款单套打", &body, size)
+    doc_shell("收付款单套打", &body, size, auto_print)
 }
 
 fn one_receipt_doc(d: &ReceiptPrint, f: &DocPrintFields) -> String {
@@ -1062,8 +1078,8 @@ mod tests {
 
         // 尺寸影响分页：两张 8 行单（单张成本 = 6+8+1+1 = 16 行单位）
         let two = vec![mk_order("XS101", 8), mk_order("XS102", 8)];
-        let a4 = super::order_forms_sized_html("甲", &two, &Default::default(), "a4");
-        let a5 = super::order_forms_sized_html("甲", &two, &Default::default(), "a5");
+        let a4 = super::order_forms_sized_html("甲", &two, &Default::default(), "a4", false);
+        let a5 = super::order_forms_sized_html("甲", &two, &Default::default(), "a5", false);
         assert_eq!(a4.matches("class=\"page\"").count(), 1, "A4 两单同页");
         assert_eq!(a5.matches("class=\"page\"").count(), 2, "A5 只装得下一单");
         assert!(a5.contains("size:A5"), "应输出 A5 @page");
@@ -1077,7 +1093,7 @@ mod tests {
             memo: String::new(),
             voucher_no: String::new(),
         };
-        let html = super::receipt_forms_sized_html("甲", &[d], &Default::default(), "third");
+        let html = super::receipt_forms_sized_html("甲", &[d], &Default::default(), "third", false);
         assert!(html.contains("99mm 210mm"), "三等分应输出自定义 @page 尺寸");
     }
 

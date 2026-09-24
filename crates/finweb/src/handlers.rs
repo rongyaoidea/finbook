@@ -4605,7 +4605,7 @@ async fn print_so_form(
         f.col_tax = false;
         f.totals = false;
     }
-    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
+    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q), q.get("auto").map(|s| s.as_str() == "1").unwrap_or(false));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -4647,7 +4647,7 @@ async fn print_po_form(
         f.col_tax = false;
         f.totals = false;
     }
-    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
+    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q), q.get("auto").map(|s| s.as_str() == "1").unwrap_or(false));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -4677,7 +4677,7 @@ async fn print_receipt_form(
         return Err(AppError::bad_request("没有可打印的收付款单"));
     }
     let f = doc_fields_from_q(&q);
-    let html = findb::printform::receipt_forms_sized_html(&company, &prints, &f, &doc_size_from_q(&q));
+    let html = findb::printform::receipt_forms_sized_html(&company, &prints, &f, &doc_size_from_q(&q), q.get("auto").map(|s| s.as_str() == "1").unwrap_or(false));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 

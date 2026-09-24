@@ -133,6 +133,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/options", get(get_options).put(put_options))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/workbench", get(get_workbench))
+        .route("/api/quick-search", get(quick_search))
         .route("/api/overview", get(get_overview))
         .route("/api/periods", get(get_periods))
         .route("/api/period", post(post_period))
@@ -1479,6 +1480,112 @@ fn wb_report_domain(
         ],
     });
     Ok(())
+}
+
+/// Ctrl+K 快速搜索：凭证（复用 VoucherQuery → data_scope 落地）/ 采购订单 / 销售订单 /
+/// 请购（后三类需 OrderOps）/ 我的报销（doc_in_scope 数据范围，防跨人泄露）。
+async fn quick_search(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let kw = q.get("q").map(|s| s.trim().to_string()).unwrap_or_default();
+    if kw.is_empty() {
+        return Ok(Json(json!({ "rows": [] })));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let cur = current_period(&state, &user);
+    let like = format!("%{kw}%");
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+
+    // 凭证：复用列表口径（关键字 = 摘要/科目/凭证号，数据范围同步生效）
+    let vq = findb::vouchers::VoucherQuery {
+        keyword: Some(kw.clone()),
+        limit: Some(4),
+        asc: false,
+        ..Default::default()
+    }
+    .with_data_scope(&user.user);
+    for v in findb::vouchers::list(&db, &vq)? {
+        rows.push(json!({
+            "kind": "voucher",
+            "id": v.id,
+            "label": format!("{}-{} {}", v.word, v.no, v.memo),
+            "sub": v.date.format("%Y-%m-%d").to_string(),
+            "view": "vouchers",
+        }));
+    }
+
+    if user.can(Perm::OrderOps) {
+        let pack = |kind: &str, view: &str, sql: &str, db: &findb::Db, like: &str| -> Vec<serde_json::Value> {
+            let mut out = Vec::new();
+            if let Ok(mut st) = db.conn().prepare(sql) {
+                if let Ok(iter) = st.query_map(rusqlite::params![like, like], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                }) {
+                    for row in iter.flatten() {
+                        out.push(json!({
+                            "kind": kind,
+                            "id": row.0,
+                            "label": format!("{} {}", row.1, row.2),
+                            "sub": "",
+                            "view": view,
+                        }));
+                    }
+                }
+            }
+            out
+        };
+        rows.extend(pack(
+            "po",
+            "po-doc",
+            "SELECT id, no, supplier_name FROM purchase_order WHERE no LIKE ?1 OR supplier_name LIKE ?2 ORDER BY id DESC LIMIT 3",
+            &db,
+            &like,
+        ));
+        rows.extend(pack(
+            "so",
+            "so-doc",
+            "SELECT id, no, customer_name FROM sales_order WHERE no LIKE ?1 OR customer_name LIKE ?2 ORDER BY id DESC LIMIT 3",
+            &db,
+            &like,
+        ));
+        rows.extend(pack(
+            "req",
+            "po-doc",
+            "SELECT id, no, item_name FROM purchase_req WHERE no LIKE ?1 OR item_name LIKE ?2 ORDER BY id DESC LIMIT 3",
+            &db,
+            &like,
+        ));
+    }
+
+    // 我的报销（数据范围与列表页一致）
+    let mut mine = 0;
+    for c in findb::business::claim_list(&db, cur, None)? {
+        if mine >= 3 {
+            break;
+        }
+        if !doc_in_scope(&user, &c.applicant) {
+            continue;
+        }
+        if c.no.contains(&kw) || c.reason.contains(&kw) {
+            rows.push(json!({
+                "kind": "claim",
+                "id": c.id,
+                "label": format!("{} {}", c.no, c.reason),
+                "sub": c.applicant,
+                "view": "claims",
+            }));
+            mine += 1;
+        }
+    }
+
+    Ok(Json(json!({ "rows": rows })))
 }
 
 /// 管理员「账目总览」：只读视角的账目全貌（仅系统管理员可访问）

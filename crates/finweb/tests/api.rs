@@ -5735,6 +5735,114 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Ctrl+K 快速搜索：凭证/请购/报销按关键词分域返回 + 空词与无结果边界。
+#[tokio::test]
+async fn quick_search_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 空词 → 空结果
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/quick-search?q=", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 0, "空词不搜");
+
+    // 造请购（品名关键词）→ 搜到 req 类
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/req",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-09",
+                "item_code": "RM9", "item_name": "快搜物料", "qty": "5",
+                "status": "draft", "requester": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/quick-search?q=%E5%BF%AB%E6%90%9C%E7%89%A9%E6%96%99", &sid)) // 快搜物料
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["kind"] == "req" && x["view"] == "po-doc"),
+        "应搜到请购：{r}"
+    );
+
+    // 造凭证（memo+摘要关键词）→ 搜到 voucher 类
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let cur_ymm: i32 = cur_label.replace('-', "").parse().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": format!("{cur_label}-06"),
+                "word": "记", "no": 1, "attachments": 0, "memo": "快搜凭证摘录",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "快搜凭证摘录", "debit": "20", "credit": "0" },
+                    { "line": 2, "account_code": "660201", "summary": "快搜凭证摘录", "debit": "0", "credit": "20" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "造凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/quick-search?q=%E5%BF%AB%E6%90%9C%E5%87%AD%E8%AF%81", &sid)) // 快搜凭证
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["kind"] == "voucher" && x["view"] == "vouchers"),
+        "应搜到凭证：{r}"
+    );
+
+    // 造报销（事由关键词）→ 搜到 claim 类（数据范围内）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/claims",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "biz_date": format!("{cur_label}-07"),
+                "applicant": "张三", "dept": "销售部", "reason": "快搜报销事由",
+                "amount": "88",
+                "items": [{ "expense_account": "660201", "amount": "88", "memo": "" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "造报销");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/quick-search?q=%E5%BF%AB%E6%90%9C%E6%8A%A5%E9%94%80", &sid)) // 快搜报销
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["kind"] == "claim" && x["view"] == "claims"),
+        "应搜到报销：{r}"
+    );
+
+    // 无结果 → 200 空数组
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/quick-search?q=zzzz-not-exist", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 0, "无结果不报错");
+}
+
 /// 单据下推与追溯（对标金蝶源单→目标单）：审批 → 下推PO → 双向链 → 到货流水并入 → 拆单。
 #[tokio::test]
 async fn doc_push_chain() {

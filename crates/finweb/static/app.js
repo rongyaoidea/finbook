@@ -44,6 +44,52 @@ function toast(msg, kind) {
 }
 
 let modalStack = [];
+// Ctrl+K 全局快速搜索；Ctrl+Enter 提交当前弹窗主按钮（与画布 Ctrl+Z/Y 不冲突）
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openQuickSearch();
+  } else if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && typeof modalStack !== "undefined" && modalStack.length) {
+    const top = modalStack[modalStack.length - 1];
+    const btn = top.querySelector(".foot .btn.primary") || top.querySelector(".btn.primary");
+    if (btn) { e.preventDefault(); btn.click(); }
+  }
+});
+
+// 快速搜索面板：分组结果 → 点击/回车直达目标页面（服务端按权限与数据范围裁剪）
+function openQuickSearch() {
+  const mask = modal(`<h3>快速搜索 <span class="muted" style="font-size:12px;font-weight:400">Ctrl+K 唤起 · Enter 打开首条 · Esc 关闭</span></h3>
+    <input id="qs-input" placeholder="单号 / 名称 / 摘要 / 关键词…" style="width:100%" />
+    <div id="qs-results" class="muted" style="margin-top:8px;min-height:120px;max-height:55vh;overflow:auto">输入关键词即时搜索</div>
+    <div class="foot"><button class="btn ghost" id="qs-close">关闭</button></div>`);
+  $("#qs-close", mask).onclick = closeModal;
+  const input = $("#qs-input", mask);
+  const box = $("#qs-results", mask);
+  input.focus();
+  const KIND = { voucher: "凭证", po: "采购订单", so: "销售订单", req: "请购单", claim: "报销单" };
+  let timer = null;
+  const run = async () => {
+    const kw = input.value.trim();
+    if (!kw) { box.className = "muted"; box.textContent = "输入关键词即时搜索"; return; }
+    try {
+      const r = await api(`/quick-search?q=${encodeURIComponent(kw)}`);
+      const rows = r.rows || [];
+      box.className = "";
+      box.innerHTML = rows.length
+        ? rows.map((x, i) => `<button class="btn ghost" data-qs="${i}" data-view="${esc(x.view)}" style="display:flex;width:100%;justify-content:space-between;gap:8px;margin-bottom:4px;text-align:left">
+            <span><span class="tag">${KIND[x.kind] || esc(x.kind)}</span> ${esc(x.label)}</span>
+            <span class="muted" style="font-size:12px;white-space:nowrap">${esc(x.sub || "")}</span></button>`).join("")
+        : `<div class="muted">无匹配结果</div>`;
+      $all("[data-qs]", mask).forEach((b) => b.onclick = () => { state.view = b.dataset.view; closeModal(); renderMain(); });
+    } catch (e) { box.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  input.oninput = () => { clearTimeout(timer); timer = setTimeout(run, 260); };
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); const b = mask.querySelector("[data-qs]"); if (b) b.click(); }
+    else if (e.key === "Escape") { closeModal(); }
+  };
+}
+
 function modal(html, wide) {
   const root = document.getElementById("modal-root");
   const mask = document.createElement("div");
@@ -3785,6 +3831,7 @@ async function openDocChain(kind, id, title) {
 
 async function viewPoDoc(main) {
   const period = encodeURIComponent(state.current || "");
+  let lastReq = null; // 最近一条请购（「复制上一条」数据源）
   const table = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>单号</th><th>存货</th><th>数量</th><th>状态</th><th>请购人</th><th>备注</th><th></th></tr></thead>
       <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td>${r.status === "ordered" ? `<span class="tag ok">已下推</span>` : esc(r.status)}</td><td>${esc(r.requester)}</td><td>${esc(r.memo)}</td><td class="row-actions">${r.status === "draft" ? `<button class="btn ghost sm" data-req-approve="${r.id}">审批</button>` : ""}${r.status === "approved" || r.status === "ordered" ? `<button class="btn primary sm" data-req-push="${r.id}">下推采购订单</button>` : ""}</td></tr>`).join("")}</tbody></table>`
@@ -3800,6 +3847,7 @@ async function viewPoDoc(main) {
       <label>数量 <input id="pd-qty" style="width:80px" /></label>
       <label>备注 <input id="pd-memo" style="width:140px" /></label>
       <button class="btn primary" id="pd-save">保存请购单</button>
+      <button class="btn ghost sm" id="pd-copy">复制上一条</button>
     </div>
     <div class="toolbar">
       <label>采购订单ID <input id="pd-poid" style="width:80px" /></label>
@@ -3835,6 +3883,7 @@ async function viewPoDoc(main) {
     try {
       const r = await api(`/procure/req?period=${period}`);
       $("#pd-list").innerHTML = table(r.rows || []);
+      lastReq = (r.rows || [])[0] || null;
       $all("[data-req-approve]").forEach((b) => b.onclick = async () => {
         try { const r = await api(`/procure/req/${b.dataset.reqApprove}/approve`, { method: "POST" }); toast(r && r.pending ? `已审批 → 下一节点：${r.pending}` : "已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
@@ -3861,6 +3910,14 @@ async function viewPoDoc(main) {
       toast("已保存请购单", "ok"); $("#pd-qty").value = ""; $("#pd-memo").value = ""; load();
     } catch (e) { toast(e.message, "err"); }
   });
+  $("#pd-copy").onclick = () => {
+    if (!lastReq) { toast("本期暂无请购单可复制", "err"); return; }
+    $("#pd-item").value = lastReq.item_name || lastReq.item_code || "";
+    $("#pd-qty").value = String(lastReq.qty || "");
+    $("#pd-memo").value = lastReq.memo || "";
+    toast("已复制上一条（请核对后保存）", "ok");
+    $("#pd-item").focus();
+  };
   const poid = () => parseInt($("#pd-poid").value.trim(), 10) || 0;
   const amt = () => $("#pd-amt").value.trim();
   const memo = () => $("#pd-memo2").value.trim();

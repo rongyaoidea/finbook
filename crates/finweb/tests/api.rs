@@ -3095,6 +3095,200 @@ async fn payroll_voucher_status_tracking() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复生成发放凭证应被拦");
 }
 
+/// 对标金蝶流程：订单 CRUD + 状态流转 + 行金额服务端计算 + 客户信用卡控。
+#[tokio::test]
+async fn order_crud_and_credit_guard() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建销售订单：2 行（140301 50×12@13% → 不含税 600 / 税 78）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "customer_code": "C01",
+                "customer_name": "客户甲", "status": "Draft", "memo": "",
+                "lines": [
+                    { "item_code": "140301", "qty_ordered": "50", "unit_price": "12", "tax_rate": "0.13" },
+                    { "item_code": "140501", "qty_ordered": "2", "unit_price": "100", "tax_rate": "0.13" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建销售订单应成功：{body}");
+    let r: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = r["id"].as_i64().unwrap();
+    assert_eq!(money_num(r["total_amount"].as_str().unwrap()), 800.0, "行金额服务端计算：50×12+2×100");
+    assert_eq!(money_num(r["total_tax"].as_str().unwrap()), 104.0, "税额=金额×税率");
+
+    // 列表可回读（含明细）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == id)
+        .expect("列表应含新订单");
+    assert_eq!(row["lines"].as_array().unwrap().len(), 2);
+
+    // 草稿 → 已确认
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "确认应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == id)
+        .unwrap();
+    assert_eq!(row["status"], "Confirmed");
+
+    // 客户信用额度：超限确认被拒，额度内可确认
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/aux",
+            &sid,
+            serde_json::json!({
+                "id": 0, "kind": "customer", "code": "C99", "name": "信用客户",
+                "parent_code": null, "disabled": false,
+                "props": { "credit_limit": "100" }, "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建客户档案应成功");
+
+    // 超限订单：草稿可存，确认被拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-06", "customer_code": "C99",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "100", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "草稿不受信用限制");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let over_id = r["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{over_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超信用额度应被拒");
+    let s = body_string(resp).await;
+    assert!(s.contains("信用额度不足"), "应提示信用额度不足：{s}");
+
+    // 额度内订单：50×2=100 ≤100 → 确认成功
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-07", "customer_code": "C99",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "50", "unit_price": "2", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let ok_id = r["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{ok_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "额度内订单应可确认");
+    // 两笔占用合计 500+100 > 100 —— 再来一笔新的应被拒（占用按全部有效订单累计）
+    // 注：超限单仍是草稿不计占用，占用=已确认的100；此处再确认原超限单 → 100+500=600>100 拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{over_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "累计占用超限仍应被拒");
+
+    // 删除（草稿/已确认均可删，so_delete 无状态限制）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{ok_id}/delete"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "删除订单应成功");
+
+    // 采购订单镜像：建单 + 确认
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-08", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "30", "unit_price": "9", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let pid = r["id"].as_i64().unwrap();
+    assert_eq!(money_num(r["total_amount"].as_str().unwrap()), 270.0);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{pid}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购订单确认应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{pid}/delete"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// 资金预算视图：当期现金/银行科目预算 vs 已记账实际（形态校验；口径见 findb 单测）
 #[tokio::test]
 async fn funds_budget_view_api() {

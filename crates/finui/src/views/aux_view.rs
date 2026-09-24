@@ -208,6 +208,19 @@ impl AuxView {
                             );
                             ui.end_row();
                         }
+                        if e.kind == AuxKind::Customer {
+                            let mut cl = e
+                                .prop(fincore::auxiliary::prop::CREDIT_LIMIT)
+                                .cloned()
+                                .unwrap_or_default();
+                            ui.label("信用额度（0=不限）：");
+                            ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut cl));
+                            e.set_prop(
+                                fincore::auxiliary::prop::CREDIT_LIMIT,
+                                cl.trim().to_string(),
+                            );
+                            ui.end_row();
+                        }
                         ui.label("上级编码：");
                         let mut p = e.parent_code.clone().unwrap_or_default();
                         ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut p));

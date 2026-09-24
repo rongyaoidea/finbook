@@ -3447,10 +3447,23 @@ async function viewPoDoc(main) {
       <button class="btn" id="pd-return">退货</button>
       <button class="btn" id="pd-pay">付款</button>
     </div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">采购订单</h4><span class="grow"></span><button class="btn primary sm" id="po-new">新建采购订单</button></div><div id="po-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>请购单</h4><div id="pd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>采购订单执行跟踪</h4><div id="pd-track">加载中…</div></div>`;
 
   const load = async () => {
+    try {
+      const s = await api(`/procure/po?period=${period}`);
+      const orows = s.rows || [];
+      $("#po-list").innerHTML = orows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无采购订单，点右上「新建采购订单」</div>`;
+      $all("[data-po-edit]").forEach((b) => b.onclick = () => openOrderEditor("po", main, parseInt(b.dataset.poEdit, 10)));
+      $all("[data-po-confirm]").forEach((b) => b.onclick = () => poTransition(b.dataset.poConfirm, "Confirmed"));
+      $all("[data-po-cancel]").forEach((b) => b.onclick = () => poTransition(b.dataset.poCancel, "Cancelled"));
+      $all("[data-po-exec]").forEach((b) => b.onclick = () => { $("#pd-poid").value = b.dataset.poExec; toast(`已填入订单ID ${b.dataset.poExec}，可到货/付款`, "ok"); });
+      $all("[data-po-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该采购订单？", true))) return; try { await api(`/procure/po/${b.dataset.poDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#po-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/procure/req?period=${period}`);
       $("#pd-list").innerHTML = table(r.rows || []);
@@ -3463,6 +3476,10 @@ async function viewPoDoc(main) {
       $("#pd-track").innerHTML = poTrack(t.rows || []);
     } catch (e) { $("#pd-track").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
   };
+  const poTransition = async (id, status) => {
+    try { await api(`/procure/po/${id}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); toast("已更新订单状态", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#po-new").onclick = () => openOrderEditor("po", main, null);
   $("#pd-save").addEventListener("click", async () => {
     try {
       await postJson("/procure/req", { id: 0, period: ymm(state.current || ""), date: today(), item_code: $("#pd-item").value.trim(), item_name: $("#pd-item").value.trim(), qty: $("#pd-qty").value.trim() || "0", status: "draft", requester: "", memo: $("#pd-memo").value.trim() });
@@ -3509,10 +3526,23 @@ async function viewSoDoc(main) {
       <button class="btn" id="sd-credit">信用检查</button>
     </div>
     <div id="sd-credit-result" class="muted" style="margin-top:6px"></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>报价单</h4><div id="sd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>销售订单执行跟踪</h4><div id="sd-track">加载中…</div></div>`;
 
   const load = async () => {
+    try {
+      const s = await api(`/sales/so?period=${period}`);
+      const orows = s.rows || [];
+      $("#so-list").innerHTML = orows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无销售订单，点右上「新建销售订单」</div>`;
+      $all("[data-so-edit]").forEach((b) => b.onclick = () => openOrderEditor("so", main, parseInt(b.dataset.soEdit, 10)));
+      $all("[data-so-confirm]").forEach((b) => b.onclick = () => soTransition(b.dataset.soConfirm, "Confirmed"));
+      $all("[data-so-cancel]").forEach((b) => b.onclick = () => soTransition(b.dataset.soCancel, "Cancelled"));
+      $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
+      $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#so-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/sales/quote?period=${period}`);
       $("#sd-list").innerHTML = table(r.rows || []);
@@ -3525,6 +3555,10 @@ async function viewSoDoc(main) {
       $("#sd-track").innerHTML = soTrack(t.rows || []);
     } catch (e) { $("#sd-track").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
   };
+  const soTransition = async (id, status) => {
+    try { await api(`/sales/so/${id}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); toast("已更新订单状态", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#so-new").onclick = () => openOrderEditor("so", main, null);
   $("#sd-save").addEventListener("click", async () => {
     try {
       await postJson("/sales/quote", { id: 0, period: ymm(state.current || ""), date: today(), customer_code: $("#sd-cust").value.trim(), customer_name: $("#sd-cust").value.trim(), item_code: $("#sd-item").value.trim(), item_name: $("#sd-item").value.trim(), qty: $("#sd-qty").value.trim() || "0", unit_price: $("#sd-price").value.trim() || "0", status: "draft", prepared_by: "", memo: "" });
@@ -3548,6 +3582,115 @@ async function viewSoDoc(main) {
     } catch (e) { toast(e.message, "err"); }
   });
   load();
+}
+
+// ---------------- 订单（销售/采购）CRUD：对标金蝶订单流程 ----------------
+const ORDER_STATUS_LABEL = {
+  Draft: "草稿", Confirmed: "已确认", PartialShip: "部分发货", PartialIn: "部分入库",
+  Completed: "已完成", Cancelled: "已作废",
+};
+const ORDER_CFG = {
+  so: { base: "/sales/so", view: "so-doc", party: "客户编码", partyName: "客户名称", pkey: "customer_code", nkey: "customer_name" },
+  po: { base: "/procure/po", view: "po-doc", party: "供应商编码", partyName: "供应商名称", pkey: "supplier_code", nkey: "supplier_name" },
+};
+
+async function openOrderEditor(kind, main, id) {
+  const cfg = ORDER_CFG[kind];
+  let o = null;
+  if (id) {
+    try {
+      const r = await api(`${cfg.base}?period=${encodeURIComponent(state.current || "")}`);
+      o = (r.rows || []).find((x) => x.id === id);
+    } catch (e) { toast(e.message, "err"); return; }
+    if (!o) { toast("未找到该订单，请刷新列表", "err"); return; }
+  }
+  const ord = o || { id: 0, status: "Draft", date: today(), memo: "", lines: [] };
+  ord[cfg.pkey] = ord[cfg.pkey] || "";
+  ord[cfg.nkey] = ord[cfg.nkey] || "";
+  let lines = (ord.lines || []).map((l) => ({
+    item_code: l.item_code || "", item_name: l.item_name || "",
+    qty_ordered: String(l.qty_ordered != null ? l.qty_ordered : "1"),
+    unit_price: String(l.unit_price != null ? l.unit_price : "0"),
+    tax_rate: String(l.tax_rate != null ? l.tax_rate : "0.13"),
+    qty_shipped: String(l.qty_shipped != null ? l.qty_shipped : "0"),
+    qty_received: String(l.qty_received != null ? l.qty_received : "0"),
+    memo: l.memo || "",
+  }));
+  const blank = { item_code: "", item_name: "", qty_ordered: "1", unit_price: "0", tax_rate: "0.13", qty_shipped: "0", qty_received: "0", memo: "" };
+  if (!lines.length) lines = [{ ...blank }];
+  const mask = modal(`
+    <h3>${id ? `编辑订单 ${esc(ord.no || "")}` : (kind === "so" ? "新建销售订单" : "新建采购订单")}</h3>
+    <div class="toolbar">
+      <label>${cfg.party} * <input id="oe-party" value="${esc(ord[cfg.pkey])}" style="width:100px" /></label>
+      <label>${cfg.partyName} <input id="oe-party-name" value="${esc(ord[cfg.nkey])}" style="width:110px" /></label>
+      <label>日期 <input id="oe-date" type="date" value="${esc(ord.date)}" /></label>
+      <label>备注 <input id="oe-memo" value="${esc(ord.memo)}" style="width:120px" /></label>
+    </div>
+    <table class="grid" id="oe-tbl">
+      <thead><tr><th>存货编码 *</th><th>名称</th><th class="num">数量</th><th class="num">单价(不含税)</th><th class="num">税率</th><th class="num">行金额</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button class="btn ghost sm" id="oe-add">+ 增加明细行</button>
+    <div style="margin-top:8px" class="muted">合计：不含税 <b id="oe-t-amt">0.00</b>　税额 <b id="oe-t-tax">0.00</b>　价税合计 <b id="oe-t-total">0.00</b></div>
+    <div class="foot"><button class="btn primary" id="oe-save">保存</button><button class="btn ghost" id="oe-close">取消</button></div>
+  `, true);
+  const tbody = $("#oe-tbl tbody", mask);
+  const recalc = () => {
+    let a = 0, t = 0;
+    lines.forEach((l) => {
+      a += (parseFloat(l.qty_ordered) || 0) * (parseFloat(l.unit_price) || 0);
+      t += (parseFloat(l.qty_ordered) || 0) * (parseFloat(l.unit_price) || 0) * (parseFloat(l.tax_rate) || 0);
+    });
+    $("#oe-t-amt", mask).textContent = a.toFixed(2);
+    $("#oe-t-tax", mask).textContent = t.toFixed(2);
+    $("#oe-t-total", mask).textContent = (a + t).toFixed(2);
+  };
+  const render = () => {
+    tbody.innerHTML = lines.map((l, i) => `<tr>
+      <td><input data-f="item_code" data-i="${i}" value="${esc(l.item_code)}" style="width:90px" /></td>
+      <td><input data-f="item_name" data-i="${i}" value="${esc(l.item_name)}" style="width:110px" /></td>
+      <td><input data-f="qty_ordered" data-i="${i}" value="${esc(l.qty_ordered)}" style="width:64px" /></td>
+      <td><input data-f="unit_price" data-i="${i}" value="${esc(l.unit_price)}" style="width:80px" /></td>
+      <td><input data-f="tax_rate" data-i="${i}" value="${esc(l.tax_rate)}" style="width:56px" /></td>
+      <td class="num">${((parseFloat(l.qty_ordered) || 0) * (parseFloat(l.unit_price) || 0)).toFixed(2)}</td>
+      <td><button class="btn ghost sm" data-del="${i}">删</button></td>
+    </tr>`).join("");
+    $all("input[data-f]", tbody).forEach((inp) => {
+      inp.onchange = () => { lines[parseInt(inp.dataset.i, 10)][inp.dataset.f] = inp.value; recalc(); render(); };
+    });
+    $all("[data-del]", tbody).forEach((b) => b.onclick = () => {
+      lines.splice(parseInt(b.dataset.del, 10), 1);
+      if (!lines.length) lines.push({ ...blank });
+      recalc(); render();
+    });
+  };
+  render(); recalc();
+  $("#oe-add", mask).onclick = () => { lines.push({ ...blank }); render(); recalc(); };
+  $("#oe-close", mask).onclick = closeModal;
+  $("#oe-save", mask).onclick = async () => {
+    const party = $("#oe-party", mask).value.trim();
+    if (!party) { toast(`${cfg.party}必填`, "err"); return; }
+    const clean = lines.filter((l) => l.item_code.trim());
+    if (!clean.length) { toast("至少一行明细（填写存货编码）", "err"); return; }
+    const body = {
+      id: ord.id || 0,
+      period: ymm(state.current || ""),
+      date: $("#oe-date", mask).value,
+      [cfg.pkey]: party,
+      [cfg.nkey]: $("#oe-party-name", mask).value.trim() || party,
+      status: ord.status || "Draft",
+      memo: $("#oe-memo", mask).value.trim(),
+      lines: clean.map((l) => ({
+        item_code: l.item_code.trim(), item_name: l.item_name.trim(),
+        qty_ordered: l.qty_ordered, unit_price: l.unit_price, tax_rate: l.tax_rate,
+        qty_shipped: l.qty_shipped, qty_received: l.qty_received, memo: l.memo,
+      })),
+    };
+    try {
+      await api(cfg.base, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("已保存订单", "ok"); closeModal(); rerenderView(cfg.view, main);
+    } catch (e) { toast(e.message, "err"); }
+  };
 }
 
 async function viewOrderChangeLog(main) {
@@ -4482,6 +4625,7 @@ function openAuxEditor(main, ent, kind) {
     <h3>${isEdit ? "编辑档案" : "新增档案"}（${esc(AUX_KINDS.find((k) => k.code === kind).label)}）</h3>
     <div class="field"><label>编码 *</label><input id="au-code" value="${esc(e.code)}" /></div>
     <div class="field"><label>名称 *</label><input id="au-name" value="${esc(e.name)}" /></div>
+    ${kind === "customer" ? `<div class="field"><label>信用额度（0 = 不限；超出后订单「确认」被拒）</label><input id="au-credit" value="${esc((e.props && e.props.credit_limit) || "0")}" /></div>` : ""}
     <div class="field"><label>上级编码（分级档案用）</label><input id="au-parent" value="${esc(e.parent_code || "")}" /></div>
     <div class="field"><label>备注</label><input id="au-memo" value="${esc(e.memo)}" /></div>
     <div class="field"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="au-disabled" ${e.disabled ? "checked" : ""} />停用</label></div>
@@ -4501,7 +4645,7 @@ function openAuxEditor(main, ent, kind) {
       parent_code: parent || null,
       disabled: $("#au-disabled", mask).checked,
       memo: $("#au-memo", mask).value.trim(),
-      props: e.props || {},
+      props: Object.assign({}, e.props || {}, kind === "customer" ? { credit_limit: $("#au-credit", mask).value.trim() || "0" } : {}),
     });
     try {
       if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

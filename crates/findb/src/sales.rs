@@ -258,13 +258,20 @@ pub fn customer_credit_limit(db: &Db, customer_code: &str) -> DbResult<Money> {
     Ok(map.get("credit_limit").map(|s| m(s)).unwrap_or(Money::ZERO))
 }
 
-/// 信用检查：某客户累计应收（销售订单总额 − 已收款）是否超额度。
+/// 信用检查：某客户**已确认**订单占用（订单总额 − 已收款）是否超额度。
+/// 对标金蝶：草稿订单不占用信用（可自由编辑/废弃），确认起才形成承诺；
 /// 返回 (累计占用, 信用额度, 是否超限)。
 pub fn credit_check(db: &Db, customer_code: &str, period: Period) -> DbResult<(Money, Money, bool)> {
     let limit = customer_credit_limit(db, customer_code)?;
     let orders = crate::scm::so_list(db, period, None)?;
     let mut receivable = Money::ZERO;
-    for o in orders.iter().filter(|o| o.customer_code == customer_code && !matches!(o.status, crate::scm::SoStatus::Cancelled)) {
+    for o in orders
+        .iter()
+        .filter(|o| {
+            o.customer_code == customer_code
+                && !matches!(o.status, crate::scm::SoStatus::Cancelled | crate::scm::SoStatus::Draft)
+        })
+    {
         receivable += o.total_amount;
         receivable -= so_payment_sum(db, o.id)?;
     }

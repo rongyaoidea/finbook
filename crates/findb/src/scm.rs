@@ -8,6 +8,19 @@ use rusqlite::OptionalExtension;
 
 use crate::{Db, DbResult, FinError};
 
+/// 状态列以**无引号文本**落库（历史行为：`to_value(...).as_str()`），而 serde_json
+/// 解析枚举要求合法 JSON——裸 `Draft` 会报 "expected value"。读回时统一补引号，
+/// 并兼容历史数据中偶发的带引号值；否则所有状态会被 `unwrap_or(Draft)` 静默吞掉。
+pub fn status_from<T: serde::de::DeserializeOwned>(stored: &str) -> Option<T> {
+    let s = stored.trim();
+    let quoted = if s.starts_with('"') {
+        s.to_string()
+    } else {
+        format!("\"{s}\"")
+    };
+    serde_json::from_str(&quoted).ok()
+}
+
 // ===========================================================================
 // 采购订单
 // ===========================================================================
@@ -25,7 +38,7 @@ impl PoStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PoLine {
     pub id: i64, pub po_id: i64,
     pub item_code: String, pub item_name: String,
@@ -34,7 +47,7 @@ pub struct PoLine {
     pub amount: Money, pub tax_amount: Money, pub memo: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PurchaseOrder {
     pub id: i64, pub period: Period, pub no: String, pub date: NaiveDate,
     pub supplier_code: String, pub supplier_name: String,
@@ -54,6 +67,71 @@ impl PurchaseOrder {
     }
 }
 
+/// 按 id 取采购订单（含明细）
+pub fn po_get(db: &Db, id: i64) -> DbResult<Option<PurchaseOrder>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, period, no, date, supplier_code, supplier_name, status,
+                total_amount, total_tax, received_amount, prepared_by, memo
+         FROM purchase_order WHERE id=?1",
+    )?;
+    let mut po = stmt
+        .query_row([id], |r| {
+            Ok(PurchaseOrder {
+                id: r.get(0)?,
+                period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?,
+                date: r.get(3)?,
+                supplier_code: r.get(4)?,
+                supplier_name: r.get(5)?,
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                received_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?,
+                memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })
+        .optional()?;
+    let Some(po) = po else {
+        return Ok(None);
+    };
+    let mut po = po;
+    let mut lstmt = db.conn().prepare(
+        "SELECT id, item_code, item_name, qty_ordered, qty_received,
+                unit_price, tax_rate, amount, tax_amount, memo
+         FROM po_line WHERE po_id=? ORDER BY id",
+    )?;
+    po.lines = lstmt
+        .query_map([id], |r| {
+            Ok(PoLine {
+                id: r.get(0)?,
+                po_id: id,
+                item_code: r.get(1)?,
+                item_name: r.get(2)?,
+                qty_ordered: Money::parse_or_zero(&r.get::<_, String>(3)?),
+                qty_received: Money::parse_or_zero(&r.get::<_, String>(4)?),
+                unit_price: Money::parse_or_zero(&r.get::<_, String>(5)?),
+                tax_rate: Money::parse_or_zero(&r.get::<_, String>(6)?),
+                amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                tax_amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                memo: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(po))
+}
+
+/// 采购订单状态流转（草稿 → 已确认 / 作废）
+pub fn po_set_status(db: &Db, id: i64, to: PoStatus) -> DbResult<()> {
+    let Some(mut po) = po_get(db, id)? else {
+        return Err(FinError::not_found("采购订单").into());
+    };
+    po.status = to;
+    po_save(db, &mut po)?;
+    Ok(())
+}
+
 // ===========================================================================
 // 销售订单
 // ===========================================================================
@@ -71,7 +149,7 @@ impl SoStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SoLine {
     pub id: i64, pub so_id: i64,
     pub item_code: String, pub item_name: String,
@@ -80,7 +158,7 @@ pub struct SoLine {
     pub amount: Money, pub tax_amount: Money, pub memo: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SalesOrder {
     pub id: i64, pub period: Period, pub no: String, pub date: NaiveDate,
     pub customer_code: String, pub customer_name: String,
@@ -259,7 +337,7 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
                 id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
                 no: r.get(2)?, date: r.get(3)?,
                 supplier_code: r.get(4)?, supplier_name: r.get(5)?,
-                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
                 total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
                 received_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
@@ -273,7 +351,7 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
                 id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
                 no: r.get(2)?, date: r.get(3)?,
                 supplier_code: r.get(4)?, supplier_name: r.get(5)?,
-                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(PoStatus::Draft),
                 total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
                 received_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
@@ -308,9 +386,38 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
 }
 
 pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
-    let tx = db.write_tx()?;
     so.total_amount = so.lines.iter().map(|l| l.amount).sum();
     so.total_tax = so.lines.iter().map(|l| l.tax_amount).sum();
+    // 信用控制（对标金蝶）：非草稿/非作废订单校验客户信用额度（辅助档案 props.credit_limit，0=不限）。
+    // 占用 = 已确认订单（总额 − 已收款）：credit_check 不计草稿，因此旧单若是已确认要先剔除再加新额，
+    // 草稿单首次确认则只加不减。
+    if !matches!(so.status, SoStatus::Draft | SoStatus::Cancelled) && !so.customer_code.is_empty() {
+        let (mut used, limit, _) = crate::sales::credit_check(db, &so.customer_code, so.period)?;
+        if so.id > 0 {
+            let (old_total, old_status): (String, String) = db
+                .conn()
+                .query_row(
+                    "SELECT total_amount, status FROM sales_order WHERE id=?1",
+                    [so.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .unwrap_or_default();
+            let old_counted = !matches!(old_status.as_str(), "Draft" | "Cancelled");
+            if old_counted {
+                used -= Money::parse_or_zero(&old_total);
+            }
+        }
+        used += so.total_amount;
+        if !limit.is_zero() && used > limit {
+            return Err(FinError::state(format!(
+                "客户 {} 信用额度不足：占用 {}，额度 {}（信用额度在辅助档案·客户中设置）",
+                so.customer_code, used, limit
+            ))
+            .into());
+        }
+    }
+    let tx = db.write_tx()?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     
     let id = if so.id > 0 {
@@ -391,7 +498,7 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
                 id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
                 no: r.get(2)?, date: r.get(3)?,
                 customer_code: r.get(4)?, customer_name: r.get(5)?,
-                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
                 total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
                 shipped_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
@@ -405,7 +512,7 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
                 id: r.get(0)?, period: Period::from_ymm(r.get(1)?),
                 no: r.get(2)?, date: r.get(3)?,
                 customer_code: r.get(4)?, customer_name: r.get(5)?,
-                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
                 total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
                 shipped_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
@@ -437,6 +544,100 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
         orders.push(so);
     }
     Ok(orders)
+}
+
+/// 按 id 取销售订单（含明细）
+pub fn so_get(db: &Db, id: i64) -> DbResult<Option<SalesOrder>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, period, no, date, customer_code, customer_name, status,
+                total_amount, total_tax, shipped_amount, prepared_by, memo
+         FROM sales_order WHERE id=?1",
+    )?;
+    let mut so = stmt
+        .query_row([id], |r| {
+            Ok(SalesOrder {
+                id: r.get(0)?,
+                period: Period::from_ymm(r.get(1)?),
+                no: r.get(2)?,
+                date: r.get(3)?,
+                customer_code: r.get(4)?,
+                customer_name: r.get(5)?,
+                status: status_from(&r.get::<_, String>(6)?).unwrap_or(SoStatus::Draft),
+                total_amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                total_tax: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                shipped_amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                prepared_by: r.get(10)?,
+                memo: r.get(11)?,
+                lines: Vec::new(),
+            })
+        })
+        .optional()?;
+    let Some(so) = so else {
+        return Ok(None);
+    };
+    let mut so = so;
+    let mut lstmt = db.conn().prepare(
+        "SELECT id, item_code, item_name, qty_ordered, qty_shipped,
+                unit_price, tax_rate, amount, tax_amount, memo
+         FROM so_line WHERE so_id=? ORDER BY id",
+    )?;
+    so.lines = lstmt
+        .query_map([id], |r| {
+            Ok(SoLine {
+                id: r.get(0)?,
+                so_id: id,
+                item_code: r.get(1)?,
+                item_name: r.get(2)?,
+                qty_ordered: Money::parse_or_zero(&r.get::<_, String>(3)?),
+                qty_shipped: Money::parse_or_zero(&r.get::<_, String>(4)?),
+                unit_price: Money::parse_or_zero(&r.get::<_, String>(5)?),
+                tax_rate: Money::parse_or_zero(&r.get::<_, String>(6)?),
+                amount: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                tax_amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                memo: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(so))
+}
+
+/// 订单状态流转（草稿 → 已确认 / 作废）：信用检查在 so_save 内把关
+pub fn so_set_status(db: &Db, id: i64, to: SoStatus) -> DbResult<()> {
+    let Some(mut so) = so_get(db, id)? else {
+        return Err(FinError::not_found("销售订单").into());
+    };
+    so.status = to;
+    so_save(db, &mut so)?;
+    Ok(())
+}
+
+/// 发货流水变化后同步订单状态：已确认 → 部分发货 / 已完成（不动草稿与作废）
+pub fn so_progress_update(db: &Db, id: i64) -> DbResult<()> {
+    let Some(so) = so_get(db, id)? else {
+        return Ok(());
+    };
+    if !matches!(so.status, SoStatus::Confirmed | SoStatus::PartialShip | SoStatus::Completed) {
+        return Ok(());
+    }
+    let total_qty: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
+    if total_qty.is_zero() {
+        return Ok(());
+    }
+    let shipped = crate::sales::so_shipment_sum(db, id)?;
+    let to = if shipped.is_zero() {
+        SoStatus::Confirmed
+    } else if shipped >= total_qty {
+        SoStatus::Completed
+    } else {
+        SoStatus::PartialShip
+    };
+    if to != so.status {
+        db.conn().execute(
+            "UPDATE sales_order SET status=?2 WHERE id=?1",
+            rusqlite::params![id, serde_json::to_value(to)?.as_str().unwrap()],
+        )?;
+    }
+    Ok(())
 }
 
 // BOM操作

@@ -256,6 +256,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/procure/price", get(get_price_history))
         .route("/api/procure/track", get(get_po_track))
         .route("/api/procure/stats", get(get_purchase_stats))
+        .route("/api/procure/po", get(list_po).post(save_po))
+        .route("/api/procure/po/:id/transition", post(transition_po))
+        .route("/api/procure/po/:id/delete", post(delete_po))
         .route("/api/sales/quote", get(list_quotation).post(save_quotation))
         .route("/api/sales/quote/:id/approve", post(approve_quotation))
         .route("/api/sales/shipment", post(add_so_shipment))
@@ -264,6 +267,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/sales/credit", get(get_credit_check))
         .route("/api/sales/track", get(get_so_track))
         .route("/api/sales/stats", get(get_sales_stats))
+        .route("/api/sales/so", get(list_so).post(save_so))
+        .route("/api/sales/so/:id/transition", post(transition_so))
+        .route("/api/sales/so/:id/delete", post(delete_so))
         // 预算预警
         .route("/api/budget/alerts", get(get_budget_alerts))
         // 坏账准备计提
@@ -4294,6 +4300,352 @@ async fn add_so_payment(
     };
     let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money_checked(&req.amount)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+// ---------------- 订单 CRUD（销售/采购，对标金蝶订单流程） ----------------
+
+#[derive(Deserialize)]
+struct OrderLineInput {
+    #[serde(default)]
+    item_code: String,
+    #[serde(default)]
+    item_name: String,
+    #[serde(default)]
+    qty_ordered: String,
+    #[serde(default)]
+    unit_price: String,
+    #[serde(default)]
+    tax_rate: String,
+    #[serde(default)]
+    qty_shipped: String,
+    #[serde(default)]
+    qty_received: String,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct SoInput {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    customer_code: String,
+    #[serde(default)]
+    customer_name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    memo: String,
+    #[serde(default)]
+    lines: Vec<OrderLineInput>,
+}
+
+#[derive(Deserialize)]
+struct PoInput {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    supplier_code: String,
+    #[serde(default)]
+    supplier_name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    memo: String,
+    #[serde(default)]
+    lines: Vec<OrderLineInput>,
+}
+
+#[derive(Deserialize)]
+struct OrderTransitionReq {
+    status: String,
+}
+
+/// 订单日期：缺省今天（非法值回退今天，不让单据失败）
+fn order_date(s: &str) -> NaiveDate {
+    if s.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::Local::now().date_naive())
+    }
+}
+
+fn so_status_parse(s: &str) -> Result<findb::scm::SoStatus, AppError> {
+    findb::scm::status_from::<findb::scm::SoStatus>(s.trim()).ok_or_else(|| {
+        AppError::bad_request("订单状态取值：Draft/Confirmed/PartialShip/Completed/Cancelled")
+    })
+}
+
+fn po_status_parse(s: &str) -> Result<findb::scm::PoStatus, AppError> {
+    findb::scm::status_from::<findb::scm::PoStatus>(s.trim()).ok_or_else(|| {
+        AppError::bad_request("订单状态取值：Draft/Confirmed/PartialIn/Completed/Cancelled")
+    })
+}
+
+async fn list_so(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let rows = findb::scm::so_list(&db, period, None)?;
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// 保存销售订单：服务端计算行金额（数量×单价）与税额（金额×税率）；
+/// 非草稿状态保存时 so_save 内做客户信用检查（对标金蝶卡控）。
+async fn save_so(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SoInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let code = req.customer_code.trim();
+    if code.is_empty() {
+        return Err(AppError::bad_request("客户编码必填"));
+    }
+    let name = if req.customer_name.trim().is_empty() {
+        code.to_string()
+    } else {
+        req.customer_name.trim().to_string()
+    };
+    let mut so = findb::scm::SalesOrder::new(period, order_date(&req.date), code, &name, user.username());
+    so.id = req.id;
+    so.memo = req.memo;
+    so.status = so_status_parse(&req.status)?;
+    if so.id > 0 {
+        let old = findb::scm::so_get(&db, so.id)?
+            .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
+        so.no = old.no;
+        so.shipped_amount = old.shipped_amount;
+    } else {
+        so.no = findb::scm::so_next_no(&db, period)?;
+    }
+    for l in &req.lines {
+        if l.item_code.trim().is_empty() {
+            continue;
+        }
+        let qty = parse_money_checked(&l.qty_ordered)?;
+        let price = parse_money_checked(&l.unit_price)?;
+        let rate = if l.tax_rate.trim().is_empty() {
+            Money::ZERO
+        } else {
+            parse_money_checked(&l.tax_rate)?
+        };
+        let amount = (qty * price).round2();
+        let tax = (amount * rate).round2();
+        so.lines.push(findb::scm::SoLine {
+            id: 0,
+            so_id: 0,
+            item_code: l.item_code.trim().to_string(),
+            item_name: if l.item_name.trim().is_empty() {
+                l.item_code.trim().to_string()
+            } else {
+                l.item_name.trim().to_string()
+            },
+            qty_ordered: qty,
+            qty_shipped: if l.qty_shipped.trim().is_empty() {
+                Money::ZERO
+            } else {
+                parse_money_checked(&l.qty_shipped)?
+            },
+            unit_price: price,
+            tax_rate: rate,
+            amount,
+            tax_amount: tax,
+            memo: l.memo.clone(),
+        });
+    }
+    if so.lines.is_empty() {
+        return Err(AppError::bad_request("订单至少一行明细"));
+    }
+    let id = findb::scm::so_save(&db, &mut so)?;
+    db.log(
+        user.username(),
+        "销售",
+        "保存销售订单",
+        &format!("#{} {} {} 不含税 {}", id, so.no, code, so.total_amount.fmt_money()),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "total_amount": so.total_amount,
+        "total_tax": so.total_tax
+    })))
+}
+
+async fn transition_so(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<OrderTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let to = so_status_parse(&req.status)?;
+    findb::scm::so_set_status(&db, id, to)?;
+    db.log(user.username(), "销售", "销售订单状态", &format!("#{} → {}", id, to.label()))?;
+    Ok(Json(json!({ "ok": true, "status": to.label() })))
+}
+
+async fn delete_so(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::scm::so_delete(&db, id)?;
+    db.log(user.username(), "销售", "删除销售订单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let rows = findb::scm::po_list(&db, period, None)?;
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// 保存采购订单（行金额/税额服务端计算，同销售订单）
+async fn save_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<PoInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let code = req.supplier_code.trim();
+    if code.is_empty() {
+        return Err(AppError::bad_request("供应商编码必填"));
+    }
+    let name = if req.supplier_name.trim().is_empty() {
+        code.to_string()
+    } else {
+        req.supplier_name.trim().to_string()
+    };
+    let mut po = findb::scm::PurchaseOrder::new(period, order_date(&req.date), code, &name, user.username());
+    po.id = req.id;
+    po.memo = req.memo;
+    po.status = po_status_parse(&req.status)?;
+    if po.id > 0 {
+        let old = findb::scm::po_get(&db, po.id)?
+            .ok_or_else(|| AppError::not_found("采购订单不存在"))?;
+        po.no = old.no;
+        po.received_amount = old.received_amount;
+    } else {
+        po.no = findb::scm::po_next_no(&db, period)?;
+    }
+    for l in &req.lines {
+        if l.item_code.trim().is_empty() {
+            continue;
+        }
+        let qty = parse_money_checked(&l.qty_ordered)?;
+        let price = parse_money_checked(&l.unit_price)?;
+        let rate = if l.tax_rate.trim().is_empty() {
+            Money::ZERO
+        } else {
+            parse_money_checked(&l.tax_rate)?
+        };
+        let amount = (qty * price).round2();
+        let tax = (amount * rate).round2();
+        po.lines.push(findb::scm::PoLine {
+            id: 0,
+            po_id: 0,
+            item_code: l.item_code.trim().to_string(),
+            item_name: if l.item_name.trim().is_empty() {
+                l.item_code.trim().to_string()
+            } else {
+                l.item_name.trim().to_string()
+            },
+            qty_ordered: qty,
+            qty_received: if l.qty_received.trim().is_empty() {
+                Money::ZERO
+            } else {
+                parse_money_checked(&l.qty_received)?
+            },
+            unit_price: price,
+            tax_rate: rate,
+            amount,
+            tax_amount: tax,
+            memo: l.memo.clone(),
+        });
+    }
+    if po.lines.is_empty() {
+        return Err(AppError::bad_request("订单至少一行明细"));
+    }
+    let id = findb::scm::po_save(&db, &mut po)?;
+    db.log(
+        user.username(),
+        "采购",
+        "保存采购订单",
+        &format!("#{} {} {} 不含税 {}", id, po.no, code, po.total_amount.fmt_money()),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "total_amount": po.total_amount,
+        "total_tax": po.total_tax
+    })))
+}
+
+async fn transition_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<OrderTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let to = po_status_parse(&req.status)?;
+    findb::scm::po_set_status(&db, id, to)?;
+    db.log(user.username(), "采购", "采购订单状态", &format!("#{} → {}", id, to.label()))?;
+    Ok(Json(json!({ "ok": true, "status": to.label() })))
+}
+
+async fn delete_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::scm::po_delete(&db, id)?;
+    db.log(user.username(), "采购", "删除采购订单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_credit_check(

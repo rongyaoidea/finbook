@@ -3678,7 +3678,7 @@ async fn stock_adjust_endpoint(
     user: CurrentUser,
     Json(req): Json<StockAdjustReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     if req.item.trim().is_empty() {
         return Err(AppError::bad_request("缺少存货 item"));
@@ -3715,7 +3715,7 @@ async fn serial_in_endpoint(
     user: CurrentUser,
     Json(req): Json<SerialInReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let date = if req.date.is_empty() {
@@ -3739,7 +3739,7 @@ async fn serial_out_endpoint(
     user: CurrentUser,
     Json(req): Json<SerialOutReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let date = if req.date.is_empty() {
@@ -3756,7 +3756,7 @@ async fn list_serial(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let item = q.get("item").cloned().unwrap_or_default();
     if item.is_empty() {
         return Err(AppError::bad_request("缺少 item"));
@@ -3771,7 +3771,7 @@ async fn get_unit(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let item = q.get("item").cloned().unwrap_or_default();
     let db = state.db_for(&user.book_key)?;
     let u = findb::inventory2::unit_get(&db, &item)?;
@@ -3794,7 +3794,7 @@ async fn set_unit(
     user: CurrentUser,
     Json(req): Json<UnitReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     findb::inventory2::unit_set(&db, &findb::inventory2::ItemUnit {
         item: req.item,
@@ -3840,7 +3840,7 @@ async fn assemble_endpoint(
     user: CurrentUser,
     Json(req): Json<AssembleReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let date = if req.date.is_empty() {
@@ -3861,7 +3861,7 @@ async fn disassemble_endpoint(
     user: CurrentUser,
     Json(req): Json<AssembleReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let date = if req.date.is_empty() {
@@ -3931,7 +3931,7 @@ async fn add_estimate(
     user: CurrentUser,
     Json(req): Json<EstimateReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     // 登记暂估即同事务生成暂估凭证（借 存货 / 贷 应付-订单供应商）
@@ -3950,7 +3950,7 @@ async fn list_estimates(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let po_id = q
         .get("po_id")
         .and_then(|s| s.parse::<i64>().ok())
@@ -3969,7 +3969,7 @@ async fn settle_estimate(
     Path(id): Path<i64>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let today = chrono::Local::now().date_naive();
     let date = if body.is_empty() {
@@ -4045,7 +4045,7 @@ async fn set_quota(
     user: CurrentUser,
     Json(req): Json<QuotaReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     findb::scm2::quota_set(&db, period, &req.supplier, &req.item, parse_money_checked(&req.quota_qty)?)?;
@@ -4072,7 +4072,7 @@ async fn list_purchase_req(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let rows = findb::procurement::pr_list(&db, period)?;
@@ -4084,7 +4084,7 @@ async fn save_purchase_req(
     user: CurrentUser,
     Json(mut req): Json<findb::procurement::PurchaseReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     if req.no.is_empty() {
         req.no = findb::procurement::pr_next_no(&db, req.period)?;
@@ -4101,7 +4101,7 @@ async fn approve_purchase_req(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     findb::procurement::pr_approve(&db, id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -4124,7 +4124,7 @@ async fn add_po_receipt(
     user: CurrentUser,
     Json(req): Json<ReceiptReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4143,7 +4143,7 @@ async fn add_po_return(
     user: CurrentUser,
     Json(req): Json<ReceiptReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4259,7 +4259,7 @@ async fn list_quotation(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let rows = findb::sales::quo_list(&db, period)?;
@@ -4271,7 +4271,7 @@ async fn save_quotation(
     user: CurrentUser,
     Json(mut req): Json<findb::sales::Quotation>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     if req.no.is_empty() {
         req.no = findb::sales::quo_next_no(&db, req.period)?;
@@ -4288,7 +4288,7 @@ async fn approve_quotation(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     findb::sales::quo_approve(&db, id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -4311,7 +4311,7 @@ async fn add_so_shipment(
     user: CurrentUser,
     Json(req): Json<ShipmentReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4344,7 +4344,7 @@ async fn add_so_return(
     user: CurrentUser,
     Json(req): Json<ShipmentReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4645,7 +4645,7 @@ async fn convert_quotation(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let so_id = findb::sales::quo_to_order(&db, id, user.username())?;
     db.log(
@@ -4751,7 +4751,7 @@ async fn list_so(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = q
         .get("period")
@@ -4768,7 +4768,7 @@ async fn save_so(
     user: CurrentUser,
     Json(req): Json<SoInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 {
         period_checked(req.period)?
@@ -4855,7 +4855,7 @@ async fn transition_so(
     Path(id): Path<i64>,
     Json(req): Json<OrderTransitionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = so_status_parse(&req.status)?;
     findb::scm::so_set_status(&db, id, to)?;
@@ -4868,7 +4868,7 @@ async fn delete_so(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     findb::scm::so_delete(&db, id)?;
     db.log(user.username(), "销售", "删除销售订单", &format!("#{id}"))?;
@@ -4880,7 +4880,7 @@ async fn list_po(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = q
         .get("period")
@@ -4896,7 +4896,7 @@ async fn save_po(
     user: CurrentUser,
     Json(req): Json<PoInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 {
         period_checked(req.period)?
@@ -4983,7 +4983,7 @@ async fn transition_po(
     Path(id): Path<i64>,
     Json(req): Json<OrderTransitionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = po_status_parse(&req.status)?;
     findb::scm::po_set_status(&db, id, to)?;
@@ -4996,7 +4996,7 @@ async fn delete_po(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     findb::scm::po_delete(&db, id)?;
     db.log(user.username(), "采购", "删除采购订单", &format!("#{id}"))?;

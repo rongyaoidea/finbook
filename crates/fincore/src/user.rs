@@ -47,6 +47,10 @@ pub enum Perm {
     Backup,
     /// 查看操作日志
     AuditLog,
+    /// 订单作业（订单 / 报价 / 执行 / 请购 / 暂估 / 配额——与科目维护分离，订单部独立上岗）
+    OrderOps,
+    /// 仓储作业（库存调整 / 序列号 / 多单位 / 组装拆卸——与科目维护分离，仓管独立上岗）
+    Warehouse,
 }
 
 impl Perm {
@@ -71,6 +75,8 @@ impl Perm {
             Perm::SysOption => "账套参数",
             Perm::Backup => "备份恢复",
             Perm::AuditLog => "操作日志",
+            Perm::OrderOps => "订单作业",
+            Perm::Warehouse => "仓储作业",
         }
     }
     pub fn all() -> &'static [Perm] {
@@ -94,6 +100,8 @@ impl Perm {
             Perm::SysOption,
             Perm::Backup,
             Perm::AuditLog,
+            Perm::OrderOps,
+            Perm::Warehouse,
         ]
     }
 }
@@ -113,6 +121,10 @@ pub enum Role {
     Cashier,
     /// 审核人：只能审核
     Auditor,
+    /// 订单专员：订单 / 报价 / 执行 / 请购 / 暂估 + 档案 + 报表（动不了科目表与凭证）
+    OrderClerk,
+    /// 仓管员：仓储作业 + 报表（动不了科目表与凭证）
+    Keeper,
     /// 只读：查看报表
     Viewer,
 }
@@ -125,6 +137,8 @@ impl Role {
             Role::Accountant => "会计",
             Role::Cashier => "出纳",
             Role::Auditor => "审核人",
+            Role::OrderClerk => "订单专员",
+            Role::Keeper => "仓管员",
             Role::Viewer => "只读",
         }
     }
@@ -135,6 +149,8 @@ impl Role {
             Role::Accountant,
             Role::Cashier,
             Role::Auditor,
+            Role::OrderClerk,
+            Role::Keeper,
             Role::Viewer,
         ]
     }
@@ -148,14 +164,16 @@ impl Role {
             Role::Supervisor => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
                 VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
-                CarryForward, PeriodClose, Report, Export, AuditLog,
+                CarryForward, PeriodClose, Report, Export, AuditLog, OrderOps, Warehouse,
             ],
             Role::Accountant => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
-                Opening, CarryForward, Report,
+                Opening, CarryForward, Report, OrderOps, Warehouse,
             ],
             Role::Cashier => &[VoucherNew, VoucherEdit, CashierSign, Report],
             Role::Auditor => &[VoucherAudit, VoucherUnaudit, Report],
+            Role::OrderClerk => &[OrderOps, AuxEdit, Report],
+            Role::Keeper => &[Warehouse, Report],
             Role::Viewer => &[Report],
         }
     }

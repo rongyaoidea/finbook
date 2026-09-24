@@ -5059,6 +5059,165 @@ async fn web_settle_manual_records_aging() {
     assert_eq!(resp.status(), StatusCode::OK, "取消核销应成功");
 }
 
+/// 预设岗位拆权：订单专员只动订单（动不了科目与凭证）；仓管员只动仓储（动不了订单与凭证）。
+#[tokio::test]
+async fn role_presets_order_clerk_and_keeper() {
+    let (state, _bd, _dir) = test_state();
+    let admin = boss_in_b1(&state).await;
+
+    // 开平台账号 → 邀请进 b1（口令沿用平台）
+    for (u, name, role) in [
+        ("ord1", "订单专员", "order_clerk"),
+        ("wh1", "仓管员", "keeper"),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &admin,
+                serde_json::json!({ "username": u, "display_name": name, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台账号 {u}");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &admin,
+                serde_json::json!({
+                    "username": u, "display_name": name, "password": "",
+                    "role": role, "must_change_pwd": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {role} 应成功");
+    }
+
+    // 登录 + 平台首登强制改密 + 进账套
+    let mut sids: Vec<String> = Vec::new();
+    for u in ["ord1", "wh1"] {
+        let (st, sid) = login(&state, u, "Test12345").await;
+        assert_eq!(st, StatusCode::OK, "{u} 登录");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 首登改密");
+        assert_eq!(select_book(&state, &sid, "b1").await, StatusCode::OK, "{u} 进账套");
+        sids.push(sid);
+    }
+    let clerk = sids[0].clone();
+    let keeper = sids[1].clone();
+
+    // 订单专员：能建订单 / 报价（OrderOps）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &clerk,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "customer_code": "C01",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "2", "unit_price": "10", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单专员应能建销售订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &clerk,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "item_code": "140501", "item_name": "成品",
+                "qty": "1", "unit_price": "5",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单专员应能建报价单");
+
+    // 订单专员：动不了科目（AccountEdit 分离的核心断言）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/accounts",
+            &clerk,
+            serde_json::json!({
+                "account": {
+                    "code": "88881", "name": "订单员不该建的科目", "category": "asset", "dir": "debit",
+                    "aux": 0, "unit": null, "currency": null, "has_qty": false,
+                    "is_cash": false, "is_bank": false, "cash_flow_item": null,
+                    "bs_item": null, "pl_item": null, "disabled": false, "memo": ""
+                },
+                "aux_kinds": []
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能维护科目");
+
+    // 两张单都动不了凭证（无 VoucherNew）
+    let voucher_payload = || {
+        serde_json::json!({
+            "id": 0, "period": 202601, "date": "2026-01-31", "word": "记",
+            "no": 77, "attachments": 0, "memo": "",
+            "entries": [
+                { "line": 1, "account_code": "1001", "summary": "x", "debit": "10", "credit": "0" },
+                { "line": 2, "account_code": "2001", "summary": "x", "debit": "0", "credit": "10" }
+            ],
+        })
+    };
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/vouchers", &clerk, voucher_payload()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能手工录凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/vouchers", &keeper, voucher_payload()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "仓管员不应能手工录凭证");
+
+    // 仓管员：能读仓储数据（Warehouse）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/unit?item=140301", &keeper))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "仓管员应能读多单位配置");
+
+    // 仓管员：动不了订单（反向隔离）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &keeper,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "customer_code": "C01",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "1", "unit_price": "1", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "仓管员不应能建订单");
+
+    // 订单专员：动不了仓储作业（反向隔离）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/assemble",
+            &clerk,
+            serde_json::json!({ "parent": "5001", "children": [["500101", "1"]], "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能组装拆卸");
+}
+
 /// 打印/导出端点冒烟（均返回 200 且内容类型正确）。
 #[tokio::test]
 async fn web_print_and_pdf_endpoints() {

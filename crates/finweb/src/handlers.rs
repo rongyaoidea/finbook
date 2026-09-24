@@ -2374,7 +2374,7 @@ async fn list_invoices(
     user: CurrentUser,
     Query(q): Query<InvoiceListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let rows = findb::invoices::list(
         &db,
@@ -2393,7 +2393,7 @@ async fn invoice_summary(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let sum = findb::invoices::summary(&db)?;
     let by_kind: serde_json::Map<String, serde_json::Value> = sum
@@ -2666,7 +2666,7 @@ async fn get_ledger(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<fincore::balance::LedgerRow>>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let (db, chart, lq) = ledger_query_from(&state, &user, &q)?;
     let rows = balances::ledger(&db, &chart, &lq)?;
     Ok(Json(rows))
@@ -2678,7 +2678,7 @@ async fn get_general_ledger(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<fincore::GeneralLedgerRow>>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let (db, _chart, lq) = ledger_query_from(&state, &user, &q)?;
     Ok(Json(balances::general_ledger(&db, &lq)?))
 }
@@ -2689,7 +2689,7 @@ async fn get_journal(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<fincore::JournalRow>>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let (db, chart, lq) = ledger_query_from(&state, &user, &q)?;
     Ok(Json(balances::journal(&db, &chart, &lq)?))
 }
@@ -2768,7 +2768,7 @@ async fn print_ledger_form(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let code = q.get("code").cloned().unwrap_or_default();
     if code.is_empty() {
         return Err(AppError::bad_request("缺少科目编码参数 code"));
@@ -2927,7 +2927,7 @@ async fn get_trial_balance(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let (rows, totals) = trial_balance_data(&state, &user, &q)?;
     let rows: Vec<TrialRow> = rows.iter().map(TrialRow::from_row).collect();
     Ok(Json(json!({
@@ -3369,7 +3369,7 @@ async fn get_multi_column(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let main = q.get("main").cloned().unwrap_or_default();
     if main.is_empty() {
         return Err(AppError::bad_request("缺少主科目 main"));
@@ -3397,7 +3397,7 @@ async fn get_summary_table(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
     let db = state.db_for(&user.book_key)?;
@@ -3410,7 +3410,7 @@ async fn get_fin_ratios(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         // 默认年初（同一会计年度 1 月）
@@ -3428,7 +3428,7 @@ async fn get_equity_statement(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
         fincore::Period::new(period.year(), 1).unwrap_or(period)
@@ -3447,7 +3447,7 @@ async fn get_report_compare(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let key = q.get("key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
     let cur = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let prev = q.get("prev").and_then(|s| parse_period(s)).unwrap_or(cur.prev());
@@ -3473,7 +3473,7 @@ async fn get_account_daily(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let code = q.get("code").cloned().unwrap_or_default();
     if code.is_empty() {
         return Err(AppError::bad_request("缺少科目编码 code"));
@@ -3500,7 +3500,7 @@ async fn get_period_reconcile(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let db = state.db_for(&user.book_key)?;
     let items = findb::reports::period_reconcile(&db, period)?;
@@ -3513,7 +3513,7 @@ async fn get_aux_balance(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let kind_code = q.get("kind").map(String::as_str).unwrap_or("customer");
     let kind = fincore::AuxKind::from_code(kind_code)
         .ok_or_else(|| AppError::bad_request("非法辅助核算维度 kind"))?;
@@ -3538,7 +3538,7 @@ async fn get_qty_balance(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let (from, to) = report_range(&state, &user, &q);
     let db = state.db_for(&user.book_key)?;
     let rows = balances::qty_balance_sheet(&db, from, to, Some(&user.user))?;
@@ -4657,7 +4657,7 @@ async fn print_receipt_form(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let company = user.company.clone();
     let ids = print_ids(&q);
@@ -5152,7 +5152,7 @@ async fn get_budget_alerts(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| fincore::Period::new(period.year(), 1).unwrap_or(period));
@@ -5373,7 +5373,7 @@ async fn list_budget_versions(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let versions = advanced::bversion_list(&db)?;
     let current = advanced::bversion_current(&db)?;
@@ -5556,7 +5556,7 @@ async fn list_notes(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let report_key = q.get("report_key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let db = state.db_for(&user.book_key)?;
@@ -5715,7 +5715,7 @@ async fn list_bills(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     // 空串表示"全部"：UI 下拉默认值为空，不能当成具体类型去过滤
     let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
@@ -5824,7 +5824,7 @@ async fn list_loans(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     // 空串表示"全部"：UI 下拉默认值为空，不能当成具体类型去过滤
     let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
@@ -5963,7 +5963,7 @@ async fn list_cash_counts(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(serde_json::json!({ "rows": findb::funds::cash_count_list(&db)? })))
 }
@@ -6068,7 +6068,7 @@ async fn list_day_clear(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let account = q
         .get("account")
@@ -6140,7 +6140,7 @@ async fn list_checks(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(json!({ "rows": findb::funds::check_list(&db)? })))
 }
@@ -6431,7 +6431,7 @@ async fn list_receipts(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(json!({ "rows": findb::receipt::receipt_list(&db)? })))
 }
@@ -6504,7 +6504,7 @@ async fn get_funds_budget(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let period = q
         .get("period")
@@ -6520,7 +6520,7 @@ async fn get_funds_daily_date(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let date = match q.get("date") {
         Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -6538,7 +6538,7 @@ async fn get_funds_daily(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let rows = findb::funds::funds_daily(&db, period)?;
@@ -6549,7 +6549,7 @@ async fn get_funds_forecast(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let fc = findb::funds::funds_forecast(&db, period)?;
@@ -6565,7 +6565,7 @@ async fn get_budget_analysis(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let year = q.get("year").and_then(|s| s.parse::<i32>().ok()).unwrap_or_else(|| current_period(&state, &user).year());
     let version = q.get("version").cloned().unwrap_or_default();
@@ -6592,7 +6592,7 @@ async fn list_cost_configs(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let rows = findb::business::cost_configs(&db)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
@@ -7050,7 +7050,7 @@ async fn get_bank(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let account = q.get("account").cloned().unwrap_or_default();
     if account.trim().is_empty() {
         return Err(AppError::bad_request("缺少银行科目 account"));
@@ -7467,7 +7467,7 @@ async fn get_balance_sheet(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let t = statement_table(
@@ -7489,7 +7489,7 @@ async fn print_balance_sheet(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let t = statement_table(
@@ -7520,7 +7520,7 @@ async fn get_income_statement(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let t = statement_table(
@@ -7539,7 +7539,7 @@ async fn print_income_statement(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let t = statement_table(
@@ -7559,7 +7559,7 @@ async fn get_cash_flow(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
@@ -7587,7 +7587,7 @@ async fn print_cash_flow(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
@@ -7601,7 +7601,7 @@ async fn print_equity_statement(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    user.require(Perm::Report)?;
+    user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
     let (from, to) = report_range(&state, &user, &q);
     let stmt = findb::reports::equity_statement(&db, from, to, Some(&user.user))?;

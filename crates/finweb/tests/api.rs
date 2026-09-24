@@ -5522,6 +5522,96 @@ async fn multi_role_positions_and_price_field_perm() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "无仓管兼岗应403");
 }
 
+/// 报表分层（对标金蝶报表按角色授权）：业务岗只见业务报表；账簿/三大表/资金需 FinReport。
+#[tokio::test]
+async fn fin_report_vs_business_report() {
+    let (state, _bd, _dir) = test_state();
+    let boss = boss_in_b1(&state).await;
+
+    // 建订单专员 cl1（无 FinReport）与出纳 ca1（有 FinReport）
+    for (u, role) in [("cl1", "order_clerk"), ("ca1", "cashier")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台 {u}");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &boss,
+                serde_json::json!({ "username": u, "display_name": u, "password": "", "role": role, "must_change_pwd": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {role}");
+    }
+    let mut sids = std::collections::HashMap::new();
+    for u in ["cl1", "ca1"] {
+        let (st, sid) = login(&state, u, "Test12345").await;
+        assert_eq!(st, StatusCode::OK, "{u} 登录");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 改密");
+        assert_eq!(select_book(&state, &sid, "b1").await, StatusCode::OK, "{u} 进账套");
+        sids.insert(u, sid);
+    }
+    let clerk = sids["cl1"].clone();
+    let cashier = sids["ca1"].clone();
+
+    // 业务岗：财务报表端点403（菜单隐藏 + 端点硬拦）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/balance-sheet?to=202601", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应看到资产负债表");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/ledger?from=202601&to=202601", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应看到账簿");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/funds/daily", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应看到资金日报");
+
+    // 业务岗：业务报表仍可用（Report 保留）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/quota?supplier=S01&item=140301", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单专员应能查配额业务报表");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/order/change-log?type=po&id=1", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单专员应能查订单变更");
+
+    // 出纳（FinReport）：资金日报可见
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/funds/daily", &cashier))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "出纳应能看资金日报");
+
+    // 管理员：财务报表照常
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/balance-sheet?to=202601", &boss))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员应能看资产负债表");
+}
+
 /// 打印/导出端点冒烟（均返回 200 且内容类型正确）。
 #[tokio::test]
 async fn web_print_and_pdf_endpoints() {

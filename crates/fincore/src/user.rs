@@ -37,6 +37,8 @@ pub enum Perm {
     PeriodClose,
             /// 查看账簿报表
             Report,
+            /// 财务报表（账簿、三大报表、试算、资金、成本、预算、发票——业务岗不可见，对标金蝶报表按角色授权）
+            FinReport,
             /// 导出数据（Excel / CSV 文件落地，仅管理员与财务主管）
             Export,
     /// 用户与权限管理
@@ -78,6 +80,7 @@ impl Perm {
             Perm::CarryForward => "期末结转",
             Perm::PeriodClose => "期末结账",
             Perm::Report => "账簿报表",
+            Perm::FinReport => "财务报表",
             Perm::Export => "导出数据",
             Perm::UserManage => "用户权限",
             Perm::SysOption => "账套参数",
@@ -107,6 +110,7 @@ impl Perm {
             Perm::CarryForward,
             Perm::PeriodClose,
             Perm::Report,
+            Perm::FinReport,
             Perm::Export,
             Perm::UserManage,
             Perm::SysOption,
@@ -196,23 +200,23 @@ impl Role {
             Role::Supervisor => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
                 VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
-                CarryForward, PeriodClose, Report, Export, AuditLog, OrderOps, Warehouse,
-                PriceView, PriceEdit, CostOps, ProductionOps,
+                CarryForward, PeriodClose, Report, FinReport, Export, AuditLog, OrderOps,
+                Warehouse, PriceView, PriceEdit, CostOps, ProductionOps,
             ],
             Role::Accountant => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
-                Opening, CarryForward, Report, OrderOps, Warehouse,
+                Opening, CarryForward, Report, FinReport, OrderOps, Warehouse,
                 PriceView, PriceEdit, CostOps, ProductionOps,
             ],
-            Role::Cashier => &[VoucherNew, VoucherEdit, CashierSign, Report],
-            Role::Auditor => &[VoucherAudit, VoucherUnaudit, Report],
+            Role::Cashier => &[VoucherNew, VoucherEdit, CashierSign, Report, FinReport],
+            Role::Auditor => &[VoucherAudit, VoucherUnaudit, Report, FinReport],
             Role::OrderClerk => &[OrderOps, AuxEdit, Report, PriceView, PriceEdit],
             Role::Keeper => &[Warehouse, Report],
-            Role::Receivables => &[VoucherNew, AuxEdit, Report],
-            Role::Payables => &[OrderOps, VoucherNew, AuxEdit, Report, PriceView, PriceEdit],
-            Role::CostAccountant => &[CostOps, VoucherNew, Report],
+            Role::Receivables => &[VoucherNew, AuxEdit, Report, FinReport],
+            Role::Payables => &[OrderOps, VoucherNew, AuxEdit, Report, FinReport, PriceView, PriceEdit],
+            Role::CostAccountant => &[CostOps, VoucherNew, Report, FinReport],
             Role::Production => &[ProductionOps, Report],
-            Role::Viewer => &[Report],
+            Role::Viewer => &[Report, FinReport],
         }
     }
 }

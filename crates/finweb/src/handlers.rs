@@ -251,6 +251,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 采购/销售全生命周期：请购 / 报价 / 到货 / 发货 / 付款 / 收款 / 退货 / 信用
         .route("/api/procure/req", get(list_purchase_req).post(save_purchase_req))
         .route("/api/procure/req/:id/approve", post(approve_purchase_req))
+        .route("/api/procure/req/:id/push-po", post(push_req_po))
         .route("/api/procure/receipt", post(add_po_receipt))
         .route("/api/procure/payment", post(add_po_payment))
         .route("/api/procure/return", post(add_po_return))
@@ -409,6 +410,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/workflows/:id/publish", post(publish_workflow))
         .route("/api/workflows/:id/unpublish", post(unpublish_workflow))
         .route("/api/workflows/:id/delete", post(delete_workflow))
+        .route("/api/doc-links", get(get_doc_links))
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
         .layer(axum::middleware::from_fn(csrf_guard))
@@ -5645,6 +5647,47 @@ async fn run_mrp(
     let run_at = advanced::mrp_run(&db, &demands)?;
     let rows = advanced::mrp_by_run(&db, &run_at)?;
     Ok(Json(serde_json::json!({ "run_at": run_at, "rows": rows })))
+}
+
+// ---- 单据下推与追溯（对标金蝶 源单→目标单） ----
+
+/// 请购单下推采购订单：审批后可推，拆单允许多次（每次新订单 + 新勾稽）
+async fn push_req_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let (po_id, po_no) = findb::docflow::req_push_po(&db, id, period, user.username())?;
+    db.log(
+        user.username(),
+        "采购",
+        "下推采购订单",
+        &format!("请购#{id} → 采购订单 {po_no}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "po_id": po_id, "po_no": po_no })))
+}
+
+/// 单据链：`?kind=req|po|so&id=` —— 上游源单（doc_link）+ 下游/执行单据（到货付款/发货收款）
+async fn get_doc_links(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q.get("kind").cloned().unwrap_or_default();
+    if !matches!(kind.as_str(), "req" | "po" | "so") {
+        return Err(AppError::bad_request("kind 只能是 req / po / so"));
+    }
+    let id: i64 = q
+        .get("id")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AppError::bad_request("缺少 id"))?;
+    let rows = findb::docflow::doc_chain(&db, &kind, id)?;
+    Ok(Json(json!({ "rows": rows })))
 }
 
 // ---- 生产订单：下达 / 开工 / 领料 / 完工入库 + BOM（工厂链「业务单据同步凭证」） ----

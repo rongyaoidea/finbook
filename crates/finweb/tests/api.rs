@@ -5735,6 +5735,134 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 单据下推与追溯（对标金蝶源单→目标单）：审批 → 下推PO → 双向链 → 到货流水并入 → 拆单。
+#[tokio::test]
+async fn doc_push_chain() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建请购（draft）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/req",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-08",
+                "item_code": "140301", "item_name": "原料", "qty": "30",
+                "status": "draft", "requester": "张三", "memo": "下推链造数"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建请购");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/req?period=202601", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let req = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["memo"] == "下推链造数")
+        .expect("请购应存在");
+    let req_id = req["id"].as_i64().unwrap();
+    assert_eq!(req["status"], "draft");
+
+    // 未审批 → 下推拒绝
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/procure/req/{req_id}/push-po"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未审批不能下推");
+
+    // 审批（无工作流 → 默认流直接通过）→ 下推成功
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/procure/req/{req_id}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "审批请购");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/procure/req/{req_id}/push-po"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "下推应成功");
+    let body = body_string(resp).await;
+    let push: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let po_id = push["po_id"].as_i64().unwrap();
+    assert!(push["po_no"].as_str().unwrap().starts_with("CG"), "订单号 CG 前缀：{body}");
+
+    // 请购 → ordered；链双向
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/req?period=202601", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let req = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_i64() == Some(req_id))
+        .unwrap();
+    assert_eq!(req["status"], "ordered", "下推后请购应为已下推");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=po&id={po_id}"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let links: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        links["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "req" && n["dir"] == "up" && n["id"].as_i64() == Some(req_id)),
+        "PO 应见上游请购：{links}"
+    );
+
+    // 到货执行 → 流水并入链（下游 receipt）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": 202601, "date": "2026-01-10", "qty": "30", "memo": "到货" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货登记");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=po&id={po_id}"), &sid))
+        .await
+        .unwrap();
+    let links: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        links["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "receipt" && n["dir"] == "down"),
+        "PO 链应含到货流水：{links}"
+    );
+
+    // 拆单：再次下推 → 请购链两个下游 PO
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/procure/req/{req_id}/push-po"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "拆单再下推");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=req&id={req_id}"), &sid))
+        .await
+        .unwrap();
+    let links: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let pos: Vec<_> = links["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "po" && n["dir"] == "down")
+        .collect();
+    assert_eq!(pos.len(), 2, "请购应见两张下游订单：{links}");
+
+    // kind 非法 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/doc-links?kind=bogus&id=1", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// 我的工作台：权限分域矩阵 + 多期趋势长度 + 待办计数联动。
 #[tokio::test]
 async fn workbench_role_matrix() {

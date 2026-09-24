@@ -25,6 +25,7 @@ pub mod stocktake;
 pub mod workflow;
 pub mod batch;
 pub mod workbench;
+pub mod docflow;
 pub mod invoices;
 pub mod mgmt;
 pub mod periods;

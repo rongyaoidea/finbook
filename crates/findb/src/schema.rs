@@ -1115,6 +1115,19 @@ CREATE TABLE IF NOT EXISTS stock_location (
     memo TEXT NOT NULL DEFAULT ''
 );
 
+-- 单据下推勾稽（对标金蝶 源单→目标单 追溯；执行类子单据靠各自外键，不入本表）
+CREATE TABLE IF NOT EXISTS doc_link (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_type   TEXT NOT NULL,    -- req / po / so / quote ...
+    src_id     INTEGER NOT NULL,
+    dst_type   TEXT NOT NULL,
+    dst_id     INTEGER NOT NULL,
+    memo       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    UNIQUE (src_type, src_id, dst_type, dst_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_link_dst ON doc_link(dst_type, dst_id);
+
 -- 可视化工作流（对标金蝶审批流设计器）：流程定义 + 节点 + 连线 + 运行实例
 CREATE TABLE IF NOT EXISTS workflow_flow (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

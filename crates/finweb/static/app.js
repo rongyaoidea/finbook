@@ -3648,10 +3648,10 @@ const PRINT_SIZES = [
   ["third", "三等分（99×210）"],
   ["custom", "自定义 宽x高 mm"],
 ];
-// 一键预设（仅订单域）：送货单 = 跟车联，隐藏 数量/单价/税率/金额/税额/合计/状态
+// 一键预设（仅订单域）：送货单 = 跟车联——保留数量供清点，隐藏单价/税率/金额/税额/合计/状态（价格不外流）
 const PRINT_PRESETS = {
   full: null,
-  delivery: ["no", "date", "party", "memo", "prepared", "code", "name", "linememo", "sign", "pack"],
+  delivery: ["no", "date", "party", "memo", "prepared", "code", "name", "qty", "linememo", "sign", "pack"],
 };
 function openPrintConfig(scope, tokens) {
   const cfg = loadPrintCfg(scope, tokens);
@@ -3670,7 +3670,7 @@ function openPrintConfig(scope, tokens) {
       </div>
       ${showPresets ? `<div><label>预设</label>
         <button class="btn ghost sm" id="pc-p-full">默认全单</button>
-        <button class="btn ghost sm" id="pc-p-del">送货单（随车·隐藏价量）</button>
+        <button class="btn ghost sm" id="pc-p-del">送货单（随车·留数量藏价格）</button>
       </div>` : ""}
     </div>
     <div class="field">

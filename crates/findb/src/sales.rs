@@ -127,6 +127,55 @@ pub fn quo_approve(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 报价单转销售订单（approved → converted）：按报价明细生成**草稿**销售订单
+/// （税率 0，可在订单明细里再调整；草稿不触发信用检查），并把报价单标记为已转换。
+/// 先建订单后改状态；状态并发变化时报错（已生成的订单草稿可在订单列表删除）。
+pub fn quo_to_order(db: &Db, id: i64, who: &str) -> DbResult<i64> {
+    let q = quo_get(db, id)?
+        .ok_or_else(|| fincore::FinError::msg("报价单不存在"))?;
+    if q.status != "approved" {
+        return Err(fincore::FinError::msg(format!(
+            "仅已审批的报价单可转订单（当前：{}）",
+            q.status
+        ))
+        .into());
+    }
+    let mut so = crate::scm::SalesOrder::new(
+        q.period,
+        q.date,
+        &q.customer_code,
+        &q.customer_name,
+        who,
+    );
+    so.no = crate::scm::so_next_no(db, q.period)?;
+    so.memo = format!("由报价单 {} 转入", q.no);
+    let amount = (q.qty * q.unit_price).round2();
+    so.lines.push(crate::scm::SoLine {
+        id: 0,
+        so_id: 0,
+        item_code: q.item_code.clone(),
+        item_name: q.item_name.clone(),
+        qty_ordered: q.qty,
+        qty_shipped: Money::ZERO,
+        unit_price: q.unit_price,
+        tax_rate: Money::ZERO,
+        amount,
+        tax_amount: Money::ZERO,
+        memo: String::new(),
+    });
+    let so_id = crate::scm::so_save(db, &mut so)?;
+    let n = db.conn().execute(
+        "UPDATE quotation SET status='converted' WHERE id=?1 AND status='approved'",
+        [id],
+    )?;
+    if n == 0 {
+        return Err(
+            fincore::FinError::msg("报价单状态已变化，请刷新后重试").into(),
+        );
+    }
+    Ok(so_id)
+}
+
 // ===========================================================================
 // 发货 / 收款 / 退货
 // ===========================================================================

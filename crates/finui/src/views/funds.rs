@@ -1302,6 +1302,41 @@ impl FundsView {
                     Err(_) => ctx.error("日期格式应为 YYYY-MM-DD"),
                 }
             }
+            if ui.button("打印全部").clicked() {
+                let rows = findb::receipt::receipt_list(ctx.db()).unwrap_or_default();
+                if rows.is_empty() {
+                    ctx.error("没有可打印的收付款单");
+                } else {
+                    let n = rows.len();
+                    let company = ctx.db().options().company.clone();
+                    let prints: Vec<findb::printform::ReceiptPrint> = rows
+                        .into_iter()
+                        .map(|d| findb::printform::ReceiptPrint {
+                            no: d.no,
+                            date: d.date.format("%Y-%m-%d").to_string(),
+                            kind_label: if d.kind == "receipt" { "收款" } else { "付款" }
+                                .to_string(),
+                            fund: d.fund_account,
+                            party: d.party,
+                            amount: d.amount,
+                            memo: d.memo,
+                            voucher_no: d
+                                .voucher_id
+                                .map(|v| format!("记-{v:04}"))
+                                .unwrap_or_default(),
+                        })
+                        .collect();
+                    let html =
+                        findb::printform::receipt_forms_html(&company, &prints, &Default::default());
+                    match crate::views::export::print_html_content("收付款单套打", &html) {
+                        Ok(m) => {
+                            ctx.log("资金", "收付款单套打", &format!("{n} 张"));
+                            ctx.info(m);
+                        }
+                        Err(e) => ctx.error(e),
+                    }
+                }
+            }
         });
         ui.label(
             RichText::new("保存即生成记账凭证草稿（记账后入账），并按往来单位对未清挂账 FIFO 自动核销")

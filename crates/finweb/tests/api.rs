@@ -3181,6 +3181,206 @@ async fn receipt_doc_api_flow() {
     assert_eq!(resp.status(), StatusCode::OK, "凭证删除后单据可删");
 }
 
+/// 报价单转订单 + 单据套打（字段白名单 / 批量紧凑分页 / A4）。
+#[tokio::test]
+async fn quote_to_order_and_doc_print() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 报价单 → 审批 → 转订单（草稿）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "item_code": "140501", "item_name": "成品",
+                "qty": "10", "unit_price": "20",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建报价单应成功");
+    let qid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{qid}/approve"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "报价审批应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{qid}/to-order"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "转订单应成功");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["so_id"]
+        .as_i64()
+        .unwrap();
+
+    // 订单存在：金额200、草稿、带来源备注
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == so_id)
+        .expect("转换生成的订单应存在");
+    assert_eq!(row["status"], "Draft");
+    assert_eq!(money_num(row["total_amount"].as_str().unwrap()), 200.0);
+    assert!(row["memo"].as_str().unwrap().contains("由报价单"), "订单应带来源备注");
+    // 报价单状态 → converted；重复转换被拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/quote?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let qrow = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == qid)
+        .unwrap();
+    assert_eq!(qrow["status"], "converted", "报价单应标记已转订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{qid}/to-order"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已转换不可再转");
+
+    // 第二张订单（批量紧凑分页：两张小单应同页）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-06", "customer_code": "C01",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "5", "unit_price": "10", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so2 =
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"].as_i64().unwrap();
+
+    // 订单套打：两张同页 + 默认全字段
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/sales/so/print-form?ids={so_id},{so2}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()[axum::http::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .contains("text/html"));
+    let html = body_string(resp).await;
+    assert!(
+        html.contains("销售订单") && html.contains("客户甲") && html.contains("税率"),
+        "默认应全字段显示"
+    );
+    assert_eq!(html.matches("class=\"page\"").count(), 1, "两张小单应紧凑同页");
+
+    // 字段收窄：fields 白名单生效
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/sales/so/print-form?ids={so_id}&fields=no,date,code,qty,amount"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let html = body_string(resp).await;
+    assert!(!html.contains("税率") && html.contains("单号"), "fields 白名单应生效：{html}");
+
+    // ids 缺省 = 期间全部；空期间 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so/print-form?period=202601", &sid))
+        .await
+        .unwrap();
+    let html = body_string(resp).await;
+    assert!(html.matches("class=\"doc\"").count() >= 2, "缺省应打印期间内全部订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so/print-form?period=202501", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "无可打印订单应400");
+
+    // 采购订单套打 smoke
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-07", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let pid =
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/procure/po/print-form?ids={pid}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("采购订单") && html.contains("供应商"), "采购套打应含标题与供应商");
+
+    // 收付款单套打 smoke（收款 + 金额大写）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/receipts",
+            &sid,
+            serde_json::json!({
+                "date": "2026-01-10", "kind": "receipt", "fund_account": "100201",
+                "party": "C01", "amount": "1234.56", "memo": "回款"
+            }),
+        ))
+        .await
+        .unwrap();
+    let rid =
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/funds/receipts/print-form?ids={rid}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(
+        html.contains("收款单") && html.contains("壹仟贰佰叁拾肆元伍角陆分"),
+        "收付款套打应含单名与金额大写"
+    );
+}
+
 /// 采购暂估自动出凭证：登记（借存货/贷应付-供应商）+ 冲回反向 + 幂等。
 #[tokio::test]
 async fn estimate_auto_voucher() {

@@ -3447,7 +3447,7 @@ async function viewPoDoc(main) {
       <button class="btn" id="pd-return">退货</button>
       <button class="btn" id="pd-pay">付款</button>
     </div>
-    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">采购订单</h4><span class="grow"></span><button class="btn primary sm" id="po-new">新建采购订单</button></div><div id="po-list" class="muted" style="margin-top:8px">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">采购订单</h4><span class="grow"></span><button class="btn ghost sm" id="po-print">打印所选</button><button class="btn ghost sm" id="po-printcfg">打印设置</button><button class="btn primary sm" id="po-new">新建采购订单</button></div><div id="po-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>请购单</h4><div id="pd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>采购订单执行跟踪</h4><div id="pd-track">加载中…</div></div>`;
 
@@ -3456,13 +3456,22 @@ async function viewPoDoc(main) {
       const s = await api(`/procure/po?period=${period}`);
       const orows = s.rows || [];
       $("#po-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="po-chkall" title="全选" /></th><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="po-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无采购订单，点右上「新建采购订单」</div>`;
       $all("[data-po-edit]").forEach((b) => b.onclick = () => openOrderEditor("po", main, parseInt(b.dataset.poEdit, 10)));
       $all("[data-po-confirm]").forEach((b) => b.onclick = () => poTransition(b.dataset.poConfirm, "Confirmed"));
       $all("[data-po-cancel]").forEach((b) => b.onclick = () => poTransition(b.dataset.poCancel, "Cancelled"));
       $all("[data-po-exec]").forEach((b) => b.onclick = () => { $("#pd-poid").value = b.dataset.poExec; toast(`已填入订单ID ${b.dataset.poExec}，可到货/付款`, "ok"); });
       $all("[data-po-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该采购订单？", true))) return; try { await api(`/procure/po/${b.dataset.poDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      if ($("#po-chkall")) $("#po-chkall").onclick = (e) => { $all(".po-chk").forEach((c) => { c.checked = e.target.checked; }); };
+      $("#po-print").onclick = () => {
+        let ids = $all(".po-chk").filter((c) => c.checked).map((c) => c.value);
+        if (!ids.length) ids = $all(".po-chk").map((c) => c.value);
+        if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
+        const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
+        window.open(`/api/procure/po/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+      };
+      $("#po-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#po-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/procure/req?period=${period}`);
@@ -3499,7 +3508,7 @@ async function viewSoDoc(main) {
   const period = encodeURIComponent(state.current || "");
   const table = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>单号</th><th>客户</th><th>存货</th><th>数量</th><th>单价</th><th>状态</th><th></th></tr></thead>
-      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.customer_name)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td class="num">${esc(r.unit_price)}</td><td>${esc(r.status)}</td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-quo-approve="${r.id}">审批</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.customer_name)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td class="num">${esc(r.unit_price)}</td><td>${esc(({ draft: "草稿", approved: "已审批", converted: "已转订单", cancelled: "已作废" })[r.status] || r.status)}</td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-quo-approve="${r.id}">审批</button>` : ""}${r.status === "approved" ? `<button class="btn ghost sm" data-quo-toorder="${r.id}">转订单</button>` : ""}${r.status === "converted" ? `<span class="tag ok">已转订单</span>` : ""}</td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">暂无报价单</div>`;
   const soTrack = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>订单号</th><th>客户</th><th>订单数量</th><th>发货数量</th><th>执行率</th></tr></thead>
@@ -3526,7 +3535,7 @@ async function viewSoDoc(main) {
       <button class="btn" id="sd-credit">信用检查</button>
     </div>
     <div id="sd-credit-result" class="muted" style="margin-top:6px"></div>
-    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span><button class="btn ghost sm" id="so-print">打印所选</button><button class="btn ghost sm" id="so-printcfg">打印设置</button><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>报价单</h4><div id="sd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>销售订单执行跟踪</h4><div id="sd-track">加载中…</div></div>`;
 
@@ -3535,19 +3544,35 @@ async function viewSoDoc(main) {
       const s = await api(`/sales/so?period=${period}`);
       const orows = s.rows || [];
       $("#so-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无销售订单，点右上「新建销售订单」</div>`;
       $all("[data-so-edit]").forEach((b) => b.onclick = () => openOrderEditor("so", main, parseInt(b.dataset.soEdit, 10)));
       $all("[data-so-confirm]").forEach((b) => b.onclick = () => soTransition(b.dataset.soConfirm, "Confirmed"));
       $all("[data-so-cancel]").forEach((b) => b.onclick = () => soTransition(b.dataset.soCancel, "Cancelled"));
       $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
       $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      if ($("#so-chkall")) $("#so-chkall").onclick = (e) => { $all(".so-chk").forEach((c) => { c.checked = e.target.checked; }); };
+      $("#so-print").onclick = () => {
+        let ids = $all(".so-chk").filter((c) => c.checked).map((c) => c.value);
+        if (!ids.length) ids = $all(".so-chk").map((c) => c.value);
+        if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
+        const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
+        window.open(`/api/sales/so/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+      };
+      $("#so-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#so-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
       const r = await api(`/sales/quote?period=${period}`);
       $("#sd-list").innerHTML = table(r.rows || []);
       $all("[data-quo-approve]").forEach((b) => b.onclick = async () => {
         try { await api(`/sales/quote/${b.dataset.quoApprove}/approve`, { method: "POST" }); toast("已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-quo-toorder]").forEach((b) => b.onclick = async () => {
+        try {
+          const r = await postJson(`/sales/quote/${b.dataset.quoToorder}/to-order`, {});
+          toast(`已生成销售订单 #${r.so_id}（草稿，可在上方订单列表确认执行）`, "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
       });
     } catch (e) { $("#sd-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
@@ -3582,6 +3607,59 @@ async function viewSoDoc(main) {
     } catch (e) { toast(e.message, "err"); }
   });
   load();
+}
+
+// ---------------- 单据套打（订单/收付款单）：字段白名单 + 批量打印 ----------------
+const PRINT_ORDER_FIELDS = ["no", "date", "status", "party", "memo", "prepared", "code", "name", "qty", "price", "rate", "amount", "tax", "linememo", "totals", "sign", "pack"];
+const PRINT_RECEIPT_FIELDS = ["no", "date", "status", "party", "fund", "voucher", "memo", "amount", "sign", "pack"];
+const PRINT_LABELS = {
+  no: "单号", date: "日期", status: "状态 / 类型", party: "客户·供应商 / 往来单位",
+  memo: "备注", prepared: "制单人", code: "存货编码", name: "名称", qty: "数量",
+  price: "单价", rate: "税率", amount: "金额", tax: "税额", linememo: "行备注",
+  fund: "资金账户", voucher: "关联凭证号", totals: "合计行", sign: "签章栏",
+  pack: "紧凑分页（多单挤一页，充分利用 A4）",
+};
+function loadPrintCfg(scope, tokens) {
+  try {
+    const raw = localStorage.getItem("fb.print." + scope);
+    if (raw) {
+      const saved = new Set(JSON.parse(raw));
+      return new Set(tokens.filter((t) => saved.has(t)));
+    }
+  } catch (e) { /* 坏数据回默认 */ }
+  return new Set(tokens);
+}
+function savePrintCfg(scope, set) {
+  try { localStorage.setItem("fb.print." + scope, JSON.stringify([...set])); } catch (e) { /* 存储不可用则本次会话仍生效 */ }
+}
+function printFieldsParam(set) {
+  return [...set].filter((t) => t !== "pack").join(",");
+}
+function packParam(set) { return set.has("pack") ? "1" : "0"; }
+function openPrintConfig(scope, tokens) {
+  const set = loadPrintCfg(scope, tokens);
+  const mask = modal(`
+    <h3>打印设置（字段可选）</h3>
+    <div class="field">
+      <label style="display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center">
+        ${tokens.map((t) => `<span style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="pc-f" value="${t}" ${set.has(t) ? "checked" : ""} />${PRINT_LABELS[t] || t}</span>`).join("")}
+      </label>
+    </div>
+    <p class="muted" style="font-size:12px;margin:0">勾选要打印的字段与明细列；「紧凑分页」把多张单据排进同一张 A4，关掉则一单一页。设置保存在本机浏览器。</p>
+    <div class="foot" style="gap:8px;justify-content:space-between">
+      <span><button class="btn ghost sm" id="pc-all">全选</button> <button class="btn ghost sm" id="pc-none">清空</button></span>
+      <span><button class="btn ghost" id="pc-cancel">取消</button> <button class="btn primary" id="pc-save">保存</button></span>
+    </div>
+  `);
+  const boxes = $all(".pc-f", mask);
+  $("#pc-all", mask).onclick = () => boxes.forEach((b) => { b.checked = true; });
+  $("#pc-none", mask).onclick = () => boxes.forEach((b) => { b.checked = false; });
+  $("#pc-cancel", mask).onclick = closeModal;
+  $("#pc-save", mask).onclick = () => {
+    savePrintCfg(scope, new Set(boxes.filter((b) => b.checked).map((b) => b.value)));
+    closeModal();
+    toast("打印设置已保存", "ok");
+  };
 }
 
 // ---------------- 订单（销售/采购）CRUD：对标金蝶订单流程 ----------------
@@ -3911,10 +3989,20 @@ async function renderReceipts(body) {
       <label>金额 <input id="rc-amt" style="width:110px" /></label>
       <label>备注 <input id="rc-memo" style="width:130px" /></label>
       <button class="btn primary" id="rc-new">新增收付款</button>
+      <button class="btn ghost sm" id="rc-print">批量打印</button>
+      <button class="btn ghost sm" id="rc-printcfg">打印设置</button>
     </div>
     <div class="muted" style="font-size:12px;margin-bottom:6px">保存即生成记账凭证草稿（会计记账后入账，H-3 草稿不入余额），并按往来单位对未清挂账 FIFO 自动核销；往来单位选凭证辅助编码（C01/S01…）。</div>
     <div id="rc-list" class="muted">加载中…</div>`;
   $("#rc-kind").onchange = () => loadParties();
+  $("#rc-print").onclick = () => {
+    let ids = $all(".rc-chk").filter((c) => c.checked).map((c) => c.value);
+    if (!ids.length) ids = $all(".rc-chk").map((c) => c.value);
+    if (!ids.length) { toast("没有可打印的收付款单", "err"); return; }
+    const cfg = loadPrintCfg("receipt", PRINT_RECEIPT_FIELDS);
+    window.open(`/api/funds/receipts/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+  };
+  $("#rc-printcfg").onclick = () => openPrintConfig("receipt", PRINT_RECEIPT_FIELDS);
   $("#rc-new").onclick = async () => {
     if (!$("#rc-party").value) { toast("请选择往来单位", "err"); return; }
     try {
@@ -3934,8 +4022,8 @@ async function renderReceipts(body) {
       const r = await api("/funds/receipts");
       const rows = r.rows || [];
       $("#rc-list").innerHTML = rows.length
-        ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th>类型</th><th>资金账户</th><th>往来单位</th><th class="num">金额</th><th>凭证</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((d) => `<tr>
-            <td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "receipt" ? "收款" : "付款"}</td>
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="rc-chkall" title="全选" /></th><th>单号</th><th>日期</th><th>类型</th><th>资金账户</th><th>往来单位</th><th class="num">金额</th><th>凭证</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((d) => `<tr>
+            <td><input type="checkbox" class="rc-chk" value="${d.id}" /></td><td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "receipt" ? "收款" : "付款"}</td>
             <td>${esc(d.fund_account)}</td><td>${esc(d.party)}</td><td class="num">${fmt(d.amount)}</td>
             <td>${d.voucher_id ? `<a href="#" data-rc-v="${d.voucher_id}">凭证 #${d.voucher_id}</a>` : "—"}</td>
             <td>${esc(d.memo || "")}</td>
@@ -3943,6 +4031,7 @@ async function renderReceipts(body) {
         : `<div class="muted">暂无收付款单</div>`;
       $all("[data-rc-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.rcV, 10)); });
       $all("[data-rc-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该收付款单？其凭证需先作废或删除", true))) return; try { await api(`/funds/receipts/${b.dataset.rcD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      if ($("#rc-chkall")) $("#rc-chkall").onclick = (e) => { $all(".rc-chk").forEach((c) => { c.checked = e.target.checked; }); };
     } catch (e) { $("#rc-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
 }
@@ -4006,6 +4095,7 @@ async function renderJournal(body) {
       <button class="btn sm ghost" id="jn-unclear">取消日清</button>
       <button class="btn sm" id="jn-receipt">收款登记</button>
       <button class="btn sm" id="jn-payment">付款登记</button>
+      <button class="btn sm ghost" id="jn-print">打印日记账</button>
     </div><div id="jn-table" class="muted">加载中…</div>`;
   const period = ymm(state.current || "");
   const y = parseInt(period.slice(0, 4), 10), m = parseInt(period.slice(4, 6), 10);
@@ -4041,6 +4131,7 @@ async function renderJournal(body) {
   };
   $("#jn-clear").onclick = () => setClear(true);
   $("#jn-unclear").onclick = () => setClear(false);
+  $("#jn-print").onclick = () => printPreview(`出纳日记账 ${acct()} ${period}`, $("#jn-table").querySelector("table"));
   const jump = (dir) => {
     state.pendingCash = { account: acct(), dir };
     document.querySelector('.nav-item[data-view="vouchers"]').click();

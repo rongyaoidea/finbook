@@ -259,8 +259,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/procure/po", get(list_po).post(save_po))
         .route("/api/procure/po/:id/transition", post(transition_po))
         .route("/api/procure/po/:id/delete", post(delete_po))
+        .route("/api/procure/po/print-form", get(print_po_form))
         .route("/api/sales/quote", get(list_quotation).post(save_quotation))
         .route("/api/sales/quote/:id/approve", post(approve_quotation))
+        .route("/api/sales/quote/:id/to-order", post(convert_quotation))
         .route("/api/sales/shipment", post(add_so_shipment))
         .route("/api/sales/payment", post(add_so_payment))
         .route("/api/sales/return", post(add_so_return))
@@ -270,6 +272,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/sales/so", get(list_so).post(save_so))
         .route("/api/sales/so/:id/transition", post(transition_so))
         .route("/api/sales/so/:id/delete", post(delete_so))
+        .route("/api/sales/so/print-form", get(print_so_form))
         // 预算预警
         .route("/api/budget/alerts", get(get_budget_alerts))
         // 坏账准备计提
@@ -330,6 +333,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/funds/advances/:id/delete", post(delete_advance))
         .route("/api/funds/receipts", get(list_receipts).post(create_receipt))
         .route("/api/funds/receipts/:id/delete", post(delete_receipt))
+        .route("/api/funds/receipts/print-form", get(print_receipt_form))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -4420,6 +4424,217 @@ async fn add_so_payment(
         ),
     )?;
     Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
+}
+
+// ---------------- 单据套打（订单 / 收付款单）：字段白名单 + 批量紧凑分页 ----------------
+
+/// 从查询串取打印字段：`fields=no,date,...` 白名单（空=全显）；`pack=0` 一单一页
+fn doc_fields_from_q(q: &HashMap<String, String>) -> findb::printform::DocPrintFields {
+    let mut f = findb::printform::fields_from_tokens(
+        q.get("fields").map(|s| s.as_str()).unwrap_or(""),
+    );
+    if q.get("pack").map(|s| s.as_str()) == Some("0") {
+        f.pack = false;
+    }
+    f
+}
+
+/// `ids=1,2,3`（去重保序）；缺省返回空 = 由调用方按期间/全部取数
+fn print_ids(q: &HashMap<String, String>) -> Vec<i64> {
+    let mut ids: Vec<i64> = q
+        .get("ids")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect())
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn so_to_print(o: findb::scm::SalesOrder) -> findb::printform::OrderPrint {
+    findb::printform::OrderPrint {
+        title: "销售订单".to_string(),
+        no: o.no,
+        date: o.date.format("%Y-%m-%d").to_string(),
+        status: o.status.label().to_string(),
+        party_label: "客户".to_string(),
+        party: format!("{} {}", o.customer_code, o.customer_name),
+        prepared_by: o.prepared_by,
+        memo: o.memo,
+        rows: o
+            .lines
+            .into_iter()
+            .map(|l| findb::printform::OrderPrintRow {
+                code: l.item_code,
+                name: l.item_name,
+                qty: l.qty_ordered,
+                price: l.unit_price,
+                rate: l.tax_rate,
+                amount: l.amount,
+                tax: l.tax_amount,
+                memo: l.memo,
+            })
+            .collect(),
+        amount_total: o.total_amount,
+        tax_total: o.total_tax,
+    }
+}
+
+fn po_to_print(o: findb::scm::PurchaseOrder) -> findb::printform::OrderPrint {
+    findb::printform::OrderPrint {
+        title: "采购订单".to_string(),
+        no: o.no,
+        date: o.date.format("%Y-%m-%d").to_string(),
+        status: o.status.label().to_string(),
+        party_label: "供应商".to_string(),
+        party: format!("{} {}", o.supplier_code, o.supplier_name),
+        prepared_by: o.prepared_by,
+        memo: o.memo,
+        rows: o
+            .lines
+            .into_iter()
+            .map(|l| findb::printform::OrderPrintRow {
+                code: l.item_code,
+                name: l.item_name,
+                qty: l.qty_ordered,
+                price: l.unit_price,
+                rate: l.tax_rate,
+                amount: l.amount,
+                tax: l.tax_amount,
+                memo: l.memo,
+            })
+            .collect(),
+        amount_total: o.total_amount,
+        tax_total: o.total_tax,
+    }
+}
+
+fn receipt_to_print(d: findb::receipt::ReceiptDoc) -> findb::printform::ReceiptPrint {
+    findb::printform::ReceiptPrint {
+        no: d.no,
+        date: d.date.format("%Y-%m-%d").to_string(),
+        kind_label: if d.kind == "receipt" { "收款" } else { "付款" }.to_string(),
+        fund: d.fund_account,
+        party: d.party,
+        amount: d.amount,
+        memo: d.memo,
+        voucher_no: d.voucher_id.map(|v| format!("记-{v:04}")).unwrap_or_default(),
+    }
+}
+
+/// 销售订单套打 HTML：`ids` 逗号分隔（缺省 = 期间内全部）；`fields` 选字段；`pack=0` 一单一页
+async fn print_so_form(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let company = user.company.clone();
+    let ids = print_ids(&q);
+    let mut orders = Vec::new();
+    if ids.is_empty() {
+        let period = q
+            .get("period")
+            .and_then(|s| parse_period(s))
+            .unwrap_or_else(|| current_period(&state, &user));
+        for o in findb::scm::so_list(&db, period, None)? {
+            orders.push(so_to_print(o));
+        }
+    } else {
+        for id in ids {
+            let o = findb::scm::so_get(&db, id)?
+                .ok_or_else(|| AppError::bad_request(format!("销售订单 #{id} 不存在")))?;
+            orders.push(so_to_print(o));
+        }
+    }
+    if orders.is_empty() {
+        return Err(AppError::bad_request("没有可打印的订单"));
+    }
+    let f = doc_fields_from_q(&q);
+    let html = findb::printform::order_forms_html(&company, &orders, &f);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+/// 采购订单套打 HTML（同销售订单：ids / fields / pack）
+async fn print_po_form(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let company = user.company.clone();
+    let ids = print_ids(&q);
+    let mut orders = Vec::new();
+    if ids.is_empty() {
+        let period = q
+            .get("period")
+            .and_then(|s| parse_period(s))
+            .unwrap_or_else(|| current_period(&state, &user));
+        for o in findb::scm::po_list(&db, period, None)? {
+            orders.push(po_to_print(o));
+        }
+    } else {
+        for id in ids {
+            let o = findb::scm::po_get(&db, id)?
+                .ok_or_else(|| AppError::bad_request(format!("采购订单 #{id} 不存在")))?;
+            orders.push(po_to_print(o));
+        }
+    }
+    if orders.is_empty() {
+        return Err(AppError::bad_request("没有可打印的订单"));
+    }
+    let f = doc_fields_from_q(&q);
+    let html = findb::printform::order_forms_html(&company, &orders, &f);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+/// 收付款单套打 HTML：`ids` 缺省 = 全部（可配 `period` 过滤）
+async fn print_receipt_form(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let company = user.company.clone();
+    let ids = print_ids(&q);
+    let period = q.get("period").and_then(|s| parse_period(s));
+    let all = findb::receipt::receipt_list(&db)?;
+    let mut prints = Vec::new();
+    for d in all.into_iter() {
+        if !ids.is_empty() {
+            if ids.contains(&d.id) {
+                prints.push(receipt_to_print(d));
+            }
+        } else if period.map(|p| d.period == p).unwrap_or(true) {
+            prints.push(receipt_to_print(d));
+        }
+    }
+    if prints.is_empty() {
+        return Err(AppError::bad_request("没有可打印的收付款单"));
+    }
+    let f = doc_fields_from_q(&q);
+    let html = findb::printform::receipt_forms_html(&company, &prints, &f);
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
+}
+
+/// 报价单转销售订单（approved → converted）：生成草稿订单，税率 0 可在订单中再调整
+async fn convert_quotation(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let so_id = findb::sales::quo_to_order(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "销售",
+        "报价转订单",
+        &format!("报价 #{id} → 销售订单 #{so_id}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "so_id": so_id })))
 }
 
 // ---------------- 订单 CRUD（销售/采购，对标金蝶订单流程） ----------------

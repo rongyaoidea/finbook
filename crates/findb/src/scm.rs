@@ -241,6 +241,10 @@ pub struct ProductionOrder {
     pub work_center: String,
     pub prepared_by: String,
     pub memo: String,
+    /// inhouse 自制 / outsourcing 委外
+    pub order_kind: String,
+    pub supplier_code: String,
+    pub supplier_name: String,
 }
 
 // ===========================================================================
@@ -1011,26 +1015,32 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
     let id = if order.id > 0 {
         tx.execute(
             "UPDATE production_order SET period=?, date=?, item_code=?, item_name=?,
-             planned_qty=?, completed_qty=?, status=?, work_center=?, prepared_by=?, memo=?, updated_at=?
+             planned_qty=?, completed_qty=?, status=?, work_center=?, prepared_by=?, memo=?,
+             order_kind=?, supplier_code=?, supplier_name=?, updated_at=?
              WHERE id=?",
             rusqlite::params![
                 order.period.ymm(), order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 order.status.code(),
-                order.work_center, order.prepared_by, order.memo, now, order.id
+                order.work_center, order.prepared_by, order.memo,
+                order.order_kind, order.supplier_code, order.supplier_name,
+                now, order.id
             ],
         )?;
         order.id
     } else {
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name,
-             planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+             planned_qty, completed_qty, status, work_center, prepared_by, memo,
+             order_kind, supplier_code, supplier_name, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
             rusqlite::params![
                 order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 order.status.code(),
-                order.work_center, order.prepared_by, order.memo, now
+                order.work_center, order.prepared_by, order.memo,
+                order.order_kind, order.supplier_code, order.supplier_name,
+                now
             ],
         )?;
         tx.last_insert_rowid()
@@ -1044,13 +1054,13 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
     let sql = if let Some(_s) = status {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo
+             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
              FROM production_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
         )
     } else {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo
+             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
              FROM production_order WHERE period=? ORDER BY date DESC, id DESC"
         )
     };
@@ -1065,6 +1075,7 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
+                order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     } else {
@@ -1076,6 +1087,7 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
+                order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     };
@@ -1098,6 +1110,9 @@ mod prod_tests {
             planned_qty: Money::parse("100").unwrap(), completed_qty: Money::ZERO,
             status: ProdStatus::Draft, work_center: "WC01".to_string(),
             prepared_by: "u1".to_string(), memo: String::new(),
+            order_kind: "inhouse".to_string(),
+            supplier_code: String::new(),
+            supplier_name: String::new(),
         };
         order.no = prod_next_no(&db, p).unwrap();
         let id = prod_save(&db, &mut order).unwrap();

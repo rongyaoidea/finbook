@@ -714,10 +714,51 @@ pub fn prod_start(db: &Db, po_id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 委外加工费确认：归集人工（CostType::Labor → 完工结转由 500102 承接）
+/// + 生成应付凭证 借 500102 / 贷 应付科目（供应商辅助）。仅委外订单、金额 > 0；期间随订单。
+pub fn outsource_fee(db: &Db, po_id: i64, amount: Money, date: NaiveDate, who: &str) -> DbResult<i64> {
+    if !amount.is_positive() {
+        return Err(FinError::msg("加工费必须大于 0").into());
+    }
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::msg("生产订单不存在"))?;
+    if order.order_kind != "outsourcing" {
+        return Err(FinError::msg("仅委外订单可确认加工费").into());
+    }
+    if order.supplier_code.trim().is_empty() {
+        return Err(FinError::msg("委外订单缺少供应商，请先补充").into());
+    }
+    use fincore::{AuxRef, Entry, Voucher, VoucherSource};
+    let biz = db.options().biz_accounts.clone();
+    let period = order.period;
+    let tx = db.write_tx()?;
+    add_cost_of(&tx, po_id, CostType::Labor, amount, "委外加工费")?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = VoucherSource::Business;
+    v.memo = format!("委外加工费 {}", order.no);
+    v.push_entry(Entry {
+        debit: amount,
+        ..Entry::new(1, "500102", "委外加工费")
+    });
+    v.push_entry(Entry {
+        credit: amount,
+        aux: AuxRef {
+            supplier: Some(order.supplier_code.clone()),
+            ..Default::default()
+        },
+        ..Entry::new(2, biz.ap.as_str(), "委外加工费")
+    });
+    v.renumber();
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
+    Ok(vid)
+}
+
 pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> {
     let row = db.conn()
         .query_row(
-            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo
+            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
              FROM production_order WHERE id=?",
             [po_id],
             |r| Ok(ProductionOrder {
@@ -733,6 +774,9 @@ pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> 
                 work_center: r.get(9)?,
                 prepared_by: r.get(10)?,
                 memo: r.get(11)?,
+                order_kind: r.get(12)?,
+                supplier_code: r.get(13)?,
+                supplier_name: r.get(14)?,
             }),
         );
     match row {
@@ -825,6 +869,9 @@ mod tests {
             planned_qty: m("3"), completed_qty: m("0"),
             status: ProdStatus::InProgress, work_center: "WC01".into(),
             prepared_by: "u1".into(), memo: "".into(),
+            order_kind: "inhouse".into(),
+            supplier_code: String::new(),
+            supplier_name: String::new(),
         };
 
         // 领料结转：借 500101=60 / 贷 140301=60

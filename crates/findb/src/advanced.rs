@@ -1943,6 +1943,9 @@ mod tests {
             planned_qty: m("10"), completed_qty: m("0"),
             status: crate::scm::ProdStatus::Released,
             work_center: "WC1".into(), prepared_by: "u".into(), memo: String::new(),
+            order_kind: "inhouse".into(),
+            supplier_code: String::new(),
+            supplier_name: String::new(),
         };
         order.no = crate::scm::prod_next_no(&db, p).unwrap();
         let po_id = crate::scm::prod_save(&db, &mut order).unwrap();

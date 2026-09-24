@@ -5735,6 +5735,190 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 委外加工全链（委外=生产的变体）：建单(kind=outsourcing) → BOM+标准价 → 领料 → 开工 →
+/// 加工费凭证（借500102/贷应付-供应商）→ 完工结转含加工费；非委外单确认加工费 400。
+#[tokio::test]
+async fn outsourcing_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 当前期间与日期
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let cur_ymm: i32 = cur_label.replace('-', "").parse().unwrap();
+    let d15 = format!("{cur_label}-15");
+    let d16 = format!("{cur_label}-16");
+    let d20 = format!("{cur_label}-20");
+
+    // 标准价 + BOM（1 成品 = 2 原料）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "moving_average", "standard_cost": "10" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bom",
+            &sid,
+            serde_json::json!({ "parent": "140501", "children": [{ "child": "140301", "qty": "2", "loss": "0" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 建委外订单（10 件，供应商 S01）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({
+                "item_code": "140501", "qty": "10", "kind": "outsourcing",
+                "supplier_code": "S01", "supplier_name": "供应商甲", "date": d15.clone()
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建委外订单");
+    let body = body_string(resp).await;
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let po_id = created["id"].as_i64().unwrap();
+
+    // 列表带出委外标识与供应商
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/prod", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"].as_i64() == Some(po_id))
+        .unwrap();
+    assert_eq!(row["order_kind"], "outsourcing");
+    assert_eq!(row["supplier_name"], "供应商甲");
+
+    // 领料（20 件 × 10 = 200）→ 开工
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{po_id}/issue"),
+            &sid,
+            serde_json::json!({ "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "委外发料");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(money_num(r["total"].as_str().unwrap()), 200.0, "发料成本 200");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/prod/{po_id}/start"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开工");
+
+    // 加工费 300 → 凭证 借500102 / 贷应付(供应商辅助)
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{po_id}/outsource-fee"),
+            &sid,
+            serde_json::json!({ "amount": "300", "date": d16.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "确认加工费");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let fee_vid = r["voucher_id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{fee_vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    let dr = entries
+        .iter()
+        .find(|e| e["account_code"] == "500102")
+        .expect("借 500102 直接人工");
+    assert_eq!(money_num(dr["debit"].as_str().unwrap()), 300.0);
+    let cr = entries
+        .iter()
+        .find(|e| money_num(e["credit"].as_str().unwrap()) == 300.0)
+        .expect("贷应付 300");
+    assert_eq!(cr["aux"]["supplier"], "S01", "应付带供应商辅助");
+
+    // 非委外订单确认加工费 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "1", "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    let plain: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let plain_id = plain["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{plain_id}/outsource-fee"),
+            &sid,
+            serde_json::json!({ "amount": "50", "date": d16.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "非委外订单不能确认加工费");
+
+    // 完工 10 件 → 结转 = 料 200 + 工 300 = 500（借 140501；贷 500101=200、500102=300）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{po_id}/complete"),
+            &sid,
+            serde_json::json!({ "qty": "10", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "委外完工入库");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let list: Vec<serde_json::Value> = serde_json::from_str(&body_string(resp).await).unwrap();
+    let comp = list
+        .iter()
+        .find(|x| x["summary"].as_str().map(|s| s.contains("完工")).unwrap_or(false))
+        .expect("应有完工凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/vouchers/{}", comp["id"].as_i64().unwrap()),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    let dr = entries
+        .iter()
+        .find(|e| e["account_code"] == "140501")
+        .expect("借库存商品");
+    assert_eq!(money_num(dr["debit"].as_str().unwrap()), 500.0, "完工结转 = 料200+工300");
+    let l500101 = entries
+        .iter()
+        .find(|e| e["account_code"] == "500101")
+        .expect("贷直接材料");
+    assert_eq!(money_num(l500101["credit"].as_str().unwrap()), 200.0);
+    let l500102 = entries
+        .iter()
+        .find(|e| e["account_code"] == "500102")
+        .expect("贷直接人工（加工费）");
+    assert_eq!(money_num(l500102["credit"].as_str().unwrap()), 300.0);
+}
+
 /// 最近价带出：采购订单保存自动沉淀价格历史，按日期倒序返回最新价。
 #[tokio::test]
 async fn price_history_suggest() {

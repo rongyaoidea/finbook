@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -591,6 +591,9 @@ CREATE TABLE IF NOT EXISTS production_order (
     work_center     TEXT NOT NULL DEFAULT '',
     prepared_by     TEXT NOT NULL DEFAULT '',
     memo            TEXT NOT NULL DEFAULT '',
+    order_kind      TEXT NOT NULL DEFAULT 'inhouse', -- inhouse 自制 / outsourcing 委外
+    supplier_code   TEXT NOT NULL DEFAULT '',
+    supplier_name   TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT '',
     updated_at      TEXT NOT NULL DEFAULT ''
 );
@@ -1370,6 +1373,13 @@ const MIGRATE_V21: &[(&str, &str, &str)] =
 const MIGRATE_V22: &[(&str, &str, &str)] =
     &[("receipt_doc", "status", "TEXT NOT NULL DEFAULT 'audited'")];
 
+/// v22 → v23：委外加工（生产订单加 委外类型 与 供应商 两组列）
+const MIGRATE_V23: &[(&str, &str, &str)] = &[
+    ("production_order", "order_kind", "TEXT NOT NULL DEFAULT 'inhouse'"),
+    ("production_order", "supplier_code", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "supplier_name", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "bom", "version")? {
@@ -1587,6 +1597,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V20)?;
             migrate_generic(conn, MIGRATE_V21)?;
             migrate_generic(conn, MIGRATE_V22)?;
+            migrate_generic(conn, MIGRATE_V23)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

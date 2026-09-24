@@ -2555,6 +2555,56 @@ async function viewBudgetVersions(main) {
   load();
 }
 
+// 新建委外订单（委外=生产的变体：BOM/领料/开工/完工全复用生产链，加工费独立确认）
+function openOutsourceEditor(reload) {
+  const mask = modal(`<h3>新建委外订单</h3>
+    <div class="field"><label>加工产品编码 *</label><input id="os-item" placeholder="如 140501" /></div>
+    <div class="field"><label>数量 *</label><input id="os-qty" value="1" /></div>
+    <div class="field"><label>供应商编码 *</label><input id="os-sup" placeholder="如 S01" /></div>
+    <div class="field"><label>供应商名称</label><input id="os-supn" /></div>
+    <div class="field"><label>日期</label><input type="date" id="os-date" value="${today()}" /></div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">委外订单复用生产链：维护 BOM → 领料出库（发材料）→ 开工 → 确认加工费 → 完工入库。</p>
+    <div class="foot"><button class="btn primary" id="os-save">创建</button><button class="btn ghost" id="os-cancel">取消</button></div>`);
+  $("#os-cancel", mask).onclick = closeModal;
+  $("#os-save", mask).onclick = async () => {
+    const item = $("#os-item", mask).value.trim();
+    const qty = $("#os-qty", mask).value.trim();
+    const sup = $("#os-sup", mask).value.trim();
+    if (!item || !qty || !sup) { toast("产品编码、数量、供应商必填", "err"); return; }
+    try {
+      const r = await postJson("/prod", {
+        item_code: item, qty, kind: "outsourcing",
+        supplier_code: sup, supplier_name: $("#os-supn", mask).value.trim(), date: $("#os-date", mask).value,
+      });
+      toast(`已创建委外订单 ${r.no}（BOM → 领料 → 开工 → 加工费 → 完工）`, "ok");
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+// 委外加工费确认：借 500102 / 贷应付(供应商辅助)；并入订单人工要素随完工结转
+function openFeeEditor(order, reload) {
+  if (!order) { toast("请先选择生产订单", "err"); return; }
+  if (order.order_kind !== "outsourcing") { toast("仅委外订单可确认加工费", "err"); return; }
+  const mask = modal(`<h3>确认加工费 · 委外 ${esc(order.no || "")}</h3>
+    <div class="field"><label>加工费金额 *</label><input id="fe-amt" placeholder="不含税金额" /></div>
+    <div class="field"><label>日期</label><input type="date" id="fe-date" value="${today()}" /></div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">凭证：借 500102 生产成本-直接人工 / 贷 应付账款（供应商辅助）；金额并入该订单人工要素，完工时随库存商品结转。</p>
+    <div class="foot"><button class="btn primary" id="fe-save">确认</button><button class="btn ghost" id="fe-cancel">取消</button></div>`);
+  $("#fe-cancel", mask).onclick = closeModal;
+  $("#fe-save", mask).onclick = async () => {
+    const amt = $("#fe-amt", mask).value.trim();
+    if (!amt) { toast("请填写加工费金额", "err"); return; }
+    try {
+      const r = await postJson(`/prod/${order.id}/outsource-fee`, { amount: amt, date: $("#fe-date", mask).value });
+      toast(`已确认加工费，凭证 #${r.voucher_id}`, "ok");
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
 // BOM 维护（报工页「维护BOM」）：子件 / 用量 / 损耗率；领料与 MRP 按 BOM 展开
 function openBomEditor(item, reload) {
   let rows = [{ child: "", qty: "1", loss: "0" }];
@@ -2606,6 +2656,8 @@ async function viewWorkReport(main) {
       <button class="btn" id="wr-issue">领料出库</button>
       <label>完工数量 <input id="wr-cq" style="width:70px" value="0" /></label>
       <button class="btn" id="wr-complete">完工入库</button>
+      <button class="btn ghost sm" id="wr-out">新建委外</button>
+      <button class="btn ghost sm" id="wr-fee">确认加工费</button>
     </div>
     <div id="wr-ops" class="muted">选择生产订单后加载工序</div>`;
   let orders = [];
@@ -2613,7 +2665,7 @@ async function viewWorkReport(main) {
     const r = await api("/prod");
     orders = r.orders || [];
   } catch (e) { toast(e.message, "err"); }
-  $("#wr-po").innerHTML = orders.map((o) => `<option value="${o.id}">${esc(o.no)} · ${esc(o.item_name)}（${o.status}）</option>`).join("") || `<option value="">当前期间无生产订单</option>`;
+  $("#wr-po").innerHTML = orders.map((o) => `<option value="${o.id}">${o.order_kind === "outsourcing" ? "【委外】" : ""}${esc(o.no)} · ${esc(o.item_name)}（${o.status}）</option>`).join("") || `<option value="">当前期间无生产订单</option>`;
   // 工厂链动作：下达（MRP 页）→ 开工 → 领料出库 → 完工入库（BOM 在「维护BOM」编辑）
   const selOrder = () => orders.find((o) => String(o.id) === $("#wr-po").value);
   const syncCq = () => {
@@ -2649,6 +2701,8 @@ async function viewWorkReport(main) {
     if (!o) { toast("请先选择生产订单", "err"); return; }
     openBomEditor(o.item_code, reloadView);
   };
+  $("#wr-out").onclick = () => openOutsourceEditor(reloadView);
+  $("#wr-fee").onclick = () => openFeeEditor(selOrder(), reloadView);
   if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。先到「MRP」页对「生产」行点「下达」。</div>`; return; }
   const loadOps = async () => {
     const poId = $("#wr-po").value;

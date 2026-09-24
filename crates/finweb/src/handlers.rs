@@ -291,6 +291,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/prod/:id/start", post(prod_start_ep))
         .route("/api/prod/:id/issue", post(prod_issue_ep))
         .route("/api/prod/:id/complete", post(prod_complete_ep))
+        .route("/api/prod/:id/outsource-fee", post(outsource_fee_ep))
         .route("/api/bom", get(get_bom_ep).post(save_bom_ep))
         .route("/api/mrp/latest", get(get_mrp_latest))
         .route("/api/mrp/run", post(run_mrp))
@@ -5667,6 +5668,8 @@ async fn list_prod_orders(
                 "planned_qty": o.planned_qty.fmt_qty(),
                 "completed_qty": o.completed_qty.fmt_qty(),
                 "status": format!("{:?}", o.status),
+                "order_kind": o.order_kind,
+                "supplier_name": o.supplier_name,
             })
         })
         .collect();
@@ -5969,6 +5972,35 @@ async fn price_history_ep(
 // ---- 生产订单：下达 / 开工 / 领料 / 完工入库 + BOM（工厂链「业务单据同步凭证」） ----
 
 #[derive(Deserialize)]
+struct OutsourceFeeReq {
+    amount: String,
+    #[serde(default)]
+    date: String,
+}
+
+/// 委外加工费确认：借 500102 生产成本-直接人工 / 贷 应付科目（供应商辅助）；
+/// 金额并入该订单人工要素，完工时随 140501 结转（委外=生产的变体，全链复用）。
+async fn outsource_fee_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<OutsourceFeeReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = prod_act_date(&req.date);
+    let amount = parse_money_checked(&req.amount)?;
+    let vid = findb::manufacturing::outsource_fee(&db, id, amount, date, user.username())?;
+    db.log(
+        user.username(),
+        "生产",
+        "委外加工费",
+        &format!("PO#{id} ×{} 凭证#{vid}", amount.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
+}
+
+#[derive(Deserialize)]
 struct ProdCreateReq {
     item_code: String,
     #[serde(default)]
@@ -5977,6 +6009,13 @@ struct ProdCreateReq {
     date: String,
     #[serde(default)]
     work_center: String,
+    /// inhouse（默认）/ outsourcing 委外
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    supplier_code: String,
+    #[serde(default)]
+    supplier_name: String,
 }
 
 fn prod_act_date(s: &str) -> chrono::NaiveDate {
@@ -6015,6 +6054,13 @@ async fn create_prod_ep(
         work_center: req.work_center.trim().to_string(),
         prepared_by: user.username().to_string(),
         memo: String::new(),
+        order_kind: if req.kind.trim() == "outsourcing" {
+            "outsourcing".to_string()
+        } else {
+            "inhouse".to_string()
+        },
+        supplier_code: req.supplier_code.trim().to_string(),
+        supplier_name: req.supplier_name.trim().to_string(),
     };
     order.no = findb::scm::prod_next_no(&db, period)?;
     let id = findb::scm::prod_save(&db, &mut order)?;

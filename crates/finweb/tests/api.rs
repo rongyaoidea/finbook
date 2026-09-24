@@ -1750,7 +1750,7 @@ async fn readonly_roles_cannot_write() {
 }
 
 /// 通过 extra_perms 拿到 UserManage 的普通用户，不能改自己的角色 / 权限矩阵 /
-/// 数据范围（那等于一步自我提权）；改他人的授权仍然放行。
+/// 数据范围（那等于一步自我提权）；改他人的授权也已收紧为仅管理员（2026-09 审计）。
 #[tokio::test]
 async fn user_manager_cannot_escalate_self() {
     let (state, _bd, _dir) = test_state();
@@ -1842,7 +1842,8 @@ async fn user_manager_cannot_escalate_self() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "自助改显示名不该被拦");
 
-    // 改他人授权仍然可以：说明拦的是「改自己」而不是把 UserManage 削没了
+    // 改他人权限：收紧为仅管理员（2026-09 审计：只有 admin 可以调整其他账号的权限）。
+    // sup1 虽被额外授予 UserManage，但角色是会计 → 越权改他人角色应被拒。
     let resp = handlers::router(state.clone())
         .oneshot(authed_put(
             "/api/users/acc9",
@@ -1851,10 +1852,154 @@ async fn user_manager_cannot_escalate_self() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "改他人角色应放行");
-    let v: serde_json::Value =
-        serde_json::from_str(&body_string(resp).await).expect("响应应是 JSON");
-    assert_eq!(v["ok"], serde_json::json!(true));
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "非管理员改他人权限应被拒"
+    );
+}
+
+/// 权限调整收归管理员 + 会计出纳不相容（2026-09 审计双需求）。
+#[tokio::test]
+async fn admin_only_perm_changes_and_duty_separation() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = boss_in_b1(&state).await;
+
+    // ① 会计出纳互斥（建号路径）：出纳签字 × 会计核心 → 拒绝
+    for (u, role, extra) in [
+        ("mix1", "accountant", vec!["cashier_sign"]),
+        ("mix2", "cashier", vec!["voucher_post"]),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss_sid,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台 {u}");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &boss_sid,
+                serde_json::json!({
+                    "username": u, "display_name": u, "password": "",
+                    "role": role, "must_change_pwd": false, "extra_perms": extra,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{role} + {extra:?} 混合应被拒");
+        let s = body_string(resp).await;
+        assert!(s.contains("会计与出纳"), "应提示互斥：{s}");
+    }
+
+    // 合法组合：mgr1 = 会计 + UserManage（无出纳签字）；vic1 = 纯出纳
+    for (u, role, extra) in [
+        ("mgr1", "accountant", Some(vec!["user_manage"])),
+        ("vic1", "cashier", None),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss_sid,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台 {u}");
+        let mut body = serde_json::json!({
+            "username": u, "display_name": u, "password": "",
+            "role": role, "must_change_pwd": false,
+        });
+        if let Some(x) = extra {
+            body["extra_perms"] = serde_json::json!(x);
+        }
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post("/api/users", &boss_sid, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {role} 应成功");
+    }
+
+    // mgr1 登录 → 首登改密 → 进 b1
+    let (st, mgr) = login(&state, "mgr1", "Test12345").await;
+    assert_eq!(st, StatusCode::OK, "mgr1 登录");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &mgr,
+            serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "mgr1 首登改密");
+    assert_eq!(select_book(&state, &mgr, "b1").await, StatusCode::OK, "mgr1 进账套");
+
+    // ② 权限调整仅管理员：mgr1 持有 UserManage 但非管理员
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/vic1",
+            &mgr,
+            serde_json::json!({ "role": "viewer" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员改他人角色应403");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &mgr,
+            serde_json::json!({ "username": "x9", "display_name": "x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员建号应403");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/users/vic1", &mgr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员删号应403");
+    // 非授权字段仍可自助
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/mgr1",
+            &mgr,
+            serde_json::json!({ "display_name": "自改名" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "自助改显示名应放行");
+
+    // 管理员放行对照 + update 路径互斥校验
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/vic1",
+            &boss_sid,
+            serde_json::json!({ "extra_perms": ["audit_log"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员改权限应放行");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/vic1",
+            &boss_sid,
+            serde_json::json!({ "extra_perms": ["voucher_post"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "出纳+记账 update 路径应拒绝");
+    let s = body_string(resp).await;
+    assert!(s.contains("会计与出纳"), "应提示互斥：{s}");
+
+    // 收尾：管理员删号放行
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/users/vic1", &boss_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员删号应放行");
 }
 
 // ---------------------------------------------------------------------------

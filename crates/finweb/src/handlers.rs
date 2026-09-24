@@ -956,6 +956,10 @@ async fn create_user(
     Json(req): Json<CreateUserReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
+    // 权限调整收归管理员：即使被额外授予 UserManage，非管理员也不能铸号分配角色/权限
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("只有管理员可以创建账号并分配权限"));
+    }
     let username = req.username.trim().to_string();
     if username.is_empty() {
         return Err(AppError::bad_request("用户名不能为空"));
@@ -1026,6 +1030,18 @@ async fn update_user(
             return Err(AppError::bad_request(
                 "不能修改自己的角色、权限矩阵或停用本人，请由其他管理员操作",
             ));
+        }
+    }
+    // 权限调整收归管理员（2026-09 审计）：非管理员即使持有 UserManage，也不能调整
+    // 其他账号的角色/权限矩阵/数据范围/停用；显示名、备注等非授权字段仍可代改。
+    if username != user.username() {
+        let touches_grant = req.role.is_some()
+            || req.extra_perms.is_some()
+            || req.deny_perms.is_some()
+            || req.data_scope.is_some()
+            || req.disabled.is_some();
+        if touches_grant && !user.user.is_admin() {
+            return Err(AppError::forbidden("只有管理员可以调整其他账号的权限"));
         }
     }
     if let Some(d) = req.display_name {
@@ -1188,6 +1204,10 @@ async fn delete_user(
     user.require(Perm::UserManage)?;
     if username == user.username() {
         return Err(AppError::bad_request("不能删除当前登录的账号"));
+    }
+    // 删号 = 调整他人账号，收归管理员
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("只有管理员可以删除账号"));
     }
     let db = state.db_for(&user.book_key)?;
     let u = users::get(&db, &username)?

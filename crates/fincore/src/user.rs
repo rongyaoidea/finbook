@@ -395,6 +395,36 @@ impl User {
         self.role.perms().contains(&p) || self.extra_perms.contains(&p)
     }
 
+    /// 不相容职务分离（会计 × 出纳）：**出纳签字**不得与**会计角色核心权限**同现于同一账号。
+    /// 会计核心 = 会计预设中出纳没有的部分（按角色预设动态求差，随预设同步演进）；
+    /// 系统管理员天然持有全部权限，豁免。建号（insert）与每次权限变更（update）都会调用，
+    /// 两端（Web / 桌面）与数据范围保存共用这一拦截点。
+    pub fn validate_duty_separation(u: &User) -> Result<(), String> {
+        if u.role == Role::Admin {
+            return Ok(());
+        }
+        // 有效权限 = 角色预设 + 额外授权 − 明确关闭（与 User::can 同口径，但不受 disabled 影响）
+        let eff = |p: Perm| {
+            !u.deny_perms.contains(&p) && (u.role.perms().contains(&p) || u.extra_perms.contains(&p))
+        };
+        if !eff(Perm::CashierSign) {
+            return Ok(());
+        }
+        let accountant_core: Vec<Perm> = Role::Accountant
+            .perms()
+            .iter()
+            .copied()
+            .filter(|p| !Role::Cashier.perms().contains(p))
+            .collect();
+        if accountant_core.iter().any(|&p| eff(p)) {
+            return Err(
+                "会计与出纳权限不可出现在同一账号：出纳签字与会计核心权限（记账/删证/科目/档案/建账/结转/订单/仓储）互斥"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_password(&mut self, plain: &str) {
         self.password_hash = hash_password(plain);
         self.pwd_changed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();

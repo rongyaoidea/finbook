@@ -144,6 +144,11 @@ impl FinBookApp {
                     ctx.error(format!("没有「{}」权限", Perm::UserManage.label()));
                     return;
                 }
+                // 删号 = 调整他人账号，收归管理员
+                if !ctx.user().is_admin() {
+                    ctx.error("只有管理员可以删除账号");
+                    return;
+                }
                 let r = findb::users::delete(ctx.db(), id);
                 if ctx.handle(r).is_some() {
                     ctx.log("用户", "删除用户", &format!("#{id}"));

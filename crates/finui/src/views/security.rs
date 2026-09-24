@@ -862,6 +862,11 @@ impl SecurityView {
         };
         let mut u = base;
         // 编辑区里可能留下空行，落库前去掉，否则"空字符串部门"会被当成一种限制
+        // 数据范围 = 权限调整的一种，收归管理员
+        if !ctx.user().is_admin() {
+            ctx.error("只有管理员可以调整数据范围权限");
+            return;
+        }
         self.scope.depts.retain(|d| !d.trim().is_empty());
         u.data_scope = self.scope.clone();
         if ctx.handle(findb::users::update(ctx.db(), &u)).is_some() {

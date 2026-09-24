@@ -65,6 +65,10 @@ pub fn get_by_id(db: &Db, id: i64) -> DbResult<Option<User>> {
 }
 
 pub fn insert(db: &Db, u: &User) -> DbResult<i64> {
+    // 不相容职务：会计与出纳权限不可同现（建号即校验，两端共用）
+    if let Err(m) = fincore::user::User::validate_duty_separation(u) {
+        return Err(fincore::FinError::validate(m).into());
+    }
     db.conn().execute(
         "INSERT INTO user(username,display_name,password_hash,role,disabled,extra_perms,memo,
             pwd_changed_at,must_change_pwd,locked_until,last_login_at,data_scope_json,device_id,device_name,deny_perms_json)
@@ -91,6 +95,10 @@ pub fn insert(db: &Db, u: &User) -> DbResult<i64> {
 }
 
 pub fn update(db: &Db, u: &User) -> DbResult<()> {
+    // 不相容职务：每次权限变更后重新校验（Web 改权限 / 桌面保存 / 数据范围保存共用）
+    if let Err(m) = fincore::user::User::validate_duty_separation(u) {
+        return Err(fincore::FinError::validate(m).into());
+    }
     update_on(db.conn(), u)
 }
 

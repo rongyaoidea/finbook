@@ -348,6 +348,11 @@ impl UsersView {
         if save {
             let mut u = self.editing.clone().unwrap();
             self.err.clear();
+            // 权限调整收归管理员：非管理员即使能看到本页，也不能建号或改权限
+            if !ctx.user().is_admin() {
+                self.err = "只有管理员可以创建账号或调整权限".to_string();
+                return;
+            }
             if u.username.trim().is_empty() {
                 self.err = "用户名不能为空".to_string();
                 return;

@@ -486,11 +486,23 @@ fn get_item_cost(db: &Db, item_code: &str, period_ymm: i32) -> DbResult<Money> {
                WHERE item=? AND kind='purchase' AND period<=?
                ORDER BY biz_date DESC LIMIT 1";
 
-    db.conn()
+    if let Some(price) = db
+        .conn()
         .query_row(sql, [item_code, &period_ymm.to_string()], |r| r.get::<_, String>(0))
         .optional()?
-        .map(|s| Money::parse_or_zero(&s))
-        .ok_or_else(|| FinError::msg("物料成本未知").into())
+    {
+        let p = Money::parse_or_zero(&price);
+        if p.is_positive() {
+            return Ok(p);
+        }
+    }
+    // 回退：计价配置的标准价（Web 侧入库不带采购单价；与盘点/暂估同口径）。
+    // 两者都缺才报错——错误文案保持不变，既有测试兼容。
+    let std = crate::business::item_standard_cost(db, item_code)?;
+    if std.is_positive() {
+        return Ok(std);
+    }
+    Err(FinError::msg("物料成本未知").into())
 }
 
 // ===========================================================================
@@ -676,6 +688,22 @@ pub fn completion_voucher_in(
     crate::vouchers::save_in(tx, &mut v)
 }
 
+/// 生产订单开工：已下达 → 生产中（条件更新防并发；完工入库的前置状态）。
+pub fn prod_start(db: &Db, po_id: i64) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let n = tx.execute(
+        "UPDATE production_order SET status='in_progress', updated_at=?2
+         WHERE id=?1 AND status='released'",
+        rusqlite::params![po_id, now],
+    )?;
+    if n == 0 {
+        return Err(FinError::state("仅「已下达」的订单可开工（或状态已被他人变更）").into());
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> {
     let row = db.conn()
         .query_row(
@@ -691,7 +719,7 @@ pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> 
                 item_name: r.get(5)?,
                 planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
-                status: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(ProdStatus::Draft),
+                status: crate::scm::prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?,
                 prepared_by: r.get(10)?,
                 memo: r.get(11)?,

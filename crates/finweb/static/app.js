@@ -2271,8 +2271,14 @@ async function viewMrp(main) {
     </div>
     <div id="mrp-result" class="muted">输入需求产品与数量后运行</div>`;
   const load = (rows) => {
-    $("#mrp-result").innerHTML = `<table><thead><tr><th>层级</th><th>物料</th><th>毛需求</th><th>现有库存</th><th>净需求</th><th>计划量</th><th>行动</th><th>来源</th></tr></thead>
-      <tbody>${rows.map((x) => `<tr><td>${x.level}</td><td>${esc(x.item_code)}</td><td class="r">${fmt(x.gross_req)}</td><td class="r">${fmt(x.on_hand)}</td><td class="r">${fmt(x.net_req)}</td><td class="r">${fmt(x.planned_qty)}</td><td>${x.action === "produce" ? "生产" : x.action === "purchase" ? "采购" : "无"}</td><td>${esc(x.source)}</td></tr>`).join("")}</tbody></table>`;
+    $("#mrp-result").innerHTML = `<table><thead><tr><th>层级</th><th>物料</th><th>毛需求</th><th>现有库存</th><th>净需求</th><th>计划量</th><th>行动</th><th>来源</th><th></th></tr></thead>
+      <tbody>${rows.map((x) => `<tr><td>${x.level}</td><td>${esc(x.item_code)}</td><td class="r">${fmt(x.gross_req)}</td><td class="r">${fmt(x.on_hand)}</td><td class="r">${fmt(x.net_req)}</td><td class="r">${fmt(x.planned_qty)}</td><td>${x.action === "produce" ? "生产" : x.action === "purchase" ? "采购" : "无"}</td><td>${esc(x.source)}</td><td>${x.action === "produce" ? `<button class="btn ghost sm" data-mrp-go-item="${esc(x.item_code)}" data-mrp-go-qty="${esc(String(x.planned_qty))}">下达</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
+    $all("[data-mrp-go-item]").forEach((b) => b.onclick = async () => {
+      try {
+        const r = await postJson("/prod", { item_code: b.dataset.mrpGoItem, qty: b.dataset.mrpGoQty });
+        toast(`已下达生产订单 ${r.no}（到「工序报工」开工/领料）`, "ok");
+      } catch (e) { toast(e.message, "err"); }
+    });
   };
   $("#mrp-run").addEventListener("click", async () => {
     const item = $("#mrp-item").value.trim();
@@ -2465,14 +2471,57 @@ async function viewBudgetVersions(main) {
   load();
 }
 
+// BOM 维护（报工页「维护BOM」）：子件 / 用量 / 损耗率；领料与 MRP 按 BOM 展开
+function openBomEditor(item, reload) {
+  let rows = [{ child: "", qty: "1", loss: "0" }];
+  const mask = modal(`<h3>维护BOM · ${esc(item)}</h3>
+    <table class="grid" id="bm-t"><thead><tr><th>子件编码 *</th><th>用量/件</th><th>损耗率</th><th></th></tr></thead><tbody></tbody></table>
+    <button class="btn ghost sm" id="bm-add">＋子件</button>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">用量 = 每 1 件父件所需子件数量；损耗率如 0.05。保存覆盖当前版本 BOM（领料按 BOM × 计划量展开）。</p>
+    <div class="foot"><button class="btn primary" id="bm-save">保存</button><button class="btn ghost" id="bm-cancel">取消</button></div>`);
+  const draw = () => {
+    $("#bm-t tbody", mask).innerHTML = rows.map((r, i) => `<tr>
+      <td><input data-f="child" data-i="${i}" value="${esc(r.child)}" style="width:120px" /></td>
+      <td><input data-f="qty" data-i="${i}" value="${esc(r.qty)}" style="width:70px" /></td>
+      <td><input data-f="loss" data-i="${i}" value="${esc(r.loss)}" style="width:60px" /></td>
+      <td><button class="btn ghost sm" data-del="${i}">×</button></td></tr>`).join("");
+    $all("[data-del]", mask).forEach((b) => b.onclick = () => { rows.splice(parseInt(b.dataset.del, 10), 1); if (!rows.length) rows.push({ child: "", qty: "1", loss: "0" }); draw(); });
+    $all("[data-f]", mask).forEach((inp) => inp.oninput = () => { rows[parseInt(inp.dataset.i, 10)][inp.dataset.f] = inp.value; });
+  };
+  draw();
+  api(`/bom?parent=${encodeURIComponent(item)}`).then((r) => {
+    const list = r.rows || [];
+    if (list.length) rows = list.map((x) => ({ child: x.child_code, qty: String(x.qty), loss: String(x.loss_rate) }));
+    draw();
+  }).catch((e) => toast(e.message, "err"));
+  $("#bm-add", mask).onclick = () => { rows.push({ child: "", qty: "1", loss: "0" }); draw(); };
+  $("#bm-cancel", mask).onclick = closeModal;
+  $("#bm-save", mask).onclick = async () => {
+    const clean = rows.filter((r) => r.child.trim());
+    if (!clean.length) { toast("至少一个子件", "err"); return; }
+    try {
+      const r = await postJson("/bom", { parent: item, children: clean.map((c) => ({ child: c.child.trim(), qty: c.qty, loss: c.loss })) });
+      toast(`BOM 已保存（${r.children} 个子件）`, "ok");
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
 // ===========================================================================
 // 工序报工
 // ===========================================================================
 async function viewWorkReport(main) {
   main.innerHTML = `<h2>工序报工</h2>
     <div class="toolbar">
-      <label>生产订单 <select id="wr-po" style="min-width:180px"></select></label>
+      <label>生产订单 <select id="wr-po" style="min-width:230px"></select></label>
       <button class="btn primary" id="wr-load">加载工序</button>
+      <span class="grow"></span>
+      <button class="btn ghost sm" id="wr-bom">维护BOM</button>
+      <button class="btn ghost sm" id="wr-start">开工</button>
+      <button class="btn" id="wr-issue">领料出库</button>
+      <label>完工数量 <input id="wr-cq" style="width:70px" value="0" /></label>
+      <button class="btn" id="wr-complete">完工入库</button>
     </div>
     <div id="wr-ops" class="muted">选择生产订单后加载工序</div>`;
   let orders = [];
@@ -2481,7 +2530,42 @@ async function viewWorkReport(main) {
     orders = r.orders || [];
   } catch (e) { toast(e.message, "err"); }
   $("#wr-po").innerHTML = orders.map((o) => `<option value="${o.id}">${esc(o.no)} · ${esc(o.item_name)}（${o.status}）</option>`).join("") || `<option value="">当前期间无生产订单</option>`;
-  if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。请先在业务模块下达生产订单。</div>`; return; }
+  // 工厂链动作：下达（MRP 页）→ 开工 → 领料出库 → 完工入库（BOM 在「维护BOM」编辑）
+  const selOrder = () => orders.find((o) => String(o.id) === $("#wr-po").value);
+  const syncCq = () => {
+    const o = selOrder();
+    $("#wr-cq").value = o ? String(Math.max(0, Number(o.planned_qty) - Number(o.completed_qty))) : "0";
+  };
+  $("#wr-po").onchange = syncCq;
+  syncCq();
+  const reloadView = () => rerenderView("work-report", main);
+  $("#wr-start").onclick = async () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    try { await postJson(`/prod/${o.id}/start`, {}); toast("已开工（订单进入生产中，可完工）", "ok"); reloadView(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wr-issue").onclick = async () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    if (!(await confirmDialog(`对 ${o.no} 领料出库？按 BOM × 计划量展开并生成领料凭证。`, true))) return;
+    try {
+      const r = await postJson(`/prod/${o.id}/issue`, { date: today() });
+      toast(`已领料 ${r.items} 项物料，成本合计 ${r.total}`, "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wr-complete").onclick = async () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    const qty = $("#wr-cq").value.trim();
+    if (!(await confirmDialog(`完工入库 ${qty} 件？将推进订单状态并生成完工结转凭证。`, true))) return;
+    try { await postJson(`/prod/${o.id}/complete`, { qty, date: today() }); toast("已完工入库并结转成本", "ok"); reloadView(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wr-bom").onclick = () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    openBomEditor(o.item_code, reloadView);
+  };
+  if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。先到「MRP」页对「生产」行点「下达」。</div>`; return; }
   const loadOps = async () => {
     const poId = $("#wr-po").value;
     if (!poId) return;

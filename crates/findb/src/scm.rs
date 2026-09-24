@@ -203,6 +203,28 @@ impl ProdStatus {
             ProdStatus::Cancelled => "已作废",
         }
     }
+    /// 落库码（小写，与 prod_complete/prod_start 的裸 SQL 口径一致）
+    pub fn code(self) -> &'static str {
+        match self {
+            ProdStatus::Draft => "draft",
+            ProdStatus::Released => "released",
+            ProdStatus::InProgress => "in_progress",
+            ProdStatus::Completed => "completed",
+            ProdStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// 读生产订单状态：容忍历史三种存量（裸小写 / 裸驼峰 serde 值 / 带引号 JSON），未知回退草稿。
+/// 此前直接 `serde_json::from_str`（裸值不是合法 JSON）导致所有状态被读成 Draft。
+pub fn prod_status_from(s: &str) -> ProdStatus {
+    match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "released" => ProdStatus::Released,
+        "inprogress" | "in_progress" => ProdStatus::InProgress,
+        "completed" => ProdStatus::Completed,
+        "cancelled" | "canceled" => ProdStatus::Cancelled,
+        _ => ProdStatus::Draft,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -994,7 +1016,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
             rusqlite::params![
                 order.period.ymm(), order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
-                serde_json::to_value(&order.status)?.as_str().unwrap(),
+                order.status.code(),
                 order.work_center, order.prepared_by, order.memo, now, order.id
             ],
         )?;
@@ -1007,7 +1029,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
             rusqlite::params![
                 order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
-                serde_json::to_value(&order.status)?.as_str().unwrap(),
+                order.status.code(),
                 order.work_center, order.prepared_by, order.memo, now
             ],
         )?;
@@ -1034,14 +1056,14 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
     };
     
     let mut stmt = db.conn().prepare(&sql)?;
-    let rows = if let Some(_s) = status {
-        stmt.query_map(rusqlite::params![period.ymm(), serde_json::to_value(&_s)?.as_str().unwrap()], |r| {
+    let rows = if let Some(s) = status {
+        stmt.query_map(rusqlite::params![period.ymm(), s.code()], |r| {
             Ok(ProductionOrder {
                 id: r.get(0)?, no: r.get(1)?, period: Period::from_ymm(r.get(2)?),
                 date: r.get(3)?, item_code: r.get(4)?, item_name: r.get(5)?,
                 planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
-                status: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(ProdStatus::Draft),
+                status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
@@ -1052,7 +1074,7 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 date: r.get(3)?, item_code: r.get(4)?, item_name: r.get(5)?,
                 planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
-                status: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(ProdStatus::Draft),
+                status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?

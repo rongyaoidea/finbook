@@ -280,10 +280,14 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 工艺路线 / 报工 / MRP
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
-        .route("/api/prod", get(list_prod_orders))
+        .route("/api/prod", get(list_prod_orders).post(create_prod_ep))
         .route("/api/prod/:id/ops", get(get_prod_ops))
         .route("/api/prod/op/report", post(report_prod_op))
         .route("/api/prod/op/finish", post(finish_prod_op))
+        .route("/api/prod/:id/start", post(prod_start_ep))
+        .route("/api/prod/:id/issue", post(prod_issue_ep))
+        .route("/api/prod/:id/complete", post(prod_complete_ep))
+        .route("/api/bom", get(get_bom_ep).post(save_bom_ep))
         .route("/api/mrp/latest", get(get_mrp_latest))
         .route("/api/mrp/run", post(run_mrp))
         // 预算版本
@@ -5492,6 +5496,244 @@ async fn run_mrp(
     let run_at = advanced::mrp_run(&db, &demands)?;
     let rows = advanced::mrp_by_run(&db, &run_at)?;
     Ok(Json(serde_json::json!({ "run_at": run_at, "rows": rows })))
+}
+
+// ---- 生产订单：下达 / 开工 / 领料 / 完工入库 + BOM（工厂链「业务单据同步凭证」） ----
+
+#[derive(Deserialize)]
+struct ProdCreateReq {
+    item_code: String,
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    work_center: String,
+}
+
+fn prod_act_date(s: &str) -> chrono::NaiveDate {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Local::now().date_naive())
+}
+
+/// 下达生产订单（MRP 结果页「下达」/ 手工）：状态=已下达。
+/// 此前生产订单全系统无创建入口（仅 MRP 计划与测试直造），此端点补齐工厂链第一环。
+async fn create_prod_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ProdCreateReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let code = req.item_code.trim();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少存货编码 item_code"));
+    }
+    let qty = parse_money_checked(&req.qty)?;
+    if !qty.is_positive() {
+        return Err(AppError::bad_request("计划数量必须大于 0"));
+    }
+    let period = current_period(&state, &user);
+    let mut order = findb::scm::ProductionOrder {
+        id: 0,
+        no: String::new(),
+        period,
+        date: prod_act_date(&req.date),
+        item_code: code.to_string(),
+        item_name: code.to_string(),
+        planned_qty: qty,
+        completed_qty: Money::ZERO,
+        status: findb::scm::ProdStatus::Released,
+        work_center: req.work_center.trim().to_string(),
+        prepared_by: user.username().to_string(),
+        memo: String::new(),
+    };
+    order.no = findb::scm::prod_next_no(&db, period)?;
+    let id = findb::scm::prod_save(&db, &mut order)?;
+    db.log(
+        user.username(),
+        "生产",
+        "下达生产订单",
+        &format!("{} {} ×{}", order.no, code, qty.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "no": order.no })))
+}
+
+/// 开工：已下达 → 生产中（完工入库的前置状态；条件更新防并发）
+async fn prod_start_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::manufacturing::prod_start(&db, id)?;
+    db.log(user.username(), "生产", "开工", &format!("PO#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ProdActReq {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    qty: String,
+}
+
+/// 领料出库：按 BOM × 计划量 × (1+损耗) 展开，同事务 扣库存 + 归集生产成本 +
+/// 出领料凭证（借 500101 生产成本-直接材料 / 贷各物料科目，数量核算）。
+/// 凭证期间随订单；仅 已下达/生产中 可领。
+async fn prod_issue_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ProdActReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let order = findb::manufacturing::get_prod_order(&db, id)?
+        .ok_or_else(|| AppError::bad_request("生产订单不存在"))?;
+    if !matches!(
+        order.status,
+        findb::scm::ProdStatus::Released | findb::scm::ProdStatus::InProgress
+    ) {
+        return Err(AppError::bad_request("仅已下达/生产中的订单可领料"));
+    }
+    let date = prod_act_date(&req.date);
+    let rows =
+        findb::manufacturing::prod_issue_materials(&db, id, date, order.period, user.username())?;
+    let total: Money = rows.iter().map(|(_, _, a)| *a).sum();
+    db.log(
+        user.username(),
+        "生产",
+        "领料出库",
+        &format!("{} 项数 {} 成本 {}", order.no, rows.len(), total.fmt_qty()),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "items": rows.len(),
+        "total": total.fmt_qty(),
+        "rows": rows
+            .iter()
+            .map(|(c, q, a)| json!({ "item": c, "qty": q.fmt_qty(), "amount": a.fmt_qty() }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// 完工入库：qty 留空 = 其余未完工数量；同事务 入库 + 订单推进 completed +
+/// 完工结转凭证（借 140501 库存商品数量核算 / 贷 500101~03 各要素，只出非零）。
+/// 仅生产中订单可完工（条件更新防重复完工）。
+async fn prod_complete_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ProdActReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let order = findb::manufacturing::get_prod_order(&db, id)?
+        .ok_or_else(|| AppError::bad_request("生产订单不存在"))?;
+    let qty = if req.qty.trim().is_empty() {
+        order.planned_qty - order.completed_qty
+    } else {
+        parse_money_checked(&req.qty)?
+    };
+    if !qty.is_positive() {
+        return Err(AppError::bad_request("完工数量必须大于 0（或订单已全部完工）"));
+    }
+    let date = prod_act_date(&req.date);
+    let move_id =
+        findb::manufacturing::prod_complete(&db, id, date, order.period, qty, user.username())?;
+    db.log(
+        user.username(),
+        "生产",
+        "完工入库",
+        &format!("{} ×{}", order.no, qty.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true, "move_id": move_id, "qty": qty.fmt_qty() })))
+}
+
+#[derive(Deserialize)]
+struct BomReq {
+    parent: String,
+    #[serde(default)]
+    children: Vec<BomChildReq>,
+}
+
+#[derive(Deserialize)]
+struct BomChildReq {
+    child: String,
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    loss: String,
+}
+
+/// BOM 查询（报工页「维护BOM」回显）
+async fn get_bom_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let parent = q.get("parent").map(|s| s.trim()).unwrap_or("");
+    if parent.is_empty() {
+        return Err(AppError::bad_request("缺少 parent（父件编码）"));
+    }
+    let rows = findb::scm::bom_list(&db, parent)?;
+    Ok(Json(json!({
+        "rows": rows
+            .iter()
+            .map(|b| json!({
+                "child_code": b.child_code,
+                "qty": b.qty.fmt_qty(),
+                "loss_rate": b.loss_rate.fmt_qty(),
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// BOM 保存（覆盖当前版本；领料与 MRP 均按 BOM 展开）
+async fn save_bom_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BomReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let parent = req.parent.trim();
+    if parent.is_empty() {
+        return Err(AppError::bad_request("缺少父件编码"));
+    }
+    let mut items: Vec<(String, Money, Money)> = Vec::new();
+    for c in &req.children {
+        let code = c.child.trim();
+        if code.is_empty() {
+            continue;
+        }
+        let qty = parse_money_checked(&c.qty)?;
+        if !qty.is_positive() {
+            return Err(AppError::bad_request(&format!("子件 {code} 用量必须大于 0")));
+        }
+        let loss = if c.loss.trim().is_empty() {
+            Money::ZERO
+        } else {
+            parse_money_checked(&c.loss)?
+        };
+        items.push((code.to_string(), qty, loss));
+    }
+    if items.is_empty() {
+        return Err(AppError::bad_request("至少一个子件"));
+    }
+    findb::scm::bom_save(&db, parent, &items)?;
+    db.log(
+        user.username(),
+        "生产",
+        "维护BOM",
+        &format!("{parent}：{}个子件", items.len()),
+    )?;
+    Ok(Json(json!({ "ok": true, "children": items.len() })))
 }
 
 // ---- 预算版本 ----

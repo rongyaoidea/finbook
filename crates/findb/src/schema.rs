@@ -1128,6 +1128,23 @@ CREATE TABLE IF NOT EXISTS doc_link (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_link_dst ON doc_link(dst_type, dst_id);
 
+-- 质检单（对标金蝶来料检验：合格留库，不合格自动按订单单价退货冲减库存）
+CREATE TABLE IF NOT EXISTS qc_order (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_id      INTEGER NOT NULL,
+    item       TEXT NOT NULL DEFAULT '',
+    qty_insp   TEXT NOT NULL DEFAULT '0',
+    qty_pass   TEXT NOT NULL DEFAULT '0',
+    qty_fail   TEXT NOT NULL DEFAULT '0',
+    result     TEXT NOT NULL DEFAULT 'pass',  -- pass / fail / partial
+    inspector  TEXT NOT NULL DEFAULT '',
+    date       TEXT NOT NULL DEFAULT '',
+    memo       TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_qc_po ON qc_order(po_id);
+
 -- 可视化工作流（对标金蝶审批流设计器）：流程定义 + 节点 + 连线 + 运行实例
 CREATE TABLE IF NOT EXISTS workflow_flow (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

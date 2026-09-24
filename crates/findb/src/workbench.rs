@@ -311,9 +311,11 @@ pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
         let on = batches.iter().filter(|b| b.balance.is_positive()).count() as i64;
         let counts = crate::stocktake::count_list(db)?;
         let pending = counts.iter().filter(|c| c.status == "draft").count() as i64;
+        let low = crate::inventory2::below_safety(db)?;
         out.cards.push(card("仓管", "batch_expiry", "临期批次(30天)", exp.len().to_string(), "个"));
         out.cards.push(card("仓管", "batch_on", "在库批次", on.to_string(), "个"));
         out.cards.push(card("仓管", "count_pending", "未完成盘点", pending.to_string(), "单"));
+        out.cards.push(card("仓管", "below_safety", "低于安全库存", low.len().to_string(), "项"));
         let mut in_m: BTreeMap<i32, f64> = BTreeMap::new();
         let mut out_m: BTreeMap<i32, f64> = BTreeMap::new();
         let mut st = db.conn().prepare(
@@ -348,6 +350,7 @@ pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
         ));
         out.todos.push(todo("仓管", "expiry_todo", "临期批次处理", exp.len() as i64, "inv-batch"));
         out.todos.push(todo("仓管", "count_todo", "未完成盘点单", pending, "inv-count"));
+        out.todos.push(todo("仓管", "safety_todo", "低于安全库存", low.len() as i64, "inv-warehouse"));
     }
 
     // ---- 生产 ----

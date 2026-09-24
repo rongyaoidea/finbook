@@ -353,6 +353,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/batches/expiring", get(expiring_batches_ep))
         .route("/api/inventory/locations", get(list_locations).post(save_location))
         .route("/api/inventory/locations/:id/delete", post(delete_location))
+        .route("/api/inventory/form-convert", post(form_convert_ep))
+        .route("/api/inventory/qc", post(qc_order_ep))
+        .route("/api/inventory/below-safety", get(below_safety_ep))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -4452,7 +4455,7 @@ async fn add_po_receipt(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_receipt_add(&db, &findb::procurement::PoReceipt {
+    let id = findb::procurement::po_receipt_with_stock(&db, &findb::procurement::PoReceipt {
         id: 0, po_id: req.po_id, period, date, qty: parse_money_checked(&req.qty)?, memo: req.memo,
     })?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
@@ -4471,7 +4474,7 @@ async fn add_po_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_return_add(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
+    let id = findb::procurement::po_return_with_stock(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -5754,6 +5757,138 @@ async fn run_mrp(
     let run_at = advanced::mrp_run(&db, &demands)?;
     let rows = advanced::mrp_by_run(&db, &run_at)?;
     Ok(Json(serde_json::json!({ "run_at": run_at, "rows": rows })))
+}
+
+// ---- 库存作业：形态转换 / 质检 / 低库存预警（对标金蝶） ----
+
+#[derive(Deserialize)]
+struct FormConvertReq {
+    from_item: String,
+    to_item: String,
+    qty: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 形态转换：源物料出库 → 目标物料入库（同数量，数量口径，无总账凭证）
+async fn form_convert_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<FormConvertReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let qty = parse_money_checked(&req.qty)?;
+    findb::inventory2::form_convert(
+        &db,
+        period,
+        date,
+        req.from_item.trim(),
+        req.to_item.trim(),
+        qty,
+        &req.memo,
+    )?;
+    db.log(
+        user.username(),
+        "库存",
+        "形态转换",
+        &format!("{} → {} ×{}", req.from_item, req.to_item, qty.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct QcReq {
+    po_id: i64,
+    qty_insp: String,
+    #[serde(default)]
+    qty_fail: String,
+    #[serde(default)]
+    inspector: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 质检单：合格留库；不合格**自动按订单单价退货**（负到货 + 负采购入库同事务）
+async fn qc_order_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<QcReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let insp = parse_money_checked(&req.qty_insp)?;
+    let fail = if req.qty_fail.trim().is_empty() {
+        Money::ZERO
+    } else {
+        parse_money_checked(&req.qty_fail)?
+    };
+    let inspector = if req.inspector.trim().is_empty() {
+        user.username().to_string()
+    } else {
+        req.inspector.trim().to_string()
+    };
+    let id = findb::procurement::qc_save(
+        &db,
+        req.po_id,
+        insp,
+        fail,
+        &inspector,
+        date,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "库存",
+        "质检",
+        &format!(
+            "PO#{} 检验 {} 合格 {} 不合格 {}",
+            req.po_id,
+            insp.fmt_qty(),
+            (insp - fail).fmt_qty(),
+            fail.fmt_qty()
+        ),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "qty_pass": (insp - fail).fmt_qty(),
+        "qty_fail": fail.fmt_qty(),
+    })))
+}
+
+/// 低于安全库存（item_plan 安全量 vs 现有库存）
+async fn below_safety_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::inventory2::below_safety(&db)?;
+    Ok(Json(json!({
+        "rows": rows
+            .iter()
+            .map(|(i, on, s)| json!({ "item": i, "on_hand": on.fmt_qty(), "safety": s.fmt_qty() }))
+            .collect::<Vec<_>>()
+    })))
 }
 
 // ---- 单据下推与追溯（对标金蝶 源单→目标单） ----

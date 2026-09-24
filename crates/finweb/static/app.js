@@ -3484,6 +3484,15 @@ async function viewInvAssemble(main) {
       <textarea id="ia-children" style="width:420px;height:70px" placeholder="RM1:2&#10;RM2:1"></textarea>
       <button class="btn" id="ia-do">组装</button>
       <button class="btn" id="ia-undo">拆卸</button>
+    </div>
+    <div class="toolbar">
+      <label style="font-weight:600">形态转换</label>
+      <label>源物料 <input id="fc-from" style="width:120px" /></label>
+      <label>→ 目标物料 <input id="fc-to" style="width:120px" /></label>
+      <label>数量 <input id="fc-qty" style="width:80px" /></label>
+      <label>备注 <input id="fc-memo" style="width:140px" /></label>
+      <button class="btn" id="fc-do">转换</button>
+      <span class="muted" style="font-size:12px">同数量一减一增，金额交期末结价</span>
     </div>`;
   $("#ia-date").value = new Date().toISOString().slice(0, 10);
   const doOp = async (disassemble) => {
@@ -3499,6 +3508,16 @@ async function viewInvAssemble(main) {
     } catch (e) { toast(e.message, "err"); }
   };
   $("#ia-do").addEventListener("click", () => doOp(false));
+  $("#fc-do").onclick = async () => {
+    const from = $("#fc-from").value.trim(), to = $("#fc-to").value.trim(), qty = $("#fc-qty").value.trim();
+    if (!from || !to || !qty) { toast("请填写源物料、目标物料与数量", "err"); return; }
+    if (from === to) { toast("源与目标不能相同", "err"); return; }
+    try {
+      await postJson("/inventory/form-convert", { from_item: from, to_item: to, qty, memo: $("#fc-memo").value.trim(), date: $("#ia-date").value.trim() });
+      toast(`已形态转换 ${from} → ${to} ×${qty}`, "ok");
+      $("#fc-qty").value = ""; $("#fc-memo").value = "";
+    } catch (e) { toast(e.message, "err"); }
+  };
   $("#ia-undo").addEventListener("click", () => doOp(true));
 }
 
@@ -3807,6 +3826,32 @@ async function viewProcureQuota(main) {
   });
 }
 
+// 来料质检（对标金蝶检验单）：合格留库；不合格自动按订单单价退货冲减库存
+function openQcEditor(poId, reload) {
+  const mask = modal(`<h3>来料质检 · 采购订单 #${esc(String(poId))}</h3>
+    <div class="field"><label>检验数量 *</label><input id="qc-insp" placeholder="本批送检数量" /></div>
+    <div class="field"><label>不合格数量（0 = 全部合格）</label><input id="qc-fail" value="0" /></div>
+    <div class="field"><label>检验人</label><input id="qc-who" placeholder="留空 = 当前账号" /></div>
+    <div class="field"><label>日期</label><input type="date" id="qc-date" value="${today()}" /></div>
+    <div class="field"><label>备注</label><input id="qc-memo" /></div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">合格部分留库；不合格部分自动按采购订单单价退货（负到货 + 负入库流水）。订单单价为 0 时请先补价。</p>
+    <div class="foot"><button class="btn primary" id="qc-save">保存质检单</button><button class="btn ghost" id="qc-cancel">取消</button></div>`);
+  $("#qc-cancel", mask).onclick = closeModal;
+  $("#qc-save", mask).onclick = async () => {
+    const insp = $("#qc-insp", mask).value.trim();
+    if (!insp) { toast("请填写检验数量", "err"); return; }
+    try {
+      const r = await postJson("/inventory/qc", {
+        po_id: Number(poId), qty_insp: insp, qty_fail: $("#qc-fail", mask).value.trim() || "0",
+        inspector: $("#qc-who", mask).value.trim(), date: $("#qc-date", mask).value, memo: $("#qc-memo", mask).value.trim(),
+      });
+      toast(`质检完成：合格 ${r.qty_pass}${Number(r.qty_fail) > 0 ? `，不合格 ${r.qty_fail} 已自动退货` : ""}`, "ok");
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
 // 单据链追溯面板（对标金蝶 源单/目标单 追溯）：上游源单 + 下游执行流水合并展示
 async function openDocChain(kind, id, title) {
   const mask = modal(`<h3>单据链 · ${esc(title || kind)} #${esc(String(id))}</h3>
@@ -3866,12 +3911,13 @@ async function viewPoDoc(main) {
       const s = await api(`/procure/po?period=${period}`);
       const orows = s.rows || [];
       $("#po-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="po-chkall" title="全选" /></th><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="po-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-chain="${o.id}">链</button><button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="po-chkall" title="全选" /></th><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="po-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-chain="${o.id}">链</button>${can("warehouse") ? `<button class="btn ghost sm" data-po-qc="${o.id}">质检</button>` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无采购订单，点右上「新建采购订单」</div>`;
       $all("[data-po-edit]").forEach((b) => b.onclick = () => openOrderEditor("po", main, parseInt(b.dataset.poEdit, 10)));
       $all("[data-po-confirm]").forEach((b) => b.onclick = () => poTransition(b.dataset.poConfirm, "Confirmed"));
       $all("[data-po-cancel]").forEach((b) => b.onclick = () => poTransition(b.dataset.poCancel, "Cancelled"));
       $all("[data-po-chain]").forEach((b) => b.onclick = () => openDocChain("po", b.dataset.poChain, "采购订单"));
+      $all("[data-po-qc]").forEach((b) => b.onclick = () => openQcEditor(b.dataset.poQc, load));
       $all("[data-po-exec]").forEach((b) => b.onclick = () => { $("#pd-poid").value = b.dataset.poExec; toast(`已填入订单ID ${b.dataset.poExec}，可到货/付款`, "ok"); });
       $all("[data-po-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该采购订单？", true))) return; try { await api(`/procure/po/${b.dataset.poDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#po-chkall")) $("#po-chkall").onclick = (e) => { $all(".po-chk").forEach((c) => { c.checked = e.target.checked; }); };

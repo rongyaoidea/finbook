@@ -186,6 +186,248 @@ pub struct PoPayment {
     pub memo: String,
 }
 
+// ===========================================================================
+// 到货/退货（Web 入口）：执行流水 + 采购入库库存流水 同事务（采购链闭环）
+// ===========================================================================
+
+/// 在调用方事务内写一条到货/退货执行行，返回行 id
+fn receipt_row_in(
+    tx: &rusqlite::Transaction,
+    po_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    tx.execute(
+        "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            po_id,
+            period.ymm(),
+            date.format("%Y-%m-%d").to_string(),
+            crate::exact_param(qty),
+            memo
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// 在调用方事务内写采购入库库存流水（kind=purchase，价=订单行单价）
+fn stock_purchase_in(
+    tx: &rusqlite::Transaction,
+    po_no: &str,
+    item: &str,
+    price: Money,
+    qty: Money,
+    period: Period,
+    date: NaiveDate,
+    memo: &str,
+) -> DbResult<()> {
+    let mut mv = crate::business::StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: crate::business::StockKind::Purchase,
+        item: item.to_string(),
+        warehouse: String::new(),
+        batch_no: String::new(),
+        qty,
+        price,
+        amount: qty * price,
+        voucher_id: None,
+        memo: if memo.is_empty() {
+            format!("采购入库 {po_no}")
+        } else {
+            memo.to_string()
+        },
+    };
+    crate::business::stock_insert_of(tx, &mut mv)?;
+    Ok(())
+}
+
+/// 订单首行（品名与单价）——到货/退货/质检统一取价口径
+fn first_line(po: &crate::scm::PurchaseOrder) -> Result<&crate::scm::PoLine, fincore::FinError> {
+    po.lines.first().ok_or_else(|| fincore::FinError::msg("采购订单没有明细行，不能入库"))
+}
+
+/// 到货登记：执行流水 + 采购入库流水**同事务**。
+/// 防呆：订单无行拒、单价为 0 拒（0 价入库会污染移动平均——下推后请先补价）。
+/// 多行订单按首行（品/价）入库并 memo 注明；这也是「最近采购价」的真实数据源。
+pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
+    if r.qty.is_negative() || r.qty.is_zero() {
+        return Err(fincore::FinError::msg("到货数量必须为正数").into());
+    }
+    let po = crate::scm::po_get(db, r.po_id)?
+        .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
+    let line = first_line(&po)?;
+    if line.unit_price.is_zero() {
+        return Err(fincore::FinError::msg(
+            "采购订单单价为 0：请先补价再入库（防 0 价污染库存成本）",
+        )
+        .into());
+    }
+    let item = line.item_code.clone();
+    let price = line.unit_price;
+    let tx = db.write_tx()?;
+    let rid = receipt_row_in(&tx, r.po_id, r.period, r.date, r.qty, &r.memo)?;
+    stock_purchase_in(
+        &tx,
+        &po.no,
+        &item,
+        price,
+        r.qty,
+        r.period,
+        r.date,
+        &format!("采购入库 {}", po.no),
+    )?;
+    tx.commit()?;
+    Ok(rid)
+}
+
+/// 采购退货：负到货行 + 负采购入库流水同事务；**超退防呆**（本次退量 ≤ 累计净收货）
+pub fn po_return_with_stock(
+    db: &Db,
+    po_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    if qty.is_negative() || qty.is_zero() {
+        return Err(fincore::FinError::msg("退货数量必须为正数").into());
+    }
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
+    let line = first_line(&po)?;
+    if line.unit_price.is_zero() {
+        return Err(fincore::FinError::msg("采购订单单价为 0：请先补价再退货").into());
+    }
+    let item = line.item_code.clone();
+    let price = line.unit_price;
+    let received = po_receipt_sum(db, po_id)?;
+    if qty > received {
+        return Err(fincore::FinError::state(format!(
+            "退货数量 {} 超过累计净收货 {}",
+            qty.fmt_qty(),
+            received.fmt_qty()
+        ))
+        .into());
+    }
+    let tx = db.write_tx()?;
+    let rid = receipt_row_in(&tx, po_id, period, date, qty.negated(), &format!("退货 {memo}"))?;
+    stock_purchase_in(
+        &tx,
+        &po.no,
+        &item,
+        price,
+        qty.negated(),
+        period,
+        date,
+        &format!("采购退货 {}", po.no),
+    )?;
+    tx.commit()?;
+    Ok(rid)
+}
+
+/// 累计净收货（含历史负行）
+pub fn po_receipt_sum(db: &Db, po_id: i64) -> DbResult<Money> {
+    let rows: Vec<String> = db
+        .conn()
+        .prepare("SELECT qty FROM po_receipt WHERE po_id=?1")?
+        .query_map([po_id], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.iter().map(|s| m(s)).sum())
+}
+
+/// 质检单（对标金蝶来料检验）：不合格部分**自动按订单单价退货**（负到货+负入库同事务），
+/// 结论 pass/fail/partial 随不合格数推导。合格部分留库不动（到货已入库）。
+pub fn qc_save(
+    db: &Db,
+    po_id: i64,
+    qty_insp: Money,
+    qty_fail: Money,
+    inspector: &str,
+    date: NaiveDate,
+    memo: &str,
+    who: &str,
+) -> DbResult<i64> {
+    if !qty_insp.is_positive() {
+        return Err(fincore::FinError::msg("检验数量必须大于 0").into());
+    }
+    if qty_fail.is_negative() || qty_fail > qty_insp {
+        return Err(fincore::FinError::msg("不合格数必须 ≥0 且 ≤ 检验数").into());
+    }
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
+    let line = first_line(&po)?;
+    if qty_fail.is_positive() && line.unit_price.is_zero() {
+        return Err(fincore::FinError::msg("采购订单单价为 0：请先补价再处理不合格退货").into());
+    }
+    let item = line.item_code.clone();
+    let price = line.unit_price;
+    let result = if !qty_fail.is_positive() {
+        "pass"
+    } else if qty_fail == qty_insp {
+        "fail"
+    } else {
+        "partial"
+    };
+    let tx = db.write_tx()?;
+    if qty_fail.is_positive() {
+        let received = {
+            let mut st = tx.prepare("SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM po_receipt WHERE po_id=?1")?;
+            let v: f64 = st.query_row([po_id], |r| r.get(0))?;
+            Money::parse_or_zero(&format!("{v:.4}"))
+        };
+        if qty_fail > received {
+            return Err(fincore::FinError::state(format!(
+                "不合格数 {} 超过累计净收货 {}",
+                qty_fail.fmt_qty(),
+                received.fmt_qty()
+            ))
+            .into());
+        }
+        receipt_row_in(
+            &tx,
+            po_id,
+            Period::from_date(date),
+            date,
+            qty_fail.negated(),
+            &format!("质检退货 {}", memo),
+        )?;
+        stock_purchase_in(
+            &tx,
+            &po.no,
+            &item,
+            price,
+            qty_fail.negated(),
+            Period::from_date(date),
+            date,
+            &format!("质检退货 {}", po.no),
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO qc_order(po_id,item,qty_insp,qty_pass,qty_fail,result,inspector,date,memo,created_by,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        rusqlite::params![
+            po_id,
+            item,
+            crate::exact_param(qty_insp),
+            crate::exact_param(qty_insp - qty_fail),
+            crate::exact_param(qty_fail),
+            result,
+            inspector,
+            date.format("%Y-%m-%d").to_string(),
+            memo,
+            who,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
 pub fn po_payment_add(db: &Db, p: &PoPayment) -> DbResult<i64> {
     db.conn().execute(
         "INSERT INTO po_payment(po_id,period,date,amount,memo) VALUES(?1,?2,?3,?4,?5)",

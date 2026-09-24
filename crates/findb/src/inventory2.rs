@@ -268,6 +268,89 @@ pub fn disassemble(db: &Db, period: Period, date: NaiveDate, parent: &str, child
     Ok(())
 }
 
+/// 形态转换（对标金蝶形态转换单）：源物料出库 → 目标物料入库，同数量一减一增。
+/// 数量口径（金额交期末结价），与组装/拆卸一致；无总账凭证（存货内部结构调整）。
+pub fn form_convert(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    from_item: &str,
+    to_item: &str,
+    qty: Money,
+    memo: &str,
+) -> DbResult<()> {
+    if from_item == to_item {
+        return Err(fincore::FinError::msg("源物料与目标物料不能相同").into());
+    }
+    if !from_item.trim().is_empty() && !to_item.trim().is_empty() && !qty.is_positive() {
+        return Err(fincore::FinError::msg("转换数量必须大于 0").into());
+    }
+    use crate::business::{stock_insert, StockKind, StockMove};
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::OtherOut,
+            item: from_item.to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty: qty.negated(),
+            price: Money::ZERO,
+            amount: Money::ZERO,
+            voucher_id: None,
+            memo: format!("形态转换 {}", memo),
+        },
+    )?;
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::OtherIn,
+            item: to_item.to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty,
+            price: Money::ZERO,
+            amount: Money::ZERO,
+            voucher_id: None,
+            memo: format!("形态转换 {}", memo),
+        },
+    )?;
+    Ok(())
+}
+
+/// 低于安全库存的存货：item_plan.safety_stock > 0 且现有库存（流水汇总）< 安全量。
+/// 返回 (存货, 现有库存, 安全库存)——工作台仓管预警与低库存待办数据源。
+pub fn below_safety(db: &Db) -> DbResult<Vec<(String, Money, Money)>> {
+    let mut st = db.conn().prepare(
+        "SELECT item_code, CAST(safety_stock AS REAL) FROM item_plan
+         WHERE CAST(safety_stock AS REAL) > 0 ORDER BY item_code",
+    )?;
+    let plans: Vec<(String, f64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = Vec::new();
+    for (item, safety) in plans {
+        let on: f64 = db.conn().query_row(
+            "SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM stock_move WHERE item=?1",
+            [&item],
+            |r| r.get(0),
+        )?;
+        if on < safety {
+            out.push((
+                item,
+                Money::parse_or_zero(&format!("{on:.4}")),
+                Money::parse_or_zero(&format!("{safety:.4}")),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// 库存状态：分仓库结存
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WhStock {

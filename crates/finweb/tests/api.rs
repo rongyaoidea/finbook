@@ -5735,6 +5735,156 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 库存作业：到货即入库（补价防呆）→ 质检不合格自动退货 → 超退防呆 → 形态转换 → 低库存端点。
+#[tokio::test]
+async fn inventory_qc_convert_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 带价采购订单（20 件 × 8 元）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-11", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "质检链造数",
+                "lines": [{ "item_code": "140301", "qty_ordered": "20", "unit_price": "8", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单");
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 到货 20 → 采购入库流水（kind=purchase）库存 +20
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": 202601, "date": "2026-01-12", "qty": "20", "memo": "首批" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货入库");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let on_hand: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(on_hand, 20.0, "到货后 140301 库存 20");
+
+    // 质检：检验 20、不合格 5 → 自动退货 → 库存 15
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/qc",
+            &sid,
+            serde_json::json!({
+                "po_id": po_id, "qty_insp": "20", "qty_fail": "5",
+                "inspector": "质检员甲", "date": "2026-01-13", "memo": "外观不良"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "质检保存");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["qty_pass"], "15");
+    assert_eq!(r["qty_fail"], "5");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let on_hand: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(on_hand, 15.0, "不合格 5 已退货 → 库存 15");
+
+    // 质检防呆：不合格 > 检验 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/qc",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "qty_insp": "5", "qty_fail": "9" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不合格超检验应拒");
+
+    // 超退防呆：直接退货 20 > 累计净收货 15 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/return",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": 202601, "date": "2026-01-14", "qty": "20", "memo": "超退测试" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超退应拒");
+
+    // 形态转换 140301 → 140501 ×10：5 / 10
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/form-convert",
+            &sid,
+            serde_json::json!({ "from_item": "140301", "to_item": "140501", "qty": "10", "date": "2026-01-15", "memo": "转产" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "形态转换");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let q: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(q, 5.0, "源物料剩 5");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140501", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let q: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(q, 10.0, "目标物料 +10");
+
+    // 同物料转换 → 400；低库存端点 200
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/form-convert",
+            &sid,
+            serde_json::json!({ "from_item": "140301", "to_item": "140301", "qty": "1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "同物料转换应拒");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/below-safety", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "低库存端点可用");
+}
+
 /// Ctrl+K 快速搜索：凭证/请购/报销按关键词分域返回 + 空词与无结果边界。
 #[tokio::test]
 async fn quick_search_flow() {
@@ -5924,7 +6074,7 @@ async fn doc_push_chain() {
         "PO 应见上游请购：{links}"
     );
 
-    // 到货执行 → 流水并入链（下游 receipt）
+    // 0 价防呆：未补价到货 → 400（0 价入库会污染移动平均）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/procure/receipt",
@@ -5933,7 +6083,32 @@ async fn doc_push_chain() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "到货登记");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "0 价订单到货应被防呆拦截");
+    // 补价 + 补供应商（save_po 按 id 更新）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "id": po_id, "period": 202601, "date": "2026-01-08",
+                "supplier_code": "S01", "supplier_name": "供应商甲",
+                "status": "Draft", "memo": "源：请购",
+                "lines": [{ "item_code": "140301", "qty_ordered": "30", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "补价应成功");
+    // 到货执行 → 采购入库库存流水 + 流水并入链（下游 receipt）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": 202601, "date": "2026-01-10", "qty": "30", "memo": "到货" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货登记（补价后）");
     let resp = handlers::router(state.clone())
         .oneshot(authed_get(&format!("/api/doc-links?kind=po&id={po_id}"), &sid))
         .await

@@ -676,8 +676,39 @@ pub struct BookOptions {
     /// （已废弃）审核环节已移除：未记账凭证核对后直接记账。
     /// 字段仅为兼容旧账套序列化而保留，不再生效。
     pub require_audit: bool,
+    /// 业务凭证默认科目（收付款单 / 发货收入 / 暂估等自动生成用）
+    #[serde(default)]
+    pub biz_accounts: BizAccounts,
     /// 凭证字号方案
     pub voucher_words: Vec<String>,
+}
+
+/// 业务凭证默认科目配置（须为末级科目编码；空值生成时回退到本默认表）
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BizAccounts {
+    /// 应收账款（客户辅助）
+    pub ar: String,
+    /// 应付账款（供应商辅助）
+    pub ap: String,
+    /// 主营业务收入
+    pub income: String,
+    /// 销项税额
+    pub tax_sales: String,
+    /// 默认资金账户（银行/现金）
+    pub fund: String,
+}
+
+impl Default for BizAccounts {
+    fn default() -> Self {
+        Self {
+            ar: "112201".to_string(),
+            ap: "220201".to_string(),
+            income: "600101".to_string(),
+            tax_sales: "22210102".to_string(),
+            fund: "100201".to_string(),
+        }
+    }
 }
 
 impl Default for BookOptions {
@@ -693,6 +724,7 @@ impl Default for BookOptions {
             enable_audit: false,
             require_cashier: false,
             require_audit: true,
+            biz_accounts: BizAccounts::default(),
             voucher_words: vec!["记".to_string()],
         }
     }

@@ -129,21 +129,34 @@ pub fn settle(
     amount: Money,
     who: &str,
 ) -> DbResult<i64> {
+    // 「读未核销额 → 校验 → 累加写回」必须整体原子。BEGIN IMMEDIATE 在开头就取得
+    // 写锁，期间不会有别的写事务插进来；否则两笔并发核销会各自通过超额校验，
+    // 并把对方的累计额覆盖掉（唯一索引只保证行唯一，管不住金额）。
+    let tx = db.write_tx()?;
+    let id = settle_in_tx(&tx, from_entry, to_entry, amount, who)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// 同事务版核销：供收付款单在建单事务内复用。校验与 [`settle`] 完全一致，**不 commit**。
+pub fn settle_in_tx(
+    tx: &rusqlite::Transaction,
+    from_entry: i64,
+    to_entry: i64,
+    amount: Money,
+    who: &str,
+) -> DbResult<i64> {
     if from_entry == to_entry {
         return Err(fincore::FinError::msg("不能把分录核销到自己身上").into());
     }
     if amount <= Money::ZERO {
         return Err(fincore::FinError::msg("核销金额必须大于零").into());
     }
-    // 「读未核销额 → 校验 → 累加写回」必须整体原子。BEGIN IMMEDIATE 在开头就取得
-    // 写锁，期间不会有别的写事务插进来；否则两笔并发核销会各自通过超额校验，
-    // 并把对方的累计额覆盖掉（唯一索引只保证行唯一，管不住金额）。
-    let tx = db.write_tx()?;
-    let f = match entry_of(&tx, from_entry)? {
+    let f = match entry_of(tx, from_entry)? {
         Some(e) => e,
         None => return Err(fincore::FinError::not_found("被核销分录").into()),
     };
-    let t = match entry_of(&tx, to_entry)? {
+    let t = match entry_of(tx, to_entry)? {
         Some(e) => e,
         None => return Err(fincore::FinError::not_found("核销方分录").into()),
     };
@@ -161,8 +174,8 @@ pub fn settle(
         .into());
     }
     // 检查超额
-    let open_f = f.signed().abs() - settled_of(&tx, from_entry)?;
-    let open_t = t.signed().abs() - settled_of(&tx, to_entry)?;
+    let open_f = f.signed().abs() - settled_of(tx, from_entry)?;
+    let open_t = t.signed().abs() - settled_of(tx, to_entry)?;
     if amount > open_f {
         return Err(fincore::FinError::msg(format!(
             "核销金额 {amount} 超过被核销方未核销额 {open_f}"
@@ -205,7 +218,6 @@ pub fn settle(
         ],
     )?;
     let id = tx.last_insert_rowid();
-    tx.commit()?;
     Ok(id)
 }
 

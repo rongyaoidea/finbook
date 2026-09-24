@@ -328,6 +328,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/funds/advances/:id/pay", post(pay_advance))
         .route("/api/funds/advances/:id/settle", post(settle_advance))
         .route("/api/funds/advances/:id/delete", post(delete_advance))
+        .route("/api/funds/receipts", get(list_receipts).post(create_receipt))
+        .route("/api/funds/receipts/:id/delete", post(delete_receipt))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -4137,7 +4139,7 @@ async fn add_po_payment(
     user: CurrentUser,
     Json(req): Json<PaymentReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4145,10 +4147,42 @@ async fn add_po_payment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_payment_add(&db, &findb::procurement::PoPayment {
-        id: 0, po_id: req.po_id, period, date, amount: parse_money_checked(&req.amount)?, memo: req.memo,
-    })?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    let amount = parse_money_checked(&req.amount)?;
+    // 对标金蝶：付款动作即出台账凭证并按供应商自动核销（默认资金账户取账套配置）
+    let po = findb::scm::po_get(&db, req.po_id)?
+        .ok_or_else(|| AppError::not_found("采购订单不存在"))?;
+    let (_doc, vid, settled) = findb::receipt::receipt_create(
+        &db,
+        "payment",
+        date,
+        "",
+        &po.supplier_code,
+        amount,
+        &req.memo,
+        user.username(),
+    )?;
+    let id = findb::procurement::po_payment_add(
+        &db,
+        &findb::procurement::PoPayment {
+            id: 0,
+            po_id: req.po_id,
+            period,
+            date,
+            amount,
+            memo: req.memo,
+        },
+    )?;
+    db.log(
+        user.username(),
+        "采购",
+        "采购付款",
+        &format!(
+            "#{} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            req.po_id,
+            amount.fmt_money()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
 }
 
 async fn get_price_history(
@@ -4290,7 +4324,7 @@ async fn add_so_payment(
     user: CurrentUser,
     Json(req): Json<SoPaymentReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let period = if req.period > 0 { period_checked(req.period)? } else { current_period(&state, &user) };
     let date = if req.date.is_empty() {
@@ -4298,8 +4332,33 @@ async fn add_so_payment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_payment_add(&db, req.so_id, period, date, parse_money_checked(&req.amount)?, &req.memo)?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    let amount = parse_money_checked(&req.amount)?;
+    // 对标金蝶：收款动作即出台账凭证并按客户自动核销（默认资金账户取账套配置）
+    let so = findb::scm::so_get(&db, req.so_id)?
+        .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
+    let (_doc, vid, settled) = findb::receipt::receipt_create(
+        &db,
+        "receipt",
+        date,
+        "",
+        &so.customer_code,
+        amount,
+        &req.memo,
+        user.username(),
+    )?;
+    let id =
+        findb::sales::so_payment_add(&db, req.so_id, period, date, amount, &req.memo)?;
+    db.log(
+        user.username(),
+        "销售",
+        "销售收款",
+        &format!(
+            "#{} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            req.so_id,
+            amount.fmt_money()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
 }
 
 // ---------------- 订单 CRUD（销售/采购，对标金蝶订单流程） ----------------
@@ -5950,6 +6009,82 @@ async fn delete_advance(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct ReceiptCreateReq {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    fund_account: String,
+    #[serde(default)]
+    party: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_receipts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::receipt::receipt_list(&db)? })))
+}
+
+/// 新增收付款单：同事务生成资金凭证 + FIFO 自动核销（对标金蝶收款单/付款单）
+async fn create_receipt(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ReceiptCreateReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let kind = if req.kind == "payment" { "payment" } else { "receipt" };
+    let amount = parse_money_checked(&req.amount)?;
+    let (id, vid, settled) = findb::receipt::receipt_create(
+        &db,
+        kind,
+        date,
+        &req.fund_account,
+        &req.party,
+        amount,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "资金",
+        "新增收付款单",
+        &format!(
+            "#{id} {} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            if kind == "receipt" { "收款" } else { "付款" },
+            amount.fmt_money()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
+}
+
+async fn delete_receipt(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::receipt::receipt_delete(&db, id)?;
+    db.log(user.username(), "资金", "删除收付款单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn delete_loan(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -7471,7 +7606,9 @@ async fn list_aux(
     user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<AuxEntity>>, AppError> {
-    user.require(Perm::AuxEdit)?;
+    // 档案列表是**只读参照**（凭证/收付款单都要选客户、供应商、职员……），
+    // 任何可记账角色都需要；增删改仍由 AuxEdit 把关。
+    user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
     let kind = q
         .get("kind")

@@ -1048,6 +1048,23 @@ CREATE TABLE IF NOT EXISTS advance (
 );
 CREATE INDEX IF NOT EXISTS idx_advance_status ON advance(status, date);
 
+-- 收付款单（对标金蝶收款单/付款单：出纳资金动作 → 凭证 + 自动核销）
+CREATE TABLE IF NOT EXISTS receipt_doc (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    no           TEXT NOT NULL DEFAULT '',
+    period       INTEGER NOT NULL,
+    date         TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'receipt', -- receipt=收款 / payment=付款
+    fund_account TEXT NOT NULL DEFAULT '100201',
+    party        TEXT NOT NULL DEFAULT '',       -- 往来单位辅助编码
+    amount       TEXT NOT NULL DEFAULT '0',
+    memo         TEXT NOT NULL DEFAULT '',
+    voucher_id   INTEGER,
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_doc_period ON receipt_doc(period, kind);
+
 -- 存货计价方式配置（按存货档案 code）
 CREATE TABLE IF NOT EXISTS item_cost_method (
     item          TEXT PRIMARY KEY,

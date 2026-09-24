@@ -478,6 +478,17 @@ pub fn delete(db: &Db, id: i64) -> DbResult<()> {
         return Err(FinError::state("已审核凭证不能删除，请先反审核").into());
     }
     fincore::engine::validate_delete(&v, crate::periods::closed_upto(db)?).into_result()?;
+    // 删除前清掉该凭证分录上的核销配对（手工/收付款自动核销），避免留下悬空核销记录
+    let mut st = db
+        .conn()
+        .prepare("SELECT id FROM voucher_entry WHERE voucher_id=?1")?;
+    let entry_ids: Vec<i64> = st
+        .query_map([id], |r| r.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
+    for e in entry_ids {
+        crate::settle::unsettle_entry(db, e)?;
+    }
     let files: Vec<String> = crate::attach::list(db, id)?
         .into_iter()
         .filter(|a| !a.inline)

@@ -3095,6 +3095,92 @@ async fn payroll_voucher_status_tracking() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复生成发放凭证应被拦");
 }
 
+/// 收付款单 API 流程：出凭证 + 自动核销 + 删除链（凭证先行）。
+#[tokio::test]
+async fn receipt_doc_api_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 先造一张应收挂账（客户辅助 C01）并记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05", "word": "记",
+                "no": 81, "attachments": 0, "memo": "挂账",
+                "entries": [
+                    { "line": 1, "account_code": "112201", "summary": "挂账",
+                      "debit": "1000", "credit": "0", "aux": { "customer": "C01" } },
+                    { "line": 2, "account_code": "600101", "summary": "收入",
+                      "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "挂账凭证应可保存");
+    let ar_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{ar_id}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "挂账应记账");
+
+    // 收款 600：出凭证 + 自动核销
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/receipts",
+            &sid,
+            serde_json::json!({
+                "date": "2026-01-10", "kind": "receipt", "fund_account": "100201",
+                "party": "C01", "amount": "600", "memo": "回款"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增收款单应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let doc_id = r["id"].as_i64().unwrap();
+    let vid = r["voucher_id"].as_i64().expect("收款单应生成凭证");
+    assert_eq!(r["settled"].as_i64().unwrap(), 1, "应自动核销 1 笔");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["entries"][0]["account_code"], "100201");
+    assert_eq!(v["entries"][1]["account_code"], "112201");
+    assert_eq!(v["entries"][1]["aux"]["customer"], "C01");
+
+    // 列表可见
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/funds/receipts", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+
+    // 删除链：凭证存在 → 拒；删凭证 → 单据可删
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/funds/receipts/{doc_id}/delete"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "凭证存在时不能删单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{vid}/delete"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "草稿凭证应可删除");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/funds/receipts/{doc_id}/delete"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "凭证删除后单据可删");
+}
+
 /// 对标金蝶流程：订单 CRUD + 状态流转 + 行金额服务端计算 + 客户信用卡控。
 #[tokio::test]
 async fn order_crud_and_credit_guard() {

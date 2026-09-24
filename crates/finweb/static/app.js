@@ -3491,7 +3491,7 @@ async function viewPoDoc(main) {
   const memo = () => $("#pd-memo2").value.trim();
   $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast("已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.voucher_id ? `已付款，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   load();
 }
 
@@ -3570,7 +3570,7 @@ async function viewSoDoc(main) {
   const memo = () => $("#sd-memo").value.trim();
   $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-return").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/return", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast("已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.voucher_id ? `已收款，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}` : "已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-credit").addEventListener("click", async () => {
     const c = $("#sd-credit-cust").value.trim();
     if (!c) { toast("请填写客户", "err"); return; }
@@ -3729,6 +3729,7 @@ async function viewFunds(main) {
       <button class="btn sm ${state.fundsTab === "journal" ? "primary" : "ghost"}" id="ft-journal">日记账</button>
       <button class="btn sm ${state.fundsTab === "advance" ? "primary" : "ghost"}" id="ft-advance">借支</button>
       <button class="btn sm ${state.fundsTab === "budget" ? "primary" : "ghost"}" id="ft-budget">资金预算</button>
+      <button class="btn sm ${state.fundsTab === "receipt" ? "primary" : "ghost"}" id="ft-receipt">收付款</button>
       <button class="btn sm ${state.fundsTab === "forecast" ? "primary" : "ghost"}" id="ft-forecast">资金预测</button>
     </div>
     <div id="funds-body" class="muted">加载中…</div>`;
@@ -3742,6 +3743,7 @@ async function viewFunds(main) {
   $("#ft-journal").onclick = () => switchTab("journal");
   $("#ft-advance").onclick = () => switchTab("advance");
   $("#ft-budget").onclick = () => switchTab("budget");
+  $("#ft-receipt").onclick = () => switchTab("receipt");
   $("#ft-forecast").onclick = () => switchTab("forecast");
 
   const body = $("#funds-body");
@@ -3784,6 +3786,8 @@ async function viewFunds(main) {
     renderAdvances(body);
   } else if (tab === "budget") {
     renderBudget(body);
+  } else if (tab === "receipt") {
+    renderReceipts(body);
   } else {
     body.className = "";
     try {
@@ -3882,6 +3886,64 @@ async function renderAdvances(body) {
       });
       $all("[data-ad-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该借支单？", true))) return; try { await api(`/funds/advances/${b.dataset.adD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
     } catch (e) { $("#ad-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+// 收付款单（对标金蝶收款单/付款单）：保存即出凭证并按往来单位 FIFO 自动核销
+async function renderReceipts(body) {
+  body.className = "";
+  const kindSel = () => $("#rc-kind").value;
+  const loadParties = async () => {
+    let parties = [];
+    try { parties = await api(`/aux?kind=${kindSel() === "receipt" ? "customer" : "supplier"}`); } catch (e) { parties = []; }
+    const sel = $("#rc-party");
+    if (!sel) return;
+    sel.innerHTML = parties.length
+      ? parties.map((p) => `<option value="${esc(p.code)}">${esc(p.code)} ${esc(p.name)}</option>`).join("")
+      : `<option value="">（先到辅助档案新增${kindSel() === "receipt" ? "客户" : "供应商"}）</option>`;
+    sel.disabled = !parties.length;
+  };
+  body.innerHTML = `<div class="toolbar">
+      <label>日期 <input type="date" id="rc-date" value="${today()}" /></label>
+      <label>类型 <select id="rc-kind"><option value="receipt">收款</option><option value="payment">付款</option></select></label>
+      <label>资金账户 <input id="rc-fund" value="" placeholder="默认100201" style="width:100px" /></label>
+      <label>往来单位 <select id="rc-party" style="width:170px"></select></label>
+      <label>金额 <input id="rc-amt" style="width:110px" /></label>
+      <label>备注 <input id="rc-memo" style="width:130px" /></label>
+      <button class="btn primary" id="rc-new">新增收付款</button>
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:6px">保存即生成记账凭证草稿（会计记账后入账，H-3 草稿不入余额），并按往来单位对未清挂账 FIFO 自动核销；往来单位选凭证辅助编码（C01/S01…）。</div>
+    <div id="rc-list" class="muted">加载中…</div>`;
+  $("#rc-kind").onchange = () => loadParties();
+  $("#rc-new").onclick = async () => {
+    if (!$("#rc-party").value) { toast("请选择往来单位", "err"); return; }
+    try {
+      const r = await postJson("/funds/receipts", {
+        date: $("#rc-date").value, kind: kindSel(), fund_account: $("#rc-fund").value.trim(),
+        party: $("#rc-party").value, amount: $("#rc-amt").value.trim(), memo: $("#rc-memo").value.trim(),
+      });
+      toast(`已保存，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}`, "ok");
+      $("#rc-amt").value = ""; $("#rc-memo").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  await loadParties();
+  await load();
+  async function load() {
+    try {
+      const r = await api("/funds/receipts");
+      const rows = r.rows || [];
+      $("#rc-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th>类型</th><th>资金账户</th><th>往来单位</th><th class="num">金额</th><th>凭证</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((d) => `<tr>
+            <td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "receipt" ? "收款" : "付款"}</td>
+            <td>${esc(d.fund_account)}</td><td>${esc(d.party)}</td><td class="num">${fmt(d.amount)}</td>
+            <td>${d.voucher_id ? `<a href="#" data-rc-v="${d.voucher_id}">凭证 #${d.voucher_id}</a>` : "—"}</td>
+            <td>${esc(d.memo || "")}</td>
+            <td class="row-actions"><button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无收付款单</div>`;
+      $all("[data-rc-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.rcV, 10)); });
+      $all("[data-rc-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该收付款单？其凭证需先作废或删除", true))) return; try { await api(`/funds/receipts/${b.dataset.rcD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#rc-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
 }
 
@@ -4669,6 +4731,14 @@ async function viewOptions(main) {
       <div class="field"><label>启用期间（YYYYMM）</label><input id="op-start" value="${esc(o.start_period)}" /></div>
       <div class="field"><label>科目编码级长（逗号分隔，如 4,2,2,2,2）</label><input id="op-scheme" value="${esc((o.code_scheme || []).join(","))}" /></div>
       <div class="field"><label>凭证字方案（逗号分隔，如 记,收,付,转）</label><input id="op-words" value="${esc((o.voucher_words || []).join(","))}" /></div>
+      <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+        <div><label>应收科目(客户)</label><input id="op-biz-ar" value="${esc((o.biz_accounts || {}).ar || "112201")}" style="width:90px" /></div>
+        <div><label>应付科目(供应商)</label><input id="op-biz-ap" value="${esc((o.biz_accounts || {}).ap || "220201")}" style="width:90px" /></div>
+        <div><label>收入科目</label><input id="op-biz-income" value="${esc((o.biz_accounts || {}).income || "600101")}" style="width:90px" /></div>
+        <div><label>销项税科目</label><input id="op-biz-tax" value="${esc((o.biz_accounts || {}).tax_sales || "22210102")}" style="width:90px" /></div>
+        <div><label>默认资金账户</label><input id="op-biz-fund" value="${esc((o.biz_accounts || {}).fund || "100201")}" style="width:90px" /></div>
+      </div>
+      <p class="muted" style="font-size:12px">业务凭证自动生成的默认科目（收付款单/发货收入/暂估等），须为末级科目编码。</p>
       <div class="field" style="display:flex;gap:24px;flex-wrap:wrap">
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-audit" ${o.enable_audit ? "checked" : ""} />启用审核环节（未审核不能记账）</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-qty" ${o.enable_qty ? "checked" : ""} />启用数量核算</label>
@@ -4694,6 +4764,13 @@ async function viewOptions(main) {
       enable_qty: $("#op-qty").checked,
       enable_foreign: $("#op-foreign").checked,
       require_cashier: $("#op-cashier").checked,
+      biz_accounts: {
+        ar: $("#op-biz-ar").value.trim() || "112201",
+        ap: $("#op-biz-ap").value.trim() || "220201",
+        income: $("#op-biz-income").value.trim() || "600101",
+        tax_sales: $("#op-biz-tax").value.trim() || "22210102",
+        fund: $("#op-biz-fund").value.trim() || "100201",
+      },
     });
     try { await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存账套参数", "ok"); }
     catch (e) { toast(e.message, "err"); }

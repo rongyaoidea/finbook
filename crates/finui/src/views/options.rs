@@ -130,6 +130,25 @@ impl OptionsView {
             ui.checkbox(&mut o.enable_foreign, "启用外币核算");
         });
 
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("业务凭证默认科目").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("应收");
+            ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.ar));
+            ui.label("应付");
+            ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.ap));
+            ui.label("收入");
+            ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.income));
+            ui.label("销项税");
+            ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.tax_sales));
+            ui.label("资金");
+            ui.add_sized([86.0, 22.0], egui::TextEdit::singleline(&mut o.biz_accounts.fund));
+        });
+        ui.label(
+            RichText::new("须为末级科目；收付款单 / 发货收入 / 暂估等自动生成凭证的默认取此").weak(),
+        );
+
         ui.add_space(14.0);
         ui.separator();
         ui.label(RichText::new("账套信息").strong());

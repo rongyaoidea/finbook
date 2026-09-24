@@ -37,6 +37,13 @@ pub struct FundsView {
     pub ck_amount: String,
     pub ck_date: String,
     pub ck_memo: String,
+    // 收付款单录入
+    pub rc_date: String,
+    pub rc_kind: String,
+    pub rc_fund: String,
+    pub rc_party: String,
+    pub rc_amount: String,
+    pub rc_memo: String,
     // 出纳日记账（科目 + 日清日期）
     pub j_account: String,
     pub j_date: String,
@@ -80,6 +87,12 @@ impl Default for FundsView {
             ad_memo: String::new(),
             ad_exp_account: "660201".to_string(),
             ad_exp_amount: String::new(),
+            rc_date: String::new(),
+            rc_kind: "receipt".to_string(),
+            rc_fund: String::new(),
+            rc_party: String::new(),
+            rc_amount: String::new(),
+            rc_memo: String::new(),
         }
     }
 }
@@ -95,7 +108,7 @@ impl FundsView {
         });
 
         widgets::toolbar(ui, |ui| {
-            for (i, label) in ["资金日报", "票据", "融资", "现金盘点", "支票簿", "日记账", "借支", "资金预算", "资金预测"].iter().enumerate() {
+            for (i, label) in ["资金日报", "票据", "融资", "现金盘点", "支票簿", "日记账", "借支", "资金预算", "收付款", "资金预测"].iter().enumerate() {
                 if ui.selectable_label(self.tab == i as u8, *label).clicked() {
                     self.tab = i as u8;
                     self.dirty = true;
@@ -116,6 +129,7 @@ impl FundsView {
             5 => self.show_journal(ctx, ui),
             6 => self.show_advances(ctx, ui),
             7 => self.show_budget(ctx, ui),
+            8 => self.show_receipts(ctx, ui),
             _ => self.show_forecast(ctx, ui),
         }
     }
@@ -294,6 +308,26 @@ impl FundsView {
                     ]);
                 }
                 ("资金预算", sh)
+            }
+            8 => {
+                let rows = findb::receipt::receipt_list(ctx.db()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "收付款单",
+                    vec!["单号".to_string(), "日期".to_string(), "类型".to_string(), "资金账户".to_string(), "往来单位".to_string(), "金额".to_string(), "凭证".to_string(), "备注".to_string()],
+                );
+                for d in rows {
+                    sh.push(vec![
+                        d.no.clone(),
+                        d.date.format("%Y-%m-%d").to_string(),
+                        if d.kind == "receipt" { "收款".to_string() } else { "付款".to_string() },
+                        d.fund_account.clone(),
+                        d.party.clone(),
+                        d.amount.fmt_plain(),
+                        d.voucher_id.map(|v| format!("#{v}")).unwrap_or_default(),
+                        d.memo.clone(),
+                    ]);
+                }
+                ("收付款单", sh)
             }
             _ => {
                 let fc = findb::funds::funds_forecast(ctx.db(), ctx.period()).unwrap_or_default();
@@ -1198,6 +1232,128 @@ impl FundsView {
                 _ => {}
             }
         });
+    }
+
+    /// 收付款单：保存即出凭证 + 按往来单位 FIFO 自动核销（对标金蝶收款单/付款单）
+    fn show_receipts(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        if self.rc_date.is_empty() {
+            self.rc_date = today.clone();
+        }
+        widgets::toolbar(ui, |ui| {
+            ui.label("日期");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.rc_date));
+            ui.label("类型");
+            egui::ComboBox::from_id_salt("rc_kind")
+                .selected_text(if self.rc_kind == "payment" { "付款" } else { "收款" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.rc_kind, "receipt".to_string(), "收款");
+                    ui.selectable_value(&mut self.rc_kind, "payment".to_string(), "付款");
+                });
+            ui.label("资金账户");
+            ui.add_sized(
+                [90.0, 22.0],
+                egui::TextEdit::singleline(&mut self.rc_fund).hint_text("默认100201"),
+            );
+            ui.label("往来单位");
+            ui.add_sized(
+                [110.0, 22.0],
+                egui::TextEdit::singleline(&mut self.rc_party).hint_text("辅助编码 C01/S01"),
+            );
+            ui.label("金额");
+            ui.add_sized([100.0, 22.0], egui::TextEdit::singleline(&mut self.rc_amount));
+            ui.label("备注");
+            ui.add_sized([120.0, 22.0], egui::TextEdit::singleline(&mut self.rc_memo));
+            if ui.button("新增收付款").clicked() {
+                match chrono::NaiveDate::parse_from_str(&self.rc_date, "%Y-%m-%d") {
+                    Ok(date) => {
+                        let who = ctx.user().username.clone();
+                        let amount = Money::parse_or_zero(&self.rc_amount);
+                        match findb::receipt::receipt_create(
+                            ctx.db(),
+                            &self.rc_kind,
+                            date,
+                            &self.rc_fund,
+                            &self.rc_party,
+                            amount,
+                            &self.rc_memo,
+                            &who,
+                        ) {
+                            Ok((_, vid, settled)) => {
+                                ctx.log(
+                                    "资金",
+                                    "新增收付款",
+                                    &format!("{} {} 凭证 #{vid}", self.rc_kind, amount.fmt_money()),
+                                );
+                                ctx.info(format!(
+                                    "已生成凭证 #{vid}{}",
+                                    if settled > 0 {
+                                        format!("（自动核销 {settled} 笔）")
+                                    } else {
+                                        String::new()
+                                    }
+                                ));
+                                self.rc_amount.clear();
+                                self.rc_memo.clear();
+                            }
+                            Err(e) => ctx.error(e.to_string()),
+                        }
+                    }
+                    Err(_) => ctx.error("日期格式应为 YYYY-MM-DD"),
+                }
+            }
+        });
+        ui.label(
+            RichText::new("保存即生成记账凭证草稿（记账后入账），并按往来单位对未清挂账 FIFO 自动核销")
+                .weak(),
+        );
+
+        let rows = findb::receipt::receipt_list(ctx.db()).unwrap_or_default();
+        let cols = [
+            widgets::TCol::new("单号", 140.0).fixed(),
+            widgets::TCol::new("日期", 100.0).fixed(),
+            widgets::TCol::new("类型", 70.0).fixed(),
+            widgets::TCol::new("资金账户", 90.0).fixed(),
+            widgets::TCol::new("往来单位", 110.0).fixed(),
+            widgets::TCol::new("金额", 120.0).right(),
+            widgets::TCol::new("凭证", 90.0).fixed(),
+            widgets::TCol::new("备注", 140.0),
+            widgets::TCol::new("操作", 80.0).fixed(),
+        ];
+        let mut del: Option<i64> = None;
+        widgets::grid(ui, "receipt_docs", &cols, rows.len(), 24.0, |i, c, ui| {
+            let d = &rows[i];
+            match c {
+                0 => { ui.label(RichText::new(&d.no).monospace()); }
+                1 => { ui.label(d.date.format("%Y-%m-%d").to_string()); }
+                2 => { ui.label(if d.kind == "receipt" { "收款" } else { "付款" }); }
+                3 => { ui.label(RichText::new(&d.fund_account).monospace()); }
+                4 => { ui.label(&d.party); }
+                5 => widgets::amount_label(ui, d.amount),
+                6 => {
+                    match d.voucher_id {
+                        Some(v) => { ui.label(RichText::new(format!("#{v}")).color(palette::CREDIT)); }
+                        None => { ui.label("—"); }
+                    }
+                }
+                7 => { ui.label(&d.memo); }
+                8 => {
+                    if ui.small_button("删除").clicked() {
+                        del = Some(d.id);
+                    }
+                }
+                _ => {}
+            }
+        });
+        if let Some(id) = del {
+            match findb::receipt::receipt_delete(ctx.db(), id) {
+                Ok(()) => {
+                    ctx.log("资金", "删除收付款单", &format!("#{id}"));
+                    ctx.info("已删除收付款单");
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
     }
 
     fn show_forecast(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {

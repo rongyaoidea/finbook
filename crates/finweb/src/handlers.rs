@@ -393,6 +393,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/claims/:id", put(update_claim).delete(delete_claim))
         .route("/api/claims/:id/transition", post(claim_transition))
         .route("/api/claims/:id/voucher", post(claim_voucher))
+        .route("/api/workflows", get(list_workflows).post(save_workflow))
+        .route("/api/workflows/instances", get(list_wf_instances))
+        .route("/api/workflows/:id/publish", post(publish_workflow))
+        .route("/api/workflows/:id/unpublish", post(unpublish_workflow))
+        .route("/api/workflows/:id/delete", post(delete_workflow))
         // SPA 首页：动态注入资源版本号，避免浏览器长期缓存旧版 JS/CSS
         .route("/", get(serve_index))
         .layer(axum::middleware::from_fn(csrf_guard))
@@ -4132,6 +4137,24 @@ async fn approve_purchase_req(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
+    // 工作流拦截：有已发布流程 → 先走节点链，终态才执行原审批
+    match findb::workflow::intercept(
+        &db,
+        findb::workflow::BIZ_PURCHASE_REQ,
+        id,
+        &user.user,
+        true,
+        "",
+    )? {
+        findb::workflow::Gate::Pending { next } => {
+            db.log(user.username(), "审批", "工作流节点", &format!("请购#{id} → {next}"))?;
+            return Ok(Json(json!({ "ok": true, "pending": next })));
+        }
+        findb::workflow::Gate::Final { approved: false } => {
+            return Ok(Json(json!({ "ok": true, "rejected": true })));
+        }
+        _ => {}
+    }
     findb::procurement::pr_approve(&db, id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -4320,6 +4343,24 @@ async fn approve_quotation(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
+    // 工作流拦截：有已发布流程 → 先走节点链（Pending 只推进不批单；终态才执行原审批）
+    match findb::workflow::intercept(
+        &db,
+        findb::workflow::BIZ_QUOTATION,
+        id,
+        &user.user,
+        true,
+        "",
+    )? {
+        findb::workflow::Gate::Pending { next } => {
+            db.log(user.username(), "审批", "工作流节点", &format!("报价#{id} → {next}"))?;
+            return Ok(Json(json!({ "ok": true, "pending": next })));
+        }
+        findb::workflow::Gate::Final { approved: false } => {
+            return Ok(Json(json!({ "ok": true, "rejected": true })));
+        }
+        _ => {}
+    }
     findb::sales::quo_approve(&db, id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -4455,6 +4496,81 @@ async fn add_so_payment(
         ),
     )?;
     Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
+}
+
+// ---------------- 可视化工作流（对标金蝶审批流设计器） ----------------
+
+/// 流程列表（含节点/连线）。查看=Report；保存/发布/删除=SysOption（账套配置权）。
+async fn list_workflows(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::workflow::flow_list(&db)? })))
+}
+
+async fn save_workflow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(f): Json<findb::workflow::WfFlowInput>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = findb::workflow::flow_save(&db, &f, user.username())?;
+    db.log(
+        user.username(),
+        "工作流",
+        "保存流程",
+        &format!("{}（{}，节点 {}）", f.name, findb::workflow::biz_label(&f.biz_type), f.nodes.len()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn publish_workflow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::workflow::flow_set_status(&db, id, true, user.username())?;
+    db.log(user.username(), "工作流", "发布流程", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn unpublish_workflow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::workflow::flow_set_status(&db, id, false, user.username())?;
+    db.log(user.username(), "工作流", "撤回发布", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_workflow(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::workflow::flow_delete(&db, id)?;
+    db.log(user.username(), "工作流", "删除流程", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 运行实例（当前节点/状态/轨迹），供「工作流」页回放
+async fn list_wf_instances(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::workflow::instances(&db)? })))
 }
 
 // ---------------- 单据套打（订单 / 收付款单）：字段白名单 + 批量紧凑分页 ----------------
@@ -6502,8 +6618,29 @@ async fn audit_receipt(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherAudit)?;
     let db = state.db_for(&user.book_key)?;
+    // 工作流优先：有流程 → 参与人/审核权由拦截器判定，终态才出凭证；
+    // 无流程（默认流）→ 维持原审核权 VoucherAudit（出纳录单、审核人把关）
+    match findb::workflow::intercept(
+        &db,
+        findb::workflow::BIZ_RECEIPT,
+        id,
+        &user.user,
+        true,
+        "",
+    )? {
+        findb::workflow::Gate::Pending { next } => {
+            db.log(user.username(), "审批", "工作流节点", &format!("收付款#{id} → {next}"))?;
+            return Ok(Json(json!({ "ok": true, "pending": next })));
+        }
+        findb::workflow::Gate::Final { approved: false } => {
+            return Ok(Json(json!({ "ok": true, "rejected": true })));
+        }
+        findb::workflow::Gate::NoFlow => {
+            user.require(Perm::VoucherAudit)?;
+        }
+        findb::workflow::Gate::Final { approved: true } => {}
+    }
     let (vid, settled) = findb::receipt::receipt_audit(&db, id, user.username())?;
     db.log(
         user.username(),
@@ -8713,6 +8850,30 @@ async fn claim_transition(
         .ok_or_else(|| AppError::not_found("报销单不存在"))?;
     if !doc_in_scope(&user, &c.applicant) {
         return Err(AppError::forbidden("数据范围受限，不能操作他人的报销单"));
+    }
+    // 工作流拦截（仅 批准/驳回 两个目标）：有流程 → Pending 只推进；NoFlow/Final → 原流转
+    let gate_for = if to == business::ClaimStatus::Approved {
+        Some(true)
+    } else if to == business::ClaimStatus::Rejected {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(appr) = gate_for {
+        match findb::workflow::intercept(
+            &db,
+            findb::workflow::BIZ_CLAIM,
+            id,
+            &user.user,
+            appr,
+            "",
+        )? {
+            findb::workflow::Gate::Pending { next } => {
+                db.log(user.username(), "报销", "工作流节点", &format!("#{id} → {next}"))?;
+                return Ok(Json(json!({ "ok": true, "status": to, "pending": next })));
+            }
+            _ => {}
+        }
     }
     business::claim_transition(&db, id, to, user.username())?;
     db.log(user.username(), "报销", "状态流转", &format!("#{id} → {}", to.label()))?;

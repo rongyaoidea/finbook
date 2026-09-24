@@ -406,6 +406,7 @@ const NAV_ITEMS = [
   { id: "inv-warehouse", label: "分仓库库存", perm: "report", group: "库存" },
   { id: "inv-transfer", label: "调拨报表", perm: "report", group: "库存" },
   { id: "approval", label: "审批中心", perm: "report", group: "系统" },
+  { id: "workflow", label: "工作流", perm: "report", group: "系统" },
   { id: "archive", label: "电子档案", perm: "report", group: "系统" },
   { id: "options", label: "账套参数", perm: "sys_option", group: "系统" },
   { id: "logs", label: "操作日志", perm: "audit_log", group: "系统" },
@@ -457,6 +458,7 @@ const VIEWS = {
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
   "inv-count": viewInvCount,
+  "workflow": viewWorkflow,
   "procure-quota": viewProcureQuota,
   "po-doc": viewPoDoc,
   "so-doc": viewSoDoc,
@@ -3582,7 +3584,7 @@ async function viewPoDoc(main) {
       const r = await api(`/procure/req?period=${period}`);
       $("#pd-list").innerHTML = table(r.rows || []);
       $all("[data-req-approve]").forEach((b) => b.onclick = async () => {
-        try { await api(`/procure/req/${b.dataset.reqApprove}/approve`, { method: "POST" }); toast("已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+        try { const r = await api(`/procure/req/${b.dataset.reqApprove}/approve`, { method: "POST" }); toast(r && r.pending ? `已审批 → 下一节点：${r.pending}` : "已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
     } catch (e) { $("#pd-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
     try {
@@ -3666,7 +3668,7 @@ async function viewSoDoc(main) {
       const r = await api(`/sales/quote?period=${period}`);
       $("#sd-list").innerHTML = table(r.rows || []);
       $all("[data-quo-approve]").forEach((b) => b.onclick = async () => {
-        try { await api(`/sales/quote/${b.dataset.quoApprove}/approve`, { method: "POST" }); toast("已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+        try { const r = await api(`/sales/quote/${b.dataset.quoApprove}/approve`, { method: "POST" }); toast(r && r.pending ? `已审批 → 下一节点：${r.pending}` : "已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
       $all("[data-quo-toorder]").forEach((b) => b.onclick = async () => {
         try {
@@ -3708,6 +3710,385 @@ async function viewSoDoc(main) {
     } catch (e) { toast(e.message, "err"); }
   });
   load();
+}
+
+// ---------------- 工作流可视化设计器 + 运行实例（对标金蝶审批流设计器） ----------------
+// 节点-动作模型：开始/审批/条件/消息节点 + 普通/驳回连线；**无出边的审批节点 = 流程终点**；
+// 无已发布流程的业务走默认审批（向后兼容）。设计保存需 sys_option（账套管理员）。
+async function viewWorkflow(main) {
+  const mode = state.wfMode || "design";
+  main.innerHTML = `<h2>工作流</h2>
+    <div class="toolbar">
+      <button class="btn sm ${mode === "design" ? "primary" : "ghost"}" id="wf-d">流程设计</button>
+      <button class="btn sm ${mode === "instances" ? "primary" : "ghost"}" id="wf-i">运行实例</button>
+      <span class="grow"></span>
+      ${can("sys_option") ? `<button class="btn primary sm" id="wf-new">新建流程</button>` : `<span class="muted" style="font-size:12px">仅账套管理员可新建/发布流程；审批人按节点参与人在实例页操作</span>`}
+    </div>
+    <div id="wf-body">${mode === "design" ? "加载中…" : ""}</div>`;
+  $("#wf-d").onclick = () => { state.wfMode = "design"; viewWorkflow(main); };
+  $("#wf-i").onclick = () => { state.wfMode = "instances"; viewWorkflow(main); };
+  if (mode === "instances") return renderWfInstances($("#wf-body"));
+  await renderWfDesign($("#wf-body"));
+  if ($("#wf-new")) $("#wf-new").onclick = () => openWfEditor(null, () => renderWfDesign($("#wf-body")));
+}
+
+async function renderWfInstances(body) {
+  body.className = "";
+  try {
+    const r = await api("/workflows/instances");
+    const rows = r.rows || [];
+    body.className = "";
+    body.innerHTML = rows.length
+      ? `<table class="grid"><thead><tr><th>#</th><th>类型</th><th>单据</th><th>流程</th><th>当前节点</th><th>状态</th><th>轨迹</th><th></th></tr></thead><tbody>${rows.map((it) => {
+          const st = it.status === "running" ? '<span class="tag">进行中</span>' : it.status === "approved" ? '<span class="tag ok">已通过</span>' : '<span class="tag warn">已驳回</span>';
+          const track = (it.log || []).map((l) => `<div>${esc(l.at)} · ${esc(l.who)} · ${l.action === "approve" ? "通过" : "驳回"}</div>`).join("") || "<div class='muted'>无</div>";
+          return `<tr><td>${it.id}</td><td>${esc(it.biz_label)}</td><td>#${it.biz_id}</td><td>${esc(it.flow_name)}</td><td>${esc(it.current_label)}</td><td>${st}</td>
+            <td><details><summary class="muted">查看</summary><div style="font-size:12px">${track}</div></details></td>
+            <td class="row-actions">${it.status === "running" ? `<button class="btn ghost sm" data-wf-ok='{"bt":"${it.biz_type}","bi":${it.biz_id}}'>通过</button><button class="btn ghost sm" data-wf-no='{"bt":"${it.biz_type}","bi":${it.biz_id}}'>驳回</button>` : ""}</td></tr>`;
+        }).join("")}</tbody></table>`
+      : `<div class="muted">暂无运行实例（对已发布流程的业务单据执行「审批/审核」时自动创建并推进）</div>`;
+    const act = async (bt, bi, approve) => {
+      try {
+        let resp;
+        if (bt === "quotation") resp = await postJson(`/sales/quote/${bi}/approve`, {});
+        else if (bt === "purchase_req") resp = await postJson(`/procure/req/${bi}/approve`, {});
+        else if (bt === "claim") resp = await postJson(`/claims/${bi}/transition`, { status: approve ? "approved" : "rejected" });
+        else if (bt === "receipt") resp = approve ? await postJson(`/funds/receipts/${bi}/audit`, {}) : await Promise.reject(new Error("收付款单请在资金管理页处理"));
+        else throw new Error("该类型暂不支持从实例页操作");
+        if (resp && resp.pending) toast(`已审批 → 下一节点：${resp.pending}`, "ok");
+        else if (approve) toast("已批准，业务单据同步生效", "ok");
+        else toast("已驳回", "ok");
+        renderWfInstances(body);
+      } catch (e) { toast(e.message, "err"); }
+    };
+    $all("[data-wf-ok]").forEach((b) => b.onclick = () => { const d = JSON.parse(b.dataset.wfOk); act(d.bt, d.bi, true); });
+    $all("[data-wf-no]").forEach((b) => b.onclick = async () => { if (await confirmDialog("确认驳回该单据？", true)) { const d = JSON.parse(b.dataset.wfNo); act(d.bt, d.bi, false); } });
+  } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+async function renderWfDesign(body) {
+  body.className = "";
+  try {
+    const r = await api("/workflows");
+    const rows = r.rows || [];
+    const canEdit = can("sys_option");
+    body.className = "";
+    body.innerHTML = rows.length
+      ? `<table class="grid"><thead><tr><th>流程名</th><th>业务类型</th><th>状态</th><th>节点 / 连线</th><th>更新时间</th><th></th></tr></thead><tbody>${rows.map((f) => `<tr>
+          <td>${esc(f.name)}</td><td>${esc(f.biz_type)}</td>
+          <td>${f.status === "published" ? '<span class="tag ok">已发布</span>' : '<span class="tag warn">草稿</span>'}</td>
+          <td>${(f.nodes || []).length} / ${(f.edges || []).length}</td><td>${esc(f.updated_at || "")}</td>
+          <td class="row-actions">${canEdit ? `<button class="btn ghost sm" data-wf-edit="${f.id}">编辑</button>${f.status === "published" ? `<button class="btn ghost sm" data-wf-unpub="${f.id}">撤回</button>` : `<button class="btn ghost sm" data-wf-pub="${f.id}">发布</button>`}<button class="btn ghost sm" data-wf-del="${f.id}">删除</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="muted">暂无流程，点右上「新建流程」开始（未配置流程的业务保持默认审批，行为不变）</div>`;
+    const reload = () => renderWfDesign(body);
+    const byId = (id) => rows.find((f) => f.id === id);
+    $all("[data-wf-edit]").forEach((b) => b.onclick = () => openWfEditor(byId(parseInt(b.dataset.wfEdit, 10)), reload));
+    $all("[data-wf-pub]").forEach((b) => b.onclick = async () => { try { await postJson(`/workflows/${b.dataset.wfPub}/publish`, {}); toast("已发布：该业务单据的审批将走此流程", "ok"); reload(); } catch (e) { toast(e.message, "err"); } });
+    $all("[data-wf-unpub]").forEach((b) => b.onclick = async () => { try { await postJson(`/workflows/${b.dataset.wfUnpub}/unpublish`, {}); toast("已撤回，恢复默认审批", "ok"); reload(); } catch (e) { toast(e.message, "err"); } });
+    $all("[data-wf-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该流程？运行中实例将一并清理。", true))) return; try { await postJson(`/workflows/${b.dataset.wfDel}/delete`, {}); toast("已删除", "ok"); reload(); } catch (e) { toast(e.message, "err"); } });
+  } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// 画布编辑器：拖拽移动（20px 钉吸）、圆点拖出连线（Shift=驳回线）、滚轮缩放、空白拖拽平移、
+// Delete 删除、Ctrl+Z/Y 撤销重做、小地图、属性侧抽屉（参与人=角色多选）
+function openWfEditor(flow, reload) {
+  let roles = [];
+  let fid = flow ? flow.id : 0;
+  let name = flow ? flow.name : "";
+  let biz = flow ? flow.biz_type : "quotation";
+  let nodes = flow && flow.nodes ? JSON.parse(JSON.stringify(flow.nodes)) : [
+    { id: "n1", type: "start", name: "开始", participants: [], strategy: "all", reject_to: "", x: 40, y: 140 },
+  ];
+  let edges = flow && flow.edges ? JSON.parse(JSON.stringify(flow.edges)) : [];
+  let sel = null;           // {kind:"node"|"edge", id}
+  let connFrom = null;      // 连线起点节点 id
+  let tempTo = null;        // 鼠标当前位置（svg 坐标）
+  let drag = null;          // {id, dx, dy}
+  let pan = null;           // {sx, sy, vx, vy}
+  const view = { x: 0, y: 0, w: 720, h: 430 };
+  const undo = [], redo = [];
+  const snap = () => { undo.push(JSON.stringify({ nodes, edges })); if (undo.length > 60) undo.shift(); redo.length = 0; };
+  const T = { start: "开始", approve: "审批", condition: "条件", message: "消息" };
+  const nodeById = (id) => nodes.find((n) => n.id === id);
+  const mask = modal(`
+    <h3>${flow ? "编辑流程" : "新建流程"}</h3>
+    <div class="toolbar" style="margin-bottom:6px">
+      <label>流程名 <input id="wf-name" value="${esc(name)}" style="width:150px" /></label>
+      <label>业务类型 <select id="wf-biz">
+        <option value="quotation" ${biz === "quotation" ? "selected" : ""}>报价单</option>
+        <option value="purchase_req" ${biz === "purchase_req" ? "selected" : ""}>请购单</option>
+        <option value="claim" ${biz === "claim" ? "selected" : ""}>报销单</option>
+        <option value="receipt" ${biz === "receipt" ? "selected" : ""}>收付款单</option>
+      </select></label>
+      <span class="grow"></span>
+      <button class="btn ghost sm" data-add="start">＋开始</button>
+      <button class="btn ghost sm" data-add="approve">＋审批</button>
+      <button class="btn ghost sm" data-add="condition">＋条件</button>
+      <button class="btn ghost sm" data-add="message">＋消息</button>
+      <button class="btn ghost sm" id="wf-fit">适配</button>
+      ${fid && can("sys_option") ? `<button class="btn ghost sm" id="wf-pub">发布/撤回</button>` : ""}
+      <button class="btn primary sm" id="wf-save">保存</button>
+      <button class="btn ghost sm" id="wf-close">关闭</button>
+    </div>
+    <div style="display:flex;gap:10px;align-items:stretch">
+      <div style="flex:1;position:relative;border:1px solid #ccc;border-radius:6px;overflow:hidden">
+        <svg id="wf-svg" style="display:block;width:100%;height:430px;touch-action:none;background:#fafbfc"></svg>
+        <svg id="wf-map" width="150" height="92" style="position:absolute;right:8px;bottom:8px;background:rgba(255,255,255,.92);border:1px solid #bbb;border-radius:4px"></svg>
+      </div>
+      <div id="wf-props" style="width:250px;border:1px solid #ccc;border-radius:6px;padding:8px;font-size:12px;overflow:auto"></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">拖动节点移动（20px 钉吸）；从节点右侧蓝点拖到另一节点连线，按住 Shift 拖 = 驳回线；滚轮缩放、空白处拖拽平移、Delete 删除、Ctrl+Z/Y 撤销重做。<b>无出边的审批节点即流程终点</b>；参与人留空 = 需「审核权限」者可批。</p>
+  `, true);
+  const svg = $("#wf-svg", mask);
+  const map = $("#wf-map", mask);
+  const props = $("#wf-props", mask);
+
+  const toSvg = (e) => {
+    const rc = svg.getBoundingClientRect();
+    return { x: view.x + (e.clientX - rc.left) * view.w / rc.width, y: view.y + (e.clientY - rc.top) * view.h / rc.height };
+  };
+  const render = () => {
+    svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+    const paths = edges.map((e) => {
+      const a = nodeById(e.from), b = nodeById(e.to);
+      if (!a || !b) return "";
+      const isRej = e.kind === "reject";
+      const x1 = a.x + 120, y1 = a.y + 20, x2 = b.x, y2 = b.y + 20;
+      const mid = (x1 + x2) / 2;
+      const d = `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`;
+      const color = isRej ? "#c62828" : "#455a64";
+      const dash = isRej ? ' stroke-dasharray="6 4"' : "";
+      const selA = sel && sel.kind === "edge" && sel.id === e.id;
+      const label = (e.condition || (isRej ? "驳回" : "")) ? `<text x="${mid}" y="${(y1 + y2) / 2 - 5}" font-size="11" text-anchor="middle" fill="${color}">${esc(e.condition || "驳回")}</text>` : "";
+      return `<path d="${d}" fill="none" stroke="${selA ? "#1976d2" : color}" stroke-width="${selA ? 3 : 2}"${dash} marker-end="url(#wf-arw)" data-edge="${e.id}" style="cursor:pointer" />${label}`;
+    }).join("");
+    const temp = connFrom && tempTo ? (() => {
+      const a = nodeById(connFrom);
+      if (!a) return "";
+      return `<line x1="${a.x + 120}" y1="${a.y + 20}" x2="${tempTo.x}" y2="${tempTo.y}" stroke="#1976d2" stroke-width="2" stroke-dasharray="4 3" />`;
+    })() : "";
+    const gs = nodes.map((n) => {
+      const fill = { start: "#e8f5e9", approve: "#e3f2fd", condition: "#fff8e1", message: "#f3e5f5" }[n.type] || "#eee";
+      const on = sel && sel.kind === "node" && sel.id === n.id;
+      const label = n.name && n.name.trim() ? n.name : T[n.type] || n.type;
+      return `<g data-id="${n.id}" transform="translate(${n.x},${n.y})" style="cursor:move">
+        <rect width="120" height="40" rx="8" fill="${fill}" stroke="${on ? "#1976d2" : "#546e7a"}" stroke-width="${on ? 2.5 : 1.2}"/>
+        <text x="60" y="25" font-size="13" text-anchor="middle" fill="#263238">${esc(label)}</text>
+        <circle class="wf-h" cx="120" cy="20" r="7" fill="#1976d2" stroke="#fff" stroke-width="1.5" style="cursor:crosshair"/>
+      </g>`;
+    }).join("");
+    svg.innerHTML = `<defs><marker id="wf-arw" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#455a64"/></marker></defs>${paths}${temp}${gs}`;
+    // 小地图
+    const maxX = Math.max(400, ...nodes.map((n) => n.x + 140));
+    const maxY = Math.max(240, ...nodes.map((n) => n.y + 60));
+    const sc = Math.min(150 / maxX, 92 / maxY);
+    map.innerHTML = nodes.map((n) => `<rect x="${n.x * sc}" y="${n.y * sc}" width="${120 * sc}" height="${40 * sc}" fill="#546e7a" rx="2"/>`).join("")
+      + `<rect x="${view.x * sc}" y="${view.y * sc}" width="${view.w * sc}" height="${view.h * sc}" fill="none" stroke="#1976d2" stroke-width="1.5"/>`;
+    renderProps();
+  };
+  const renderProps = () => {
+    if (!sel) {
+      props.innerHTML = `<div class="muted">未选中。<br>单击节点/连线选中后在此编辑属性。<br><br>· 审批节点设置参与人（留空 = 需审核权限）<br>· 驳回：连线用 Shift+拖拽 或节点「驳回至」<br>· 保存后由管理员发布</div>`;
+      return;
+    }
+    if (sel.kind === "node") {
+      const n = nodeById(sel.id);
+      if (!n) { sel = null; return renderProps(); }
+      props.innerHTML = `
+        <div class="field"><label>名称</label><input id="pr-name" value="${esc(n.name)}" /></div>
+        <div class="field"><label>类型</label><input value="${T[n.type] || n.type}" readonly /></div>
+        ${n.type === "approve" ? `
+        <div class="field"><label>参与人（角色，留空=需审核权限）</label><div id="pr-parts" style="display:flex;flex-direction:column;gap:4px"></div></div>
+        <div class="field"><label>会签策略（v1 单人通过即过）</label><select id="pr-strat">
+          <option value="all" ${n.strategy === "all" ? "selected" : ""}>全部通过</option>
+          <option value="any" ${n.strategy === "any" ? "selected" : ""}>任一通过</option>
+        </select></div>
+        <div class="field"><label>驳回至（可选）</label><select id="pr-rej"><option value="">（用驳回连线）</option>${nodes.filter((x) => x.id !== n.id).map((x) => `<option value="${x.id}" ${n.reject_to === x.id ? "selected" : ""}>${esc(x.name || T[x.type] || x.id)}</option>`).join("")}</select></div>` : ""}
+        <div style="display:flex;gap:6px;margin-top:6px"><button class="btn danger sm" id="pr-del">删除节点</button></div>`;
+      $("#pr-name", mask).onchange = (ev) => { snap(); n.name = ev.target.value; render(); };
+      if (n.type === "approve") {
+        const box = $("#pr-parts", mask);
+        const draw = () => {
+          if (!roles.length) { box.innerHTML = `<span class="muted">角色加载中…</span>`; return; }
+          box.innerHTML = roles.map((r) => `<label style="display:flex;gap:4px;align-items:center"><input type="checkbox" class="pr-p" value="${r.role}" ${(n.participants || []).includes(r.role) ? "checked" : ""} />${esc(r.label)}</label>`).join("");
+          $all(".pr-p", mask).forEach((cb) => cb.onchange = () => {
+            snap();
+            n.participants = $all(".pr-p", mask).filter((c) => c.checked).map((c) => c.value);
+          });
+        };
+        draw();
+        if (!roles.length) loadRoles().then((rs) => { roles = rs; draw(); });
+        $("#pr-strat", mask).onchange = (ev) => { snap(); n.strategy = ev.target.value; };
+        $("#pr-rej", mask).onchange = (ev) => { snap(); n.reject_to = ev.target.value; render(); };
+      }
+      $("#pr-del", mask).onclick = () => { snap(); nodes = nodes.filter((x) => x.id !== n.id); edges = edges.filter((e) => e.from !== n.id && e.to !== n.id); sel = null; render(); };
+    } else {
+      const e2 = edges.find((x) => x.id === sel.id);
+      if (!e2) { sel = null; return renderProps(); }
+      props.innerHTML = `
+        <div class="field"><label>连线类型</label><select id="pr-kind">
+          <option value="normal" ${e2.kind !== "reject" ? "selected" : ""}>普通</option>
+          <option value="reject" ${e2.kind === "reject" ? "selected" : ""}>驳回</option>
+        </select></div>
+        <div class="field"><label>条件（展示用，v1 不求值）</label><input id="pr-cond" value="${esc(e2.condition || "")}" placeholder="如：金额&gt;5000" /></div>
+        <div style="margin-top:6px"><button class="btn danger sm" id="pr-del2">删除连线</button></div>`;
+      $("#pr-kind", mask).onchange = (ev) => { snap(); e2.kind = ev.target.value; render(); };
+      $("#pr-cond", mask).onchange = (ev) => { snap(); e2.condition = ev.target.value; render(); };
+      $("#pr-del2", mask).onclick = () => { snap(); edges = edges.filter((x) => x.id !== e2.id); sel = null; render(); };
+    }
+  };
+
+  // 交互：按下
+  svg.addEventListener("pointerdown", (e) => {
+    const pt = toSvg(e);
+    const g = e.target.closest && e.target.closest("g[data-id]");
+    const path = e.target.closest && e.target.closest("[data-edge]");
+    if (e.target.classList && e.target.classList.contains("wf-h") && g) {
+      snap();
+      connFrom = g.dataset.id;
+      tempTo = pt;
+      svg.setPointerCapture(e.pointerId);
+      render();
+      return;
+    }
+    if (g) {
+      const n = nodeById(g.dataset.id);
+      if (!n) return;
+      sel = { kind: "node", id: n.id };
+      snap();
+      drag = { id: n.id, dx: pt.x - n.x, dy: pt.y - n.y };
+      svg.setPointerCapture(e.pointerId);
+      render();
+      return;
+    }
+    if (path) {
+      sel = { kind: "edge", id: path.dataset.edge };
+      render();
+      return;
+    }
+    sel = null;
+    pan = { sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y };
+    svg.setPointerCapture(e.pointerId);
+    render();
+  });
+  svg.addEventListener("pointermove", (e) => {
+    const pt = toSvg(e);
+    if (drag) {
+      const n = nodeById(drag.id);
+      if (!n) return;
+      n.x = Math.round((pt.x - drag.dx) / 20) * 20;
+      n.y = Math.round((pt.y - drag.dy) / 20) * 20;
+      render();
+    } else if (connFrom) {
+      tempTo = pt;
+      render();
+    } else if (pan) {
+      const rc = svg.getBoundingClientRect();
+      view.x = pan.vx - (e.clientX - pan.sx) * view.w / rc.width;
+      view.y = pan.vy - (e.clientY - pan.sy) * view.h / rc.height;
+      render();
+    }
+  });
+  svg.addEventListener("pointerup", (e) => {
+    if (connFrom) {
+      const g = e.target.closest && e.target.closest("g[data-id]");
+      const to = g && g.dataset.id;
+      if (to && to !== connFrom) {
+        edges.push({ id: `e${Date.now()}`, from: connFrom, to, kind: e.shiftKey ? "reject" : "normal", condition: "" });
+      }
+      connFrom = null;
+      tempTo = null;
+      render();
+    }
+    drag = null;
+    pan = null;
+  });
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const f = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+    const cx = view.x + view.w / 2, cy = view.y + view.h / 2;
+    view.w = Math.min(4000, Math.max(240, view.w * f));
+    view.h = view.w * (430 / 720);
+    view.x = cx - view.w / 2;
+    view.y = cy - view.h / 2;
+    render();
+  }, { passive: false });
+
+  const onKey = (e) => {
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "select" || tag === "textarea") return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); doUndo(); }
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") { e.preventDefault(); doRedo(); }
+    else if ((e.key === "Delete" || e.key === "Backspace") && sel) {
+      e.preventDefault();
+      if (sel.kind === "node") {
+        snap();
+        nodes = nodes.filter((x) => x.id !== sel.id);
+        edges = edges.filter((x) => x.from !== sel.id && x.to !== sel.id);
+      } else {
+        snap();
+        edges = edges.filter((x) => x.id !== sel.id);
+      }
+      sel = null;
+      render();
+    }
+  };
+  const doUndo = () => {
+    if (!undo.length) return;
+    redo.push(JSON.stringify({ nodes, edges }));
+    const s = JSON.parse(undo.pop());
+    nodes = s.nodes; edges = s.edges; sel = null; render();
+  };
+  const doRedo = () => {
+    if (!redo.length) return;
+    undo.push(JSON.stringify({ nodes, edges }));
+    const s = JSON.parse(redo.pop());
+    nodes = s.nodes; edges = s.edges; sel = null; render();
+  };
+  document.addEventListener("keydown", onKey);
+
+  // 工具条
+  $all("[data-add]", mask).forEach((b) => b.onclick = () => {
+    snap();
+    const type = b.dataset.add;
+    const off = (nodes.length % 6) * 24;
+    nodes.push({
+      id: `n${Date.now()}`, type,
+      name: type === "approve" ? "审批" : (T[type] || type),
+      participants: [], strategy: "all", reject_to: "",
+      x: Math.round((view.x + view.w / 2 - 60 + off) / 20) * 20,
+      y: Math.round((view.y + 60 + off) / 20) * 20,
+    });
+    render();
+  });
+  $("#wf-fit", mask).onclick = () => {
+    if (!nodes.length) return;
+    view.x = -20;
+    view.y = -20;
+    view.w = Math.max(...nodes.map((n) => n.x + 160)) + 40;
+    view.h = Math.max(...nodes.map((n) => n.y + 80)) + 40;
+    render();
+  };
+  $("#wf-save", mask).onclick = async () => {
+    name = $("#wf-name", mask).value.trim();
+    biz = $("#wf-biz", mask).value;
+    if (!name) { toast("请填写流程名", "err"); return; }
+    if (!nodes.some((n) => n.type === "start")) { toast("流程必须包含一个开始节点", "err"); return; }
+    try {
+      const r = await postJson("/workflows", { id: fid, name, biz_type: biz, nodes, edges });
+      fid = r.id;
+      toast(`已保存（流程 #${fid}）`, "ok");
+      document.removeEventListener("keydown", onKey);
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#wf-pub", mask)) $("#wf-pub", mask).onclick = async () => {
+    try { await postJson(`/workflows/${fid}/publish`, {}); toast("已发布/切换发布状态", "ok"); document.removeEventListener("keydown", onKey); closeModal(); reload && reload(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wf-close", mask).onclick = () => { document.removeEventListener("keydown", onKey); closeModal(); };
+  loadRoles().then((rs) => { roles = rs; renderProps(); });
+  render();
 }
 
 // ---------------- 单据套打（订单/收付款单）：字段白名单 + 批量打印 ----------------
@@ -3990,7 +4371,15 @@ async function viewFunds(main) {
     </div>
     <div id="funds-body" class="muted">加载中…</div>`;
   const tab = state.fundsTab || "daily";
-  const switchTab = (t) => { state.fundsTab = t; viewFunds(main); };
+  // 资金管理页写按钮按 voucher_new 显隐：导航放行的是 fin_report（只读/成本会计可进页），
+  // 而页内写操作服务端要求 voucher_new——显隐与权限一致，避免"看得见点不了"
+  const FUNDS_WRITE_IDS = ["#rc-new", "#cc-new", "#ck-new", "#ad-new", "#bill-new", "#loan-new",
+    "#jn-clear", "#jn-unclear", "#jn-receipt", "#jn-payment"];
+  const gateFundsWrites = () => {
+    if (can("voucher_new")) return;
+    FUNDS_WRITE_IDS.forEach((s) => { const el = $(s); if (el) el.remove(); });
+  };
+  const switchTab = (t) => { state.fundsTab = t; viewFunds(main); gateFundsWrites(); };
   $("#ft-daily").onclick = () => switchTab("daily");
   $("#ft-bill").onclick = () => switchTab("bill");
   $("#ft-loan").onclick = () => switchTab("loan");
@@ -4058,6 +4447,8 @@ async function viewFunds(main) {
       </div>`;
     } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
+  // 页内写按钮按 voucher_new 显隐（初始进入与切页签都会经过）
+  gateFundsWrites();
 }
 
 // 资金预算 vs 执行（现金/银行科目；实际=当期已记账净额 H-3）
@@ -4207,6 +4598,7 @@ async function renderReceipts(body) {
       $all("[data-rc-audit]").forEach((b) => b.onclick = async () => {
         try {
           const r = await postJson(`/funds/receipts/${b.dataset.rcAudit}/audit`, {});
+          if (r.pending) { toast(`已审批 → 下一节点：${r.pending}`, "ok"); load(); return; }
           toast(`已审核，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}`, "ok");
           load();
         } catch (e) { toast(e.message, "err"); }
@@ -5641,7 +6033,7 @@ async function viewClaims(main) {
   }));
   $all("[data-trans]", body).forEach((b) => b.addEventListener("click", async () => {
     const to = b.dataset.to;
-    try { await api(`/claims/${b.dataset.trans}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: to }) }); toast("状态已更新", "ok"); reload(); }
+    try { const out = await api(`/claims/${b.dataset.trans}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: to }) }); toast(out && out.pending ? `已审批 → 下一节点：${out.pending}` : "状态已更新", "ok"); reload(); }
     catch (e) { toast(e.message, "err"); }
   }));
   $all("[data-vgen]", body).forEach((b) => b.addEventListener("click", () => {

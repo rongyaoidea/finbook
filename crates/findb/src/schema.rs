@@ -1092,6 +1092,52 @@ CREATE TABLE IF NOT EXISTS inv_count_line (
 CREATE INDEX IF NOT EXISTS idx_inv_count ON inv_count(period, status);
 CREATE INDEX IF NOT EXISTS idx_inv_count_line ON inv_count_line(count_id);
 
+-- 可视化工作流（对标金蝶审批流设计器）：流程定义 + 节点 + 连线 + 运行实例
+CREATE TABLE IF NOT EXISTS workflow_flow (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    biz_type   TEXT NOT NULL,                -- quotation / purchase_req / claim / receipt
+    status     TEXT NOT NULL DEFAULT 'draft', -- draft / published
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS workflow_node (
+    id           TEXT NOT NULL,          -- 客户端节点 id（如 n1）
+    flow_id      INTEGER NOT NULL,
+    type         TEXT NOT NULL,          -- start / approve / condition / message
+    name         TEXT NOT NULL DEFAULT '',
+    participants TEXT NOT NULL DEFAULT '[]',  -- 允许角色 code JSON 数组（空 = 有审批权即可）
+    strategy     TEXT NOT NULL DEFAULT 'all', -- 会签策略 all/any（v1 单人通过即过，字段存档）
+    reject_to    TEXT NOT NULL DEFAULT '',    -- 显式驳回目标节点（优先于 reject 连线）
+    seq          INTEGER NOT NULL DEFAULT 0,
+    x            REAL NOT NULL DEFAULT 0,
+    y            REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (flow_id, id)
+);
+CREATE TABLE IF NOT EXISTS workflow_edge (
+    id        TEXT NOT NULL,             -- 客户端边 id
+    flow_id   INTEGER NOT NULL,
+    from_node TEXT NOT NULL,
+    to_node   TEXT NOT NULL,
+    kind      TEXT NOT NULL DEFAULT 'normal', -- normal / reject
+    condition TEXT NOT NULL DEFAULT '',
+    seq       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (flow_id, id)
+);
+CREATE TABLE IF NOT EXISTS workflow_instance (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id      INTEGER NOT NULL,
+    biz_type     TEXT NOT NULL,
+    biz_id       INTEGER NOT NULL,
+    current_node TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'running', -- running / approved / rejected
+    log_json     TEXT NOT NULL DEFAULT '[]',      -- 运行轨迹 [{node,action,who,at}]
+    created_at   TEXT NOT NULL DEFAULT '',
+    UNIQUE (biz_type, biz_id)                     -- 一单一个活动实例
+);
+CREATE INDEX IF NOT EXISTS idx_wf_flow_biz ON workflow_flow(biz_type, status);
+
 -- 存货计价方式配置（按存货档案 code）
 CREATE TABLE IF NOT EXISTS item_cost_method (
     item          TEXT PRIMARY KEY,

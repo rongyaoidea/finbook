@@ -5603,6 +5603,172 @@ async fn multi_role_positions_and_price_field_perm() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "无仓管兼岗应403");
 }
 
+/// 可视化工作流（对标金蝶审批流）：设计 → 发布 → 单据审批自动入流逐节点推进 → 默认流回退。
+#[tokio::test]
+async fn workflow_visual_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建报价（流程发布前先批一张 → 默认流立即生效）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "item_code": "140501", "item_name": "成品",
+                "qty": "1", "unit_price": "5",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let q1 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/sales/quote/{q1}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["pending"].is_null(), "无流程 → 默认流立即批准，无 pending：{r}");
+
+    // 设计两节点流（校验 + 保存 + 发布）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows",
+            &sid,
+            serde_json::json!({
+                "id": 0, "name": "报价两级审批", "biz_type": "quotation",
+                "nodes": [
+                    { "id": "n1", "type": "start", "name": "开始" },
+                    { "id": "n2", "type": "approve", "name": "初审" },
+                    { "id": "n3", "type": "approve", "name": "复核" }
+                ],
+                "edges": [
+                    { "id": "e1", "from": "n1", "to": "n2", "kind": "normal" },
+                    { "id": "e2", "from": "n2", "to": "n3", "kind": "normal" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存流程应成功");
+    let flow_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    // 无开始节点 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows",
+            &sid,
+            serde_json::json!({
+                "name": "坏流程", "biz_type": "quotation",
+                "nodes": [{ "id": "x1", "type": "approve", "name": "审批" }], "edges": []
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "缺开始节点应拒绝");
+    // 发布
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/workflows/{flow_id}/publish"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发布应成功");
+
+    // 流程内报价：第一节点 → pending（单据不动），第二节点 → 终态批准
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-06",
+                "customer_code": "C02", "customer_name": "客户乙",
+                "item_code": "140501", "item_name": "成品",
+                "qty": "2", "unit_price": "10",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let q2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/sales/quote/{q2}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["pending"], serde_json::json!("复核"), "首节点应返回下一节点：{r}");
+    // 单据此时仍未批准
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/quote?period=202601", &sid))
+        .await
+        .unwrap();
+    let rows = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap();
+    let row = rows["rows"].as_array().unwrap().iter().find(|x| x["id"] == q2).unwrap();
+    assert_eq!(row["status"], "draft", "pending 阶段单据不应被批准");
+    // 第二节点 → 终态 → 原批准执行
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/sales/quote/{q2}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["pending"].is_null(), "终节点不应再有 pending：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/quote?period=202601", &sid))
+        .await
+        .unwrap();
+    let rows = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap();
+    let row = rows["rows"].as_array().unwrap().iter().find(|x| x["id"] == q2).unwrap();
+    assert_eq!(row["status"], "approved", "终态后单据应已批准");
+
+    // 实例回放：q2 应产生 approved 实例
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workflows/instances", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let inst = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap();
+    let arr = inst["rows"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|i| {
+            i["biz_type"] == "quotation" && i["biz_id"].as_i64() == Some(q2) && i["status"] == "approved"
+        }),
+        "应存在 q2 的已通过实例"
+    );
+
+    // 删除有运行中实例的流程 → 拒（再造第三张报价走首节点后删除）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-07",
+                "customer_code": "C03", "customer_name": "客户丙",
+                "item_code": "140501", "item_name": "成品",
+                "qty": "3", "unit_price": "5",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let q3 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let _ = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/sales/quote/{q3}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/workflows/{flow_id}/delete"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "有运行中实例不能删流程");
+}
+
 /// 存货盘点流程：账面快照 → 应用（其他入库流水 + 盘盈盘亏凭证 1901）→ 守卫。
 #[tokio::test]
 async fn stock_count_flow() {

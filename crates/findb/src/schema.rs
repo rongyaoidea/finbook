@@ -1092,6 +1092,29 @@ CREATE TABLE IF NOT EXISTS inv_count_line (
 CREATE INDEX IF NOT EXISTS idx_inv_count ON inv_count(period, status);
 CREATE INDEX IF NOT EXISTS idx_inv_count_line ON inv_count_line(count_id);
 
+-- 存货批次主数据（对标金蝶批号/保质期管理；批次余额 = stock_move 按 (item,batch_no) 汇总）
+CREATE TABLE IF NOT EXISTS stock_batch (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    item            TEXT NOT NULL,
+    batch_no        TEXT NOT NULL,
+    production_date TEXT NOT NULL DEFAULT '',
+    expiry_date     TEXT NOT NULL DEFAULT '',   -- = 生产日期 + 保质期天数（存货档案属性）
+    warehouse       TEXT NOT NULL DEFAULT '',
+    location        TEXT NOT NULL DEFAULT '',   -- 初始库位（库位主数据 code）
+    memo            TEXT NOT NULL DEFAULT '',
+    created_by      TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    UNIQUE (item, batch_no)
+);
+-- 库位主数据（对标金蝶货位：存储/拣货/隔离）
+CREATE TABLE IF NOT EXISTS stock_location (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'storage', -- storage 存储 / pick 拣货 / quarantine 隔离
+    memo TEXT NOT NULL DEFAULT ''
+);
+
 -- 可视化工作流（对标金蝶审批流设计器）：流程定义 + 节点 + 连线 + 运行实例
 CREATE TABLE IF NOT EXISTS workflow_flow (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

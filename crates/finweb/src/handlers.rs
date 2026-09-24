@@ -340,6 +340,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/count", post(create_count))
         .route("/api/inventory/count/:id/apply", post(apply_count))
         .route("/api/inventory/count/:id/delete", post(delete_count))
+        .route("/api/inventory/batch", post(register_batch))
+        .route("/api/inventory/batches", get(list_batches))
+        .route("/api/inventory/batches/fefo", post(fefo_batches))
+        .route("/api/inventory/batches/expiring", get(expiring_batches_ep))
+        .route("/api/inventory/locations", get(list_locations).post(save_location))
+        .route("/api/inventory/locations/:id/delete", post(delete_location))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -6783,6 +6789,157 @@ async fn delete_count(
     let db = state.db_for(&user.book_key)?;
     findb::stocktake::count_delete(&db, id)?;
     db.log(user.username(), "库存", "删除盘点单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------- 批次与库位（对标金蝶批号/保质期/货位） ----------------
+
+#[derive(Deserialize)]
+struct BatchRegisterReq {
+    #[serde(default)]
+    item: String,
+    #[serde(default)]
+    batch_no: String,
+    #[serde(default)]
+    production_date: String,
+    #[serde(default)]
+    warehouse: String,
+    #[serde(default)]
+    location: String,
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 批次出入登记：批号空=自动 BT+日期+序号；同事务写库存流水（带批号，与普通库存同一本账）
+async fn register_batch(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BatchRegisterReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let direction = if req.direction == "out" { "out" } else { "in" };
+    let (id, no, bal) = findb::batch::batch_register(
+        &db,
+        &req.item,
+        &req.batch_no,
+        &req.production_date,
+        req.warehouse.trim(),
+        req.location.trim(),
+        parse_money_checked(&req.qty)?,
+        direction,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "库存",
+        if direction == "in" { "批次入库" } else { "批次出库" },
+        &format!("{} {} ×{} 余额 {}", req.item, no, req.qty, bal.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "batch_no": no, "balance": bal.fmt_qty() })))
+}
+
+/// 批次列表（含余额；?item= 过滤）
+async fn list_batches(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let item = q.get("item").cloned().unwrap_or_default();
+    Ok(Json(json!({ "rows": findb::batch::batch_list(&db, &item)? })))
+}
+
+#[derive(Deserialize)]
+struct FefoReq {
+    #[serde(default)]
+    item: String,
+    #[serde(default)]
+    qty: String,
+}
+
+/// FEFO 推荐（近效期先出）
+async fn fefo_batches(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<FefoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.item.trim().is_empty() {
+        return Err(AppError::bad_request("缺少存货编码 item"));
+    }
+    let qty = parse_money_checked(&req.qty)?;
+    let rows = findb::batch::fefo_recommend(&db, &req.item, qty)?;
+    Ok(Json(json!({
+        "rows": rows
+            .iter()
+            .map(|(b, e, t)| json!({ "batch_no": b, "expiry_date": e, "take": t.fmt_qty() }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// 临期批次（默认30天窗口）
+async fn expiring_batches_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let days = q.get("days").and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
+    Ok(Json(json!({ "rows": findb::batch::expiring_batches(&db, days)? })))
+}
+
+#[derive(Deserialize)]
+struct LocationReq {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_locations(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::batch::location_list(&db)? })))
+}
+
+async fn save_location(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<LocationReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = if req.kind.is_empty() { "storage" } else { &req.kind };
+    let id = findb::batch::location_save(&db, &req.code, &req.name, kind, &req.memo)?;
+    db.log(user.username(), "库存", "保存库位", &format!("{} {}", req.code, req.name))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn delete_location(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::batch::location_delete(&db, id)?;
+    db.log(user.username(), "库存", "删除库位", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
 }
 

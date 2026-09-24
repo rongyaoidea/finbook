@@ -397,6 +397,7 @@ const NAV_ITEMS = [
   { id: "so-doc", label: "销售单据", perm: "order_ops", group: "销售" },
   { id: "so-reconcile", label: "销售对账", perm: "report", group: "销售" },
   { id: "order-change-log", label: "订单变更", perm: "report", group: "销售" },
+  { id: "inv-batch", label: "批次库位", perm: "warehouse", group: "库存" },
   { id: "inv-count", label: "存货盘点", perm: "warehouse", group: "库存" },
   { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
   { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
@@ -458,6 +459,7 @@ const VIEWS = {
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
   "inv-count": viewInvCount,
+  "inv-batch": viewBatch,
   "workflow": viewWorkflow,
   "procure-quota": viewProcureQuota,
   "po-doc": viewPoDoc,
@@ -3461,6 +3463,111 @@ function openCountEditor(warehouse, reload) {
   };
 }
 
+// 批次库存与库位（对标金蝶批号/保质期/货位）：登记写库存流水带批号（与普通库存同一本账）、
+// 批次余额=流水按批汇总、FEFO 近效期先出推荐、临期预警、库位主数据
+async function viewBatch(main) {
+  main.innerHTML = `<h2>批次库存与库位</h2>
+    <div class="toolbar">
+      <label>存货 * <input id="bt-item" style="width:110px" /></label>
+      <label>方向 <select id="bt-dir"><option value="in">入库</option><option value="out">出库</option></select></label>
+      <label>批号 <input id="bt-no" style="width:150px" placeholder="留空自动 BT+日期+序号" /></label>
+      <label>生产日期 <input type="date" id="bt-prod" value="${today()}" /></label>
+      <label>仓库 <input id="bt-wh" style="width:90px" placeholder="空=默认仓" /></label>
+      <label>库位 <select id="bt-loc" style="width:120px"><option value="">（无）</option></select></label>
+      <label>数量 <input id="bt-qty" style="width:80px" /></label>
+      <button class="btn primary" id="bt-reg">登记</button>
+      <span class="grow"></span>
+      <label>FEFO需求 <input id="bt-fq" style="width:70px" value="1" /></label>
+      <button class="btn" id="bt-fefo">近效期推荐</button>
+      <button class="btn ghost sm" id="bt-loc-new">新增库位</button>
+    </div>
+    <div id="bt-fefo-out" class="muted" style="margin-bottom:6px"></div>
+    <div class="panel"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">批次台账</h4><span class="grow"></span><label style="font-size:12px">临期窗口 <input id="bt-days" value="30" style="width:56px" /> 天 <button class="btn ghost sm" id="bt-exp">刷新</button></label></div><div id="bt-list" class="muted" style="margin-top:6px">加载中…</div></div>
+    <div class="panel"><h4 style="margin-top:12px">库位主数据（存储 / 拣货 / 隔离）</h4><div id="bt-locs" class="muted">加载中…</div></div>`;
+  const loadLocs = async () => {
+    try {
+      const r = await api("/inventory/locations");
+      const rows = r.rows || [];
+      const sel = $("#bt-loc");
+      if (sel) sel.innerHTML = `<option value="">（无）</option>` + rows.map((l) => `<option value="${esc(l.code)}">${esc(l.code)} ${esc(l.name)}</option>`).join("");
+      $("#bt-locs").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>编码</th><th>名称</th><th>类型</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((l) => `<tr><td>${esc(l.code)}</td><td>${esc(l.name)}</td><td>${{ storage: "存储", pick: "拣货", quarantine: "隔离" }[l.kind] || esc(l.kind)}</td><td>${esc(l.memo || "")}</td><td class="row-actions"><button class="btn ghost sm" data-lo-del="${l.id}">删</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无库位，点「新增库位」</div>`;
+      $all("[data-lo-del]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("删除该库位？", true))) return;
+        try { await api(`/inventory/locations/${b.dataset.loDel}/delete`, { method: "POST" }); toast("已删除", "ok"); loadLocs(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#bt-locs").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  const load = async () => {
+    try {
+      const [r1, r2] = await Promise.all([
+        api("/inventory/batches"),
+        api(`/inventory/batches/expiring?days=${parseInt($("#bt-days").value, 10) || 30}`),
+      ]);
+      const rows = r1.rows || [];
+      const exp = new Set((r2.rows || []).map((b) => `${b.item}|${b.batch_no}`));
+      $("#bt-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>存货</th><th>批号</th><th>生产日期</th><th>失效日期</th><th>仓库</th><th>库位</th><th class="num">余额</th><th>状态</th></tr></thead><tbody>${rows.map((b) => {
+            const isExp = exp.has(`${b.item}|${b.batch_no}`);
+            return `<tr><td>${esc(b.item)}</td><td>${esc(b.batch_no)}</td><td>${esc(b.production_date || "—")}</td><td>${esc(b.expiry_date || "—")}</td><td>${esc(b.warehouse || "默认仓")}</td><td>${esc(b.location || "—")}</td><td class="num">${fmt(b.balance)}</td><td>${isExp ? '<span class="tag warn">临期</span>' : Number(b.balance) > 0 ? '<span class="tag ok">在库</span>' : '<span class="muted">已清</span>'}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无批次，左上「登记」入库（批号留空自动生成）</div>`;
+    } catch (e) { $("#bt-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#bt-reg").onclick = async () => {
+    const item = $("#bt-item").value.trim();
+    if (!item) { toast("请填写存货编码", "err"); return; }
+    if (!$("#bt-qty").value.trim()) { toast("请填写数量", "err"); return; }
+    try {
+      const dir = $("#bt-dir").value;
+      const r = await postJson("/inventory/batch", {
+        item, batch_no: $("#bt-no").value.trim(), production_date: $("#bt-prod").value,
+        warehouse: $("#bt-wh").value.trim(), location: $("#bt-loc").value,
+        qty: $("#bt-qty").value.trim(), direction: dir, memo: "",
+      });
+      toast(`已${dir === "in" ? "入库" : "出库"} 批次 ${r.batch_no}，余额 ${r.balance}`, "ok");
+      $("#bt-no").value = ""; $("#bt-qty").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#bt-fefo").onclick = async () => {
+    const item = $("#bt-item").value.trim();
+    if (!item) { toast("请填写存货编码", "err"); return; }
+    try {
+      const need = Number($("#bt-fq").value || 0);
+      const r = await postJson("/inventory/batches/fefo", { item, qty: $("#bt-fq").value.trim() || "1" });
+      const rows = r.rows || [];
+      const got = rows.reduce((s, x) => s + Number(x.take || 0), 0);
+      $("#bt-fefo-out").innerHTML = rows.length
+        ? `<span class="tag ok">FEFO 近效期先出</span> ` + rows.map((x) => `${esc(x.batch_no)}${x.expiry_date ? `（失效 ${esc(x.expiry_date)}）` : ""} → <b>${esc(x.take)}</b>`).join("；") + (got < need ? `　<span class="tag warn">余额不足（需 ${need}）</span>` : "")
+        : `<span class="tag warn">无可用批次余额</span>`;
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#bt-exp").onclick = () => load();
+  $("#bt-loc-new").onclick = () => openLocEditor(loadLocs);
+  await Promise.all([loadLocs(), load()]);
+}
+
+function openLocEditor(reload) {
+  const mask = modal(`<h3>新增库位</h3>
+    <div class="field"><label>编码 *</label><input id="lo-code" /></div>
+    <div class="field"><label>名称 *</label><input id="lo-name" /></div>
+    <div class="field"><label>类型</label><select id="lo-kind"><option value="storage">存储</option><option value="pick">拣货</option><option value="quarantine">隔离</option></select></div>
+    <div class="field"><label>备注</label><input id="lo-memo" /></div>
+    <div class="foot"><button class="btn primary" id="lo-save">保存</button><button class="btn ghost" id="lo-cancel">取消</button></div>`);
+  $("#lo-cancel", mask).onclick = closeModal;
+  $("#lo-save", mask).onclick = async () => {
+    const code = $("#lo-code", mask).value.trim();
+    const name = $("#lo-name", mask).value.trim();
+    if (!code || !name) { toast("编码与名称必填", "err"); return; }
+    try {
+      await postJson("/inventory/locations", { code, name, kind: $("#lo-kind", mask).value, memo: $("#lo-memo", mask).value.trim() });
+      toast("已保存库位", "ok"); closeModal(); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
 async function viewPoEstimate(main) {
   main.innerHTML = `<h2>采购暂估</h2>
     <div class="toolbar">
@@ -5354,6 +5461,7 @@ function openAuxEditor(main, ent, kind) {
     <div class="field"><label>编码 *</label><input id="au-code" value="${esc(e.code)}" /></div>
     <div class="field"><label>名称 *</label><input id="au-name" value="${esc(e.name)}" /></div>
     ${kind === "customer" ? `<div class="field"><label>信用额度（0 = 不限；超出后订单「确认」被拒）</label><input id="au-credit" value="${esc((e.props && e.props.credit_limit) || "0")}" /></div>` : ""}
+    ${kind === "item" ? `<div class="field"><label>保质期天数（0 = 不启用批次效期）</label><input id="au-shelf" value="${esc((e.props && e.props.shelf_life_days) || "0")}" /></div>` : ""}
     <div class="field"><label>上级编码（分级档案用）</label><input id="au-parent" value="${esc(e.parent_code || "")}" /></div>
     <div class="field"><label>备注</label><input id="au-memo" value="${esc(e.memo)}" /></div>
     <div class="field"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="au-disabled" ${e.disabled ? "checked" : ""} />停用</label></div>
@@ -5373,7 +5481,7 @@ function openAuxEditor(main, ent, kind) {
       parent_code: parent || null,
       disabled: $("#au-disabled", mask).checked,
       memo: $("#au-memo", mask).value.trim(),
-      props: Object.assign({}, e.props || {}, kind === "customer" ? { credit_limit: $("#au-credit", mask).value.trim() || "0" } : {}),
+      props: Object.assign({}, e.props || {}, kind === "customer" ? { credit_limit: $("#au-credit", mask).value.trim() || "0" } : {}, kind === "item" ? { shelf_life_days: $("#au-shelf", mask).value.trim() || "0" } : {}),
     });
     try {
       if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

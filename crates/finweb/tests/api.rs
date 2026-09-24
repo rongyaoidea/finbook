@@ -5416,6 +5416,17 @@ async fn role_presets_order_clerk_and_keeper() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能进盘点");
+    // 批次库位 = 仓储作业
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches", &keeper))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "仓管员应能看批次");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能看批次");
 
     // 仓管员：动不了订单（反向隔离）
     let resp = handlers::router(state.clone())
@@ -5601,6 +5612,127 @@ async fn multi_role_positions_and_price_field_perm() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "无仓管兼岗应403");
+}
+
+/// 批次库位流程：登记（自动批号/流水带批）→ 余额 → FEFO → 库位 CRUD。
+#[tokio::test]
+async fn stock_batch_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 入库：批号自动生成
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/batch",
+            &sid,
+            serde_json::json!({
+                "item": "RM10", "batch_no": "", "production_date": "2026-01-10",
+                "qty": "50", "direction": "in"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "批次入库应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let auto_no = r["batch_no"].as_str().unwrap().to_string();
+    assert!(auto_no.starts_with("BT"), "自动批号 BT+日期+序号：{auto_no}");
+    assert_eq!(money_num(r["balance"].as_str().unwrap()), 50.0);
+
+    // 第二批（指定批号、生产日期更早）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/batch",
+            &sid,
+            serde_json::json!({
+                "item": "RM10", "batch_no": "B-001", "production_date": "2026-01-05",
+                "warehouse": "WH1", "location": "L1", "qty": "30", "direction": "in"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 出库20 → 余额10
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/batch",
+            &sid,
+            serde_json::json!({ "item": "RM10", "batch_no": "B-001", "qty": "20", "direction": "out" }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(money_num(r["balance"].as_str().unwrap()), 10.0, "出库后余额10");
+
+    // 列表 + 库存流水同账（批次余额与普通库存一致）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches?item=RM10", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let ws = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=RM10", &sid))
+        .await
+        .unwrap();
+    assert_eq!(ws.status(), StatusCode::OK, "仓库库存查询可用（批次=同一本账）");
+
+    // FEFO：生产日期早的先出（B-001 余额10 → 再吃自动批）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/batches/fefo",
+            &sid,
+            serde_json::json!({ "item": "RM10", "qty": "60" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rec = r["rows"].as_array().unwrap();
+    assert_eq!(rec[0]["batch_no"], "B-001", "近生产日期先出：{rec:?}");
+    assert_eq!(money_num(rec[0]["take"].as_str().unwrap()), 10.0);
+    assert_eq!(rec[1]["batch_no"], auto_no);
+    assert_eq!(money_num(rec[1]["take"].as_str().unwrap()), 50.0);
+
+    // 临期：未配保质期 → 无失效日期 → 空
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches/expiring?days=30", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 库位 CRUD + 校验
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/locations",
+            &sid,
+            serde_json::json!({ "code": "L01", "name": "A区货位", "kind": "storage", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增库位应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/locations", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let locs = r["rows"].as_array().unwrap();
+    assert_eq!(locs.len(), 1);
+    let lid = locs[0]["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/locations",
+            &sid,
+            serde_json::json!({ "code": "L02", "name": "坏类型", "kind": "bad" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "非法库位类型应拒绝");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/inventory/locations/{lid}/delete"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// 可视化工作流（对标金蝶审批流）：设计 → 发布 → 单据审批自动入流逐节点推进 → 默认流回退。

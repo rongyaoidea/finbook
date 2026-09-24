@@ -23,6 +23,7 @@ pub mod imports;
 pub mod inventory2;
 pub mod stocktake;
 pub mod workflow;
+pub mod batch;
 pub mod invoices;
 pub mod mgmt;
 pub mod periods;

@@ -557,14 +557,49 @@ pub struct ReceiptPrint {
     pub voucher_no: String,
 }
 
-// A4 竖版「行单位」排版预算：页高297mm − 上下边距20mm ≈ 可用 277mm；
-// 明细行打印高约 6.5mm → 一页约 42 个行单位；单据固定开销（标题+信息头+表头+
-// 合计+签章 ≈ 38mm）折 6 个行单位。批量时整张单据按预算塞入当前页剩余空间。
-const DOC_PAGE_BUDGET: i32 = 42;
+// 行单位排版预算：明细行打印高约 6.5mm，单据固定开销（标题+信息头+表头+
+// 合计+签章 ≈ 38mm）折 6 个行单位。**每页预算随纸张尺寸计算**（page_setup），
+// 批量时整张单据按预算塞入当前页剩余空间。
 const DOC_OVERHEAD: i32 = 6;
 
+/// 纸张 → (`.page` 规则, 行单位预算, 窄/小纸附加 CSS)。
+/// 支持 `a4`(210×297) / `a5`(二等分 210×148) / `third`(三等分 99×210) /
+/// 自定义 `"宽x高"`（mm，50..=600）；非法值回退 A4。
+pub fn page_setup(size: &str) -> (String, i32, String) {
+    let s = size.trim().to_ascii_lowercase();
+    let custom = s
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.parse::<i32>().ok()?, b.parse::<i32>().ok()?)))
+        .filter(|(w, h)| (50..=600).contains(w) && (50..=600).contains(h));
+    let (w, h, m) = if s == "a5" {
+        (210, 148, 8)
+    } else if s == "third" {
+        (99, 210, 8)
+    } else if let Some((w, h)) = custom {
+        (w, h, 8)
+    } else {
+        (210, 297, 10)
+    };
+    // 页高 − 上下边距，按 6.5mm/行 折行单位预算
+    let budget = (((h - 2 * m) as f32) / 6.5) as i32;
+    let page = match (w, h) {
+        (210, 297) => "@page{size:A4;margin:10mm;}".to_string(),
+        (210, 148) => "@page{size:A5;margin:8mm;}".to_string(),
+        _ => format!("@page{{size:{w}mm {h}mm;margin:{m}mm;}}"),
+    };
+    // 窄纸（宽 < 120mm，如三等分联）压缩字号与行高；小纸（高 < 200mm）略紧
+    let extra = if w < 120 {
+        ".dtitle .t{font-size:14px;letter-spacing:4px;}th,td{font-size:9px;padding:1px 2px;}tr.l{height:18px;}"
+            .to_string()
+    } else if h < 200 {
+        "tr.l{height:19px;}".to_string()
+    } else {
+        String::new()
+    };
+    (page, budget.max(6), extra)
+}
+
 const DOC_CSS: &str = r#"
-@page{size:A4;margin:10mm;}
 body{font-family:"宋体","SimSun","Noto Serif CJK SC",serif;color:#111;margin:0;font-size:12px;}
 .page{page-break-after:always;}
 .page:last-child{page-break-after:auto;}
@@ -593,14 +628,17 @@ tr.l{height:21px;}
 @media print{body{font-size:11px;}}
 "#;
 
-fn doc_shell(title: &str, body: &str) -> String {
+fn doc_shell(title: &str, body: &str, size: &str) -> String {
+    let (page, _, extra) = page_setup(size);
     format!(
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>{title}</title>
-<style>{DOC_CSS}</style>
+<style>{page}{DOC_CSS}{extra}</style>
 <script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>
 </head><body>{body}</body></html>"#,
         title = esc(title),
+        page = page,
+        extra = extra,
         body = body,
     )
 }
@@ -623,12 +661,23 @@ fn order_units(f: &DocPrintFields, o: &OrderPrint) -> i32 {
     DOC_OVERHEAD + o.rows.len() as i32 + i32::from(f.totals) + i32::from(f.sign)
 }
 
-/// 订单套打 HTML：`fields` 控制显示字段/列；`pack` 时按行单位预算把多张单据
-/// 紧凑排进同一张 A4（放不下才换页；单张超一页自然续页）。
+/// 订单套打 HTML（默认 A4；多尺寸见 [`order_forms_sized_html`]）
 pub fn order_forms_html(company: &str, orders: &[OrderPrint], f: &DocPrintFields) -> String {
+    order_forms_sized_html(company, orders, f, "a4")
+}
+
+/// 订单套打 HTML（指定纸张）：`fields` 控制显示字段/列；`pack` 时按**该纸张的
+/// 行单位预算**把多张单据紧凑排进同页（放不下才换页；单张超一页自然续页）。
+pub fn order_forms_sized_html(
+    company: &str,
+    orders: &[OrderPrint],
+    f: &DocPrintFields,
+    size: &str,
+) -> String {
+    let budget = page_setup(size).1;
     let mut pages: Vec<Vec<&OrderPrint>> = Vec::new();
     let mut cur: Vec<&OrderPrint> = Vec::new();
-    let mut rem = DOC_PAGE_BUDGET;
+    let mut rem = budget;
     for o in orders {
         let cost = order_units(f, o);
         if f.pack && !cur.is_empty() && cost <= rem {
@@ -639,7 +688,7 @@ pub fn order_forms_html(company: &str, orders: &[OrderPrint], f: &DocPrintFields
                 pages.push(std::mem::take(&mut cur));
             }
             cur.push(o);
-            rem = DOC_PAGE_BUDGET - cost;
+            rem = budget - cost;
         }
     }
     if !cur.is_empty() {
@@ -665,7 +714,7 @@ pub fn order_forms_html(company: &str, orders: &[OrderPrint], f: &DocPrintFields
             )
         })
         .collect();
-    doc_shell("单据套打", &body)
+    doc_shell("单据套打", &body, size)
 }
 
 fn one_order_doc(o: &OrderPrint, f: &DocPrintFields) -> String {
@@ -776,12 +825,23 @@ fn one_order_doc(o: &OrderPrint, f: &DocPrintFields) -> String {
     )
 }
 
-/// 收付款单套打 HTML（信息双列 + 金额大写 + 签章；`pack` 紧凑分页同订单）
+/// 收付款单套打 HTML（默认 A4；多尺寸见 [`receipt_forms_sized_html`]）
 pub fn receipt_forms_html(company: &str, docs: &[ReceiptPrint], f: &DocPrintFields) -> String {
+    receipt_forms_sized_html(company, docs, f, "a4")
+}
+
+/// 收付款单套打 HTML（指定纸张）：信息双列 + 金额大写 + 签章；`pack` 紧凑分页同订单
+pub fn receipt_forms_sized_html(
+    company: &str,
+    docs: &[ReceiptPrint],
+    f: &DocPrintFields,
+    size: &str,
+) -> String {
     const UNITS: i32 = DOC_OVERHEAD + 3;
+    let budget = page_setup(size).1;
     let mut pages: Vec<Vec<&ReceiptPrint>> = Vec::new();
     let mut cur: Vec<&ReceiptPrint> = Vec::new();
-    let mut rem = DOC_PAGE_BUDGET;
+    let mut rem = budget;
     for d in docs {
         if f.pack && !cur.is_empty() && UNITS <= rem {
             cur.push(d);
@@ -791,7 +851,7 @@ pub fn receipt_forms_html(company: &str, docs: &[ReceiptPrint], f: &DocPrintFiel
                 pages.push(std::mem::take(&mut cur));
             }
             cur.push(d);
-            rem = DOC_PAGE_BUDGET - UNITS;
+            rem = budget - UNITS;
         }
     }
     if !cur.is_empty() {
@@ -817,7 +877,7 @@ pub fn receipt_forms_html(company: &str, docs: &[ReceiptPrint], f: &DocPrintFiel
             )
         })
         .collect();
-    doc_shell("收付款单套打", &body)
+    doc_shell("收付款单套打", &body, size)
 }
 
 fn one_receipt_doc(d: &ReceiptPrint, f: &DocPrintFields) -> String {
@@ -984,6 +1044,41 @@ mod tests {
         let html = super::receipt_forms_html("甲公司", &[d], &f);
         assert!(!html.contains("资金账户"), "未勾选资金账户不应出现");
         assert!(html.contains("金额"), "金额行应保留");
+    }
+
+    #[test]
+    fn page_sizes_recalc_budget() {
+        let (_, b4, _) = super::page_setup("a4");
+        let (_, b5, _) = super::page_setup("a5");
+        let (_, bt, extra_t) = super::page_setup("third");
+        let (_, bc, _) = super::page_setup("140x210");
+        let (_, bf, _) = super::page_setup("abc");
+        assert_eq!(b4, 42, "A4 预算约 42 行");
+        assert!((15..b4).contains(&b5), "A5 预算应小于 A4：{b5}");
+        assert!((22..b4).contains(&bt), "三等分预算：{bt}");
+        assert!((22..b4).contains(&bc), "自定义 140x210 预算：{bc}");
+        assert_eq!(bf, b4, "非法尺寸回退 A4");
+        assert!(extra_t.contains("font-size:9px"), "三等分窄版应压缩字号");
+
+        // 尺寸影响分页：两张 8 行单（单张成本 = 6+8+1+1 = 16 行单位）
+        let two = vec![mk_order("XS101", 8), mk_order("XS102", 8)];
+        let a4 = super::order_forms_sized_html("甲", &two, &Default::default(), "a4");
+        let a5 = super::order_forms_sized_html("甲", &two, &Default::default(), "a5");
+        assert_eq!(a4.matches("class=\"page\"").count(), 1, "A4 两单同页");
+        assert_eq!(a5.matches("class=\"page\"").count(), 2, "A5 只装得下一单");
+        assert!(a5.contains("size:A5"), "应输出 A5 @page");
+        let d = super::ReceiptPrint {
+            no: "SK1".to_string(),
+            date: "2026-01-05".to_string(),
+            kind_label: "收款".to_string(),
+            fund: "100201".to_string(),
+            party: "C01".to_string(),
+            amount: fincore::Money::parse("10.00").unwrap(),
+            memo: String::new(),
+            voucher_no: String::new(),
+        };
+        let html = super::receipt_forms_sized_html("甲", &[d], &Default::default(), "third");
+        assert!(html.contains("99mm 210mm"), "三等分应输出自定义 @page 尺寸");
     }
 
     use super::*;

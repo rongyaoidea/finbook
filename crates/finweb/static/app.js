@@ -3469,7 +3469,7 @@ async function viewPoDoc(main) {
         if (!ids.length) ids = $all(".po-chk").map((c) => c.value);
         if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
         const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
-        window.open(`/api/procure/po/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+        window.open(`/api/procure/po/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
       };
       $("#po-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#po-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
@@ -3557,7 +3557,7 @@ async function viewSoDoc(main) {
         if (!ids.length) ids = $all(".so-chk").map((c) => c.value);
         if (!ids.length) { toast("当前期间没有可打印的订单", "err"); return; }
         const cfg = loadPrintCfg("order", PRINT_ORDER_FIELDS);
-        window.open(`/api/sales/so/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+        window.open(`/api/sales/so/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
       };
       $("#so-printcfg").onclick = () => openPrintConfig("order", PRINT_ORDER_FIELDS);
     } catch (e) { $("#so-list").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
@@ -3620,43 +3620,92 @@ const PRINT_LABELS = {
   pack: "紧凑分页（多单挤一页，充分利用 A4）",
 };
 function loadPrintCfg(scope, tokens) {
+  // 返回 {set: 已勾选字段, size: 纸张}；兼容旧存储（纯字段数组 → A4）
   try {
     const raw = localStorage.getItem("fb.print." + scope);
     if (raw) {
-      const saved = new Set(JSON.parse(raw));
-      return new Set(tokens.filter((t) => saved.has(t)));
+      const parsed = JSON.parse(raw);
+      const fields = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.f) ? parsed.f : null);
+      if (fields) {
+        const saved = new Set(fields);
+        const size = (!Array.isArray(parsed) && typeof parsed.s === "string") ? parsed.s : "a4";
+        return { set: new Set(tokens.filter((t) => saved.has(t))), size };
+      }
     }
   } catch (e) { /* 坏数据回默认 */ }
-  return new Set(tokens);
+  return { set: new Set(tokens), size: "a4" };
 }
-function savePrintCfg(scope, set) {
-  try { localStorage.setItem("fb.print." + scope, JSON.stringify([...set])); } catch (e) { /* 存储不可用则本次会话仍生效 */ }
+function savePrintCfg(scope, cfg) {
+  try { localStorage.setItem("fb.print." + scope, JSON.stringify({ v: 1, f: [...cfg.set], s: cfg.size })); } catch (e) { /* 存储不可用则本次会话仍生效 */ }
 }
-function printFieldsParam(set) {
-  return [...set].filter((t) => t !== "pack").join(",");
+function printFieldsParam(cfg) {
+  return [...cfg.set].filter((t) => t !== "pack").join(",");
 }
-function packParam(set) { return set.has("pack") ? "1" : "0"; }
+function packParam(cfg) { return cfg.set.has("pack") ? "1" : "0"; }
+const PRINT_SIZES = [
+  ["a4", "A4（210×297）"],
+  ["a5", "A5 二等分（210×148）"],
+  ["third", "三等分（99×210）"],
+  ["custom", "自定义 宽x高 mm"],
+];
+// 一键预设（仅订单域）：送货单 = 跟车联，隐藏 数量/单价/税率/金额/税额/合计/状态
+const PRINT_PRESETS = {
+  full: null,
+  delivery: ["no", "date", "party", "memo", "prepared", "code", "name", "linememo", "sign", "pack"],
+};
 function openPrintConfig(scope, tokens) {
-  const set = loadPrintCfg(scope, tokens);
+  const cfg = loadPrintCfg(scope, tokens);
+  const isCustom = /^\d{2,3}x\d{2,3}$/.test(cfg.size);
+  const showPresets = scope === "order";
   const mask = modal(`
-    <h3>打印设置（字段可选）</h3>
+    <h3>打印设置（纸张 · 字段可选）</h3>
+    <div class="field" style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+      <div><label>纸张</label>
+        <select id="pc-size">
+          ${PRINT_SIZES.map(([v, l]) => `<option value="${v}" ${(isCustom ? v === "custom" : v === cfg.size) ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+      </div>
+      <div id="pc-custom-wrap" style="display:${isCustom ? "inline-flex" : "none"};gap:6px;align-items:center">
+        <label>宽x高(mm) <input id="pc-custom" value="${isCustom ? esc(cfg.size) : "140x210"}" style="width:100px" placeholder="如 140x210" /></label>
+      </div>
+      ${showPresets ? `<div><label>预设</label>
+        <button class="btn ghost sm" id="pc-p-full">默认全单</button>
+        <button class="btn ghost sm" id="pc-p-del">送货单（随车·隐藏价量）</button>
+      </div>` : ""}
+    </div>
     <div class="field">
       <label style="display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center">
-        ${tokens.map((t) => `<span style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="pc-f" value="${t}" ${set.has(t) ? "checked" : ""} />${PRINT_LABELS[t] || t}</span>`).join("")}
+        ${tokens.map((t) => `<span style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="pc-f" value="${t}" ${cfg.set.has(t) ? "checked" : ""} />${PRINT_LABELS[t] || t}</span>`).join("")}
       </label>
     </div>
-    <p class="muted" style="font-size:12px;margin:0">勾选要打印的字段与明细列；「紧凑分页」把多张单据排进同一张 A4，关掉则一单一页。设置保存在本机浏览器。</p>
+    <p class="muted" style="font-size:12px;margin:0">纸张决定 @page 尺寸与分页预算（A4≈42 行 / A5≈20 / 三等分≈28，窄纸自动压缩字号）；「紧凑分页」把多张单据排进同页，关掉则一单一页。设置保存在本机浏览器。</p>
     <div class="foot" style="gap:8px;justify-content:space-between">
       <span><button class="btn ghost sm" id="pc-all">全选</button> <button class="btn ghost sm" id="pc-none">清空</button></span>
       <span><button class="btn ghost" id="pc-cancel">取消</button> <button class="btn primary" id="pc-save">保存</button></span>
     </div>
   `);
   const boxes = $all(".pc-f", mask);
-  $("#pc-all", mask).onclick = () => boxes.forEach((b) => { b.checked = true; });
+  const applyPreset = (keys) => {
+    const on = keys === null ? new Set(tokens) : new Set(keys);
+    boxes.forEach((b) => { b.checked = on.has(b.value); });
+  };
+  if (showPresets) {
+    $("#pc-p-full", mask).onclick = () => applyPreset(PRINT_PRESETS.full);
+    $("#pc-p-del", mask).onclick = () => applyPreset(PRINT_PRESETS.delivery);
+  }
+  $("#pc-all", mask).onclick = () => applyPreset(PRINT_PRESETS.full);
   $("#pc-none", mask).onclick = () => boxes.forEach((b) => { b.checked = false; });
+  const sizeSel = $("#pc-size", mask);
+  sizeSel.onchange = () => { $("#pc-custom-wrap", mask).style.display = sizeSel.value === "custom" ? "inline-flex" : "none"; };
   $("#pc-cancel", mask).onclick = closeModal;
   $("#pc-save", mask).onclick = () => {
-    savePrintCfg(scope, new Set(boxes.filter((b) => b.checked).map((b) => b.value)));
+    let size = sizeSel.value;
+    if (size === "custom") {
+      const v = $("#pc-custom", mask).value.trim().toLowerCase();
+      if (!/^\d{2,3}x\d{2,3}$/.test(v)) { toast("自定义尺寸格式：宽x高 mm，如 140x210", "err"); return; }
+      size = v;
+    }
+    savePrintCfg(scope, { set: new Set(boxes.filter((b) => b.checked).map((b) => b.value)), size });
     closeModal();
     toast("打印设置已保存", "ok");
   };
@@ -4000,7 +4049,7 @@ async function renderReceipts(body) {
     if (!ids.length) ids = $all(".rc-chk").map((c) => c.value);
     if (!ids.length) { toast("没有可打印的收付款单", "err"); return; }
     const cfg = loadPrintCfg("receipt", PRINT_RECEIPT_FIELDS);
-    window.open(`/api/funds/receipts/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}`, "_blank");
+    window.open(`/api/funds/receipts/print-form?ids=${ids.join(",")}&fields=${printFieldsParam(cfg)}&pack=${packParam(cfg)}&size=${encodeURIComponent(cfg.size)}`, "_blank");
   };
   $("#rc-printcfg").onclick = () => openPrintConfig("receipt", PRINT_RECEIPT_FIELDS);
   $("#rc-new").onclick = async () => {

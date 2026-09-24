@@ -4439,6 +4439,26 @@ fn doc_fields_from_q(q: &HashMap<String, String>) -> findb::printform::DocPrintF
     f
 }
 
+/// 打印纸张：`a4` / `a5` / `third` / 自定义 `宽x高`（mm，50..=600），非法回退 a4
+fn doc_size_from_q(q: &HashMap<String, String>) -> String {
+    let s = q
+        .get("size")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if s == "a4" || s == "a5" || s == "third" {
+        return s;
+    }
+    if let Some((w, h)) = s
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.parse::<i32>().ok()?, b.parse::<i32>().ok()?)))
+    {
+        if (50..=600).contains(&w) && (50..=600).contains(&h) {
+            return format!("{w}x{h}");
+        }
+    }
+    "a4".to_string()
+}
+
 /// `ids=1,2,3`（去重保序）；缺省返回空 = 由调用方按期间/全部取数
 fn print_ids(q: &HashMap<String, String>) -> Vec<i64> {
     let mut ids: Vec<i64> = q
@@ -4551,7 +4571,7 @@ async fn print_so_form(
         return Err(AppError::bad_request("没有可打印的订单"));
     }
     let f = doc_fields_from_q(&q);
-    let html = findb::printform::order_forms_html(&company, &orders, &f);
+    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -4585,7 +4605,7 @@ async fn print_po_form(
         return Err(AppError::bad_request("没有可打印的订单"));
     }
     let f = doc_fields_from_q(&q);
-    let html = findb::printform::order_forms_html(&company, &orders, &f);
+    let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 
@@ -4615,7 +4635,7 @@ async fn print_receipt_form(
         return Err(AppError::bad_request("没有可打印的收付款单"));
     }
     let f = doc_fields_from_q(&q);
-    let html = findb::printform::receipt_forms_html(&company, &prints, &f);
+    let html = findb::printform::receipt_forms_sized_html(&company, &prints, &f, &doc_size_from_q(&q));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
 

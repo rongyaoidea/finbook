@@ -1279,20 +1279,13 @@ impl FundsView {
                             &self.rc_memo,
                             &who,
                         ) {
-                            Ok((_, vid, settled)) => {
+                            Ok(doc_id) => {
                                 ctx.log(
                                     "资金",
-                                    "新增收付款",
-                                    &format!("{} {} 凭证 #{vid}", self.rc_kind, amount.fmt_money()),
+                                    "新增收付款（待审核）",
+                                    &format!("{} {} 单 #{doc_id}", self.rc_kind, amount.fmt_money()),
                                 );
-                                ctx.info(format!(
-                                    "已生成凭证 #{vid}{}",
-                                    if settled > 0 {
-                                        format!("（自动核销 {settled} 笔）")
-                                    } else {
-                                        String::new()
-                                    }
-                                ));
+                                ctx.info("已保存为草稿；审核后生成凭证并自动核销");
                                 self.rc_amount.clear();
                                 self.rc_memo.clear();
                             }
@@ -1352,10 +1345,12 @@ impl FundsView {
             widgets::TCol::new("往来单位", 110.0).fixed(),
             widgets::TCol::new("金额", 120.0).right(),
             widgets::TCol::new("凭证", 90.0).fixed(),
+            widgets::TCol::new("状态", 64.0).fixed(),
             widgets::TCol::new("备注", 140.0),
-            widgets::TCol::new("操作", 80.0).fixed(),
+            widgets::TCol::new("操作", 130.0).fixed(),
         ];
         let mut del: Option<i64> = None;
+        let mut act: Option<(i64, bool)> = None; // (id, true=审核 / false=撤审)
         widgets::grid(ui, "receipt_docs", &cols, rows.len(), 24.0, |i, c, ui| {
             let d = &rows[i];
             match c {
@@ -1371,8 +1366,24 @@ impl FundsView {
                         None => { ui.label("—"); }
                     }
                 }
-                7 => { ui.label(&d.memo); }
-                8 => {
+                7 => {
+                    if d.status == "audited" {
+                        ui.label("已审核");
+                    } else {
+                        ui.label(RichText::new("待审核").weak());
+                    }
+                }
+                8 => { ui.label(&d.memo); }
+                9 => {
+                    if d.status == "draft" && ctx.can(fincore::Perm::VoucherAudit) {
+                        if ui.small_button("审核").clicked() {
+                            act = Some((d.id, true));
+                        }
+                    } else if d.status == "audited" && ctx.can(fincore::Perm::VoucherAudit) {
+                        if ui.small_button("撤审").clicked() {
+                            act = Some((d.id, false));
+                        }
+                    }
                     if ui.small_button("删除").clicked() {
                         del = Some(d.id);
                     }
@@ -1380,6 +1391,33 @@ impl FundsView {
                 _ => {}
             }
         });
+        if let Some((id, is_audit)) = act {
+            if is_audit {
+                let who = ctx.user().username.clone();
+                match findb::receipt::receipt_audit(ctx.db(), id, &who) {
+                    Ok((vid, settled)) => {
+                        ctx.log("资金", "审核收付款单", &format!("#{id} 凭证 #{vid}"));
+                        ctx.info(format!(
+                            "已审核，凭证 #{vid}{}",
+                            if settled > 0 {
+                                format!("（自动核销 {settled} 笔）")
+                            } else {
+                                String::new()
+                            }
+                        ));
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            } else {
+                match findb::receipt::receipt_unaudit(ctx.db(), id) {
+                    Ok(()) => {
+                        ctx.log("资金", "撤销审核收付款单", &format!("#{id}"));
+                        ctx.info("已撤销审核，单据回到草稿");
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
+        }
         if let Some(id) = del {
             match findb::receipt::receipt_delete(ctx.db(), id) {
                 Ok(()) => {

@@ -334,6 +334,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/funds/receipts", get(list_receipts).post(create_receipt))
         .route("/api/funds/receipts/:id/delete", post(delete_receipt))
         .route("/api/funds/receipts/print-form", get(print_receipt_form))
+        .route("/api/funds/receipts/:id/audit", post(audit_receipt))
+        .route("/api/funds/receipts/:id/unaudit", post(unaudit_receipt))
+        .route("/api/inventory/counts", get(list_counts))
+        .route("/api/inventory/count", post(create_count))
+        .route("/api/inventory/count/:id/apply", post(apply_count))
+        .route("/api/inventory/count/:id/delete", post(delete_count))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -4207,7 +4213,8 @@ async fn add_po_payment(
     // 对标金蝶：付款动作即出台账凭证并按供应商自动核销（默认资金账户取账套配置）
     let po = findb::scm::po_get(&db, req.po_id)?
         .ok_or_else(|| AppError::not_found("采购订单不存在"))?;
-    let (_doc, vid, settled) = findb::receipt::receipt_create(
+    // 审核流：先落草稿收付款单（凭证由审核人审核时同事务生成并自动核销）
+    let doc_id = findb::receipt::receipt_create(
         &db,
         "payment",
         date,
@@ -4231,14 +4238,14 @@ async fn add_po_payment(
     db.log(
         user.username(),
         "采购",
-        "采购付款",
+        "采购付款登记",
         &format!(
-            "#{} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            "#{} {} 付款单 #{doc_id}（待审核）",
             req.po_id,
             amount.fmt_money()
         ),
     )?;
-    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
+    Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
 
 async fn get_price_history(
@@ -4424,7 +4431,8 @@ async fn add_so_payment(
     // 对标金蝶：收款动作即出台账凭证并按客户自动核销（默认资金账户取账套配置）
     let so = findb::scm::so_get(&db, req.so_id)?
         .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
-    let (_doc, vid, settled) = findb::receipt::receipt_create(
+    // 审核流：先落草稿收付款单（凭证由审核人审核时同事务生成并自动核销）
+    let doc_id = findb::receipt::receipt_create(
         &db,
         "receipt",
         date,
@@ -4439,14 +4447,14 @@ async fn add_so_payment(
     db.log(
         user.username(),
         "销售",
-        "销售收款",
+        "销售收款登记",
         &format!(
-            "#{} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            "#{} {} 收款单 #{doc_id}（待审核）",
             req.so_id,
             amount.fmt_money()
         ),
     )?;
-    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
+    Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
 
 // ---------------- 单据套打（订单 / 收付款单）：字段白名单 + 批量紧凑分页 ----------------
@@ -6449,7 +6457,8 @@ async fn create_receipt(
     };
     let kind = if req.kind == "payment" { "payment" } else { "receipt" };
     let amount = parse_money_checked(&req.amount)?;
-    let (id, vid, settled) = findb::receipt::receipt_create(
+    // 审核流：只落草稿单据；凭证与自动核销在「审核」（VoucherAudit）时生成
+    let id = findb::receipt::receipt_create(
         &db,
         kind,
         date,
@@ -6462,14 +6471,14 @@ async fn create_receipt(
     db.log(
         user.username(),
         "资金",
-        "新增收付款单",
+        "新增收付款单（待审核）",
         &format!(
-            "#{id} {} {} 凭证 #{vid}（自动核销 {settled} 笔）",
+            "#{id} {} {}",
             if kind == "receipt" { "收款" } else { "付款" },
             amount.fmt_money()
         ),
     )?;
-    Ok(Json(json!({ "ok": true, "id": id, "voucher_id": vid, "settled": settled })))
+    Ok(Json(json!({ "ok": true, "id": id, "status": "draft" })))
 }
 
 async fn delete_receipt(
@@ -6481,6 +6490,162 @@ async fn delete_receipt(
     let db = state.db_for(&user.book_key)?;
     findb::receipt::receipt_delete(&db, id)?;
     db.log(user.username(), "资金", "删除收付款单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------- 收付款单审核流 + 存货盘点 ----------------
+
+/// 审核收付款单（对标金蝶）：同事务生成资金凭证 + FIFO 自动核销。审核权 = VoucherAudit
+/// （审核人/主管/管理员——出纳录单、审核人把关，职责分离）。
+async fn audit_receipt(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherAudit)?;
+    let db = state.db_for(&user.book_key)?;
+    let (vid, settled) = findb::receipt::receipt_audit(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "审核收付款单",
+        &format!("#{id} 凭证 #{vid}（自动核销 {settled} 笔）"),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid, "settled": settled })))
+}
+
+/// 撤销审核：删除未记账凭证（含核销配对清理）→ 单据回草稿
+async fn unaudit_receipt(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherAudit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::receipt::receipt_unaudit(&db, id)?;
+    db.log(user.username(), "资金", "撤销审核收付款单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CountLineInput {
+    #[serde(default)]
+    item: String,
+    #[serde(default)]
+    count_qty: String,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct CountReq {
+    #[serde(default)]
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    warehouse: String,
+    #[serde(default)]
+    memo: String,
+    #[serde(default)]
+    lines: Vec<CountLineInput>,
+}
+
+/// 盘点单列表（含明细：账面快照 vs 实盘）
+async fn list_counts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::stocktake::count_list(&db)? })))
+}
+
+/// 新建盘点单：服务端按仓库快照账面数量（Warehouse = 仓管作业）
+async fn create_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CountReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let mut lines: Vec<(String, Money, String)> = Vec::new();
+    for l in &req.lines {
+        if l.item.trim().is_empty() {
+            continue;
+        }
+        lines.push((
+            l.item.trim().to_string(),
+            parse_money_checked(&l.count_qty)?,
+            l.memo.clone(),
+        ));
+    }
+    let (id, no) = findb::stocktake::count_create(
+        &db,
+        period,
+        date,
+        req.warehouse.trim(),
+        &req.memo,
+        &lines,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "库存",
+        "新建盘点单",
+        &format!("#{no} {} 行", lines.len()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "no": no })))
+}
+
+/// 应用盘点单：生成其他入库/出库流水 + 盘盈盘亏凭证（金额=差异×标准价）
+async fn apply_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let (rid, vid, value) = findb::stocktake::count_apply(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "库存",
+        "应用盘点",
+        &format!(
+            "#{rid} 价值 {} {}",
+            value.fmt_money(),
+            vid.map(|v| format!("凭证 #{v}")).unwrap_or_else(|| "未出凭证".into())
+        ),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": rid,
+        "voucher_id": vid,
+        "value": value.fmt_money(),
+        "message": if vid.is_some() { "" } else { "未配置标准价，仅调整库存流水" },
+    })))
+}
+
+async fn delete_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::stocktake::count_delete(&db, id)?;
+    db.log(user.username(), "库存", "删除盘点单", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
 }
 

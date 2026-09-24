@@ -20,8 +20,8 @@ fn now() -> String {
 // ===========================================================================
 
 /// 暂估借方科目：存货编码本身在科目表 → 直接当科目用（请购/暂估惯例 140301）；
-/// 否则回退账套配置的暂估材料科目（biz_accounts.material）。
-fn estimate_account(db: &Db, item: &str) -> String {
+/// 否则回退账套配置的暂估材料科目（biz_accounts.material）。盘点凭证复用。
+pub(crate) fn estimate_account(db: &Db, item: &str) -> String {
     match crate::accounts::chart(db) {
         Ok(ch) if ch.get(item).is_some() => item.to_string(),
         _ => db.options().biz_accounts.material.clone(),
@@ -30,7 +30,8 @@ fn estimate_account(db: &Db, item: &str) -> String {
 
 /// 暂估分录（条目）：数量科目带数量/单价（与金额自洽）、启用存货辅助的科目带 item
 /// （编码即档案值，presence-only 校验通过）；on_debit=false 时金额落在贷方（冲回用）。
-fn estimate_item_entry(
+/// 盘盈盘亏凭证复用。
+pub(crate) fn estimate_item_entry(
     db: &Db,
     item: &str,
     amount: Money,

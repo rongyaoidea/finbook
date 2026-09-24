@@ -397,6 +397,7 @@ const NAV_ITEMS = [
   { id: "so-doc", label: "销售单据", perm: "order_ops", group: "销售" },
   { id: "so-reconcile", label: "销售对账", perm: "report", group: "销售" },
   { id: "order-change-log", label: "订单变更", perm: "report", group: "销售" },
+  { id: "inv-count", label: "存货盘点", perm: "warehouse", group: "库存" },
   { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
   { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
   { id: "inv-serial", label: "序列号", perm: "warehouse", group: "库存" },
@@ -455,6 +456,7 @@ const VIEWS = {
   "inv-warehouse": viewInvWarehouse,
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
+  "inv-count": viewInvCount,
   "procure-quota": viewProcureQuota,
   "po-doc": viewPoDoc,
   "so-doc": viewSoDoc,
@@ -3369,6 +3371,94 @@ async function viewInvTransfer(main) {
 // ===========================================================================
 // 采购/销售深度：采购暂估 / 供应商配额 / 订单变更
 // ===========================================================================
+// 存货盘点：账面按仓库快照（服务端）→ 录实盘 → 应用出其他入库/出库流水 + 盘盈盘亏凭证
+async function viewInvCount(main) {
+  main.innerHTML = `<h2>存货盘点</h2>
+    <div class="toolbar">
+      <label>仓库 <input id="ic-wh" style="width:110px" placeholder="空 = 全部仓库" /></label>
+      <button class="btn primary" id="ic-new">新建盘点单</button>
+      <span class="grow"></span>
+      <span class="muted" style="font-size:12px">草稿可删；应用后生成盘盈盘亏流水与凭证（金额 = 差异 × 标准价，未配标准价只调流水），不可再删——冲回请做反向盘点</span>
+    </div>
+    <div id="ic-list" class="muted">加载中…</div>`;
+  const load = async () => {
+    try {
+      const r = await api("/inventory/counts");
+      const rows = r.rows || [];
+      $("#ic-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th>仓库</th><th>明细（账面 → 实盘）</th><th>状态</th><th>凭证</th><th></th></tr></thead><tbody>${rows.map((c) => {
+            const lines = (c.lines || []).map((l) => `${esc(l.item)} ${fmt(l.book_qty)} → <b>${fmt(l.count_qty)}</b>${Number(l.count_qty) - Number(l.book_qty) !== 0 ? `（${(Number(l.count_qty) - Number(l.book_qty)) > 0 ? "+" : ""}${Number(l.count_qty) - Number(l.book_qty)}）` : ""}`).join("；");
+            return `<tr><td>${esc(c.no)}</td><td>${esc(c.date)}</td><td>${esc(c.warehouse || "全部")}</td><td>${lines || "—"}</td>
+              <td>${c.status === "applied" ? '<span class="tag ok">已应用</span>' : '<span class="tag warn">草稿</span>'}</td>
+              <td>${c.voucher_id ? `<a href="#" data-ic-v="${c.voucher_id}">凭证 #${c.voucher_id}</a>` : "—"}</td>
+              <td class="row-actions">${c.status === "draft" ? `<button class="btn ghost sm" data-ic-apply="${c.id}">应用</button><button class="btn ghost sm" data-ic-del="${c.id}">删除</button>` : ""}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无盘点单，点「新建盘点单」开始</div>`;
+      $all("[data-ic-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.icV, 10)); });
+      $all("[data-ic-del]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("删除该盘点单？", true))) return;
+        try { await api(`/inventory/count/${b.dataset.icDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-ic-apply]").forEach((b) => b.onclick = async () => {
+        try {
+          const r2 = await postJson(`/inventory/count/${b.dataset.icApply}/apply`, {});
+          toast(r2.voucher_id ? `已应用，盘盈盘亏凭证 #${r2.voucher_id}` : `已应用（${r2.message || "仅调库存流水"}）`, "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#ic-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#ic-new").onclick = () => openCountEditor($("#ic-wh").value.trim(), load);
+  await load();
+}
+
+function openCountEditor(warehouse, reload) {
+  let lines = [{ item: "", count_qty: "", memo: "" }];
+  const mask = modal(`<h3>新建盘点单</h3>
+    <div class="toolbar">
+      <label>日期 <input type="date" id="cn-date" value="${today()}" /></label>
+      <label>仓库 <input id="cn-wh" value="${esc(warehouse)}" style="width:110px" placeholder="空 = 全部仓库" /></label>
+      <label>备注 <input id="cn-memo" style="width:150px" /></label>
+    </div>
+    <table class="grid" id="cn-tbl"><thead><tr><th>存货编码 *</th><th>实盘数量 *</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+    <button class="btn ghost sm" id="cn-add">+ 增加行</button>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">保存时服务端按仓库快照账面数量（快照后可看到 账面→实盘 差异）；应用后不可修改。</p>
+    <div class="foot"><button class="btn primary" id="cn-save">保存盘点单</button><button class="btn ghost" id="cn-cancel">取消</button></div>`);
+  const tbody = $("#cn-tbl tbody", mask);
+  const render = () => {
+    tbody.innerHTML = lines.map((l, i) => `<tr>
+      <td><input data-f="item" data-i="${i}" value="${esc(l.item)}" style="width:130px" /></td>
+      <td><input data-f="count_qty" data-i="${i}" value="${esc(l.count_qty)}" style="width:95px" /></td>
+      <td><input data-f="memo" data-i="${i}" value="${esc(l.memo)}" style="width:140px" /></td>
+      <td><button class="btn ghost sm" data-del="${i}">删</button></td></tr>`).join("");
+    $all("input[data-f]", tbody).forEach((inp) => { inp.onchange = () => { lines[parseInt(inp.dataset.i, 10)][inp.dataset.f] = inp.value; }; });
+    $all("[data-del]", tbody).forEach((b) => b.onclick = () => {
+      lines.splice(parseInt(b.dataset.del, 10), 1);
+      if (!lines.length) lines.push({ item: "", count_qty: "", memo: "" });
+      render();
+    });
+  };
+  render();
+  $("#cn-add", mask).onclick = () => { lines.push({ item: "", count_qty: "", memo: "" }); render(); };
+  $("#cn-cancel", mask).onclick = closeModal;
+  $("#cn-save", mask).onclick = async () => {
+    const clean = lines.filter((l) => l.item.trim());
+    if (!clean.length) { toast("至少填写一行存货编码", "err"); return; }
+    try {
+      const r = await postJson("/inventory/count", {
+        period: ymm(state.current || ""),
+        date: $("#cn-date", mask).value,
+        warehouse: $("#cn-wh", mask).value.trim(),
+        memo: $("#cn-memo", mask).value.trim(),
+        lines: clean.map((l) => ({ item: l.item.trim(), count_qty: l.count_qty, memo: l.memo })),
+      });
+      toast(`已保存盘点单 ${r.no}`, "ok");
+      closeModal();
+      reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
 async function viewPoEstimate(main) {
   main.innerHTML = `<h2>采购暂估</h2>
     <div class="toolbar">
@@ -3515,7 +3605,7 @@ async function viewPoDoc(main) {
   const memo = () => $("#pd-memo2").value.trim();
   $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.voucher_id ? `已付款，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已付款，付款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   load();
 }
 
@@ -3606,7 +3696,7 @@ async function viewSoDoc(main) {
   const memo = () => $("#sd-memo").value.trim();
   $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已发货，确认收入凭证 #${r.voucher_id}` : "已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-return").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/return", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已退货，冲回凭证 #${r.voucher_id}` : "已退货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.voucher_id ? `已收款，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}` : "已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已收款，收款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-credit").addEventListener("click", async () => {
     const c = $("#sd-credit-cust").value.trim();
     if (!c) { toast("请填写客户", "err"); return; }
@@ -4091,7 +4181,7 @@ async function renderReceipts(body) {
         date: $("#rc-date").value, kind: kindSel(), fund_account: $("#rc-fund").value.trim(),
         party: $("#rc-party").value, amount: $("#rc-amt").value.trim(), memo: $("#rc-memo").value.trim(),
       });
-      toast(`已保存，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}`, "ok");
+      toast(`已保存为待审核单（审核后生成凭证并自动核销）`, "ok");
       $("#rc-amt").value = ""; $("#rc-memo").value = "";
       load();
     } catch (e) { toast(e.message, "err"); }
@@ -4103,16 +4193,28 @@ async function renderReceipts(body) {
       const r = await api("/funds/receipts");
       const rows = r.rows || [];
       $("#rc-list").innerHTML = rows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="rc-chkall" title="全选" /></th><th>单号</th><th>日期</th><th>类型</th><th>资金账户</th><th>往来单位</th><th class="num">金额</th><th>凭证</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((d) => `<tr>
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="rc-chkall" title="全选" /></th><th>单号</th><th>日期</th><th>类型</th><th>资金账户</th><th>往来单位</th><th class="num">金额</th><th>凭证</th><th>状态</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((d) => `<tr>
             <td><input type="checkbox" class="rc-chk" value="${d.id}" /></td><td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "receipt" ? "收款" : "付款"}</td>
             <td>${esc(d.fund_account)}</td><td>${esc(d.party)}</td><td class="num">${fmt(d.amount)}</td>
             <td>${d.voucher_id ? `<a href="#" data-rc-v="${d.voucher_id}">凭证 #${d.voucher_id}</a>` : "—"}</td>
+            <td>${d.status === "audited" ? '<span class="tag ok">已审核</span>' : '<span class="tag warn">待审核</span>'}</td>
             <td>${esc(d.memo || "")}</td>
-            <td class="row-actions"><button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
+            <td class="row-actions">${can("voucher_audit") ? (d.status === "draft" ? `<button class="btn ghost sm" data-rc-audit="${d.id}">审核</button>` : `<button class="btn ghost sm" data-rc-unaudit="${d.id}">撤审</button>`) : ""}<button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无收付款单</div>`;
       $all("[data-rc-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.rcV, 10)); });
       $all("[data-rc-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该收付款单？其凭证需先作废或删除", true))) return; try { await api(`/funds/receipts/${b.dataset.rcD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#rc-chkall")) $("#rc-chkall").onclick = (e) => { $all(".rc-chk").forEach((c) => { c.checked = e.target.checked; }); };
+      $all("[data-rc-audit]").forEach((b) => b.onclick = async () => {
+        try {
+          const r = await postJson(`/funds/receipts/${b.dataset.rcAudit}/audit`, {});
+          toast(`已审核，凭证 #${r.voucher_id}${r.settled ? `（自动核销 ${r.settled} 笔）` : ""}`, "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-rc-unaudit]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("撤销审核？将删除其未记账凭证并清理核销配对，单据回到草稿。", true))) return;
+        try { await postJson(`/funds/receipts/${b.dataset.rcUnaudit}/unaudit`, {}); toast("已撤销审核", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
     } catch (e) { $("#rc-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
 }

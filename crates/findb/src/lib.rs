@@ -21,6 +21,7 @@ pub mod business;
 pub mod funds;
 pub mod imports;
 pub mod inventory2;
+pub mod stocktake;
 pub mod invoices;
 pub mod mgmt;
 pub mod periods;

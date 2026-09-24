@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -1061,10 +1061,36 @@ CREATE TABLE IF NOT EXISTS receipt_doc (
     amount       TEXT NOT NULL DEFAULT '0',
     memo         TEXT NOT NULL DEFAULT '',
     voucher_id   INTEGER,
+    status       TEXT NOT NULL DEFAULT 'audited', -- draft 待审 / audited 已审（历史单据均有凭证）
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_receipt_doc_period ON receipt_doc(period, kind);
+
+-- 存货盘点单（账面按仓库快照 + 实盘录入 → 应用生成其他入库/出库流水与盘盈盘亏凭证）
+CREATE TABLE IF NOT EXISTS inv_count (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL DEFAULT '',
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    warehouse   TEXT NOT NULL DEFAULT '',   -- 空 = 全部仓库合计
+    memo        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft 草稿 / applied 已应用
+    voucher_id  INTEGER,
+    applied_at  TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS inv_count_line (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    count_id  INTEGER NOT NULL,
+    item      TEXT NOT NULL,
+    book_qty  TEXT NOT NULL DEFAULT '0',
+    count_qty TEXT NOT NULL DEFAULT '0',
+    memo      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_inv_count ON inv_count(period, status);
+CREATE INDEX IF NOT EXISTS idx_inv_count_line ON inv_count_line(count_id);
 
 -- 存货计价方式配置（按存货档案 code）
 CREATE TABLE IF NOT EXISTS item_cost_method (
@@ -1239,6 +1265,11 @@ const MIGRATE_V20: &[(&str, &str, &str)] = &[
 /// v20 → v21：兼任岗位（多角色）。有效权限 = 主岗位 + roles_json 并集 − deny。
 const MIGRATE_V21: &[(&str, &str, &str)] =
     &[("user", "roles_json", "TEXT NOT NULL DEFAULT '[]'")];
+
+/// v21 → v22：收付款单审核流（历史单据均已生成凭证 → 默认 'audited'）；
+/// 存货盘点两张新表由 DDL 直接建（每次 migrate 都会执行 CREATE IF NOT EXISTS）。
+const MIGRATE_V22: &[(&str, &str, &str)] =
+    &[("receipt_doc", "status", "TEXT NOT NULL DEFAULT 'audited'")];
 
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
@@ -1456,6 +1487,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V19)?;
             migrate_generic(conn, MIGRATE_V20)?;
             migrate_generic(conn, MIGRATE_V21)?;
+            migrate_generic(conn, MIGRATE_V22)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

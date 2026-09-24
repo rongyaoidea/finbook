@@ -180,6 +180,106 @@ pub fn so_payment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
 
 // ===========================================================================
 // 统计 / 执行跟踪 / 信用管理
+
+/// 发货 / 退货 → 收入确认凭证（对标金蝶：出库时点确认收入与应收）
+///
+/// 按订单累计口径**按比例确认**：确认额 = 订单(不含税收入 / 税额) × (本次数量 ÷ 订购总数量)；
+/// 发货封顶到未发货余量（超发不重复确认），退货封顶到已发货量（不超额冲回）。
+/// 科目取账套 `biz_accounts`（应收/收入/销项税），应收 = 收入 + 税额（借贷必平）。
+/// 金额为零或订单无明细 → `Ok(None)`（不生成凭证）。
+pub fn so_income_voucher(
+    db: &Db,
+    so_id: i64,
+    delta_qty: Money,
+    date: NaiveDate,
+    who: &str,
+) -> DbResult<Option<i64>> {
+    let Some(so) = crate::scm::so_get(db, so_id)? else {
+        return Err(fincore::FinError::not_found("销售订单").into());
+    };
+    let total_qty: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
+    if total_qty.is_zero() || (so.total_amount.is_zero() && so.total_tax.is_zero()) {
+        return Ok(None);
+    }
+    let shipped = so_shipment_sum(db, so_id)?;
+    let eff = if delta_qty.is_positive() {
+        let remaining = total_qty - shipped;
+        if !remaining.is_positive() {
+            return Ok(None); // 已发完，超发不重复确认
+        }
+        delta_qty.min(remaining)
+    } else {
+        let back = delta_qty.abs().min(shipped);
+        if !back.is_positive() {
+            return Ok(None); // 未发过货，无从冲回
+        }
+        back.negated()
+    };
+    let ratio = eff
+        .checked_div(total_qty)
+        .ok_or_else(|| fincore::FinError::state("订购总量为零"))?;
+    let income = (so.total_amount * ratio).round2();
+    let tax = (so.total_tax * ratio).round2();
+    let ar = income + tax;
+    if income.is_zero() && tax.is_zero() {
+        return Ok(None);
+    }
+    let ret = eff.is_negative();
+    let biz = db.options().biz_accounts.clone();
+    let period = fincore::Period::from_date(date);
+    let tx = db.write_tx()?;
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = fincore::Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = fincore::VoucherSource::Business;
+    v.memo = if ret {
+        format!("销售退货冲回 {}", so.no)
+    } else {
+        format!("发货确认 {}", so.no)
+    };
+    let memo = v.memo.clone();
+    let ar_aux = fincore::AuxRef {
+        customer: Some(so.customer_code.clone()),
+        ..Default::default()
+    };
+    if !ret {
+        v.push_entry(fincore::Entry {
+            debit: ar,
+            aux: ar_aux,
+            ..fincore::Entry::new(1, biz.ar.as_str(), memo.as_str())
+        });
+        v.push_entry(fincore::Entry {
+            credit: income,
+            ..fincore::Entry::new(2, biz.income.as_str(), memo.as_str())
+        });
+        if !tax.is_zero() {
+            v.push_entry(fincore::Entry {
+                credit: tax,
+                ..fincore::Entry::new(3, biz.tax_sales.as_str(), memo.as_str())
+            });
+        }
+    } else {
+        v.push_entry(fincore::Entry {
+            debit: income.abs(),
+            ..fincore::Entry::new(1, biz.income.as_str(), memo.as_str())
+        });
+        if !tax.is_zero() {
+            v.push_entry(fincore::Entry {
+                debit: tax.abs(),
+                ..fincore::Entry::new(2, biz.tax_sales.as_str(), memo.as_str())
+            });
+        }
+        v.push_entry(fincore::Entry {
+            credit: ar.abs(),
+            aux: ar_aux,
+            ..fincore::Entry::new(3, biz.ar.as_str(), memo.as_str())
+        });
+    }
+    v.renumber();
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
+    tx.commit()?;
+    Ok(Some(vid))
+}
 // ===========================================================================
 
 #[derive(Clone, Debug, serde::Serialize)]

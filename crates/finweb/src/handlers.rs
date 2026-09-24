@@ -4286,8 +4286,24 @@ async fn add_so_shipment(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    let qty = parse_money_checked(&req.qty)?;
+    if qty.is_negative() || qty.is_zero() {
+        return Err(AppError::bad_request("发货数量必须为正数"));
+    }
+    // 对标金蝶：未确认订单不能出库（草稿/作废订单先确认）
+    let so = findb::scm::so_get(&db, req.so_id)?
+        .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
+    if matches!(
+        so.status,
+        findb::scm::SoStatus::Draft | findb::scm::SoStatus::Cancelled
+    ) {
+        return Err(AppError::bad_request("订单未确认，不能发货（请先「确认」订单）"));
+    }
+    // 确认收入与应收（比例法；先出凭证再落发货流水，金额为零时无凭证）
+    let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty, date, user.username())?;
+    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, qty, &req.memo)?;
+    findb::scm::so_progress_update(&db, req.so_id)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }
 
 async fn add_so_return(
@@ -4303,8 +4319,24 @@ async fn add_so_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::sales::so_return_add(&db, req.so_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    let qty = parse_money_checked(&req.qty)?;
+    if qty.is_negative() || qty.is_zero() {
+        return Err(AppError::bad_request("退货数量必须为正数"));
+    }
+    // 对标金蝶：未确认订单不能退货
+    let so = findb::scm::so_get(&db, req.so_id)?
+        .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
+    if matches!(
+        so.status,
+        findb::scm::SoStatus::Draft | findb::scm::SoStatus::Cancelled
+    ) {
+        return Err(AppError::bad_request("订单未确认，不能退货（请先「确认」订单）"));
+    }
+    // 冲回收入与应收（负向比例；封顶已发货量）
+    let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty.negated(), date, user.username())?;
+    let id = findb::sales::so_return_add(&db, req.so_id, period, date, qty, &req.memo)?;
+    findb::scm::so_progress_update(&db, req.so_id)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }
 
 #[derive(Deserialize)]

@@ -3181,6 +3181,123 @@ async fn receipt_doc_api_flow() {
     assert_eq!(resp.status(), StatusCode::OK, "凭证删除后单据可删");
 }
 
+/// 发货 → 收入确认凭证（比例法）+ 退货冲回 + 订单状态联动。
+#[tokio::test]
+async fn sales_ship_income_voucher() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 订单：1 行 10×10@13% → 不含税 100 / 税 13 / 价税 113
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "customer_code": "C01",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "10", "unit_price": "10", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = r["id"].as_i64().unwrap();
+
+    // 草稿订单不能发货（对标金蝶：执行前须确认）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": id, "period": 202601, "date": "2026-01-15", "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "草稿订单发货应被拒");
+
+    // 确认订单
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "确认订单应成功");
+
+    // 全量发货 → 收入凭证（借应收113 / 贷收入100 / 贷销项13）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": id, "period": 202601, "date": "2026-01-15", "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let vid = r["voucher_id"].as_i64().expect("发货应确认收入凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["entries"][0]["account_code"], "112201");
+    assert_eq!(v["entries"][0]["aux"]["customer"], "C01");
+    assert_eq!(money_num(v["entries"][0]["debit"].as_str().unwrap()), 113.0);
+    assert_eq!(v["entries"][1]["account_code"], "600101");
+    assert_eq!(money_num(v["entries"][1]["credit"].as_str().unwrap()), 100.0);
+    assert_eq!(v["entries"][2]["account_code"], "22210102");
+    assert_eq!(money_num(v["entries"][2]["credit"].as_str().unwrap()), 13.0);
+
+    // 订单状态 → 已完成（全量发货）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap();
+    assert_eq!(row["status"], "Completed", "全量发货后订单应为已完成");
+
+    // 超发不再确认：再发 5 → 无新凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": id, "period": 202601, "date": "2026-01-16", "qty": "5", "memo": "超发" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["voucher_id"].is_null(), "超发不应重复确认收入：{r}");
+
+    // 退货 4 → 冲回凭证（收入40 / 销项5.2 / 应收45.2）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/return",
+            &sid,
+            serde_json::json!({ "so_id": id, "period": 202601, "date": "2026-01-17", "qty": "4", "memo": "部分退货" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "退货应成功");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rvid = r["voucher_id"].as_i64().expect("退货应生成冲回凭证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{rvid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["entries"][0]["account_code"], "600101");
+    assert_eq!(money_num(v["entries"][0]["debit"].as_str().unwrap()), 40.0);
+    assert_eq!(v["entries"][1]["account_code"], "22210102");
+    assert_eq!(money_num(v["entries"][1]["debit"].as_str().unwrap()), 5.2);
+    assert_eq!(v["entries"][2]["account_code"], "112201");
+    assert_eq!(money_num(v["entries"][2]["credit"].as_str().unwrap()), 45.2);
+}
+
 /// 对标金蝶流程：订单 CRUD + 状态流转 + 行金额服务端计算 + 客户信用卡控。
 #[tokio::test]
 async fn order_crud_and_credit_guard() {

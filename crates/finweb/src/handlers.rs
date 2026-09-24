@@ -364,6 +364,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 成本：计价配置 + 期末结价
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
+        .route("/api/cost/gl-reconcile", get(gl_reconcile_ep))
         .route("/api/cost/period-end", get(run_period_end_cost).post(run_period_end_cost))
         // 固定资产（与桌面端对齐）：卡片 / 折旧计划 / 计提 / 清理
         .route("/api/assets", get(list_assets).post(create_asset))
@@ -7840,6 +7841,33 @@ async fn clear_cost_method(
     let db = state.db_for(&user.book_key)?;
     findb::business::item_cost_method_clear(&db, &item)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 存货核算 ↔ 总账 对账（CostOps）：库存流水金额 vs 存货辅助余额，差异定位
+async fn gl_reconcile_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = match q
+        .get("period")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => parse_period(&p)
+            .ok_or_else(|| AppError::bad_request("期间格式应为 202601 或 2026-01"))?,
+        None => current_period(&state, &user),
+    };
+    let rep = findb::balances::gl_reconcile(&db, period, Some(&user.user))?;
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "stock_total": rep.stock_total,
+        "gl_total": rep.gl_total,
+        "diff_total": rep.diff_total,
+        "rows": rep.rows,
+    })))
 }
 
 async fn run_period_end_cost(

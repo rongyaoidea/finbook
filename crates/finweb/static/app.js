@@ -5404,11 +5404,13 @@ async function viewCost(main) {
     <div class="toolbar">
       <button class="btn sm ${state.costTab === "config" ? "primary" : "ghost"}" id="ct-config">计价方式</button>
       <button class="btn sm ${state.costTab === "close" ? "primary" : "ghost"}" id="ct-close">期末结价</button>
+      <button class="btn sm ${state.costTab === "recon" ? "primary" : "ghost"}" id="ct-recon">总账对账</button>
     </div>
     <div id="cost-body" class="muted">加载中…</div>`;
   const tab = state.costTab || "config";
   $("#ct-config").onclick = () => { state.costTab = "config"; viewCost(main); };
   $("#ct-close").onclick = () => { state.costTab = "close"; viewCost(main); };
+  $("#ct-recon").onclick = () => { state.costTab = "recon"; viewCost(main); };
   const body = $("#cost-body");
   if (tab === "config") {
     body.className = "";
@@ -5433,6 +5435,31 @@ async function viewCost(main) {
         });
       } catch (e) { $("#cost-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
     }
+  } else if (tab === "recon") {
+    body.className = "";
+    body.innerHTML = `<div class="toolbar">
+        <label>期间 <input id="rc-per" value="${esc(state.current)}" style="width:90px" /></label>
+        <button class="btn primary" id="rc-run">对账</button>
+        <span class="muted" style="font-size:12px">库存流水金额（含结价调整）↔ 存货辅助余额（累计至期间）；建议先执行期末结价再对账</span>
+      </div><div id="rc-out" class="muted">选择期间后点「对账」</div>`;
+    $("#rc-run").onclick = async () => {
+      try {
+        const r = await api(`/cost/gl-reconcile?period=${encodeURIComponent($("#rc-per").value.trim())}`);
+        const rows = r.rows || [];
+        const nz = rows.filter((x) => moneyNum(x.diff) !== 0);
+        $("#rc-out").innerHTML = `
+          <div class="cards">
+            <div class="card"><div class="k">库存侧合计</div><div class="v">${fmt(r.stock_total)}</div></div>
+            <div class="card"><div class="k">总账侧合计</div><div class="v">${fmt(r.gl_total)}</div></div>
+            <div class="card"><div class="k">差异（库存-总账）</div><div class="v" style="${moneyNum(r.diff_total) !== 0 ? "color:var(--err)" : ""}">${fmt(r.diff_total)}</div></div>
+          </div>
+          ${rows.length ? `<table class="grid" style="margin-top:10px"><thead><tr><th>存货</th><th class="num">库存金额</th><th class="num">总账金额</th><th class="num">差异</th></tr></thead><tbody>
+            ${rows.map((x) => `<tr${moneyNum(x.diff) !== 0 ? ` style="background:rgba(220,50,40,.07)"` : ""}><td>${esc(x.item)}</td><td class="num">${fmt(x.stock_value)}</td><td class="num">${fmt(x.gl_value)}</td><td class="num"><b>${fmt(x.diff)}</b></td></tr>`).join("")}
+          </tbody></table>
+          <div style="margin-top:8px">${rows.length && nz.length === 0 ? `<span class="tag ok">✔ 对账平衡</span>` : `<span class="tag warn">${nz.length} 项存在差异（常见原因：单据未出凭证 / 未执行期末结价）</span>`}</div>`
+          : `<div class="muted" style="margin-top:8px">两侧均无数据</div>`}`;
+      } catch (e) { $("#rc-out").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    };
   } else {
     body.className = "";
     body.innerHTML = `<div class="toolbar">

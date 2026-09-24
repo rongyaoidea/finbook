@@ -599,6 +599,84 @@ pub fn aux_balance(
     Ok(map.into_values().collect())
 }
 
+/// 存货核算 ↔ 总账 对账行（对标金蝶「存货核算-总账对账表」）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReconRow {
+    pub item: String,
+    /// 库存侧：库存流水金额累计（含期末结价写入的调整流水）
+    pub stock_value: Money,
+    /// 总账侧：存货辅助余额（期末，方向已展开）
+    pub gl_value: Money,
+    /// 差异 = 库存侧 - 总账侧（≠0 常见于：业务单据未出凭证 / 尚未执行期末结价）
+    pub diff: Money,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReconReport {
+    pub period: i32,
+    pub stock_total: Money,
+    pub gl_total: Money,
+    pub diff_total: Money,
+    pub rows: Vec<ReconRow>,
+}
+
+/// 存货核算 ↔ 总账 对账：两侧均累计至 period。
+/// - 库存侧 = `stock_move.amount` 按存货汇总（领料等 0 价流水由**期末结价调整流水**补齐
+///   → 建议结价后对账，口径完整）；
+/// - 总账侧 = 存货辅助余额（kind=item，账套首期 → period，方向已展开）。
+pub fn gl_reconcile(
+    db: &Db,
+    period: Period,
+    user: Option<&fincore::user::User>,
+) -> DbResult<ReconReport> {
+    // 库存侧
+    let mut stock: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
+    let mut st = db.conn().prepare(
+        "SELECT item, COALESCE(SUM(CAST(amount AS REAL)),0)
+         FROM stock_move WHERE item <> '' AND period <= ?1 GROUP BY item",
+    )?;
+    let mv_rows = st
+        .query_map([period.ymm()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (item, v) in mv_rows {
+        stock.insert(item, Money::parse_or_zero(&format!("{v:.4}")));
+    }
+    // 总账侧：存货辅助余额（自账套首期累计至 period）
+    let start = db.options().start_period;
+    let kind = fincore::AuxKind::from_code("item").expect("item 是合法辅助维度");
+    let gl_rows = aux_balance(db, kind, start, period, user)?;
+    let mut gl: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
+    for r in gl_rows {
+        gl.insert(r.key, r.end);
+    }
+    // 合并键集（两侧任一有数即出行）
+    let mut items: std::collections::BTreeSet<String> = stock.keys().cloned().collect();
+    items.extend(gl.keys().cloned());
+    let mut out = Vec::new();
+    let (mut stock_total, mut gl_total) = (Money::ZERO, Money::ZERO);
+    for item in items {
+        let s = stock.get(&item).copied().unwrap_or(Money::ZERO);
+        let g = gl.get(&item).copied().unwrap_or(Money::ZERO);
+        stock_total = stock_total + s;
+        gl_total = gl_total + g;
+        out.push(ReconRow {
+            item,
+            stock_value: s,
+            gl_value: g,
+            diff: s - g,
+        });
+    }
+    Ok(ReconReport {
+        period: period.ymm(),
+        stock_total,
+        gl_total,
+        diff_total: stock_total - gl_total,
+        rows: out,
+    })
+}
+
 /// 数量金额账行（数量核算科目，数量与金额对照）
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct QtyBalanceRow {

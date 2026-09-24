@@ -5735,6 +5735,113 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 存货核算↔总账对账：采购到货（有流水无凭证）差异 90 → 暂估凭证记账后对平。
+#[tokio::test]
+async fn gl_reconcile_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let cur_ymm: i32 = cur_label.replace('-', "").parse().unwrap();
+    let d15 = format!("{cur_label}-15");
+    let d10 = format!("{cur_label}-10");
+
+    // 带价采购 9×10 → 到货（库存金额 90，尚无总账凭证）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "对账造数",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d15.clone(), "qty": "10", "memo": "入库" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货入库");
+
+    // 对账：140301 库存 90 / 总账 0 → 差异 90（未暂估）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/gl-reconcile?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "对账端点可用");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item"] == "140301")
+        .expect("对账表应含 140301");
+    assert_eq!(money_num(row["stock_value"].as_str().unwrap()), 90.0, "库存侧 90");
+    assert_eq!(money_num(row["gl_value"].as_str().unwrap()), 0.0, "总账侧尚未有凭证");
+    assert_eq!(money_num(row["diff"].as_str().unwrap()), 90.0, "差异 90");
+    assert_eq!(money_num(r["diff_total"].as_str().unwrap()), 90.0);
+
+    // 手工暂估凭证（借 140301 带存货辅助 / 贷应付）→ 记账后入余额 → 对平
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d10.clone(), "word": "记", "no": 1,
+                "attachments": 0, "memo": "暂估入库",
+                "entries": [
+                    { "line": 1, "account_code": "140301", "summary": "暂估入库",
+                      "debit": "90", "credit": "0", "qty": "10", "price": "9",
+                      "aux": { "item": "140301" } },
+                    { "line": 2, "account_code": "220201", "summary": "暂估入库",
+                      "debit": "0", "credit": "90", "aux": { "supplier": "S01" } }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let vb = body_string(resp).await;
+    let vid = serde_json::from_str::<serde_json::Value>(&vb).unwrap()["id"]
+        .as_i64()
+        .unwrap_or(0);
+    assert!(vid > 0, "RECON_VB={vb}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{vid}/post"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账（余额口径=已记账）");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/gl-reconcile?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item"] == "140301")
+        .unwrap();
+    assert_eq!(money_num(row["gl_value"].as_str().unwrap()), 90.0, "总账侧 90");
+    assert_eq!(money_num(row["diff"].as_str().unwrap()), 0.0, "对平");
+    assert_eq!(money_num(r["diff_total"].as_str().unwrap()), 0.0, "总差异归零");
+}
+
 /// 委外加工全链（委外=生产的变体）：建单(kind=outsourcing) → BOM+标准价 → 领料 → 开工 →
 /// 加工费凭证（借500102/贷应付-供应商）→ 完工结转含加工费；非委外单确认加工费 400。
 #[tokio::test]

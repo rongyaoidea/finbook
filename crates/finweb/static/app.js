@@ -1002,11 +1002,18 @@ async function openVoucherEditor(id, seedEntries) {
     };
   });
   if (!v.entries.length) v.entries = [Object.assign({}, blank, { line: 1 }), Object.assign({}, blank, { line: 2 })];
+  // 出纳日记账「登记收付」预填：置入科目，方向由所填金额列体现
+  if (state.pendingCash && !id) {
+    const pc = state.pendingCash;
+    delete state.pendingCash;
+    v.entries[0].account_code = pc.account;
+    setTimeout(() => toast(`已预置科目 ${pc.account}（${pc.dir === "debit" ? "收款：填借方金额" : "付款：填贷方金额"}）`, "ok"), 120);
+  }
   // 可编辑状态与后端 can_edit() 对齐：未记账（含历史"已审核"）可改；已记账需先反记账
   const editable = (id === 0) || status === "draft" || status === "audited";
   const canPost = status === "draft" || status === "audited";
   const mask = modal(`
-    <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}</span></h3>
+    <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}${v.cashier ? `　出纳:${esc(v.cashier)}` : ""}</span></h3>
     <div class="toolbar">
       <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} />${editable ? `<button class="btn ghost sm" id="v-today">今天</button>` : ""}</label>
       <span id="v-date-hint" class="muted" style="font-size:12px"></span>
@@ -1025,6 +1032,8 @@ async function openVoucherEditor(id, seedEntries) {
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
       ${can("voucher_audit") && id > 0 && status === "draft" ? `<button class="btn ghost" id="v-audit">审核</button>` : ""}
       ${can("voucher_unaudit") && id > 0 && status === "audited" ? `<button class="btn ghost" id="v-unaudit">反审核</button>` : ""}
+      ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}
+      ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") && v.cashier ? `<button class="btn ghost" id="v-unsign">取消签字</button>` : ""}
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
       ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
       ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
@@ -1160,6 +1169,8 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-post", mask)) $("#v-post", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/post`, { method: "POST" }); toast("已记账", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-sign", mask)) $("#v-sign", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/sign`, { method: "POST" }); toast("已出纳签字", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-unsign", mask)) $("#v-unsign", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unsign`, { method: "POST" }); toast("已取消签字", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: "" }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
@@ -1554,7 +1565,7 @@ async function loadLedger() {
     return;
   }
   if (ledgerTab === "journal") {
-    tbl.innerHTML = `<thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th>对方科目</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th class="num">余额</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.summary)}</td><td>${esc(r.opposite_accounts || "")}</td><td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td><td>${esc(r.dir === "debit" ? "借" : "贷")}</td><td class="num">${esc(r.balance)}</td></tr>`).join("")}</tbody>`;
+    tbl.innerHTML = `<thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th>对方科目</th><th class="num">借方</th><th class="num">贷方</th><th>方向</th><th>出纳</th><th class="num">余额</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.summary)}</td><td>${esc(r.opposite_accounts || "")}</td><td class="num">${esc(r.debit)}</td><td class="num">${esc(r.credit)}</td><td>${esc(r.dir === "debit" ? "借" : "贷")}</td><td>${esc(r.cashier || "")}</td><td class="num">${esc(r.balance)}</td></tr>`).join("")}</tbody>`;
     return;
   }
   const hasQty = rows.some((r) => r.qty_balance != null);
@@ -3570,6 +3581,11 @@ async function viewFunds(main) {
       <button class="btn sm ${state.fundsTab === "daily" ? "primary" : "ghost"}" id="ft-daily">资金日报</button>
       <button class="btn sm ${state.fundsTab === "bill" ? "primary" : "ghost"}" id="ft-bill">票据</button>
       <button class="btn sm ${state.fundsTab === "loan" ? "primary" : "ghost"}" id="ft-loan">融资</button>
+      <button class="btn sm ${state.fundsTab === "count" ? "primary" : "ghost"}" id="ft-count">现金盘点</button>
+      <button class="btn sm ${state.fundsTab === "check" ? "primary" : "ghost"}" id="ft-check">支票簿</button>
+      <button class="btn sm ${state.fundsTab === "journal" ? "primary" : "ghost"}" id="ft-journal">日记账</button>
+      <button class="btn sm ${state.fundsTab === "advance" ? "primary" : "ghost"}" id="ft-advance">借支</button>
+      <button class="btn sm ${state.fundsTab === "budget" ? "primary" : "ghost"}" id="ft-budget">资金预算</button>
       <button class="btn sm ${state.fundsTab === "forecast" ? "primary" : "ghost"}" id="ft-forecast">资金预测</button>
     </div>
     <div id="funds-body" class="muted">加载中…</div>`;
@@ -3578,27 +3594,53 @@ async function viewFunds(main) {
   $("#ft-daily").onclick = () => switchTab("daily");
   $("#ft-bill").onclick = () => switchTab("bill");
   $("#ft-loan").onclick = () => switchTab("loan");
+  $("#ft-count").onclick = () => switchTab("count");
+  $("#ft-check").onclick = () => switchTab("check");
+  $("#ft-journal").onclick = () => switchTab("journal");
+  $("#ft-advance").onclick = () => switchTab("advance");
+  $("#ft-budget").onclick = () => switchTab("budget");
   $("#ft-forecast").onclick = () => switchTab("forecast");
 
   const body = $("#funds-body");
   if (tab === "daily") {
     body.className = "";
-    try {
-      const r = await api("/funds/daily");
-      const rows = r.rows || [];
-      body.innerHTML = rows.length
-        ? `<div class="muted" style="margin-bottom:8px">期间：${esc(r.period)}</div><table class="grid"><thead><tr>
-            <th>科目</th><th>科目名称</th><th class="num">期初</th><th class="num">收入</th><th class="num">支出</th><th class="num">期末</th>
-          </tr></thead><tbody>${rows.map((x) => `<tr>
-            <td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td>
-            <td class="num">${fmt(x.begin)}</td><td class="num">${fmt(x.income)}</td>
-            <td class="num">${fmt(x.expense)}</td><td class="num"><b>${fmt(x.end)}</b></td></tr>`).join("")}</tbody></table>`
-        : `<div class="muted">本期无现金/银行科目数据</div>`;
-    } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    const shift = (ds, n) => { const d = new Date(ds + "T00:00:00"); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+    if (!state.fundsDate) state.fundsDate = today();
+    body.innerHTML = `<div class="toolbar">
+        <label>日期 <input type="date" id="fd-date" value="${esc(state.fundsDate)}" /></label>
+        <button class="btn sm ghost" id="fd-prev">« 前一日</button>
+        <button class="btn sm ghost" id="fd-next">后一日 »</button>
+        <button class="btn sm ghost" id="fd-today">今天</button>
+      </div><div id="fd-table" class="muted">加载中…</div>`;
+    const load = async () => {
+      try {
+        const r = await api(`/funds/daily-by-date?date=${encodeURIComponent(state.fundsDate)}`);
+        const rows = r.rows || [];
+        $("#fd-table").innerHTML = rows.length
+          ? `<table class="grid"><thead><tr><th>科目</th><th>科目名称</th><th class="num">上日结余</th><th class="num">本日收入</th><th class="num">本日支出</th><th class="num">日末结存</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td><td class="num">${fmt(x.begin)}</td><td class="num">${fmt(x.income)}</td><td class="num">${fmt(x.expense)}</td><td class="num"><b>${fmt(x.end)}</b></td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">无现金/银行科目</div>`;
+      } catch (e) { $("#fd-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    };
+    const gotoDate = (ds) => { state.fundsDate = ds; $("#fd-date").value = ds; load(); };
+    $("#fd-date").onchange = (e) => { state.fundsDate = e.target.value; load(); };
+    $("#fd-prev").onclick = () => gotoDate(shift(state.fundsDate, -1));
+    $("#fd-next").onclick = () => gotoDate(shift(state.fundsDate, 1));
+    $("#fd-today").onclick = () => gotoDate(today());
+    load();
   } else if (tab === "bill") {
     renderBills(body);
   } else if (tab === "loan") {
     renderLoans(body);
+  } else if (tab === "count") {
+    renderCashCount(body);
+  } else if (tab === "check") {
+    renderChecks(body);
+  } else if (tab === "journal") {
+    renderJournal(body);
+  } else if (tab === "advance") {
+    renderAdvances(body);
+  } else if (tab === "budget") {
+    renderBudget(body);
   } else {
     body.className = "";
     try {
@@ -3612,6 +3654,239 @@ async function viewFunds(main) {
         }).join("")}
       </div>`;
     } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+// 资金预算 vs 执行（现金/银行科目；实际=当期已记账净额 H-3）
+async function renderBudget(body) {
+  body.className = "";
+  body.innerHTML = `<div id="fb-table" class="muted">加载中…</div>`;
+  try {
+    const r = await api(`/funds/budget?period=${ymm(state.current || "")}`);
+    const rows = r.rows || [];
+    $("#fb-table").innerHTML = rows.length
+      ? `<table class="grid"><thead><tr><th>科目</th><th>科目名称</th><th class="num">预算</th><th class="num">实际(净额)</th><th class="num">差异</th><th class="num">执行率</th><th>状态</th></tr></thead><tbody>${rows.map((x) => `<tr>
+          <td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td>
+          <td class="num">${fmt(x.budget)}</td><td class="num">${fmt(x.actual)}</td>
+          <td class="num">${fmt(x.diff)}</td><td class="num">${esc(String(x.rate))}%</td>
+          <td>${x.over ? '<span class="tag err">超预算</span>' : '<span class="tag ok">正常</span>'}</td></tr>`).join("")}</tbody></table>
+        <div class="muted" style="font-size:12px;margin-top:6px">口径：预算取当前版本的现金/银行科目预算行；实际为当期已记账发生净额（H-3）。预算金额在预算管理维护。</div>`
+      : `<div class="muted">本期未编制现金/银行科目预算：到【预算】为 1001/1002 等科目新增预算行后，此处显示执行情况。</div>`;
+  } catch (e) { $("#fb-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
+// 员工借支（出纳）：建单 → 支付（出凭证）→ 核销冲账（出凭证）
+async function renderAdvances(body) {
+  body.className = "";
+  body.innerHTML = `<div class="toolbar">
+      <label>日期 <input type="date" id="ad-date" value="${today()}" /></label>
+      <label>借支人 <input id="ad-emp" style="width:90px" /></label>
+      <label>事由 <input id="ad-purpose" style="width:150px" /></label>
+      <label>金额 <input id="ad-amt" style="width:100px" /></label>
+      <label>支付账户 <input id="ad-acct" value="1001" style="width:90px" /></label>
+      <label>备注 <input id="ad-memo" style="width:110px" /></label>
+      <button class="btn sm" id="ad-new">新增借支</button>
+    </div>
+    <div class="toolbar">
+      <span class="muted" style="font-size:12px">核销参数（支付/核销按今天记账）：</span>
+      <label>冲账费用科目 <input id="ad-exp-acct" value="660201" style="width:90px" /></label>
+      <label>冲账金额 <input id="ad-exp-amt" style="width:100px" placeholder="全额退回填0" /></label>
+    </div><div id="ad-list" class="muted">加载中…</div>`;
+  $("#ad-new").onclick = async () => {
+    if (!$("#ad-emp").value.trim()) { toast("借支人必填", "err"); return; }
+    try {
+      await api("/funds/advances", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        date: $("#ad-date").value, employee: $("#ad-emp").value.trim(), purpose: $("#ad-purpose").value.trim(),
+        amount: $("#ad-amt").value.trim(), pay_account: $("#ad-acct").value.trim(),
+        expense_account: $("#ad-exp-acct").value.trim(), memo: $("#ad-memo").value.trim(),
+      }) });
+      toast("已新增借支单", "ok");
+      for (const k of ["ad-emp", "ad-purpose", "ad-amt", "ad-memo"]) $("#" + k).value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  await load();
+  async function load() {
+    try {
+      const r = await api("/funds/advances");
+      const rows = r.rows || [];
+      const stMap = { approved: ["待支付", "warn"], paid: ["已支付", "tag"], settled: ["已核销", "ok"] };
+      $("#ad-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>编号</th><th>日期</th><th>借支人</th><th>事由</th><th class="num">金额</th><th>支付账户</th><th>状态</th><th></th></tr></thead><tbody>${rows.map((a) => {
+            const s = stMap[a.status] || [a.status, ""];
+            return `<tr><td>${esc(a.no)}</td><td>${esc(a.date)}</td><td>${esc(a.employee)}</td><td>${esc(a.purpose || "—")}</td>
+              <td class="num">${fmt(a.amount)}</td><td>${esc(a.pay_account)}</td>
+              <td><span class="tag ${s[1]}">${esc(s[0])}</span></td>
+              <td class="row-actions">
+                ${a.status === "approved" ? `<button class="btn ghost sm" data-ad-p="${a.id}">支付</button><button class="btn ghost sm" data-ad-d="${a.id}">删除</button>` : ""}
+                ${a.status === "paid" ? `<button class="btn ghost sm" data-ad-s="${a.id}">核销</button>` : ""}
+              </td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无借支单</div>`;
+      $all("[data-ad-p]").forEach((b) => b.onclick = async () => {
+        try { const x = await api(`/funds/advances/${b.dataset.adP}/pay`, { method: "POST" }); toast(x.voucher_id ? `已支付，生成凭证 #${x.voucher_id}` : "已支付", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-ad-s]").forEach((b) => b.onclick = async () => {
+        const expAmt = $("#ad-exp-amt").value.trim();
+        if (expAmt === "") { toast("请先填写冲账金额（全额退回填0）", "err"); return; }
+        try {
+          const x = await api(`/funds/advances/${b.dataset.adS}/settle`, { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ expense_account: $("#ad-exp-acct").value.trim() || "660201", expense_amount: expAmt }) });
+          toast(x.voucher_id ? `已核销，生成凭证 #${x.voucher_id}` : "已核销", "ok");
+          $("#ad-exp-amt").value = "";
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-ad-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该借支单？", true))) return; try { await api(`/funds/advances/${b.dataset.adD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#ad-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+// 支票登记簿（出纳备查簿，不入账；账务由凭证体现）
+async function renderChecks(body) {
+  body.className = "";
+  body.innerHTML = `<div class="toolbar">
+      <label>票号 <input id="ck-no" style="width:110px" /></label>
+      <label>类型 <select id="ck-kind"><option value="transfer">转账支票</option><option value="cash">现金支票</option></select></label>
+      <label>付款科目 <input id="ck-bank" value="100201" style="width:90px" /></label>
+      <label>收款人 <input id="ck-payee" style="width:120px" /></label>
+      <label>金额 <input id="ck-amt" style="width:100px" /></label>
+      <label>开出日 <input type="date" id="ck-date" value="${today()}" /></label>
+      <label>备注 <input id="ck-memo" style="width:110px" /></label>
+      <button class="btn sm" id="ck-new">新增支票</button>
+    </div><div id="ck-list" class="muted">加载中…</div>`;
+  $("#ck-new").onclick = async () => {
+    if (!$("#ck-no").value.trim()) { toast("支票号必填", "err"); return; }
+    try {
+      await api("/funds/checks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        no: $("#ck-no").value.trim(), kind: $("#ck-kind").value, bank_account: $("#ck-bank").value.trim(),
+        payee: $("#ck-payee").value.trim(), amount: $("#ck-amt").value.trim(),
+        issued_date: $("#ck-date").value, memo: $("#ck-memo").value.trim(),
+      }) });
+      toast("已登记支票", "ok");
+      for (const k of ["ck-no", "ck-payee", "ck-amt", "ck-memo"]) $("#" + k).value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  await load();
+  async function load() {
+    try {
+      const r = await api("/funds/checks");
+      const rows = r.rows || [];
+      $("#ck-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>票号</th><th>类型</th><th>付款科目</th><th>收款人</th><th class="num">金额</th><th>开出日</th><th>状态</th><th></th></tr></thead><tbody>${rows.map((c) => `<tr>
+            <td>${esc(c.no)}</td><td>${c.kind === "cash" ? "现金支票" : "转账支票"}</td>
+            <td>${esc(c.bank_account)}</td><td>${esc(c.payee || "—")}</td>
+            <td class="num">${fmt(c.amount)}</td><td>${esc(c.issued_date)}</td>
+            <td><span class="tag ${c.status === "void" ? "warn" : "ok"}">${c.status === "void" ? "已作废" : "已开出"}</span></td>
+            <td class="row-actions">
+              <button class="btn ghost sm" data-ck-s="${c.id}" data-to="${c.status === "void" ? "issued" : "void"}">${c.status === "void" ? "恢复" : "作废"}</button>
+              <button class="btn ghost sm" data-ck-d="${c.id}">删除</button>
+            </td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无支票记录</div>`;
+      $all("[data-ck-s]").forEach((b) => b.onclick = async () => { try { await api(`/funds/checks/${b.dataset.ckS}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: b.dataset.to }) }); toast("已更新", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-ck-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该支票记录？", true))) return; try { await api(`/funds/checks/${b.dataset.ckD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#ck-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+}
+
+// 出纳日记账：本期已记账逐笔滚动 + 日清标记 + 收付登记（跳凭证录入预填科目）
+async function renderJournal(body) {
+  body.className = "";
+  if (!state.journalAcct) state.journalAcct = "1001";
+  body.innerHTML = `<div class="toolbar">
+      <label>科目 <input id="jn-acct" value="${esc(state.journalAcct)}" style="width:90px" /></label>
+      <label>日清日期 <input type="date" id="jn-date" value="${today()}" /></label>
+      <button class="btn sm" id="jn-clear">标记日清</button>
+      <button class="btn sm ghost" id="jn-unclear">取消日清</button>
+      <button class="btn sm" id="jn-receipt">收款登记</button>
+      <button class="btn sm" id="jn-payment">付款登记</button>
+    </div><div id="jn-table" class="muted">加载中…</div>`;
+  const period = ymm(state.current || "");
+  const y = parseInt(period.slice(0, 4), 10), m = parseInt(period.slice(4, 6), 10);
+  const lastDay = new Date(y, m, 0).getDate();
+  const pFrom = `${period.slice(0, 4)}-${period.slice(4, 6)}-01`;
+  const pTo = `${period.slice(0, 4)}-${period.slice(4, 6)}-${String(lastDay).padStart(2, "0")}`;
+  const acct = () => $("#jn-acct").value.trim() || "1001";
+  const load = async () => {
+    const a = acct();
+    state.journalAcct = a;
+    try {
+      const [rows, cleared] = await Promise.all([
+        api(`/ledger/journal?code=${encodeURIComponent(a)}&from=${period}&to=${period}`),
+        api(`/funds/day-clear?account=${encodeURIComponent(a)}&from=${pFrom}&to=${pTo}`),
+      ]);
+      const cset = new Set(cleared.dates || []);
+      $("#jn-table").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th>对方科目</th><th class="num">借方</th><th class="num">贷方</th><th class="num">余额</th><th>日清</th></tr></thead><tbody>${rows.map((r) => {
+            const ds = String(r.date).slice(0, 10);
+            return `<tr><td>${esc(ds)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.summary)}</td><td>${esc(r.opposite_accounts || "")}</td><td class="num">${fmt(r.debit)}</td><td class="num">${fmt(r.credit)}</td><td class="num">${fmt(r.balance)}</td><td>${cset.has(ds) ? '<span class="tag ok">已日清</span>' : ""}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">该科目本期无已记账记录</div>`;
+    } catch (e) { $("#jn-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#jn-acct").onchange = () => load();
+  const setClear = async (clear) => {
+    try {
+      await api("/funds/day-clear", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_code: acct(), date: $("#jn-date").value, clear }) });
+      toast(clear ? "已标记日清" : "已取消日清", "ok");
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#jn-clear").onclick = () => setClear(true);
+  $("#jn-unclear").onclick = () => setClear(false);
+  const jump = (dir) => {
+    state.pendingCash = { account: acct(), dir };
+    document.querySelector('.nav-item[data-view="vouchers"]').click();
+    setTimeout(() => { const b = $("#new-v"); if (b) b.click(); }, 150);
+  };
+  $("#jn-receipt").onclick = () => jump("debit");
+  $("#jn-payment").onclick = () => jump("credit");
+  await load();
+}
+
+// 现金盘点（出纳）：账面按资金日报（按日）口径快照，差异一键出盘盈盘亏凭证
+async function renderCashCount(body) {
+  body.className = "";
+  body.innerHTML = `<div class="toolbar">
+      <label>日期 <input type="date" id="cc-date" value="${today()}" /></label>
+      <label>科目 <input id="cc-acct" value="1001" style="width:90px" /></label>
+      <label>实盘金额 <input id="cc-counted" style="width:110px" /></label>
+      <label>备注 <input id="cc-memo" style="width:150px" /></label>
+      <button class="btn sm" id="cc-new">新增盘点</button>
+    </div><div id="cc-list" class="muted">加载中…</div>`;
+  $("#cc-new").onclick = async () => {
+    try {
+      const r = await api("/funds/cash-counts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        date: $("#cc-date").value, account_code: $("#cc-acct").value.trim(),
+        counted: $("#cc-counted").value.trim(), memo: $("#cc-memo").value.trim(),
+      }) });
+      toast(`账面 ${fmt(r.book_amount)}，差异 ${fmt(r.diff)}`, "ok");
+      $("#cc-counted").value = ""; $("#cc-memo").value = "";
+      load();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  await load();
+  async function load() {
+    try {
+      const r = await api("/funds/cash-counts");
+      const rows = r.rows || [];
+      $("#cc-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>日期</th><th>科目</th><th class="num">账面余额</th><th class="num">实盘金额</th><th class="num">差异</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((c) => `<tr>
+            <td>${esc(c.date)}</td><td>${esc(c.account_code)}</td>
+            <td class="num">${fmt(c.book_amount)}</td><td class="num">${fmt(c.counted)}</td>
+            <td class="num">${Number(c.diff) === 0 ? fmt(c.diff) : `<b style="color:${Number(c.diff) > 0 ? "var(--ok)" : "var(--err)"}">${Number(c.diff) > 0 ? "+" : ""}${fmt(c.diff)}</b>`}</td>
+            <td>${esc(c.memo || "")}</td>
+            <td class="row-actions">
+              ${!c.voucher_id && Number(c.diff) !== 0 ? `<button class="btn ghost sm" data-cc-v="${c.id}">生成凭证</button>` : ""}
+              ${c.voucher_id ? `<span class="tag ok">已出凭证</span>` : ""}
+              <button class="btn ghost sm" data-cc-d="${c.id}">删除</button>
+            </td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无盘点记录</div>`;
+      $all("[data-cc-v]").forEach((b) => b.onclick = async () => { try { const x = await api(`/funds/cash-counts/${b.dataset.ccV}/voucher`, { method: "POST" }); toast(`已生成盘盈盘亏凭证 #${x.id}`, "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+      $all("[data-cc-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该盘点记录？", true))) return; try { await api(`/funds/cash-counts/${b.dataset.ccD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
+    } catch (e) { $("#cc-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
 }
 
@@ -3644,12 +3919,19 @@ async function renderBills(body) {
                 ${b.status === "in_hand" ? `<button class="btn ghost sm" data-bill-act="${b.id}" data-to="endorsed">背书</button>
                 <button class="btn ghost sm" data-bill-act="${b.id}" data-to="discounted">贴现</button>
                 <button class="btn ghost sm" data-bill-act="${b.id}" data-to="settled">兑付</button>` : ""}
+                ${["discounted", "endorsed", "settled"].includes(b.status) && !b.voucher_id ? `<button class="btn ghost sm" data-bill-v="${b.id}">生成凭证</button>` : ""}
               </td></tr>`;
           }).join("")}</tbody></table>`
         : `<div class="muted">暂无票据</div>`;
       $all("[data-bill]").forEach((b) => b.onclick = () => openBillEditor(parseInt(b.dataset.bill, 10)));
       $all("[data-bill-act]").forEach((b) => b.onclick = async () => {
-        try { await api(`/funds/bills/${b.dataset.billAct}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: b.dataset.to, date: today() }) }); toast("已更新", "ok"); loadBills(); } catch (e) { toast(e.message, "err"); }
+        try {
+          const r = await api(`/funds/bills/${b.dataset.billAct}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: b.dataset.to, date: today() }) });
+          toast(r.voucher_id ? `已更新，生成凭证 #${r.voucher_id}` : "已更新", "ok"); loadBills();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-bill-v]").forEach((b) => b.onclick = async () => {
+        try { const r = await api(`/funds/bills/${b.dataset.billV}/voucher`, { method: "POST" }); toast(`已生成凭证 #${r.id}`, "ok"); loadBills(); } catch (e) { toast(e.message, "err"); }
       });
     } catch (e) { $("#bill-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
@@ -3709,12 +3991,20 @@ async function renderLoans(body) {
             <td class="row-actions">
               <button class="btn ghost sm" data-loan="${l.id}">打开</button>
               ${l.status === "active" ? `<button class="btn ghost sm" data-loan-settle="${l.id}">结清</button>` : ""}
+              ${l.status === "active" && !l.voucher_id ? `<button class="btn ghost sm" data-loan-v="${l.id}">到账凭证</button>` : ""}
+              ${l.status !== "active" && !l.settle_voucher_id ? `<button class="btn ghost sm" data-loan-v="${l.id}">还本凭证</button>` : ""}
             </td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无融资记录</div>`;
       $all("[data-loan]").forEach((b) => b.onclick = () => openLoanEditor(parseInt(b.dataset.loan, 10)));
       $all("[data-loan-settle]").forEach((b) => b.onclick = async () => {
         if (!(await confirmDialog("结清该笔融资？", true))) return;
-        try { await api(`/funds/loans/${b.dataset.loanSettle}/settle`, { method: "POST" }); toast("已结清", "ok"); loadLoans(); } catch (e) { toast(e.message, "err"); }
+        try {
+          const r = await api(`/funds/loans/${b.dataset.loanSettle}/settle`, { method: "POST" });
+          toast(r.voucher_id ? `已结清，生成还本凭证 #${r.voucher_id}` : "已结清", "ok"); loadLoans();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-loan-v]").forEach((b) => b.onclick = async () => {
+        try { const r = await api(`/funds/loans/${b.dataset.loanV}/voucher`, { method: "POST" }); toast(`已生成凭证 #${r.id}`, "ok"); loadLoans(); } catch (e) { toast(e.message, "err"); }
       });
     } catch (e) { $("#loan-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
@@ -4239,6 +4529,7 @@ async function viewOptions(main) {
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-audit" ${o.enable_audit ? "checked" : ""} />启用审核环节（未审核不能记账）</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-qty" ${o.enable_qty ? "checked" : ""} />启用数量核算</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-foreign" ${o.enable_foreign ? "checked" : ""} />启用外币核算</label>
+        <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-cashier" ${o.require_cashier ? "checked" : ""} />出纳签字（涉及现金/银行的凭证记账前须签字）</label>
       </div>
       <p class="muted" style="font-size:12px">启用期间与科目级长影响科目编码校验与凭证编号，修改请谨慎；已开账后不建议改动。</p>
       ${can("sys_option") ? `<div class="foot" style="margin-top:10px"><button class="btn primary" id="op-save">保存参数</button></div>` : `<p class="muted">无修改权限（需要 sys_option）</p>`}
@@ -4258,6 +4549,7 @@ async function viewOptions(main) {
       enable_audit: $("#op-audit").checked,
       enable_qty: $("#op-qty").checked,
       enable_foreign: $("#op-foreign").checked,
+      require_cashier: $("#op-cashier").checked,
     });
     try { await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存账套参数", "ok"); }
     catch (e) { toast(e.message, "err"); }
@@ -4597,7 +4889,7 @@ async function viewPayroll(main) {
                 <td class="num">${fmt(r.additional)}</td><td class="num">${fmt(r.tax_base)}</td>
                 <td class="num">${fmt(r.tax)}</td><td class="num"><b>${fmt(r.net)}</b></td>
                 <td class="num">${fmt(r.social_co)}</td><td class="num">${fmt(r.housing_co)}</td>
-                <td>${voucherLink(r.voucher_id)}</td>
+                <td>${[["计提", r.voucher_id], ["社保", r.social_voucher_id], ["发放", r.paid_voucher_id]].filter(([, id]) => id).map(([k, id]) => `<a href="#" data-voucher="${id}">${k}#${id}</a>`).join(" ") || "—"}</td>
                 <td class="row-actions">
                   ${can("voucher_new") && !r.voucher_id ? `<button class="btn sm ghost" data-edit="${r.id}">改</button>` : ""}
                   ${can("voucher_new") && !r.voucher_id ? `<button class="btn sm ghost" data-del="${r.id}">删</button>` : ""}
@@ -4673,7 +4965,8 @@ async function viewPayroll(main) {
           <div><label>银行存款</label><input id="pv-bank" value="100201" style="width:90px" /></div>
           <div><label>应交个税</label><input id="pv-tax" value="222107" style="width:90px" /></div>
         </div>
-        <p class="muted" style="font-size:12px">计提凭证按部门拆分借方费用；社保缴纳与工资发放凭证走银行存款；同一期凭证只能生成一次，重复生成由引擎报错拦截。</p>
+        <p class="muted" style="font-size:12px">计提凭证按部门拆分借方费用；社保缴纳与工资发放凭证走银行存款；同一期同类型凭证只生成一次，重复点击幂等返回同一张。</p>
+        ${rows.length ? `<div class="muted" style="font-size:12px;margin-bottom:4px">本期凭证状态：计提 ${rows[0].voucher_id ? `<a href="#" data-voucher="${rows[0].voucher_id}">#${rows[0].voucher_id}</a>` : "未生成"} · 社保缴纳 ${rows[0].social_voucher_id ? `<a href="#" data-voucher="${rows[0].social_voucher_id}">#${rows[0].social_voucher_id}</a>` : "未生成"} · 发放 ${rows[0].paid_voucher_id ? `<a href="#" data-voucher="${rows[0].paid_voucher_id}">#${rows[0].paid_voucher_id}</a>` : "未生成"}</div>` : ""}
         <div class="foot" style="margin-top:6px;display:flex;gap:10px">
           ${rows.length ? `
           <button class="btn primary" id="pv-accrue">生成计提凭证</button>
@@ -4694,6 +4987,7 @@ async function viewPayroll(main) {
     if ($("#pv-accrue")) $("#pv-accrue").onclick = runVoucher("/payroll/accrue", { date: $("#pv-date").value, expense: $("#pv-expense").value.trim(), wage_payable: $("#pv-wage").value.trim(), social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim() }, "计提凭证");
     if ($("#pv-social")) $("#pv-social").onclick = runVoucher("/payroll/social-pay", { date: $("#pv-date").value, social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim(), personal_payable: $("#pv-personal").value.trim(), bank_account: $("#pv-bank").value.trim() }, "社保缴纳凭证");
     if ($("#pv-pay")) $("#pv-pay").onclick = runVoucher("/payroll/pay", { date: $("#pv-date").value, payable_account: $("#pv-wage").value.trim(), bank_account: $("#pv-bank").value.trim(), tax_account: $("#pv-tax").value.trim(), social_account: $("#pv-personal").value.trim() }, "发放凭证");
+    $all("[data-voucher]", body).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.voucher, 10)); }));
   }
 }
 

@@ -152,6 +152,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
         .route("/api/vouchers/:id/audit", post(voucher_audit))
         .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
+        .route("/api/vouchers/:id/sign", post(voucher_sign))
+        .route("/api/vouchers/:id/unsign", post(voucher_unsign))
         .route("/api/vouchers/:id/reverse", post(voucher_reverse))
         .route("/api/vouchers/:id/delete", post(voucher_delete))
         .route("/api/vouchers/renumber", post(voucher_renumber))
@@ -294,14 +296,32 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/archives/:id", get(get_archive))
         .route("/api/archives/:id/verify", get(verify_archive))
         .route("/api/health", get(|| async { "ok" }))
-        // 资金：票据 / 融资 / 资金日报 / 资金预测
+        // 资金：票据 / 融资 / 资金日报 / 资金预测（台账与总账联动：流转/结清自动生成凭证）
         .route("/api/funds/bills", get(list_bills).post(save_bill))
         .route("/api/funds/bills/:id/status", post(bill_transition))
         .route("/api/funds/bills/:id/delete", post(delete_bill))
+        .route("/api/funds/bills/:id/voucher", post(bill_voucher))
         .route("/api/funds/loans", get(list_loans).post(save_loan))
         .route("/api/funds/loans/:id/settle", post(loan_settle))
         .route("/api/funds/loans/:id/delete", post(delete_loan))
+        .route("/api/funds/loans/:id/voucher", post(loan_voucher))
         .route("/api/funds/daily", get(get_funds_daily))
+        .route("/api/funds/daily-by-date", get(get_funds_daily_date))
+        .route("/api/funds/budget", get(get_funds_budget))
+        .route(
+            "/api/funds/cash-counts",
+            get(list_cash_counts).post(save_cash_count),
+        )
+        .route("/api/funds/cash-counts/:id/delete", post(delete_cash_count))
+        .route("/api/funds/cash-counts/:id/voucher", post(cash_count_voucher))
+        .route("/api/funds/day-clear", get(list_day_clear).post(set_day_clear))
+        .route("/api/funds/checks", get(list_checks).post(save_check))
+        .route("/api/funds/checks/:id/status", post(check_status))
+        .route("/api/funds/checks/:id/delete", post(delete_check))
+        .route("/api/funds/advances", get(list_advances).post(save_advance))
+        .route("/api/funds/advances/:id/pay", post(pay_advance))
+        .route("/api/funds/advances/:id/settle", post(settle_advance))
+        .route("/api/funds/advances/:id/delete", post(delete_advance))
         .route("/api/funds/forecast", get(get_funds_forecast))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
@@ -1915,6 +1935,52 @@ async fn voucher_unaudit(
         return Err(AppError::bad_request("只有已审核凭证才能反审核"));
     }
     vouchers::unaudit(&db, id, user.username())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 出纳签字（未记账凭证记录签字人；require_cashier 账套作为现金/银行凭证记账前置）
+async fn voucher_sign(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CashierSign)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权对该凭证签字"));
+    }
+    if v.status == VoucherStatus::Posted {
+        return Err(AppError::bad_request("已记账凭证不能签字，请先反记账"));
+    }
+    if v.status == VoucherStatus::Void {
+        return Err(AppError::bad_request("已作废凭证不能签字"));
+    }
+    vouchers::sign(&db, id, user.username())?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 取消出纳签字
+async fn voucher_unsign(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CashierSign)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权对该凭证取消签字"));
+    }
+    if v.status == VoucherStatus::Posted {
+        return Err(AppError::bad_request("已记账凭证不能取消签字，请先反记账"));
+    }
+    if v.status == VoucherStatus::Void {
+        return Err(AppError::bad_request("已作废凭证不能取消签字"));
+    }
+    vouchers::unsign(&db, id, user.username())?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -4849,7 +4915,7 @@ async fn save_bill(
     user: CurrentUser,
     Json(req): Json<BillReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let parse_date = |s: &str| {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -4865,11 +4931,16 @@ async fn save_bill(
         counterpart: req.counterpart,
         bank: req.bank,
         amount: parse_money_checked(&req.amount)?,
-        status: req.status,
+        status: if req.status.is_empty() {
+            "in_hand".to_string()
+        } else {
+            req.status
+        },
         handled_date: None,
         memo: req.memo,
         created_by: user.username().to_string(),
         created_at: String::new(),
+        voucher_id: None,
     };
     let id = findb::funds::bill_save(&db, &mut b)?;
     db.log(user.username(), "资金", "保存票据", &format!("#{id} {}", b.no))?;
@@ -4882,14 +4953,25 @@ async fn bill_transition(
     Path(id): Path<i64>,
     Json(req): Json<BillTransitionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let date = chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
         .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?;
     let to = findb::funds::BillStatus::parse(&req.status);
-    findb::funds::bill_transition(&db, id, to, date)?;
-    db.log(user.username(), "资金", "票据流转", &format!("#{id} → {}", to.label()))?;
-    Ok(Json(json!({ "ok": true })))
+    // 资金动作（背书/贴现/兑付）在 findb 同事务自动生成台账凭证草稿
+    let vid = findb::funds::bill_transition(&db, id, to, date, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "票据流转",
+        &format!(
+            "#{} → {}{}",
+            id,
+            to.label(),
+            vid.map(|v| format!("，凭证 #{v}")).unwrap_or_default()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
 }
 
 async fn delete_bill(
@@ -4897,7 +4979,7 @@ async fn delete_bill(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     findb::funds::bill_delete(&db, id)?;
     db.log(user.username(), "资金", "删除票据", &format!("#{id}"))?;
@@ -4942,7 +5024,7 @@ async fn save_loan(
     user: CurrentUser,
     Json(req): Json<LoanReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     let parse_date = |s: &str| {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -4957,25 +5039,562 @@ async fn save_loan(
         rate_pct: parse_money_checked(&req.rate_pct)?,
         start_date: parse_date(&req.start_date)?,
         end_date: parse_date(&req.end_date)?,
-        status: req.status,
+        status: if req.status.is_empty() {
+            "active".to_string()
+        } else {
+            req.status
+        },
         memo: req.memo,
         created_by: user.username().to_string(),
         created_at: String::new(),
+        voucher_id: None,
+        settle_voucher_id: None,
+        settle_date: None,
     };
     let id = findb::funds::loan_save(&db, &mut l)?;
     db.log(user.username(), "资金", "保存融资", &format!("#{id} {}", l.no))?;
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
+#[derive(Deserialize)]
+struct LoanSettleReq {
+    #[serde(default)]
+    date: Option<String>,
+}
+
+/// 结清融资（body 可选指定结清日期；findb 同事务自动生成还本凭证）
 async fn loan_settle(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
     Path(id): Path<i64>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
-    findb::funds::loan_settle(&db, id)?;
-    db.log(user.username(), "资金", "结清融资", &format!("#{id}"))?;
+    let today = chrono::Local::now().date_naive();
+    let date = if body.is_empty() {
+        today
+    } else {
+        let req: LoanSettleReq = serde_json::from_slice(&body)
+            .map_err(|_| AppError::bad_request("请求体应为 {\"date\":\"YYYY-MM-DD\"}"))?;
+        match req.date {
+            Some(s) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+            None => today,
+        }
+    };
+    let vid = findb::funds::loan_settle(&db, id, date, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "结清融资",
+        &format!(
+            "#{id}{}",
+            vid.map(|v| format!("，凭证 #{v}")).unwrap_or_default()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
+}
+
+/// 票据补出台账凭证（流转已自动生成；本端点用于存量台账回填）
+async fn bill_voucher(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let vid = findb::funds::bill_voucher(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "票据生成凭证",
+        &format!("#{id} → 凭证 #{vid}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": vid })))
+}
+
+/// 融资台账凭证（存续=到账凭证；已结清=还本凭证回填）
+async fn loan_voucher(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let vid = findb::funds::loan_voucher(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "融资生成凭证",
+        &format!("#{id} → 凭证 #{vid}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": vid })))
+}
+
+#[derive(Deserialize)]
+struct CashCountReq {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    account_code: String,
+    #[serde(default)]
+    counted: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_cash_counts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(serde_json::json!({ "rows": findb::funds::cash_count_list(&db)? })))
+}
+
+/// 新增/修改现金盘点：账面余额与差异由服务端按资金日报（按日）口径重算
+async fn save_cash_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CashCountReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let account = if req.account_code.trim().is_empty() {
+        "1001".to_string()
+    } else {
+        req.account_code.trim().to_string()
+    };
+    let mut c = findb::funds::CashCount {
+        id: req.id,
+        period: fincore::Period::from_date(date),
+        date,
+        account_code: account,
+        book_amount: Money::ZERO,
+        counted: parse_money_checked(&req.counted)?,
+        diff: Money::ZERO,
+        memo: req.memo,
+        voucher_id: None,
+        created_by: user.username().to_string(),
+        created_at: String::new(),
+    };
+    let id = findb::funds::cash_count_save(&db, &mut c)?;
+    db.log(
+        user.username(),
+        "资金",
+        "现金盘点",
+        &format!(
+            "{} {} 实盘 {}（账面 {} 差异 {}）",
+            c.account_code,
+            c.date.format("%Y-%m-%d"),
+            c.counted.fmt_money(),
+            c.book_amount.fmt_money(),
+            c.diff.fmt_money()
+        ),
+    )?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "book_amount": c.book_amount,
+        "diff": c.diff
+    })))
+}
+
+async fn delete_cash_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::cash_count_delete(&db, id)?;
+    db.log(user.username(), "资金", "删除盘点记录", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 盘盈盘亏差异生成凭证
+async fn cash_count_voucher(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let vid = findb::funds::cash_count_voucher(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "盘点差异出凭证",
+        &format!("#{id} → 凭证 #{vid}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": vid })))
+}
+
+#[derive(Deserialize)]
+struct DayClearReq {
+    #[serde(default)]
+    account_code: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// 日清日期查询：?account=&from=YYYY-MM-DD&to=YYYY-MM-DD（缺省 today~today）
+async fn list_day_clear(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let account = q
+        .get("account")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "1001".to_string());
+    let parse = |k: &str| -> Result<Option<chrono::NaiveDate>, AppError> {
+        match q.get(k) {
+            Some(s) => Ok(Some(
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+            )),
+            None => Ok(None),
+        }
+    };
+    let today = chrono::Local::now().date_naive();
+    let from = parse("from")?.unwrap_or(today);
+    let to = parse("to")?.unwrap_or(today);
+    let dates = findb::funds::day_clear_dates(&db, &account, from, to)?;
+    Ok(Json(json!({ "dates": dates })))
+}
+
+/// 日清标记 / 取消
+async fn set_day_clear(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<DayClearReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let account = if req.account_code.trim().is_empty() {
+        "1001".to_string()
+    } else {
+        req.account_code.trim().to_string()
+    };
+    let date = chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+        .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?;
+    findb::funds::day_clear_set(&db, &account, date, req.clear, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        if req.clear { "日记账日清" } else { "取消日清" },
+        &format!("{} {}", account, date.format("%Y-%m-%d")),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CheckReq {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    no: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    bank_account: String,
+    #[serde(default)]
+    payee: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    issued_date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_checks(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::funds::check_list(&db)? })))
+}
+
+/// 支票登记簿新增/修改（备查簿，不入账）
+async fn save_check(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CheckReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.no.trim().is_empty() {
+        return Err(AppError::bad_request("支票号必填"));
+    }
+    let issued_date = if req.issued_date.is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        chrono::NaiveDate::parse_from_str(&req.issued_date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let kind = if req.kind == "cash" { "cash" } else { "transfer" };
+    let mut c = findb::funds::CheckRow {
+        id: req.id,
+        no: req.no.trim().to_string(),
+        kind: kind.to_string(),
+        bank_account: req.bank_account,
+        payee: req.payee,
+        amount: parse_money_checked(&req.amount)?,
+        issued_date,
+        status: "issued".to_string(),
+        memo: req.memo,
+        created_by: user.username().to_string(),
+        created_at: String::new(),
+    };
+    let id = findb::funds::check_save(&db, &mut c)?;
+    db.log(user.username(), "资金", "保存支票", &format!("#{id} {}", c.no))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn check_status(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let status = req["status"].as_str().unwrap_or("");
+    findb::funds::check_set_status(&db, id, status)?;
+    db.log(
+        user.username(),
+        "资金",
+        "支票状态",
+        &format!("#{id} → {status}"),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_check(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::check_delete(&db, id)?;
+    db.log(user.username(), "资金", "删除支票", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AdvanceReq {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    no: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    employee: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    pay_account: String,
+    #[serde(default)]
+    expense_account: String,
+    #[serde(default)]
+    memo: String,
+}
+
+async fn list_advances(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::funds::advance_list(&db)? })))
+}
+
+/// 新增/修改借支单（建单即 approved；支付/核销走独立端点）
+async fn save_advance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AdvanceReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        chrono::NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let no = if req.no.trim().is_empty() {
+        format!("JZ{}", chrono::Local::now().format("%Y%m%d%H%M%S"))
+    } else {
+        req.no.trim().to_string()
+    };
+    let mut a = findb::funds::Advance {
+        id: req.id,
+        no,
+        period: fincore::Period::from_date(date),
+        date,
+        employee: req.employee,
+        purpose: req.purpose,
+        amount: parse_money_checked(&req.amount)?,
+        pay_account: if req.pay_account.trim().is_empty() {
+            "1001".to_string()
+        } else {
+            req.pay_account.trim().to_string()
+        },
+        status: "approved".to_string(),
+        paid_date: None,
+        paid_voucher_id: None,
+        settle_date: None,
+        settle_voucher_id: None,
+        expense_account: if req.expense_account.trim().is_empty() {
+            "660201".to_string()
+        } else {
+            req.expense_account.trim().to_string()
+        },
+        memo: req.memo,
+        created_by: user.username().to_string(),
+        created_at: String::new(),
+    };
+    let id = findb::funds::advance_save(&db, &mut a)?;
+    db.log(
+        user.username(),
+        "资金",
+        "借支建单",
+        &format!("#{} {} {} {}", id, a.no, a.employee, a.amount.fmt_money()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+#[derive(Deserialize)]
+struct AdvanceSettleReq {
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    expense_account: String,
+    #[serde(default)]
+    expense_amount: String,
+}
+
+fn opt_body_date(body: &axum::body::Bytes) -> Result<Option<chrono::NaiveDate>, AppError> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    #[derive(Deserialize)]
+    struct D {
+        #[serde(default)]
+        date: Option<String>,
+    }
+    let d: D = serde_json::from_slice(body)
+        .map_err(|_| AppError::bad_request("请求体日期格式应为 {\"date\":\"YYYY-MM-DD\"}"))?;
+    match d.date {
+        Some(s) => Ok(Some(
+            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// 支付借支（body 可选 {date}，默认今天）；同事务生成支付凭证
+async fn pay_advance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = opt_body_date(&body)?.unwrap_or_else(|| chrono::Local::now().date_naive());
+    let vid = findb::funds::advance_pay(&db, id, date, user.username())?;
+    db.log(
+        user.username(),
+        "资金",
+        "借支支付",
+        &format!(
+            "#{id}{}",
+            vid.map(|v| format!("，凭证 #{v}")).unwrap_or_default()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
+}
+
+/// 核销借支（body: {expense_account, expense_amount, date?}）；同事务生成核销凭证
+async fn settle_advance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    if body.is_empty() {
+        return Err(AppError::bad_request(
+            "请求体应为 {\"expense_account\":\"660201\",\"expense_amount\":\"1500\",\"date\":\"YYYY-MM-DD\"?}",
+        ));
+    }
+    let req: AdvanceSettleReq = serde_json::from_slice(&body)
+        .map_err(|_| AppError::bad_request("请求体格式错误（见接口约定）"))?;
+    let date = match req.date {
+        Some(s) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let expense_account = if req.expense_account.trim().is_empty() {
+        "660201".to_string()
+    } else {
+        req.expense_account.trim().to_string()
+    };
+    let expense = parse_money_checked(&req.expense_amount)?;
+    let vid = findb::funds::advance_settle(
+        &db,
+        id,
+        &expense_account,
+        expense,
+        date,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "资金",
+        "借支核销",
+        &format!(
+            "#{id} 冲账 {expense}{}",
+            vid.map(|v| format!("，凭证 #{v}")).unwrap_or_default()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
+}
+
+async fn delete_advance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::advance_delete(&db, id)?;
+    db.log(user.username(), "资金", "删除借支单", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -4984,10 +5603,46 @@ async fn delete_loan(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     findb::funds::loan_delete(&db, id)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 资金预算 vs 执行（当期，仅现金/银行科目；实际=当期已记账净额）
+async fn get_funds_budget(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let rows = findb::funds::funds_budget(&db, period)?;
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// 资金日报（按日）：?date=YYYY-MM-DD（默认今天）→ 上日结余/本日收支/日末结存
+async fn get_funds_daily_date(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = match q.get("date") {
+        Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let rows = findb::funds::funds_daily_by_date(&db, date)?;
+    Ok(Json(json!({
+        "date": date.format("%Y-%m-%d").to_string(),
+        "rows": rows
+    })))
 }
 
 async fn get_funds_daily(
@@ -7036,7 +7691,9 @@ async fn claim_voucher(
         return Err(AppError::forbidden("数据范围受限，不能为他人报销单生成凭证"));
     }
     if c.voucher_id.is_some() {
-        return Err(AppError::bad_request("该报销单已生成过凭证"));
+        // 幂等：支付时已自动出过凭证 → 返回同一张（不新增）
+        let existing = c.voucher_id.unwrap();
+        return Ok(Json(json!({ "id": existing, "already": true })));
     }
     let vid = business::claim_voucher(&db, id, pay, user.username())?;
     db.log(user.username(), "报销", "生成凭证", &format!("#{id} 凭证 #{vid}"))?;

@@ -617,6 +617,16 @@ impl VoucherEdit {
                 return;
             }
         }
+        // 出纳日记账「登记收付」预填：载入空白凭证并置入科目（金额由出纳填写）
+        if let Some(code) = ctx.st.pending_cash.take() {
+            self.load(ctx, None);
+            if let Some(r) = self.rows.first_mut() {
+                r.code = code.clone();
+            }
+            // 预填视为已载入快照，避免"有未保存修改"确认误触发
+            self.loaded = true;
+            ctx.info(format!("已预置科目 {code}，请填写金额与摘要"));
+        }
         if !self.loaded {
             self.load(ctx, None);
         }
@@ -680,6 +690,25 @@ impl VoucherEdit {
             {
                 if ctx.can(Perm::VoucherUnaudit) {
                     do_status(ctx, self.id, "unaudit");
+                    self.reload_after(ctx);
+                }
+            }
+            // 出纳签字（可选前置：账套开启 require_cashier 后，现金/银行凭证记账前须签字）
+            if ui.button("出纳签字").clicked()
+                && self.id > 0
+                && matches!(self.status, VoucherStatus::Draft | VoucherStatus::Audited)
+            {
+                if ctx.can(Perm::CashierSign) {
+                    do_status(ctx, self.id, "sign");
+                    self.reload_after(ctx);
+                }
+            }
+            if ui.button("取消签字").clicked()
+                && self.id > 0
+                && matches!(self.status, VoucherStatus::Draft | VoucherStatus::Audited)
+            {
+                if ctx.can(Perm::CashierSign) {
+                    do_status(ctx, self.id, "unsign");
                     self.reload_after(ctx);
                 }
             }
@@ -1316,6 +1345,8 @@ pub fn do_status(ctx: &mut AppCtx<'_>, id: i64, what: &str) {
         "unpost" => findb::vouchers::unpost(ctx.db(), id),
         "audit" => findb::vouchers::audit(ctx.db(), id, &who),
         "unaudit" => findb::vouchers::unaudit(ctx.db(), id, &who),
+        "sign" => findb::vouchers::sign(ctx.db(), id, &who),
+        "unsign" => findb::vouchers::unsign(ctx.db(), id, &who),
         _ => return,
     };
     match r {
@@ -1325,6 +1356,8 @@ pub fn do_status(ctx: &mut AppCtx<'_>, id: i64, what: &str) {
                 "unpost" => "反记账",
                 "audit" => "审核",
                 "unaudit" => "反审核",
+                "sign" => "出纳签字",
+                "unsign" => "取消签字",
                 _ => "状态变更",
             };
             ctx.log("凭证", label, &format!("凭证 #{id}"));

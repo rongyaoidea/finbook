@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -985,6 +985,69 @@ CREATE TABLE IF NOT EXISTS loan (
 );
 CREATE INDEX IF NOT EXISTS idx_loan_kind ON loan(kind, status);
 
+-- 现金盘点（出纳：账面 vs 实盘，差异生成盘盈盘亏凭证）
+CREATE TABLE IF NOT EXISTS cash_count (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    period       INTEGER NOT NULL,
+    date         TEXT NOT NULL,             -- 盘点日期
+    account_code TEXT NOT NULL DEFAULT '1001',
+    book_amount  TEXT NOT NULL DEFAULT '0', -- 盘点时账面余额快照（借正，仅已记账口径）
+    counted      TEXT NOT NULL DEFAULT '0', -- 实盘金额
+    diff         TEXT NOT NULL DEFAULT '0', -- 差异 = 实盘 − 账面（正=盘盈 负=盘亏）
+    memo         TEXT NOT NULL DEFAULT '',
+    voucher_id   INTEGER,                   -- 盘盈盘亏凭证
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_cash_count_period ON cash_count(period, date);
+
+-- 日清标记（出纳日记账：某科目某日已核对）
+CREATE TABLE IF NOT EXISTS day_clear (
+    account_code TEXT NOT NULL,
+    date         TEXT NOT NULL,             -- YYYY-MM-DD
+    cleared_by   TEXT NOT NULL DEFAULT '',
+    cleared_at   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_code, date)
+);
+
+-- 支票登记簿（出纳备查簿：开出/作废；账务由凭证体现，本表不入账）
+CREATE TABLE IF NOT EXISTS check_register (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    no           TEXT NOT NULL DEFAULT '',  -- 支票号
+    kind         TEXT NOT NULL DEFAULT 'transfer', -- cash=现金支票 / transfer=转账支票
+    bank_account TEXT NOT NULL DEFAULT '',  -- 付款银行科目（如 100201）
+    payee        TEXT NOT NULL DEFAULT '',  -- 收款人
+    amount       TEXT NOT NULL DEFAULT '0',
+    issued_date  TEXT NOT NULL DEFAULT '',  -- 开出日期
+    status       TEXT NOT NULL DEFAULT 'issued', -- issued=已开出 / void=已作废
+    memo         TEXT NOT NULL DEFAULT '',
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_check_status ON check_register(status, issued_date);
+
+-- 员工借支（出纳：预借 → 支付 → 冲账核销）
+CREATE TABLE IF NOT EXISTS advance (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    no                TEXT NOT NULL DEFAULT '',
+    period            INTEGER NOT NULL,
+    date              TEXT NOT NULL,        -- 借支日期
+    employee          TEXT NOT NULL DEFAULT '', -- 借支人
+    purpose           TEXT NOT NULL DEFAULT '', -- 事由
+    amount            TEXT NOT NULL DEFAULT '0', -- 借支金额
+    pay_account       TEXT NOT NULL DEFAULT '1001', -- 支付账户
+    status            TEXT NOT NULL DEFAULT 'approved', -- approved/paid/settled
+    paid_date         TEXT,
+    paid_voucher_id   INTEGER,              -- 支付凭证（借 其他应收款 / 贷 资金）
+    settle_date       TEXT,
+    settle_voucher_id INTEGER,              -- 核销凭证（借 费用 + 退回 / 贷 其他应收款）
+    expense_account   TEXT NOT NULL DEFAULT '660201', -- 冲账费用科目
+    memo              TEXT NOT NULL DEFAULT '',
+    created_by        TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_advance_status ON advance(status, date);
+
 -- 存货计价方式配置（按存货档案 code）
 CREATE TABLE IF NOT EXISTS item_cost_method (
     item          TEXT PRIMARY KEY,
@@ -1139,6 +1202,20 @@ const MIGRATE_V8: &[(&str, &str, &str)] = &[
 /// v16 → v17：用户权限逐项覆盖（deny_perms_json）
 const MIGRATE_V17: &[(&str, &str, &str)] = &[
     ("user", "deny_perms_json", "TEXT NOT NULL DEFAULT '[]'"),
+];
+
+/// v18 → v19：资金台账挂凭证（票据/融资与总账联动，出纳资金台账可追溯到账务）
+const MIGRATE_V19: &[(&str, &str, &str)] = &[
+    ("bill", "voucher_id", "INTEGER"),
+    ("loan", "voucher_id", "INTEGER"),
+    ("loan", "settle_voucher_id", "INTEGER"),
+    ("loan", "settle_date", "TEXT"),
+];
+
+/// v19 → v20：工资发放/社保缴纳凭证回链（发放状态可见）
+const MIGRATE_V20: &[(&str, &str, &str)] = &[
+    ("payroll", "paid_voucher_id", "INTEGER"),
+    ("payroll", "social_voucher_id", "INTEGER"),
 ];
 
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
@@ -1354,6 +1431,8 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_v10(conn)?;
             migrate_generic(conn, MIGRATE_V17)?;
             migrate_v18(conn)?;
+            migrate_generic(conn, MIGRATE_V19)?;
+            migrate_generic(conn, MIGRATE_V20)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

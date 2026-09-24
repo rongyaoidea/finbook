@@ -652,6 +652,10 @@ pub struct Payroll {
     /// 公积金企业部分
     pub housing_co: Money,
     pub voucher_id: Option<i64>,
+    /// 发放凭证（工资发放动作回链）
+    pub paid_voucher_id: Option<i64>,
+    /// 社保公积金缴纳凭证
+    pub social_voucher_id: Option<i64>,
     pub memo: String,
 }
 
@@ -672,12 +676,14 @@ fn map_pay(r: &rusqlite::Row) -> rusqlite::Result<Payroll> {
         social_co: Money::parse_or_zero(&r.get::<_, String>(12)?),
         housing_co: Money::parse_or_zero(&r.get::<_, String>(13)?),
         voucher_id: r.get(14)?,
+        paid_voucher_id: r.get(16)?,
+        social_voucher_id: r.get(17)?,
         memo: r.get(15)?,
     })
 }
 
 const PAY_COLS: &str = "id,period,employee,dept,gross,social,housing,deduction,additional,
-     tax_base,tax,net,social_co,housing_co,voucher_id,memo";
+     tax_base,tax,net,social_co,housing_co,voucher_id,memo,paid_voucher_id,social_voucher_id";
 
 pub fn payroll_list(db: &Db, period: Period) -> DbResult<Vec<Payroll>> {
     let mut st = db.conn().prepare(&format!(
@@ -848,6 +854,8 @@ pub fn payroll_calc(
         social_co,
         housing_co,
         voucher_id: None,
+        paid_voucher_id: None,
+        social_voucher_id: None,
         memo: memo.to_string(),
     })
 }
@@ -881,8 +889,10 @@ pub(crate) fn ensure_unique_biz_voucher(
     memo: &str,
 ) -> DbResult<()> {
     let n: i64 = tx.query_row(
+        // 注意：source 经 serde snake_case 落库为小写（business），此前写成 'Business'
+        // 导致幂等闸从未命中、重复生成不被拦截——由 payroll 重复生成测试暴露。
         "SELECT COUNT(*) FROM voucher
-         WHERE period=?1 AND source='Business' AND memo=?2 AND status != 'void'",
+         WHERE period=?1 AND source='business' AND memo=?2 AND status != 'void'",
         rusqlite::params![period.ymm(), memo],
         |r| r.get(0),
     )?;
@@ -1041,6 +1051,13 @@ pub fn payroll_social_voucher(
     ensure_unique_biz_voucher(&tx, period, &v.memo)?;
     v.renumber();
     let id = crate::vouchers::save_in(&tx, &mut v)?;
+    // 回链社保缴纳凭证（发放状态可见）
+    for r in &rows {
+        tx.execute(
+            "UPDATE payroll SET social_voucher_id=?2 WHERE id=?1",
+            rusqlite::params![r.id, id],
+        )?;
+    }
     tx.commit()?;
     Ok(Some(id))
 }
@@ -1101,6 +1118,13 @@ pub fn payroll_pay_voucher(
     ensure_unique_biz_voucher(&tx, period, &v.memo)?;
     v.renumber();
     let id = crate::vouchers::save_in(&tx, &mut v)?;
+    // 回链发放凭证（发放状态可见）
+    for r in &rows {
+        tx.execute(
+            "UPDATE payroll SET paid_voucher_id=?2 WHERE id=?1",
+            rusqlite::params![r.id, id],
+        )?;
+    }
     tx.commit()?;
     Ok(Some(id))
 }
@@ -1391,6 +1415,11 @@ pub fn claim_transition(
         )
         .into());
     }
+    // 支付即落账：付款凭证草稿随支付生成（默认支付科目=银行 100201；H-3 草稿不入余额）。
+    // 生成失败不回滚支付（状态已生效），界面仍可经「生成凭证」幂等重试。
+    if to == ClaimStatus::Paid && c.voucher_id.is_none() {
+        claim_voucher(db, id, "100201", who)?;
+    }
     Ok(())
 }
 
@@ -1408,9 +1437,6 @@ pub fn claim_voucher(
     if c.status != ClaimStatus::Paid {
         return Err(fincore::FinError::state("只有已付款的报销单能生成凭证").into());
     }
-    if c.voucher_id.is_some() {
-        return Err(fincore::FinError::msg("该报销单已生成过凭证").into());
-    }
     if c.items.is_empty() {
         return Err(fincore::FinError::validate("报销明细为空").into());
     }
@@ -1421,6 +1447,11 @@ pub fn claim_voucher(
             c.amount
         ))
         .into());
+    }
+    // 幂等（校验之后）：支付时已自动出过凭证（或此前手动出过）→ 返回同一张，不再新增；
+    // 放在校验后保证"金额失配"等拦截在重复请求上仍然生效。
+    if let Some(existing) = c.voucher_id {
+        return Ok(existing);
     }
     let period = c.period;
     let date = c.biz_date;
@@ -1662,6 +1693,11 @@ mod tests {
         claim_transition(&db, id, ClaimStatus::Submitted, "E01").unwrap();
         claim_transition(&db, id, ClaimStatus::Approved, "boss").unwrap();
         claim_transition(&db, id, ClaimStatus::Paid, "cashier").unwrap();
+        // 支付即自动落账：付款凭证随支付生成
+        assert!(
+            claim_get(&db, id).unwrap().unwrap().voucher_id.is_some(),
+            "支付应自动生成付款凭证"
+        );
         // 明细与金额不符要拦
         let mut c2 = claim_get(&db, id).unwrap().unwrap();
         c2.amount = m("900");
@@ -1676,8 +1712,9 @@ mod tests {
         assert_eq!(v.debit_total(), m("800"));
         // 已生成凭证不能删单据
         assert!(claim_delete(&db, id).is_err());
-        // 重复生成要拦
-        assert!(claim_voucher(&db, id, "100201", "u").is_err());
+        // 幂等：重复请求返回同一张
+        let vid2 = claim_voucher(&db, id, "100201", "u").unwrap();
+        assert_eq!(vid2, vid, "重复请求应返回同一凭证");
     }
 
     /// 条件更新（CAS）：库里状态与期望值不符时一条都不动。

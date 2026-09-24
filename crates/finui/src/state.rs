@@ -54,7 +54,7 @@ pub enum NavItem {
     Budget,
     /// 多维损益
     DimProfit,
-    /// 资金管理（现金/银行日记账、票据、融资、资金预测）
+    /// 资金管理（日报/票据/融资/盘点/支票簿/日记账/借支/预算/预测）
     Funds,
     /// 预算分析（年度逐月 vs 实际，含部门维度）
     BudgetAnalysis,
@@ -384,6 +384,8 @@ pub struct AppState {
     /// 当前业务期间（所有账簿报表的默认口径）
     pub period: Period,
     pub nav: NavItem,
+    /// 出纳日记账「登记收付」预填科目（凭证录入页打开时消费一次）
+    pub pending_cash: Option<String>,
     pub toasts: ToastQueue,
     /// 状态栏消息（消息, 是否错误）
     pub status: Option<(String, bool)>,
@@ -408,6 +410,7 @@ impl Default for AppState {
             aux_names: BTreeMap::new(),
             period: Period::default(),
             nav: NavItem::Dashboard,
+            pending_cash: None,
             toasts: ToastQueue::default(),
             status: None,
             confirm: None,

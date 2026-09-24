@@ -474,8 +474,9 @@ fn t94_inventory_payroll_claim_loop() {
     let vid = business::claim_voucher(&db, cid, "100201", "测试员").unwrap();
     let v = vouchers::get(&db, vid).unwrap().unwrap();
     assert_eq!(v.diff(), Money::ZERO);
-    // 不能重复生成
-    assert!(business::claim_voucher(&db, cid, "100201", "测试员").is_err());
+    // 幂等：重复请求返回同一张（支付时已自动出账）
+    let vid2 = business::claim_voucher(&db, cid, "100201", "测试员").unwrap();
+    assert_eq!(vid2, vid);
 }
 
 // ---------------------------------------------------------------------------

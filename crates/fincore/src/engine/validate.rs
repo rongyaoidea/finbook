@@ -257,7 +257,7 @@ pub fn validate_post(v: &Voucher, _opts: &BookOptions) -> Issues {
     if !v.status.can_post() {
         iss.push(format!("凭证当前状态为「{}」，不能记账", v.status.label()));
     }
-    // 出纳签字环节已移除：出纳不使用本软件，require_cashier 不再作为记账前置条件
+    // 出纳签字前置的真正把关在 findb::vouchers::post_tx（BookOptions::require_cashier，仅现金/银行科目凭证）
     iss
 }
 

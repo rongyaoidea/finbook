@@ -995,6 +995,22 @@ pub fn journal(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<JournalR
         }
     }
 
+    // 出纳签字人回填（与对方科目同批取，出纳日记账签字列展示）
+    let mut cashiers: BTreeMap<i64, Option<String>> = BTreeMap::new();
+    if !ids.is_empty() {
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, cashier FROM voucher WHERE id IN ({placeholders})");
+        let mut stmt = db.conn().prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
+        let mut rr = stmt.query(params.as_slice())?;
+        while let Some(r) = rr.next()? {
+            let vid: i64 = r.get(0)?;
+            let c: Option<String> = r.get(1)?;
+            cashiers.insert(vid, c);
+        }
+    }
+
     let mut out = Vec::new();
     for r in rows {
         let opp = opposite
@@ -1013,6 +1029,7 @@ pub fn journal(db: &Db, chart: &Chart, q: &LedgerQuery) -> DbResult<Vec<JournalR
             balance: r.balance,
             settle_type: None,
             settle_no: None,
+            cashier: cashiers.get(&r.voucher_id).cloned().flatten(),
         });
     }
     Ok(out)

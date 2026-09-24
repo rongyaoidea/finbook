@@ -365,6 +365,7 @@ impl LedgerView {
             widgets::TCol::new("借方", 130.0).right(),
             widgets::TCol::new("贷方", 130.0).right(),
             widgets::TCol::new("方向", 44.0).fixed(),
+            widgets::TCol::new("出纳", 72.0).fixed(),
             widgets::TCol::new("余额", 140.0).right(),
         ];
         widgets::grid(ui, "ledger_journal", &cols, page.len(), 24.0, |i, c, ui| {
@@ -392,6 +393,9 @@ impl LedgerView {
                     });
                 }
                 7 => {
+                    ui.label(RichText::new(r.cashier.clone().unwrap_or_default()).weak());
+                }
+                8 => {
                     widgets::amount_label(ui, r.balance);
                 }
                 _ => {}

@@ -641,6 +641,71 @@ pub fn unaudit(db: &Db, id: i64, who: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// 出纳签字（未记账凭证记录签字人）。幂等：已签字直接返回成功（保留首位签字人，改签先取消）。
+///
+/// 与 `BookOptions::require_cashier` 配合：账套开启后，涉及现金/银行科目的凭证
+/// 须先经出纳签字才能记账（把关在 `post_tx`）。
+pub fn sign(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    match v.status {
+        VoucherStatus::Draft | VoucherStatus::Audited => {}
+        VoucherStatus::Posted => {
+            return Err(FinError::state("已记账凭证不能签字，请先反记账").into())
+        }
+        VoucherStatus::Void => return Err(FinError::state("已作废凭证不能签字").into()),
+    }
+    if v.cashier.is_some() {
+        return Ok(());
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "UPDATE voucher SET cashier=?2, updated_at=?3 WHERE id=?1",
+        rusqlite::params![id, who, now],
+    )?;
+    crate::log_on(&tx, who, "凭证", "出纳签字", &v.voucher_no())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 取消出纳签字（未记账凭证清空签字人）。幂等：未签字直接返回成功。
+pub fn unsign(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    let v: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    match v.status {
+        VoucherStatus::Draft | VoucherStatus::Audited => {}
+        VoucherStatus::Posted => {
+            return Err(FinError::state("已记账凭证不能取消签字，请先反记账").into())
+        }
+        VoucherStatus::Void => return Err(FinError::state("已作废凭证不能取消签字").into()),
+    }
+    if v.cashier.is_none() {
+        return Ok(());
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tx.execute(
+        "UPDATE voucher SET cashier=NULL, updated_at=?2 WHERE id=?1",
+        rusqlite::params![id, now],
+    )?;
+    crate::log_on(&tx, who, "凭证", "取消签字", &v.voucher_no())?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// 作废 / 恢复。作废与取消作废都会记入操作日志。
 pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
     let tx = db.write_tx()?;
@@ -739,6 +804,24 @@ fn post_tx(tx: &rusqlite::Transaction, id: i64, who: &str) -> Result<String, DbE
     let opts = crate::options_of(tx);
     if opts.enable_audit && v.status != VoucherStatus::Audited {
         return Err(FinError::state("该账套启用了审核环节，请先审核凭证再记账").into());
+    }
+    // 启用出纳签字前置的账套：涉及现金/银行科目的凭证须出纳签字后才能记账
+    if opts.require_cashier && v.cashier.is_none() {
+        let touches: Option<i32> = tx
+            .query_row(
+                "SELECT 1 FROM voucher_entry e JOIN account a ON a.code = e.account_code
+                 WHERE e.voucher_id = ?1 AND (a.is_cash = 1 OR a.is_bank = 1)
+                 LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if touches.is_some() {
+            return Err(FinError::state(
+                "该账套要求出纳签字：涉及现金/银行科目的凭证需出纳先签字再记账",
+            )
+            .into());
+        }
     }
     let closed: Option<i32> = tx.query_row(
         "SELECT MAX(period) FROM period_state WHERE closed=1",

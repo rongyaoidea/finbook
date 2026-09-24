@@ -34,7 +34,7 @@ test("账簿查询：明细账/总账/日记账", async ({ page }) => {
   await expect(page.locator("#l-table")).toContainText("账簿取数", { timeout: 15_000 });
 });
 
-test("费用报销：草稿→提交→审批通过→支付→生成凭证", async ({ page }) => {
+test("费用报销：草稿→提交→审批通过→支付→自动出凭证", async ({ page }) => {
   await newBook(page, `E2E报销${Date.now()}`);
   await page.click('.nav-item[data-view="claims"]');
   await page.click("#cl-new");
@@ -54,8 +54,6 @@ test("费用报销：草稿→提交→审批通过→支付→生成凭证", as
   await page.locator('[data-trans][data-to="paid"]').first().click();
   await expect(page.locator("#cl-body")).toContainText("已付款", { timeout: 15_000 });
 
-  await page.locator("[data-vgen]").first().click();
-  await page.fill("#cv-pay", "100201");
-  await page.click("#cv-ok");
+  // 支付即自动落账：付款凭证草稿随支付生成（H-3：草稿不入余额），无需再手动出凭证
   await expect(page.locator("#cl-body [data-voucher]")).toHaveCount(1, { timeout: 15_000 });
 });

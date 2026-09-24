@@ -83,7 +83,26 @@
 
 > 原顺序中的 L-1 / M-9 / L-2 已于 2026-09 本轮完成（见第三节）。
 
-## 六、CI 保障
+## 六、出纳功能完整性（2026-09 落地）
+
+出纳岗位评估的 10 项缺口全部实现（Web + 桌面双端，均带测试）：
+
+| # | 缺口 | 落地 |
+|---|------|------|
+| 1 | 出纳日记账工作台 | 资金管理 → 日记账：已记账逐笔 + 滚动余额；**日清标记**（`day_clear` 表，按科目按日）；**收付登记**跳凭证录入预填科目（Web `state.pendingCash` / 桌面 `AppState.pending_cash`） |
+| 2 | 出纳签字（原死权限） | `vouchers::sign/unsign` + Web `POST /api/vouchers/:id/sign|unsign` + 两端按钮 + `require_cashier` 记账前置（仅现金/银行科目，`post_tx` 把关）+ 日记账签字列 + 账套参数开关；用例 `cashier_sign_and_unsign`、`require_cashier_gates_post_and_scopes_to_funds` |
+| 3 | 支票登记簿 | `check_register` 表 + 开出↔作废流转 + 两端页签；纯备查簿不入账；用例 `day_clear_toggle_and_check_book`、`cashier_day_clear_and_checks` |
+| 4 | 员工借支闭环 | `advance` 表 approved→paid→settled；支付（借122105员工/贷资金）与核销（冲账费用+退回）同事务出凭证、幂等与超额守卫；用例 `advance_pay_and_settle_flow`、`advance_pay_settle_api_flow` |
+| 5 | 现金盘点 | `cash_count` 表，账面按资金日报（按日、仅已记账）快照；差异→盘盈盘亏凭证（1901）；挂凭证不可删；用例 `cash_count_book_snapshot_and_voucher`、`cash_count_flow` |
+| 6 | 台账-总账脱节 | 票据背书/贴现/兑付、融资结清**同事务自动生成台账凭证**（`bill.voucher_id` / `loan.voucher_id`+`settle_voucher_id`，迁移 v19），存量回填端点 + 「生成凭证」按钮；用例 `funds_ledger_voucher_linkage` |
+| 7 | 资金日报名实不符 | 新增 `funds_daily_by_date`（上日结余/本日收支/日末结存，按日翻页，仅已记账），两端页签改为按日；期间口径 `funds_daily` 保留供预测用；用例 `funds_daily_by_date_single_day`、`funds_daily_by_date_report` |
+| 8 | 报销支付不落账 + 工资无发放状态 | 报销**支付即自动出付款凭证**（默认贷100201），手动「生成凭证」幂等返回同一张；工资行新增 `paid_voucher_id`/`social_voucher_id` 回链（迁移 v20），两端展示计提/社保/发放三链状态；用例 `payroll_voucher_status_tracking` |
+| 9 | 无资金预算视图 | `funds_budget`（过滤现金/银行科目预算行 vs 当期已记账净额），Web 与桌面「资金预算」页签 + 导出；用例 `funds_budget_filters_cash_accounts`、`funds_budget_view_api` |
+| 10 | 文档与实现不一致 | README 新增 §4.9 出纳作业台；角色数 5→6、"审计"→"审核人"；`funds.rs`/`finui` 模块注释同步 |
+
+附带修复存量 bug：**工资凭证幂等闸失效**——`ensure_unique_biz_voucher` 查 `source='Business'`，而落库序列化为小写 `business`，导致「同摘要只允许一张」从未生效（由 payroll 重复生成测试暴露）。
+
+## 七、CI 保障
 
 - `.github/workflows/ci.yml` 已含 **cargo-audit** 任务（读 Cargo.lock，发现未修复 RUSTSEC 漏洞公告即失败）。
 - 仓库 `.cargo/audit.toml` 记录 3 条**有据可依的忽略项**（lopdf 仅写不读、quick-xml 0.30 被 accesskit/zbus 上游锁死），并注明解除条件；其余公告一律拦截。

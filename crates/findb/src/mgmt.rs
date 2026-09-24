@@ -176,7 +176,7 @@ pub fn budget_from_actual(
 }
 
 /// 预算执行分析行
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct BudgetRow {
     pub account_code: String,
     pub account_name: String,

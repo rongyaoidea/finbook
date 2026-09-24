@@ -158,6 +158,8 @@ pub struct JournalRow {
     pub balance: Money,
     pub settle_type: Option<String>,
     pub settle_no: Option<String>,
+    /// 出纳签字人（凭证级，出纳日记账签字列展示）
+    pub cashier: Option<String>,
 }
 
 /// 多栏账的一栏定义

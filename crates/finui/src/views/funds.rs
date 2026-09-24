@@ -1,6 +1,6 @@
 //! 资金 / 预算分析 / 成本核算 三个拓展视图
 //!
-//! - 资金管理：现金/银行日记账、票据、融资、资金预测
+//! - 资金管理：日报（按日）/ 票据 / 融资 / 现金盘点 / 支票簿 / 出纳日记账(日清) / 借支 / 资金预算 / 资金预测
 //! - 预算分析：年度逐月预算 vs 实际（含部门维度）
 //! - 成本核算：计价方式配置、期末结价
 //!
@@ -22,6 +22,33 @@ pub struct FundsView {
     pub bill_kind: String,
     pub loan_kind: String,
     pub dirty: bool,
+    /// 资金日报选中日期（None = 今天）
+    pub daily_date: Option<chrono::NaiveDate>,
+    // 现金盘点录入（日期文本 / 科目 / 实盘金额 / 备注）
+    pub cc_date: String,
+    pub cc_account: String,
+    pub cc_counted: String,
+    pub cc_memo: String,
+    // 支票登记簿录入
+    pub ck_no: String,
+    pub ck_kind: String,
+    pub ck_bank: String,
+    pub ck_payee: String,
+    pub ck_amount: String,
+    pub ck_date: String,
+    pub ck_memo: String,
+    // 出纳日记账（科目 + 日清日期）
+    pub j_account: String,
+    pub j_date: String,
+    // 员工借支录入 + 核销参数
+    pub ad_date: String,
+    pub ad_emp: String,
+    pub ad_purpose: String,
+    pub ad_amount: String,
+    pub ad_account: String,
+    pub ad_memo: String,
+    pub ad_exp_account: String,
+    pub ad_exp_amount: String,
 }
 
 impl Default for FundsView {
@@ -31,6 +58,28 @@ impl Default for FundsView {
             bill_kind: String::new(),
             loan_kind: String::new(),
             dirty: true,
+            daily_date: None,
+            cc_date: String::new(),
+            cc_account: "1001".to_string(),
+            cc_counted: String::new(),
+            cc_memo: String::new(),
+            ck_no: String::new(),
+            ck_kind: "transfer".to_string(),
+            ck_bank: "100201".to_string(),
+            ck_payee: String::new(),
+            ck_amount: String::new(),
+            ck_date: String::new(),
+            ck_memo: String::new(),
+            j_account: "1001".to_string(),
+            j_date: String::new(),
+            ad_date: String::new(),
+            ad_emp: String::new(),
+            ad_purpose: String::new(),
+            ad_amount: String::new(),
+            ad_account: "1001".to_string(),
+            ad_memo: String::new(),
+            ad_exp_account: "660201".to_string(),
+            ad_exp_amount: String::new(),
         }
     }
 }
@@ -46,7 +95,7 @@ impl FundsView {
         });
 
         widgets::toolbar(ui, |ui| {
-            for (i, label) in ["资金日报", "票据", "融资", "资金预测"].iter().enumerate() {
+            for (i, label) in ["资金日报", "票据", "融资", "现金盘点", "支票簿", "日记账", "借支", "资金预算", "资金预测"].iter().enumerate() {
                 if ui.selectable_label(self.tab == i as u8, *label).clicked() {
                     self.tab = i as u8;
                     self.dirty = true;
@@ -62,6 +111,11 @@ impl FundsView {
             0 => self.show_daily(ctx, ui),
             1 => self.show_bills(ctx, ui),
             2 => self.show_loans(ctx, ui),
+            3 => self.show_counts(ctx, ui),
+            4 => self.show_checks(ctx, ui),
+            5 => self.show_journal(ctx, ui),
+            6 => self.show_advances(ctx, ui),
+            7 => self.show_budget(ctx, ui),
             _ => self.show_forecast(ctx, ui),
         }
     }
@@ -69,10 +123,13 @@ impl FundsView {
     fn export(&mut self, ctx: &mut AppCtx<'_>, mode: crate::views::export::ExportMode) {
         let (name, sh) = match self.tab {
             0 => {
-                let rows = findb::funds::funds_daily(ctx.db(), ctx.period()).unwrap_or_default();
+                let date = self
+                    .daily_date
+                    .unwrap_or_else(|| chrono::Local::now().date_naive());
+                let rows = findb::funds::funds_daily_by_date(ctx.db(), date).unwrap_or_default();
                 let mut sh = crate::views::export::Sheet::new(
                     "资金日报",
-                    vec!["科目".to_string(), "科目名称".to_string(), "期初".to_string(), "收入".to_string(), "支出".to_string(), "期末结存".to_string()],
+                    vec!["科目".to_string(), "科目名称".to_string(), "上日结余".to_string(), "本日收入".to_string(), "本日支出".to_string(), "日末结存".to_string()],
                 );
                 for r in rows {
                     sh.push(vec![r.account_code.clone(), r.account_name.clone(), r.begin.fmt_plain(), r.income.fmt_plain(), r.expense.fmt_plain(), r.end.fmt_plain()]);
@@ -120,6 +177,124 @@ impl FundsView {
                 }
                 ("融资", sh)
             }
+            3 => {
+                let rows = findb::funds::cash_count_list(ctx.db()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "现金盘点",
+                    vec!["日期".to_string(), "科目".to_string(), "账面余额".to_string(), "实盘金额".to_string(), "差异".to_string(), "备注".to_string()],
+                );
+                for c in rows {
+                    sh.push(vec![
+                        c.date.format("%Y-%m-%d").to_string(),
+                        c.account_code.clone(),
+                        c.book_amount.fmt_plain(),
+                        c.counted.fmt_plain(),
+                        c.diff.fmt_plain(),
+                        c.memo.clone(),
+                    ]);
+                }
+                ("现金盘点", sh)
+            }
+            4 => {
+                let rows = findb::funds::check_list(ctx.db()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "支票登记簿",
+                    vec!["票号".to_string(), "类型".to_string(), "付款科目".to_string(), "收款人".to_string(), "金额".to_string(), "开出日".to_string(), "状态".to_string(), "备注".to_string()],
+                );
+                for c in rows {
+                    sh.push(vec![
+                        c.no.clone(),
+                        if c.kind == "cash" { "现金支票".to_string() } else { "转账支票".to_string() },
+                        c.bank_account.clone(),
+                        c.payee.clone(),
+                        c.amount.fmt_plain(),
+                        c.issued_date.format("%Y-%m-%d").to_string(),
+                        if c.status == "void" { "已作废".to_string() } else { "已开出".to_string() },
+                        c.memo.clone(),
+                    ]);
+                }
+                ("支票登记簿", sh)
+            }
+            5 => {
+                let code = if self.j_account.trim().is_empty() {
+                    "1001".to_string()
+                } else {
+                    self.j_account.trim().to_string()
+                };
+                let p = ctx.period();
+                let q = findb::balances::LedgerQuery {
+                    code: code.clone(),
+                    include_children: false,
+                    aux: None,
+                    from: p,
+                    to: p,
+                    posted_only: true,
+                    prepared_by: None,
+                    code_from: None,
+                    code_to: None,
+                }
+                .with_user_scope(ctx.user());
+                let rows = findb::balances::journal(ctx.db(), ctx.chart(), &q).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "出纳日记账",
+                    vec!["日期".to_string(), "凭证号".to_string(), "摘要".to_string(), "对方科目".to_string(), "借方".to_string(), "贷方".to_string(), "余额".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![
+                        r.date.format("%Y-%m-%d").to_string(),
+                        r.voucher_no.clone(),
+                        r.summary.clone(),
+                        r.opposite_accounts.clone(),
+                        r.debit.fmt_plain(),
+                        r.credit.fmt_plain(),
+                        r.balance.fmt_plain(),
+                    ]);
+                }
+                ("出纳日记账", sh)
+            }
+            6 => {
+                let rows = findb::funds::advance_list(ctx.db()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "员工借支",
+                    vec!["编号".to_string(), "日期".to_string(), "借支人".to_string(), "事由".to_string(), "金额".to_string(), "支付账户".to_string(), "状态".to_string()],
+                );
+                for a in rows {
+                    sh.push(vec![
+                        a.no.clone(),
+                        a.date.format("%Y-%m-%d").to_string(),
+                        a.employee.clone(),
+                        a.purpose.clone(),
+                        a.amount.fmt_plain(),
+                        a.pay_account.clone(),
+                        match a.status.as_str() {
+                            "approved" => "待支付",
+                            "paid" => "已支付",
+                            _ => "已核销",
+                        }
+                        .to_string(),
+                    ]);
+                }
+                ("员工借支", sh)
+            }
+            7 => {
+                let rows = findb::funds::funds_budget(ctx.db(), ctx.period()).unwrap_or_default();
+                let mut sh = crate::views::export::Sheet::new(
+                    "资金预算",
+                    vec!["科目".to_string(), "科目名称".to_string(), "预算".to_string(), "实际".to_string(), "差异".to_string(), "执行率".to_string(), "状态".to_string()],
+                );
+                for r in rows {
+                    sh.push(vec![
+                        r.account_code.clone(),
+                        r.account_name.clone(),
+                        r.budget.fmt_plain(),
+                        r.actual.fmt_plain(),
+                        r.diff.fmt_plain(),
+                        r.rate_pct(),
+                        if r.over { "超预算".to_string() } else { "正常".to_string() },
+                    ]);
+                }
+                ("资金预算", sh)
+            }
             _ => {
                 let fc = findb::funds::funds_forecast(ctx.db(), ctx.period()).unwrap_or_default();
                 let mut sh = crate::views::export::Sheet::new(
@@ -146,14 +321,32 @@ impl FundsView {
         if self.dirty {
             self.dirty = false;
         }
-        let rows = findb::funds::funds_daily(ctx.db(), ctx.period()).unwrap_or_default();
+        // 按日资金日报（口径：仅已记账，与账簿/报表一致）：默认今天，可前后翻日
+        let today = chrono::Local::now().date_naive();
+        if self.daily_date.is_none() {
+            self.daily_date = Some(today);
+        }
+        let date = self.daily_date.unwrap_or(today);
+        widgets::toolbar(ui, |ui| {
+            if ui.button("« 前一日").clicked() {
+                self.daily_date = Some(date - chrono::Duration::days(1));
+            }
+            if ui.button("后一日 »").clicked() {
+                self.daily_date = Some(date + chrono::Duration::days(1));
+            }
+            if ui.button("今天").clicked() {
+                self.daily_date = Some(today);
+            }
+            ui.label(RichText::new(date.format("%Y-%m-%d").to_string()).strong());
+        });
+        let rows = findb::funds::funds_daily_by_date(ctx.db(), date).unwrap_or_default();
         let cols = [
             widgets::TCol::new("科目", 110.0).fixed(),
             widgets::TCol::new("科目名称", 160.0),
-            widgets::TCol::new("期初", 130.0).right(),
-            widgets::TCol::new("收入", 130.0).right(),
-            widgets::TCol::new("支出", 130.0).right(),
-            widgets::TCol::new("期末结存", 130.0).right(),
+            widgets::TCol::new("上日结余", 130.0).right(),
+            widgets::TCol::new("本日收入", 130.0).right(),
+            widgets::TCol::new("本日支出", 130.0).right(),
+            widgets::TCol::new("日末结存", 130.0).right(),
         ];
         widgets::grid(ui, "funds_daily", &cols, rows.len(), 24.0, |i, c, ui| {
             let r = &rows[i];
@@ -201,6 +394,7 @@ impl FundsView {
                     memo: String::new(),
                     created_by: who,
                     created_at: String::new(),
+                    voucher_id: None,
                 };
                 match findb::funds::bill_save(db, &mut b) {
                     Ok(id) => {
@@ -226,6 +420,7 @@ impl FundsView {
             widgets::TCol::new("操作", 120.0).fixed(),
         ];
         let mut act: Option<(i64, String)> = None;
+        let mut vact: Option<i64> = None;
         widgets::grid(ui, "bills", &cols, rows.len(), 24.0, |i, c, ui| {
             let b = &rows[i];
             match c {
@@ -256,6 +451,13 @@ impl FundsView {
                                 act = Some((b.id, "settled".to_string()));
                             }
                         });
+                    } else if matches!(b.status.as_str(), "endorsed" | "discounted" | "settled")
+                        && b.voucher_id.is_none()
+                    {
+                        // 流转已自动生成台账凭证；此处供存量台账回填
+                        if ui.small_button("生成凭证").clicked() {
+                            vact = Some(b.id);
+                        }
                     }
                 }
                 _ => {}
@@ -263,10 +465,30 @@ impl FundsView {
         });
         if let Some((id, to)) = act {
             let st = findb::funds::BillStatus::parse(&to);
-            match findb::funds::bill_transition(ctx.db(), id, st, chrono::Local::now().date_naive()) {
-                Ok(()) => {
+            let who = ctx.user().username.clone();
+            match findb::funds::bill_transition(
+                ctx.db(),
+                id,
+                st,
+                chrono::Local::now().date_naive(),
+                &who,
+            ) {
+                Ok(vid) => {
                     ctx.log("资金", "票据流转", &format!("#{id} → {}", st.label()));
-                    ctx.info("已更新票据状态");
+                    ctx.info(match vid {
+                        Some(v) => format!("已更新票据状态，生成凭证 #{v}"),
+                        None => "已更新票据状态".to_string(),
+                    });
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+        if let Some(id) = vact {
+            let who = ctx.user().username.clone();
+            match findb::funds::bill_voucher(ctx.db(), id, &who) {
+                Ok(vid) => {
+                    ctx.log("资金", "生成票据凭证", &format!("#{id} → 凭证 #{vid}"));
+                    ctx.info(format!("已生成凭证 #{vid}"));
                 }
                 Err(e) => ctx.error(e.to_string()),
             }
@@ -303,6 +525,9 @@ impl FundsView {
                     memo: String::new(),
                     created_by: who,
                     created_at: String::new(),
+                    voucher_id: None,
+                    settle_voucher_id: None,
+                    settle_date: None,
                 };
                 match findb::funds::loan_save(db, &mut l) {
                     Ok(id) => {
@@ -326,8 +551,10 @@ impl FundsView {
             widgets::TCol::new("起息日", 100.0).fixed(),
             widgets::TCol::new("到期日", 100.0).fixed(),
             widgets::TCol::new("状态", 80.0).fixed(),
+            widgets::TCol::new("操作", 110.0).fixed(),
         ];
         let mut settle: Option<i64> = None;
+        let mut gen: Option<i64> = None;
         widgets::grid(ui, "loans", &cols, rows.len(), 24.0, |i, c, ui| {
             let l = &rows[i];
             match c {
@@ -347,18 +574,630 @@ impl FundsView {
                         ui.label(RichText::new("已结清").color(palette::OK));
                     }
                 }
+                8 => {
+                    if l.status == "active" && l.voucher_id.is_none() {
+                        if ui.small_button("到账凭证").clicked() {
+                            gen = Some(l.id);
+                        }
+                    } else if l.status != "active" && l.settle_voucher_id.is_none() {
+                        if ui.small_button("还本凭证").clicked() {
+                            gen = Some(l.id);
+                        }
+                    }
+                }
                 _ => {}
             }
         });
         if let Some(id) = settle {
-            match findb::funds::loan_settle(ctx.db(), id) {
-                Ok(()) => {
+            let who = ctx.user().username.clone();
+            match findb::funds::loan_settle(ctx.db(), id, chrono::Local::now().date_naive(), &who)
+            {
+                Ok(vid) => {
                     ctx.log("资金", "结清融资", &format!("#{id}"));
-                    ctx.info("已结清");
+                    ctx.info(match vid {
+                        Some(v) => format!("已结清，生成还本凭证 #{v}"),
+                        None => "已结清".to_string(),
+                    });
                 }
                 Err(e) => ctx.error(e.to_string()),
             }
         }
+        if let Some(id) = gen {
+            let who = ctx.user().username.clone();
+            match findb::funds::loan_voucher(ctx.db(), id, &who) {
+                Ok(vid) => {
+                    ctx.log("资金", "生成融资凭证", &format!("#{id} → 凭证 #{vid}"));
+                    ctx.info(format!("已生成凭证 #{vid}"));
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+    }
+
+    fn show_counts(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        if self.cc_date.is_empty() {
+            self.cc_date = today.clone();
+        }
+        widgets::toolbar(ui, |ui| {
+            ui.label("日期");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.cc_date));
+            ui.label("科目");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.cc_account));
+            ui.label("实盘金额");
+            ui.add_sized([100.0, 22.0], egui::TextEdit::singleline(&mut self.cc_counted));
+            ui.label("备注");
+            ui.add_sized([140.0, 22.0], egui::TextEdit::singleline(&mut self.cc_memo));
+            if ui.button("新增盘点").clicked() {
+                match chrono::NaiveDate::parse_from_str(&self.cc_date, "%Y-%m-%d") {
+                    Ok(date) => {
+                        let mut c = findb::funds::CashCount {
+                            id: 0,
+                            period: ctx.period(),
+                            date,
+                            account_code: if self.cc_account.trim().is_empty() {
+                                "1001".to_string()
+                            } else {
+                                self.cc_account.trim().to_string()
+                            },
+                            book_amount: Money::ZERO,
+                            counted: Money::parse_or_zero(&self.cc_counted),
+                            diff: Money::ZERO,
+                            memo: self.cc_memo.clone(),
+                            voucher_id: None,
+                            created_by: ctx.user().username.clone(),
+                            created_at: String::new(),
+                        };
+                        match findb::funds::cash_count_save(ctx.db(), &mut c) {
+                            Ok(_) => {
+                                ctx.log(
+                                    "资金",
+                                    "现金盘点",
+                                    &format!(
+                                        "{} {} 实盘 {}",
+                                        c.account_code,
+                                        c.date.format("%Y-%m-%d"),
+                                        c.counted.fmt_money()
+                                    ),
+                                );
+                                ctx.info(format!(
+                                    "账面 {}，差异 {}",
+                                    c.book_amount.fmt_money(),
+                                    c.diff.fmt_money()
+                                ));
+                                self.dirty = true;
+                            }
+                            Err(e) => ctx.error(e.to_string()),
+                        }
+                    }
+                    Err(_) => ctx.error("日期格式应为 YYYY-MM-DD"),
+                }
+            }
+        });
+
+        let rows = findb::funds::cash_count_list(ctx.db()).unwrap_or_default();
+        let cols = [
+            widgets::TCol::new("日期", 100.0).fixed(),
+            widgets::TCol::new("科目", 80.0).fixed(),
+            widgets::TCol::new("账面余额", 120.0).right(),
+            widgets::TCol::new("实盘金额", 120.0).right(),
+            widgets::TCol::new("差异", 110.0).right(),
+            widgets::TCol::new("备注", 150.0),
+            widgets::TCol::new("操作", 150.0).fixed(),
+        ];
+        let mut gen: Option<i64> = None;
+        let mut del: Option<i64> = None;
+        widgets::grid(ui, "cash_count", &cols, rows.len(), 24.0, |i, c, ui| {
+            let r = &rows[i];
+            match c {
+                0 => {
+                    ui.label(r.date.format("%Y-%m-%d").to_string());
+                }
+                1 => {
+                    ui.label(RichText::new(&r.account_code).monospace());
+                }
+                2 => widgets::amount_label(ui, r.book_amount),
+                3 => widgets::amount_label(ui, r.counted),
+                4 => {
+                    if r.diff.is_zero() {
+                        ui.label(RichText::new(r.diff.fmt_money()).weak());
+                    } else if r.diff.is_positive() {
+                        ui.label(
+                            RichText::new(format!("+{}", r.diff.fmt_money())).color(palette::OK),
+                        );
+                    } else {
+                        ui.label(RichText::new(r.diff.fmt_money()).color(palette::WARN));
+                    }
+                }
+                5 => {
+                    ui.label(&r.memo);
+                }
+                6 => {
+                    ui.horizontal(|ui| {
+                        if r.voucher_id.is_none() && !r.diff.is_zero() {
+                            if ui.small_button("生成凭证").clicked() {
+                                gen = Some(r.id);
+                            }
+                        }
+                        if r.voucher_id.is_some() {
+                            ui.label(RichText::new("已出凭证").weak());
+                        }
+                        if ui.small_button("删除").clicked() {
+                            del = Some(r.id);
+                        }
+                    });
+                }
+                _ => {}
+            }
+        });
+        if let Some(id) = gen {
+            let who = ctx.user().username.clone();
+            match findb::funds::cash_count_voucher(ctx.db(), id, &who) {
+                Ok(vid) => {
+                    ctx.log("资金", "盘点差异出凭证", &format!("#{id} → 凭证 #{vid}"));
+                    ctx.info(format!("已生成盘盈盘亏凭证 #{vid}"));
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+        if let Some(id) = del {
+            match findb::funds::cash_count_delete(ctx.db(), id) {
+                Ok(()) => {
+                    ctx.log("资金", "删除盘点记录", &format!("#{id}"));
+                    ctx.info("已删除盘点记录");
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+    }
+
+    fn show_checks(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        if self.ck_date.is_empty() {
+            self.ck_date = today.clone();
+        }
+        widgets::toolbar(ui, |ui| {
+            ui.label("票号");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ck_no));
+            ui.label("类型");
+            egui::ComboBox::from_id_salt("ck_kind")
+                .selected_text(if self.ck_kind == "cash" { "现金支票" } else { "转账支票" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.ck_kind, "transfer".to_string(), "转账支票");
+                    ui.selectable_value(&mut self.ck_kind, "cash".to_string(), "现金支票");
+                });
+            ui.label("付款科目");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ck_bank));
+            ui.label("收款人");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ck_payee));
+            ui.label("金额");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ck_amount));
+            ui.label("开出日");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ck_date));
+            ui.label("备注");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ck_memo));
+            if ui.button("新增支票").clicked() {
+                if self.ck_no.trim().is_empty() {
+                    ctx.error("支票号必填");
+                } else {
+                    match chrono::NaiveDate::parse_from_str(&self.ck_date, "%Y-%m-%d") {
+                        Ok(date) => {
+                            let mut c = findb::funds::CheckRow {
+                                id: 0,
+                                no: self.ck_no.trim().to_string(),
+                                kind: self.ck_kind.clone(),
+                                bank_account: self.ck_bank.trim().to_string(),
+                                payee: self.ck_payee.trim().to_string(),
+                                amount: Money::parse_or_zero(&self.ck_amount),
+                                issued_date: date,
+                                status: "issued".to_string(),
+                                memo: self.ck_memo.clone(),
+                                created_by: ctx.user().username.clone(),
+                                created_at: String::new(),
+                            };
+                            match findb::funds::check_save(ctx.db(), &mut c) {
+                                Ok(_) => {
+                                    ctx.log("资金", "登记支票", &format!("{} {}", c.no, c.amount.fmt_money()));
+                                    ctx.info("已登记支票");
+                                    self.ck_no.clear();
+                                    self.ck_amount.clear();
+                                    self.ck_payee.clear();
+                                    self.ck_memo.clear();
+                                }
+                                Err(e) => ctx.error(e.to_string()),
+                            }
+                        }
+                        Err(_) => ctx.error("开出日期格式应为 YYYY-MM-DD"),
+                    }
+                }
+            }
+        });
+
+        let rows = findb::funds::check_list(ctx.db()).unwrap_or_default();
+        let cols = [
+            widgets::TCol::new("票号", 110.0).fixed(),
+            widgets::TCol::new("类型", 90.0).fixed(),
+            widgets::TCol::new("付款科目", 90.0).fixed(),
+            widgets::TCol::new("收款人", 140.0),
+            widgets::TCol::new("金额", 120.0).right(),
+            widgets::TCol::new("开出日", 100.0).fixed(),
+            widgets::TCol::new("状态", 80.0).fixed(),
+            widgets::TCol::new("操作", 140.0).fixed(),
+        ];
+        let mut st_act: Option<(i64, String)> = None;
+        let mut del: Option<i64> = None;
+        widgets::grid(ui, "check_register", &cols, rows.len(), 24.0, |i, c, ui| {
+            let r = &rows[i];
+            match c {
+                0 => { ui.label(RichText::new(&r.no).monospace()); }
+                1 => { ui.label(if r.kind == "cash" { "现金支票" } else { "转账支票" }); }
+                2 => { ui.label(RichText::new(&r.bank_account).monospace()); }
+                3 => { ui.label(if r.payee.is_empty() { "—".to_string() } else { r.payee.clone() }); }
+                4 => widgets::amount_label(ui, r.amount),
+                5 => { ui.label(r.issued_date.format("%Y-%m-%d").to_string()); }
+                6 => {
+                    ui.label(if r.status == "void" {
+                        RichText::new("已作废").color(palette::WARN)
+                    } else {
+                        RichText::new("已开出").color(palette::OK)
+                    });
+                }
+                7 => {
+                    ui.horizontal(|ui| {
+                        if r.status == "void" {
+                            if ui.small_button("恢复").clicked() {
+                                st_act = Some((r.id, "issued".to_string()));
+                            }
+                        } else if ui.small_button("作废").clicked() {
+                            st_act = Some((r.id, "void".to_string()));
+                        }
+                        if ui.small_button("删除").clicked() {
+                            del = Some(r.id);
+                        }
+                    });
+                }
+                _ => {}
+            }
+        });
+        if let Some((id, status)) = st_act {
+            match findb::funds::check_set_status(ctx.db(), id, &status) {
+                Ok(()) => {
+                    ctx.log("资金", "支票状态", &format!("#{id} → {status}"));
+                    ctx.info(if status == "void" { "支票已作废" } else { "支票已恢复" });
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+        if let Some(id) = del {
+            match findb::funds::check_delete(ctx.db(), id) {
+                Ok(()) => {
+                    ctx.log("资金", "删除支票", &format!("#{id}"));
+                    ctx.info("已删除支票记录");
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+    }
+
+    /// 出纳日记账：只读已记账逐笔滚动 + 日清标记 + 收付登记（跳凭证录入预填科目）
+    fn show_journal(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        if self.j_date.is_empty() {
+            self.j_date = today.clone();
+        }
+        let p = ctx.period();
+        let code = if self.j_account.trim().is_empty() {
+            "1001".to_string()
+        } else {
+            self.j_account.trim().to_string()
+        };
+        widgets::toolbar(ui, |ui| {
+            ui.label("科目");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.j_account));
+            ui.separator();
+            ui.label("日清日期");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.j_date));
+        });
+        widgets::toolbar(ui, |ui| {
+            if ui.button("标记日清").clicked() {
+                match chrono::NaiveDate::parse_from_str(&self.j_date, "%Y-%m-%d") {
+                    Ok(d0) => {
+                        let who = ctx.user().username.clone();
+                        match findb::funds::day_clear_set(ctx.db(), &code, d0, true, &who) {
+                            Ok(()) => {
+                                ctx.log("资金", "日记账日清", &format!("{} {}", code, self.j_date));
+                                ctx.info("已标记日清");
+                            }
+                            Err(e) => ctx.error(e.to_string()),
+                        }
+                    }
+                    Err(_) => ctx.error("日清日期格式应为 YYYY-MM-DD"),
+                }
+            }
+            if ui.button("取消日清").clicked() {
+                match chrono::NaiveDate::parse_from_str(&self.j_date, "%Y-%m-%d") {
+                    Ok(d0) => {
+                        let who = ctx.user().username.clone();
+                        match findb::funds::day_clear_set(ctx.db(), &code, d0, false, &who) {
+                            Ok(()) => {
+                                ctx.log("资金", "取消日清", &format!("{} {}", code, self.j_date));
+                                ctx.info("已取消日清");
+                            }
+                            Err(e) => ctx.error(e.to_string()),
+                        }
+                    }
+                    Err(_) => ctx.error("日清日期格式应为 YYYY-MM-DD"),
+                }
+            }
+            ui.separator();
+            if ui.button("收款登记").clicked() {
+                ctx.info(format!("切到凭证录入：{code} 记借方"));
+                ctx.st.pending_cash = Some(code.clone());
+                ctx.st.nav = crate::state::NavItem::VoucherNew;
+            }
+            if ui.button("付款登记").clicked() {
+                ctx.info(format!("切到凭证录入：{code} 记贷方"));
+                ctx.st.pending_cash = Some(code.clone());
+                ctx.st.nav = crate::state::NavItem::VoucherNew;
+            }
+        });
+
+        let q = findb::balances::LedgerQuery {
+            code: code.clone(),
+            include_children: false,
+            aux: None,
+            from: p,
+            to: p,
+            posted_only: true,
+            prepared_by: None,
+            code_from: None,
+            code_to: None,
+        }
+        .with_user_scope(ctx.user());
+        let rows = findb::balances::journal(ctx.db(), ctx.chart(), &q).unwrap_or_default();
+        let cleared =
+            findb::funds::day_clear_dates(ctx.db(), &code, p.first_day(), p.last_day())
+                .unwrap_or_default();
+        let cols = [
+            widgets::TCol::new("日期", 92.0).fixed(),
+            widgets::TCol::new("凭证号", 88.0).fixed(),
+            widgets::TCol::new("摘要", 220.0),
+            widgets::TCol::new("对方科目", 220.0),
+            widgets::TCol::new("借方", 120.0).right(),
+            widgets::TCol::new("贷方", 120.0).right(),
+            widgets::TCol::new("余额", 130.0).right(),
+            widgets::TCol::new("日清", 80.0).fixed(),
+        ];
+        widgets::grid(ui, "cashier_journal", &cols, rows.len(), 24.0, |i, c, ui| {
+            let r = &rows[i];
+            match c {
+                0 => { ui.label(r.date.format("%Y-%m-%d").to_string()); }
+                1 => { ui.label(RichText::new(&r.voucher_no).monospace()); }
+                2 => { ui.label(&r.summary); }
+                3 => { ui.label(RichText::new(&r.opposite_accounts).weak()); }
+                4 => widgets::amount_label(ui, r.debit),
+                5 => widgets::amount_label(ui, r.credit),
+                6 => widgets::amount_label(ui, r.balance),
+                7 => {
+                    if cleared.contains(&r.date.format("%Y-%m-%d").to_string()) {
+                        ui.label(RichText::new("✓ 已日清").color(palette::OK));
+                    } else {
+                        ui.label(RichText::new("—").weak());
+                    }
+                }
+                _ => {}
+            }
+        });
+        if rows.is_empty() {
+            widgets::empty_hint(ui, "该科目本期无已记账记录");
+        }
+    }
+
+    /// 员工借支：建单 → 支付（出凭证）→ 核销冲账（出凭证）
+    fn show_advances(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        if self.ad_date.is_empty() {
+            self.ad_date = today.clone();
+        }
+        widgets::toolbar(ui, |ui| {
+            ui.label("日期");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ad_date));
+            ui.label("借支人");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ad_emp));
+            ui.label("事由");
+            ui.add_sized([140.0, 22.0], egui::TextEdit::singleline(&mut self.ad_purpose));
+            ui.label("金额");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ad_amount));
+            ui.label("支付账户");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ad_account));
+            ui.label("备注");
+            ui.add_sized([110.0, 22.0], egui::TextEdit::singleline(&mut self.ad_memo));
+            if ui.button("新增借支").clicked() {
+                match chrono::NaiveDate::parse_from_str(&self.ad_date, "%Y-%m-%d") {
+                    Ok(date) => {
+                        let mut a = findb::funds::Advance {
+                            id: 0,
+                            no: format!("JZ-{}", chrono::Local::now().format("%Y%m%d%H%M%S")),
+                            period: ctx.period(),
+                            date,
+                            employee: self.ad_emp.trim().to_string(),
+                            purpose: self.ad_purpose.trim().to_string(),
+                            amount: Money::parse_or_zero(&self.ad_amount),
+                            pay_account: if self.ad_account.trim().is_empty() {
+                                "1001".to_string()
+                            } else {
+                                self.ad_account.trim().to_string()
+                            },
+                            status: "approved".to_string(),
+                            paid_date: None,
+                            paid_voucher_id: None,
+                            settle_date: None,
+                            settle_voucher_id: None,
+                            expense_account: "660201".to_string(),
+                            memo: self.ad_memo.clone(),
+                            created_by: ctx.user().username.clone(),
+                            created_at: String::new(),
+                        };
+                        match findb::funds::advance_save(ctx.db(), &mut a) {
+                            Ok(_) => {
+                                ctx.log(
+                                    "资金",
+                                    "借支建单",
+                                    &format!("{} {} {}", a.no, a.employee, a.amount.fmt_money()),
+                                );
+                                ctx.info("已新增借支单");
+                                self.ad_emp.clear();
+                                self.ad_purpose.clear();
+                                self.ad_amount.clear();
+                                self.ad_memo.clear();
+                            }
+                            Err(e) => ctx.error(e.to_string()),
+                        }
+                    }
+                    Err(_) => ctx.error("日期格式应为 YYYY-MM-DD"),
+                }
+            }
+        });
+        widgets::toolbar(ui, |ui| {
+            ui.label(RichText::new("核销参数（支付/核销按今天记账）：").weak());
+            ui.label("冲账费用科目");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ad_exp_account));
+            ui.label("冲账金额");
+            ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.ad_exp_amount));
+        });
+
+        let rows = findb::funds::advance_list(ctx.db()).unwrap_or_default();
+        let cols = [
+            widgets::TCol::new("编号", 130.0).fixed(),
+            widgets::TCol::new("日期", 100.0).fixed(),
+            widgets::TCol::new("借支人", 90.0).fixed(),
+            widgets::TCol::new("事由", 160.0),
+            widgets::TCol::new("金额", 110.0).right(),
+            widgets::TCol::new("状态", 80.0).fixed(),
+            widgets::TCol::new("操作", 150.0).fixed(),
+        ];
+        let mut pay: Option<i64> = None;
+        let mut settle: Option<i64> = None;
+        let mut del: Option<i64> = None;
+        widgets::grid(ui, "advances", &cols, rows.len(), 24.0, |i, c, ui| {
+            let a = &rows[i];
+            match c {
+                0 => { ui.label(RichText::new(&a.no).monospace()); }
+                1 => { ui.label(a.date.format("%Y-%m-%d").to_string()); }
+                2 => { ui.label(&a.employee); }
+                3 => { ui.label(&a.purpose); }
+                4 => widgets::amount_label(ui, a.amount),
+                5 => {
+                    ui.label(match a.status.as_str() {
+                        "approved" => RichText::new("待支付").color(palette::WARN),
+                        "paid" => RichText::new("已支付").color(palette::CREDIT),
+                        _ => RichText::new("已核销").color(palette::OK),
+                    });
+                }
+                6 => {
+                    ui.horizontal(|ui| {
+                        if a.status == "approved" {
+                            if ui.small_button("支付").clicked() {
+                                pay = Some(a.id);
+                            }
+                            if ui.small_button("删除").clicked() {
+                                del = Some(a.id);
+                            }
+                        } else if a.status == "paid" && ui.small_button("核销").clicked() {
+                            settle = Some(a.id);
+                        }
+                    });
+                }
+                _ => {}
+            }
+        });
+        let today_d = chrono::Local::now().date_naive();
+        if let Some(id) = pay {
+            let who = ctx.user().username.clone();
+            match findb::funds::advance_pay(ctx.db(), id, today_d, &who) {
+                Ok(vid) => {
+                    ctx.log("资金", "借支支付", &format!("#{id}"));
+                    ctx.info(match vid {
+                        Some(v) => format!("已支付，生成凭证 #{v}"),
+                        None => "该借支已支付过".to_string(),
+                    });
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+        if let Some(id) = settle {
+            if self.ad_exp_amount.trim().is_empty() {
+                ctx.error("请先在上方填写冲账金额（全额退回填 0）");
+            } else {
+                let exp_acct = if self.ad_exp_account.trim().is_empty() {
+                    "660201".to_string()
+                } else {
+                    self.ad_exp_account.trim().to_string()
+                };
+                let exp = Money::parse_or_zero(&self.ad_exp_amount);
+                let who = ctx.user().username.clone();
+                match findb::funds::advance_settle(ctx.db(), id, &exp_acct, exp, today_d, &who) {
+                    Ok(vid) => {
+                        ctx.log("资金", "借支核销", &format!("#{id} 冲账 {}", exp.fmt_money()));
+                        ctx.info(match vid {
+                            Some(v) => format!("已核销，生成凭证 #{v}"),
+                            None => "该借支已核销过".to_string(),
+                        });
+                        self.ad_exp_amount.clear();
+                    }
+                    Err(e) => ctx.error(e.to_string()),
+                }
+            }
+        }
+        if let Some(id) = del {
+            match findb::funds::advance_delete(ctx.db(), id) {
+                Ok(()) => {
+                    ctx.log("资金", "删除借支单", &format!("#{id}"));
+                    ctx.info("已删除借支单");
+                }
+                Err(e) => ctx.error(e.to_string()),
+            }
+        }
+    }
+
+    /// 资金预算 vs 执行（现金/银行科目；实际=当期已记账净额，H-3）
+    fn show_budget(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {
+        let rows = findb::funds::funds_budget(ctx.db(), ctx.period()).unwrap_or_default();
+        if rows.is_empty() {
+            widgets::empty_hint(
+                ui,
+                "本期未编制现金/银行科目预算：到【预算分析】为 1001/1002 等科目新增预算行",
+            );
+            return;
+        }
+        let cols = [
+            widgets::TCol::new("科目", 100.0).fixed(),
+            widgets::TCol::new("科目名称", 150.0),
+            widgets::TCol::new("预算", 120.0).right(),
+            widgets::TCol::new("实际(净额)", 130.0).right(),
+            widgets::TCol::new("差异", 120.0).right(),
+            widgets::TCol::new("执行率", 90.0).right(),
+            widgets::TCol::new("状态", 90.0).fixed(),
+        ];
+        widgets::grid(ui, "funds_budget", &cols, rows.len(), 24.0, |i, c, ui| {
+            let r = &rows[i];
+            match c {
+                0 => { ui.label(RichText::new(&r.account_code).monospace()); }
+                1 => { ui.label(&r.account_name); }
+                2 => widgets::amount_label(ui, r.budget),
+                3 => widgets::amount_label(ui, r.actual),
+                4 => widgets::amount_label(ui, r.diff),
+                5 => { ui.label(r.rate_pct()); }
+                6 => {
+                    ui.label(if r.over {
+                        RichText::new("超预算").color(palette::WARN)
+                    } else {
+                        RichText::new("正常").color(palette::OK)
+                    });
+                }
+                _ => {}
+            }
+        });
     }
 
     fn show_forecast(&mut self, ctx: &mut AppCtx<'_>, ui: &mut Ui) {

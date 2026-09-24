@@ -416,6 +416,21 @@ impl PayrollView {
         }
         if self.rows.is_empty() {
             ui.colored_label(palette::WARN, "本期没有工资数据，无法生成凭证");
+        } else if let Some(r) = self.rows.first() {
+            // 发放状态可见：三类凭证回链（同期间共享）
+            let f = |x: Option<i64>| {
+                x.map(|v| format!("#{v}"))
+                    .unwrap_or_else(|| "未生成".to_string())
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label("本期凭证状态：");
+                ui.label(format!(
+                    "计提 {} · 社保缴纳 {} · 发放 {}",
+                    f(r.voucher_id),
+                    f(r.social_voucher_id),
+                    f(r.paid_voucher_id)
+                ));
+            });
         }
 
         widgets::card(ui, "计提工资", |ui| {

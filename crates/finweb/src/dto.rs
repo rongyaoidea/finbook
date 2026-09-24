@@ -13,6 +13,8 @@ pub struct PublicUser {
     pub display_name: String,
     pub role: Role,
     pub role_label: String,
+    /// 兼任岗位（主岗位在 role；显示名由 role_labels 合成）
+    pub roles: Vec<Role>,
     pub is_admin: bool,
     pub device_name: String,
     /// 是否已停用（前端据此显示账号状态）
@@ -128,7 +130,8 @@ impl PublicUser {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
             role: u.role,
-            role_label: u.role.label().to_string(),
+            role_label: u.role_labels(),
+            roles: u.roles.clone(),
             is_admin: u.is_admin(),
             device_name: u.device_name.clone(),
             disabled: u.disabled,
@@ -205,6 +208,9 @@ pub struct CreateUserReq {
     pub password: Option<String>,
     #[serde(default)]
     pub role: Role,
+    /// 兼任岗位（身兼多职；有效权限 = 主岗位 ∪ 兼任 ∪ extra − deny）
+    #[serde(default)]
+    pub roles: Vec<Role>,
     /// 是否强制首次登录改密（默认 true，测试场景可设为 false）
     #[serde(default = "default_true")]
     pub must_change_pwd: bool,
@@ -227,6 +233,9 @@ fn default_true() -> bool {
 pub struct UpdateUserReq {
     pub display_name: Option<String>,
     pub role: Option<Role>,
+    /// 兼任岗位整体替换（与主岗位去重后落库）
+    #[serde(default)]
+    pub roles: Option<Vec<Role>>,
     pub disabled: Option<bool>,
     pub must_change_pwd: Option<bool>,
     pub memo: Option<String>,

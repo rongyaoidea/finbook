@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -148,7 +148,8 @@ CREATE TABLE IF NOT EXISTS user (
     role          TEXT NOT NULL DEFAULT 'accountant',
     disabled      INTEGER NOT NULL DEFAULT 0,
     extra_perms   TEXT NOT NULL DEFAULT '[]',
-    memo          TEXT NOT NULL DEFAULT ''
+    memo          TEXT NOT NULL DEFAULT '',
+    roles_json    TEXT NOT NULL DEFAULT '[]'
 );
 
 -- 操作日志
@@ -1235,6 +1236,10 @@ const MIGRATE_V20: &[(&str, &str, &str)] = &[
     ("payroll", "social_voucher_id", "INTEGER"),
 ];
 
+/// v20 → v21：兼任岗位（多角色）。有效权限 = 主岗位 + roles_json 并集 − deny。
+const MIGRATE_V21: &[(&str, &str, &str)] =
+    &[("user", "roles_json", "TEXT NOT NULL DEFAULT '[]'")];
+
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "bom", "version")? {
@@ -1450,6 +1455,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_v18(conn)?;
             migrate_generic(conn, MIGRATE_V19)?;
             migrate_generic(conn, MIGRATE_V20)?;
+            migrate_generic(conn, MIGRATE_V21)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

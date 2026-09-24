@@ -441,7 +441,7 @@ impl eframe::App for FinBookApp {
                         ui.separator();
                         if let Some(u) = &self.st.user {
                             ui.label(
-                                RichText::new(format!("{}（{}）", u.display_name, u.role.label()))
+                                RichText::new(format!("{}（{}）", u.display_name, u.role_labels()))
                                     .weak(),
                             );
                             ui.label(RichText::new("👤").size(16.0));

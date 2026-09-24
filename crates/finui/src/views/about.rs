@@ -73,7 +73,7 @@ impl AboutView {
                     widgets::kv(ui, "启用期间", &o.start_period.label());
                     widgets::kv(ui, "本位币", &o.base_currency);
                     if let Some(u) = ctx.st.user.as_ref() {
-                        widgets::kv(ui, "当前用户", &format!("{}（{}）", u.display_name, u.role.label()));
+                        widgets::kv(ui, "当前用户", &format!("{}（{}）", u.display_name, u.role_labels()));
                     }
                 });
         });

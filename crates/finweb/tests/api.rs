@@ -5363,6 +5363,165 @@ async fn role_presets_order_clerk_and_keeper() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "订单专员不应能组装拆卸");
 }
 
+/// 身兼多职（岗位并集）+ 多岗位下会计出纳互斥仍生效 + 价格字段权限（服务端裁剪/置零）。
+#[tokio::test]
+async fn multi_role_positions_and_price_field_perm() {
+    let (state, _bd, _dir) = test_state();
+    let boss = boss_in_b1(&state).await;
+
+    // 角色清单：12 个预设岗位（含新四岗）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/roles", &boss))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let roles: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let arr = roles.as_array().expect("roles 应是数组");
+    assert!(arr.len() >= 12, "应有12个预设角色，实际 {}", arr.len());
+    for code in ["receivables", "payables", "cost_accountant", "production", "order_clerk", "keeper"] {
+        assert!(arr.iter().any(|r| r["role"] == code), "缺少角色 {code}");
+    }
+
+    // 三个账号先开平台（邀请前必须存在同名平台账号）
+    for u in ["mul1", "mix3", "prc1"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss,
+                serde_json::json!({ "username": u, "display_name": u, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通平台 {u}");
+    }
+    // mul1：主岗位订单专员 + 兼任仓管员（身兼多职）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss,
+            serde_json::json!({
+                "username": "mul1", "display_name": "多面手", "password": "",
+                "role": "order_clerk", "roles": ["keeper"], "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "多岗位邀请应成功：{b}");
+    // mix3：会计 + 兼任出纳 → 互斥（多岗位并集口径）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss,
+            serde_json::json!({
+                "username": "mix3", "display_name": "混岗", "password": "",
+                "role": "accountant", "roles": ["cashier"], "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "会计+出纳多岗位应被拒");
+    let s = body_string(resp).await;
+    assert!(s.contains("会计与出纳"), "应提示互斥：{s}");
+    // prc1：订单专员但被 deny 掉价格两权（字段级权限样本）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss,
+            serde_json::json!({
+                "username": "prc1", "display_name": "录单员", "password": "",
+                "role": "order_clerk", "deny_perms": ["price_view", "price_edit"],
+                "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "deny 价格权邀请应成功");
+
+    // mul1 / prc1 进账套
+    let mut sids = std::collections::HashMap::new();
+    for u in ["mul1", "prc1"] {
+        let (st, sid) = login(&state, u, "Test12345").await;
+        assert_eq!(st, StatusCode::OK, "{u} 登录");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 首登改密");
+        assert_eq!(select_book(&state, &sid, "b1").await, StatusCode::OK, "{u} 进账套");
+        sids.insert(u, sid);
+    }
+    let mul = sids["mul1"].clone();
+    let prc = sids["prc1"].clone();
+
+    // mul1 身兼多职：仓管域 + 订单域都通
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/unit?item=140301", &mul))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "兼岗（仓管）应能读仓储");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &mul,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "customer_code": "C01",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "10", "unit_price": "5", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "兼岗（订单）应能建单");
+    let r: serde_json::Value =
+        serde_json::from_str(&body_string(handlers::router(state.clone())
+            .oneshot(authed_get("/api/sales/so?period=202601", &mul)).await.unwrap()).await).unwrap();
+    let mul_row = r["rows"].as_array().unwrap().iter().find(|x| x["customer_code"] == "C01").unwrap();
+    assert_eq!(money_num(mul_row["total_amount"].as_str().unwrap()), 50.0, "有价格权应看到真实金额");
+
+    // prc1 无价格权：建单价格被服务端置零、数量保留、套打无价格列
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &prc,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-06", "customer_code": "C02",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0.13" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "prc1 建单应成功（数量域放行）");
+    let r: serde_json::Value =
+        serde_json::from_str(&body_string(handlers::router(state.clone())
+            .oneshot(authed_get("/api/sales/so?period=202601", &prc)).await.unwrap()).await).unwrap();
+    let prc_row = r["rows"].as_array().unwrap().iter().find(|x| x["customer_code"] == "C02").unwrap();
+    let prc_id = prc_row["id"].as_i64().unwrap();
+    assert_eq!(money_num(prc_row["total_amount"].as_str().unwrap()), 0.0, "无价格权金额应被置零");
+    assert_eq!(prc_row["lines"][0]["qty_ordered"], "10", "数量应保留");
+    assert_eq!(money_num(prc_row["lines"][0]["unit_price"].as_str().unwrap()), 0.0, "单价应被置零");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/sales/so/print-form?ids={prc_id}"), &prc))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(!html.contains("单价"), "无价格权套打不应出现单价列：{html}");
+
+    // prc1 没有仓管权（兼岗是显式授予的，不是人人有）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/unit?item=140301", &prc))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "无仓管兼岗应403");
+}
+
 /// 打印/导出端点冒烟（均返回 200 且内容类型正确）。
 #[tokio::test]
 async fn web_print_and_pdf_endpoints() {

@@ -982,6 +982,7 @@ async fn create_user(
         return Err(AppError::bad_request("该用户名已存在"));
     }
     let mut u = User::new(&username, &req.display_name, req.role);
+    u.roles = req.roles.iter().copied().filter(|r| *r != req.role).collect();
     u.password_hash = ru.password_hash.clone();
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     u.must_change_pwd = req.must_change_pwd;
@@ -1022,6 +1023,7 @@ async fn update_user(
     // 允许自助修改。
     if username == user.username() {
         let touches_grant = req.role.is_some()
+            || req.roles.is_some()
             || req.extra_perms.is_some()
             || req.deny_perms.is_some()
             || req.data_scope.is_some()
@@ -1036,6 +1038,7 @@ async fn update_user(
     // 其他账号的角色/权限矩阵/数据范围/停用；显示名、备注等非授权字段仍可代改。
     if username != user.username() {
         let touches_grant = req.role.is_some()
+            || req.roles.is_some()
             || req.extra_perms.is_some()
             || req.deny_perms.is_some()
             || req.data_scope.is_some()
@@ -1056,6 +1059,9 @@ async fn update_user(
             }
         }
         u.role = r;
+    }
+    if let Some(rs) = req.roles {
+        u.roles = rs.into_iter().filter(|r| *r != u.role).collect();
     }
     if let Some(d) = req.disabled {
         u.disabled = d;
@@ -4590,7 +4596,15 @@ async fn print_so_form(
     if orders.is_empty() {
         return Err(AppError::bad_request("没有可打印的订单"));
     }
-    let f = doc_fields_from_q(&q);
+    let mut f = doc_fields_from_q(&q);
+    // 字段级价格权限：无「价格查看」者，套打强制裁掉价格类列（单价/税率/金额/税额/合计）
+    if !user.user.can(Perm::PriceView) {
+        f.col_price = false;
+        f.col_rate = false;
+        f.col_amount = false;
+        f.col_tax = false;
+        f.totals = false;
+    }
     let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
@@ -4624,7 +4638,15 @@ async fn print_po_form(
     if orders.is_empty() {
         return Err(AppError::bad_request("没有可打印的订单"));
     }
-    let f = doc_fields_from_q(&q);
+    let mut f = doc_fields_from_q(&q);
+    // 字段级价格权限：无「价格查看」者，套打强制裁掉价格类列（单价/税率/金额/税额/合计）
+    if !user.user.can(Perm::PriceView) {
+        f.col_price = false;
+        f.col_rate = false;
+        f.col_amount = false;
+        f.col_tax = false;
+        f.totals = false;
+    }
     let html = findb::printform::order_forms_sized_html(&company, &orders, &f, &doc_size_from_q(&q));
     Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response())
 }
@@ -4777,7 +4799,20 @@ async fn list_so(
         .get("period")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
-    let rows = findb::scm::so_list(&db, period, None)?;
+    let mut rows = findb::scm::so_list(&db, period, None)?;
+    // 字段级价格权限：无「价格查看」——列表中单价/税额/金额服务端置零（数量保留）
+    if !user.user.can(Perm::PriceView) {
+        for o in &mut rows {
+            o.total_amount = Money::ZERO;
+            o.total_tax = Money::ZERO;
+            for l in &mut o.lines {
+                l.unit_price = Money::ZERO;
+                l.tax_rate = Money::ZERO;
+                l.amount = Money::ZERO;
+                l.tax_amount = Money::ZERO;
+            }
+        }
+    }
     Ok(Json(json!({ "rows": rows })))
 }
 
@@ -4808,11 +4843,18 @@ async fn save_so(
     so.id = req.id;
     so.memo = req.memo;
     so.status = so_status_parse(&req.status)?;
+    // 字段级价格权限：无「价格修改」者——已有行保留原单价/税率，新行置零（数量照常可改）
+    let price_ok = user.user.can(Perm::PriceEdit);
+    let mut old_price: std::collections::HashMap<String, (Money, Money)> =
+        std::collections::HashMap::new();
     if so.id > 0 {
         let old = findb::scm::so_get(&db, so.id)?
             .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
         so.no = old.no;
         so.shipped_amount = old.shipped_amount;
+        for l in &old.lines {
+            old_price.insert(l.item_code.clone(), (l.unit_price, l.tax_rate));
+        }
     } else {
         so.no = findb::scm::so_next_no(&db, period)?;
     }
@@ -4821,12 +4863,24 @@ async fn save_so(
             continue;
         }
         let qty = parse_money_checked(&l.qty_ordered)?;
-        let price = parse_money_checked(&l.unit_price)?;
-        let rate = if l.tax_rate.trim().is_empty() {
+        let mut price = parse_money_checked(&l.unit_price)?;
+        let mut rate = if l.tax_rate.trim().is_empty() {
             Money::ZERO
         } else {
             parse_money_checked(&l.tax_rate)?
         };
+        if !price_ok {
+            match old_price.get(l.item_code.trim()) {
+                Some((op, orate)) => {
+                    price = *op;
+                    rate = *orate;
+                }
+                None => {
+                    price = Money::ZERO;
+                    rate = Money::ZERO;
+                }
+            }
+        }
         let amount = (qty * price).round2();
         let tax = (amount * rate).round2();
         so.lines.push(findb::scm::SoLine {
@@ -4906,7 +4960,20 @@ async fn list_po(
         .get("period")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
-    let rows = findb::scm::po_list(&db, period, None)?;
+    let mut rows = findb::scm::po_list(&db, period, None)?;
+    // 字段级价格权限：无「价格查看」——列表中单价/税额/金额服务端置零（数量保留）
+    if !user.user.can(Perm::PriceView) {
+        for o in &mut rows {
+            o.total_amount = Money::ZERO;
+            o.total_tax = Money::ZERO;
+            for l in &mut o.lines {
+                l.unit_price = Money::ZERO;
+                l.tax_rate = Money::ZERO;
+                l.amount = Money::ZERO;
+                l.tax_amount = Money::ZERO;
+            }
+        }
+    }
     Ok(Json(json!({ "rows": rows })))
 }
 
@@ -4936,11 +5003,18 @@ async fn save_po(
     po.id = req.id;
     po.memo = req.memo;
     po.status = po_status_parse(&req.status)?;
+    // 字段级价格权限：无「价格修改」者——已有行保留原单价/税率，新行置零（数量照常可改）
+    let price_ok = user.user.can(Perm::PriceEdit);
+    let mut old_price: std::collections::HashMap<String, (Money, Money)> =
+        std::collections::HashMap::new();
     if po.id > 0 {
         let old = findb::scm::po_get(&db, po.id)?
             .ok_or_else(|| AppError::not_found("采购订单不存在"))?;
         po.no = old.no;
         po.received_amount = old.received_amount;
+        for l in &old.lines {
+            old_price.insert(l.item_code.clone(), (l.unit_price, l.tax_rate));
+        }
     } else {
         po.no = findb::scm::po_next_no(&db, period)?;
     }
@@ -4949,12 +5023,24 @@ async fn save_po(
             continue;
         }
         let qty = parse_money_checked(&l.qty_ordered)?;
-        let price = parse_money_checked(&l.unit_price)?;
-        let rate = if l.tax_rate.trim().is_empty() {
+        let mut price = parse_money_checked(&l.unit_price)?;
+        let mut rate = if l.tax_rate.trim().is_empty() {
             Money::ZERO
         } else {
             parse_money_checked(&l.tax_rate)?
         };
+        if !price_ok {
+            match old_price.get(l.item_code.trim()) {
+                Some((op, orate)) => {
+                    price = *op;
+                    rate = *orate;
+                }
+                None => {
+                    price = Money::ZERO;
+                    rate = Money::ZERO;
+                }
+            }
+        }
         let amount = (qty * price).round2();
         let tax = (amount * rate).round2();
         po.lines.push(findb::scm::PoLine {
@@ -5114,7 +5200,7 @@ async fn get_routing(
     user: CurrentUser,
     Path(item): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let ops = advanced::routing_list(&db, &item)?;
     Ok(Json(serde_json::json!({ "item_code": item, "ops": ops })))
@@ -5126,7 +5212,7 @@ async fn post_routing(
     Path(item): Path<String>,
     Json(req): Json<Vec<RoutingOpDto>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let mut ops: Vec<advanced::RoutingOp> = Vec::with_capacity(req.len());
     for d in req {
@@ -5151,7 +5237,7 @@ async fn delete_routing(
     user: CurrentUser,
     Path(item): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     advanced::routing_delete(&db, &item)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -5161,7 +5247,7 @@ async fn list_prod_orders(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = current_period(&state, &user);
     let orders = findb::scm::prod_list(&db, period, None)?;
@@ -5187,7 +5273,7 @@ async fn get_prod_ops(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let ops = advanced::prod_op_list(&db, id)?;
     Ok(Json(serde_json::json!({ "po_id": id, "ops": ops })))
@@ -5207,7 +5293,7 @@ async fn report_prod_op(
     user: CurrentUser,
     Json(req): Json<OpReportReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     advanced::prod_op_report(&db, req.op_id, parse_money_checked(&req.qty)?, parse_money_checked(&req.hours)?)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -5223,7 +5309,7 @@ async fn finish_prod_op(
     user: CurrentUser,
     Json(req): Json<OpFinishReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     advanced::prod_op_finish(&db, req.op_id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -5235,7 +5321,7 @@ async fn get_mrp_latest(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let rows = advanced::mrp_latest(&db)?;
     Ok(Json(serde_json::json!({ "rows": rows })))
@@ -5264,7 +5350,7 @@ async fn run_mrp(
     user: CurrentUser,
     Json(req): Json<MrpRunReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::ProductionOps)?;
     let db = state.db_for(&user.book_key)?;
     let mut demands: Vec<(String, Money, String)> = Vec::with_capacity(req.demands.len());
     for d in req.demands {
@@ -6517,7 +6603,7 @@ async fn save_cost_method(
     user: CurrentUser,
     Json(req): Json<CostMethodReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::CostOps)?;
     let db = state.db_for(&user.book_key)?;
     let sc = parse_money_checked(&req.standard_cost)?;
     findb::business::item_cost_method_set(&db, &req.item, Some(&req.method), sc)?;
@@ -6530,7 +6616,7 @@ async fn clear_cost_method(
     user: CurrentUser,
     Path(item): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::AccountEdit)?;
+    user.require(Perm::CostOps)?;
     let db = state.db_for(&user.book_key)?;
     findb::business::item_cost_method_clear(&db, &item)?;
     Ok(Json(json!({ "ok": true })))
@@ -6542,7 +6628,7 @@ async fn run_period_end_cost(
     method: axum::http::Method,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::PeriodClose)?;
+    user.require(Perm::CostOps)?;
     let db = state.db_for(&user.book_key)?;
     let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
     let apply = q.get("apply").map(|s| s == "1" || s == "true").unwrap_or(false);

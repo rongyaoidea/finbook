@@ -20,6 +20,8 @@ fn map_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
         disabled: r.get::<_, i64>(5)? != 0,
         extra_perms: serde_json::from_str::<Vec<Perm>>(&perms_s).unwrap_or_default(),
         deny_perms: serde_json::from_str::<Vec<Perm>>(&deny_s).unwrap_or_default(),
+        roles: serde_json::from_str::<Vec<Role>>(&r.get::<_, String>(16).unwrap_or_default())
+            .unwrap_or_default(),
         memo: r.get(7)?,
         pwd_changed_at: r.get(8)?,
         must_change_pwd: r.get::<_, i64>(9)? != 0,
@@ -32,7 +34,7 @@ fn map_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
 }
 
 const COLS: &str = "id,username,display_name,password_hash,role,disabled,extra_perms,memo,\
-pwd_changed_at,must_change_pwd,locked_until,last_login_at,data_scope_json,device_id,device_name,deny_perms_json";
+pwd_changed_at,must_change_pwd,locked_until,last_login_at,data_scope_json,device_id,device_name,deny_perms_json,roles_json";
 
 pub fn list(db: &Db) -> DbResult<Vec<User>> {
     let mut stmt = db
@@ -71,8 +73,8 @@ pub fn insert(db: &Db, u: &User) -> DbResult<i64> {
     }
     db.conn().execute(
         "INSERT INTO user(username,display_name,password_hash,role,disabled,extra_perms,memo,
-            pwd_changed_at,must_change_pwd,locked_until,last_login_at,data_scope_json,device_id,device_name,deny_perms_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            pwd_changed_at,must_change_pwd,locked_until,last_login_at,data_scope_json,device_id,device_name,deny_perms_json,roles_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         rusqlite::params![
             u.username,
             u.display_name,
@@ -89,6 +91,7 @@ pub fn insert(db: &Db, u: &User) -> DbResult<i64> {
             u.device_id,
             u.device_name,
             serde_json::to_string(&u.deny_perms)?,
+            serde_json::to_string(&u.roles)?,
         ],
     )?;
     Ok(db.conn().last_insert_rowid())
@@ -107,7 +110,7 @@ pub fn update_on(conn: &rusqlite::Connection, u: &User) -> DbResult<()> {
     conn.execute(
         "UPDATE user SET display_name=?2,password_hash=?3,role=?4,disabled=?5,extra_perms=?6,memo=?7,
             pwd_changed_at=?8,must_change_pwd=?9,locked_until=?10,last_login_at=?11,data_scope_json=?12,
-            device_id=?13,device_name=?14,deny_perms_json=?15
+            device_id=?13,device_name=?14,deny_perms_json=?15,roles_json=?16
          WHERE id=?1",
         rusqlite::params![
             u.id,
@@ -125,6 +128,7 @@ pub fn update_on(conn: &rusqlite::Connection, u: &User) -> DbResult<()> {
             u.device_id,
             u.device_name,
             serde_json::to_string(&u.deny_perms)?,
+            serde_json::to_string(&u.roles)?,
         ],
     )?;
     Ok(())

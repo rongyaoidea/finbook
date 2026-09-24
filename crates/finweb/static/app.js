@@ -378,9 +378,9 @@ const NAV_ITEMS = [
   { id: "bank", label: "银行对账", perm: "voucher_new", group: "期末" },
   { id: "settle", label: "往来核销", perm: "voucher_new", group: "期末" },
   { id: "reconcile", label: "期末对账", perm: "report", group: "期末" },
-  { id: "mrp", label: "MRP 运算", perm: "account_edit", group: "生产制造" },
-  { id: "routing", label: "工艺路线", perm: "account_edit", group: "生产制造" },
-  { id: "work-report", label: "工序报工", perm: "account_edit", group: "生产制造" },
+  { id: "mrp", label: "MRP 运算", perm: "production_ops", group: "生产制造" },
+  { id: "routing", label: "工艺路线", perm: "production_ops", group: "生产制造" },
+  { id: "work-report", label: "工序报工", perm: "production_ops", group: "生产制造" },
   { id: "funds", label: "资金管理", perm: "report", group: "资金" },
   { id: "budget-versions", label: "预算版本", perm: "report", group: "管理会计" },
   { id: "budget-alerts", label: "预算预警", perm: "report", group: "管理会计" },
@@ -1903,7 +1903,10 @@ async function openNewUser() {
     <div class="banner set" style="margin-bottom:12px">此账号用于本账套内的角色分工。对方需已拥有<b>平台账号</b>（同名）才能登录本账套；没有的请先让平台管理员在「平台账号」中开通。</div>
     <div class="field"><label>账号（须与平台账号同名）</label><input id="nu-u" /></div>
     <div class="field"><label>姓名</label><input id="nu-n" /></div>
-    <div class="field"><label>角色</label><select id="nu-r">${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></div>
+    <div class="field"><label>角色（主岗位）</label><select id="nu-r">${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></div>
+    <div class="field"><label>兼任岗位（可多选 = 身兼多职；权限取并集，出纳签字与会计核心仍互斥）</label>
+      <span style="display:flex;flex-wrap:wrap;gap:6px 14px">${roles.map((r) => `<label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="nu-rr" value="${r.role}" />${esc(r.label)}</label>`).join("")}</span>
+    </div>
     <div class="field"><label>初始口令（至少 6 位）</label><input id="nu-p" type="password" /></div>
     <div class="field"><label>备注</label><input id="nu-memo" /></div>
     <div class="field"><label><input type="checkbox" id="nu-must" checked /> 首次登录强制改密</label></div>
@@ -1921,7 +1924,7 @@ async function openNewUser() {
       if (sel.value === "on") extra.push(sel.dataset.perm);
       else if (sel.value === "off") deny.push(sel.dataset.perm);
     });
-    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value, memo: $("#nu-memo", mask).value.trim(), must_change_pwd: $("#nu-must", mask).checked, extra_perms: extra, deny_perms: deny };
+    const body = { username: $("#nu-u", mask).value.trim(), display_name: $("#nu-n", mask).value.trim(), password: $("#nu-p", mask).value, role: $("#nu-r", mask).value, roles: $all(".nu-rr", mask).filter((c) => c.checked).map((c) => c.value), memo: $("#nu-memo", mask).value.trim(), must_change_pwd: $("#nu-must", mask).checked, extra_perms: extra, deny_perms: deny };
     if (!body.username || body.password.length < 6) { toast("账号必填且口令至少 6 位", "err"); return; }
     try { await api("/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已创建用户", "ok"); closeModal(); loadUsers(); } catch (e) { toast(e.message, "err"); }
   };
@@ -1937,8 +1940,11 @@ function permMatrixHtml(roles, u) {
   const denySet = new Set(u.deny_perms || []);
   // 角色预设权限：按 code 收集（perms 是 {code,label} 对象数组，需映射为 code，
   // 否则 new Set 存的是对象、.has(p.code) 永远为 false，导致"角色默认"全部显示为 ✖）
-  const rolePerms = (roles.find((x) => x.role === u.role) || {}).perms || [];
-  const roleCodes = new Set(rolePerms.map((p) => p.code));
+  // 主岗位 + 兼任岗位的权限并集（身兼多职）
+  const roleCodes = new Set();
+  [u.role, ...(u.roles || [])].forEach((rc) => {
+    ((roles.find((x) => x.role === rc) || {}).perms || []).forEach((p) => roleCodes.add(p.code));
+  });
   const stateOf = (code) => (denySet.has(code) ? "off" : extraSet.has(code) ? "on" : "role");
   const rows = allPerms.map((p) => {
     const base = roleCodes.has(p.code) ? "（角色默认 ✔）" : "（角色默认 ✖）";
@@ -1964,7 +1970,10 @@ async function openEditUser(u) {
   const mask = modal(`
     <h3>编辑用户 · ${esc(u.username)}</h3>
     <div class="field"><label>姓名</label><input id="eu-n" value="${esc(u.display_name)}" /></div>
-    <div class="field"><label>角色</label><select id="eu-r">${roles.map((r) => `<option value="${r.role}" ${r.role === u.role ? "selected" : ""}>${esc(r.label)}</option>`).join("")}</select></div>
+    <div class="field"><label>角色（主岗位）</label><select id="eu-r">${roles.map((r) => `<option value="${r.role}" ${r.role === u.role ? "selected" : ""}>${esc(r.label)}</option>`).join("")}</select></div>
+    <div class="field"><label>兼任岗位（可多选 = 身兼多职；权限取并集）</label>
+      <span style="display:flex;flex-wrap:wrap;gap:6px 14px">${roles.map((r) => `<label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" class="eu-rr" value="${r.role}" ${(u.roles || []).includes(r.role) ? "checked" : ""} />${esc(r.label)}</label>`).join("")}</span>
+    </div>
     <div class="field"><label>备注</label><input id="eu-memo" value="${esc(u.memo || "")}" /></div>
     <div class="field"><label><input type="checkbox" id="eu-must" ${u.must_change_pwd ? "checked" : ""} /> 强制下次登录改密</label></div>
     <div class="field"><label><input type="checkbox" id="eu-dis" ${u.disabled ? "checked" : ""} ${me ? "disabled" : ""} /> 停用该账号</label></div>
@@ -1991,6 +2000,7 @@ async function openEditUser(u) {
     const body = {
       display_name: $("#eu-n", mask).value.trim(),
       role: $("#eu-r", mask).value,
+      roles: $all(".eu-rr", mask).filter((c) => c.checked).map((c) => c.value),
       memo: $("#eu-memo", mask).value.trim(),
       must_change_pwd: $("#eu-must", mask).checked,
       disabled: $("#eu-dis", mask).checked,

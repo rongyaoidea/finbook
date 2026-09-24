@@ -51,6 +51,14 @@ pub enum Perm {
     OrderOps,
     /// 仓储作业（库存调整 / 序列号 / 多单位 / 组装拆卸——与科目维护分离，仓管独立上岗）
     Warehouse,
+    /// 价格查看（订单列表 / 套打中的单价与金额字段，服务端强制裁剪）
+    PriceView,
+    /// 价格修改（无此权限者改单：已有行保留原价，新行单价置零）
+    PriceEdit,
+    /// 生产作业（MRP / 工艺路线 / 生产订单 / 报工）
+    ProductionOps,
+    /// 成本作业（计价方式配置 / 期末结价）
+    CostOps,
 }
 
 impl Perm {
@@ -77,6 +85,10 @@ impl Perm {
             Perm::AuditLog => "操作日志",
             Perm::OrderOps => "订单作业",
             Perm::Warehouse => "仓储作业",
+            Perm::PriceView => "价格查看",
+            Perm::PriceEdit => "价格修改",
+            Perm::ProductionOps => "生产作业",
+            Perm::CostOps => "成本作业",
         }
     }
     pub fn all() -> &'static [Perm] {
@@ -102,6 +114,10 @@ impl Perm {
             Perm::AuditLog,
             Perm::OrderOps,
             Perm::Warehouse,
+            Perm::PriceView,
+            Perm::PriceEdit,
+            Perm::ProductionOps,
+            Perm::CostOps,
         ]
     }
 }
@@ -125,6 +141,14 @@ pub enum Role {
     OrderClerk,
     /// 仓管员：仓储作业 + 报表（动不了科目表与凭证）
     Keeper,
+    /// 应收会计：核销 / 收付款单 / 账龄 / 坏账 + 往来建档（不做记账）
+    Receivables,
+    /// 应付会计：采购订单域 + 付款核销 + 价格（不做记账）
+    Payables,
+    /// 成本会计：计价配置 / 期末结价 + 成本凭证草稿
+    CostAccountant,
+    /// 生产计划员：MRP / 工艺路线 / 生产订单 / 报工
+    Production,
     /// 只读：查看报表
     Viewer,
 }
@@ -139,6 +163,10 @@ impl Role {
             Role::Auditor => "审核人",
             Role::OrderClerk => "订单专员",
             Role::Keeper => "仓管员",
+            Role::Receivables => "应收会计",
+            Role::Payables => "应付会计",
+            Role::CostAccountant => "成本会计",
+            Role::Production => "生产计划员",
             Role::Viewer => "只读",
         }
     }
@@ -151,6 +179,10 @@ impl Role {
             Role::Auditor,
             Role::OrderClerk,
             Role::Keeper,
+            Role::Receivables,
+            Role::Payables,
+            Role::CostAccountant,
+            Role::Production,
             Role::Viewer,
         ]
     }
@@ -165,15 +197,21 @@ impl Role {
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
                 VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
                 CarryForward, PeriodClose, Report, Export, AuditLog, OrderOps, Warehouse,
+                PriceView, PriceEdit, CostOps, ProductionOps,
             ],
             Role::Accountant => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
                 Opening, CarryForward, Report, OrderOps, Warehouse,
+                PriceView, PriceEdit, CostOps, ProductionOps,
             ],
             Role::Cashier => &[VoucherNew, VoucherEdit, CashierSign, Report],
             Role::Auditor => &[VoucherAudit, VoucherUnaudit, Report],
-            Role::OrderClerk => &[OrderOps, AuxEdit, Report],
+            Role::OrderClerk => &[OrderOps, AuxEdit, Report, PriceView, PriceEdit],
             Role::Keeper => &[Warehouse, Report],
+            Role::Receivables => &[VoucherNew, AuxEdit, Report],
+            Role::Payables => &[OrderOps, VoucherNew, AuxEdit, Report, PriceView, PriceEdit],
+            Role::CostAccountant => &[CostOps, VoucherNew, Report],
+            Role::Production => &[ProductionOps, Report],
             Role::Viewer => &[Report],
         }
     }
@@ -326,6 +364,8 @@ pub struct User {
     /// 加盐后的口令摘要，格式 `salt$hash`
     pub password_hash: String,
     pub role: Role,
+    /// 兼任岗位（身兼多职；有效权限 = 主岗位 ∪ 兼任 ∪ extra − deny）
+    pub roles: Vec<Role>,
     pub disabled: bool,
     /// 额外权限（在角色基础上追加）
     pub extra_perms: Vec<Perm>,
@@ -368,6 +408,7 @@ impl User {
             last_login_at: String::new(),
             device_id: String::new(),
             device_name: String::new(),
+            roles: Vec::new(),
             data_scope: DataScope {
                 own_voucher_only,
                 ..DataScope::default()
@@ -375,9 +416,29 @@ impl User {
         }
     }
 
-    /// 是否系统管理员（设备绑定、导出限制对管理员不生效）
+    /// 是否系统管理员（设备绑定、导出限制对管理员不生效）——主岗位或兼任任一为 Admin 即是
     pub fn is_admin(&self) -> bool {
-        self.role == Role::Admin
+        self.role == Role::Admin || self.roles.contains(&Role::Admin)
+    }
+
+    /// 主岗位 + 兼任岗位（去重，主岗位在前）
+    pub fn all_roles(&self) -> Vec<Role> {
+        let mut out = vec![self.role];
+        for r in &self.roles {
+            if !out.contains(r) {
+                out.push(*r);
+            }
+        }
+        out
+    }
+
+    /// 角色显示名（身兼多职用 / 连接，如「订单专员/仓管员」）
+    pub fn role_labels(&self) -> String {
+        self.all_roles()
+            .iter()
+            .map(|r| r.label())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     pub fn can(&self, p: Perm) -> bool {
@@ -385,14 +446,17 @@ impl User {
             return false;
         }
         // 系统管理员始终拥有全部权限，不接受逐项关闭（避免把自己锁在门外）
-        if self.role == Role::Admin {
+        if self.is_admin() {
             return true;
         }
-        // 逐项覆盖：角色预设 + 额外授权 − 明确关闭
+        // 逐项覆盖：主岗位 + 兼任岗位（并集）+ 额外授权 − 明确关闭
         if self.deny_perms.contains(&p) {
             return false;
         }
-        self.role.perms().contains(&p) || self.extra_perms.contains(&p)
+        self.all_roles()
+            .iter()
+            .any(|r| r.perms().contains(&p))
+            || self.extra_perms.contains(&p)
     }
 
     /// 不相容职务分离（会计 × 出纳）：**出纳签字**不得与**会计角色核心权限**同现于同一账号。
@@ -400,12 +464,14 @@ impl User {
     /// 系统管理员天然持有全部权限，豁免。建号（insert）与每次权限变更（update）都会调用，
     /// 两端（Web / 桌面）与数据范围保存共用这一拦截点。
     pub fn validate_duty_separation(u: &User) -> Result<(), String> {
-        if u.role == Role::Admin {
+        if u.is_admin() {
             return Ok(());
         }
-        // 有效权限 = 角色预设 + 额外授权 − 明确关闭（与 User::can 同口径，但不受 disabled 影响）
+        // 有效权限 = 主岗位 ∪ 兼任岗位 ∪ 额外授权 − 明确关闭（多岗位并集口径，与 User::can 一致）
+        let roles = u.all_roles();
         let eff = |p: Perm| {
-            !u.deny_perms.contains(&p) && (u.role.perms().contains(&p) || u.extra_perms.contains(&p))
+            !u.deny_perms.contains(&p)
+                && (roles.iter().any(|r| r.perms().contains(&p)) || u.extra_perms.contains(&p))
         };
         if !eff(Perm::CashierSign) {
             return Ok(());
@@ -415,6 +481,8 @@ impl User {
             .iter()
             .copied()
             .filter(|p| !Role::Cashier.perms().contains(p))
+            // 价格查看/修改是业务字段权限，不属于会计记账职责，不参与互斥
+            .filter(|p| !matches!(p, Perm::PriceView | Perm::PriceEdit))
             .collect();
         if accountant_core.iter().any(|&p| eff(p)) {
             return Err(

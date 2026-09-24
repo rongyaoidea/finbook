@@ -106,7 +106,7 @@ impl UsersView {
                     ui.label(t);
                 }
                 1 => { ui.label(&u.display_name); }
-                2 => { ui.label(u.role.label()); }
+                2 => { ui.label(u.role_labels()); }
                 3 => {
                     if u.last_login_at.is_empty() {
                         ui.label(RichText::new("从未登录").weak());
@@ -215,13 +215,32 @@ impl UsersView {
                         ui.end_row();
                         ui.label("角色：");
                         egui::ComboBox::from_id_salt("user_role")
-                            .selected_text(u.role.label())
+                            .selected_text(u.role_labels())
                             .width(220.0)
                             .show_ui(ui, |ui| {
                                 for r in Role::all() {
                                     ui.selectable_value(&mut u.role, *r, r.label());
                                 }
                             });
+                        ui.end_row();
+                        ui.label("兼任岗位：");
+                        ui.horizontal_wrapped(|ui| {
+                            for r in Role::all() {
+                                if *r == u.role {
+                                    continue;
+                                }
+                                let mut on = u.roles.contains(r);
+                                if ui.checkbox(&mut on, r.label()).changed() {
+                                    if on {
+                                        if !u.roles.contains(r) {
+                                            u.roles.push(*r);
+                                        }
+                                    } else {
+                                        u.roles.retain(|x| x != r);
+                                    }
+                                }
+                            }
+                        });
                         ui.end_row();
                         ui.label(if is_new { "初始密码：" } else { "重置密码：" });
                         ui.add_sized(
@@ -272,7 +291,15 @@ impl UsersView {
                 } else {
                     ui.label(RichText::new("权限覆盖（角色基础上逐项开关）").weak());
                     ui.add_space(4.0);
-                    let role_perms = u.role.perms();
+                    // 主岗位 + 兼任岗位权限并集（身兼多职）
+                    let mut role_perms: Vec<Perm> = u.role.perms().to_vec();
+                    for rc in &u.roles {
+                        for p in rc.perms() {
+                            if !role_perms.contains(p) {
+                                role_perms.push(*p);
+                            }
+                        }
+                    }
                     let extra = u.extra_perms.clone();
                     let deny = u.deny_perms.clone();
                     // -1=强制关闭 0=跟随角色 1=强制开启

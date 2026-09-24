@@ -446,7 +446,7 @@ impl SecurityView {
                     ui.label(&u.display_name);
                 }
                 2 => {
-                    ui.label(u.role.label());
+                    ui.label(u.role_labels());
                 }
                 3 => {
                     if u.disabled {

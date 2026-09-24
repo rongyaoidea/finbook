@@ -132,6 +132,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 账套参数 / 仪表盘 / 期间
         .route("/api/options", get(get_options).put(put_options))
         .route("/api/dashboard", get(get_dashboard))
+        .route("/api/workbench", get(get_workbench))
         .route("/api/overview", get(get_overview))
         .route("/api/periods", get(get_periods))
         .route("/api/period", post(post_period))
@@ -1328,6 +1329,154 @@ async fn get_dashboard(
         entries: e,
         accounts: a,
     }))
+}
+
+/// 我的工作台：按岗位权限动态聚合业务卡片 / 我的待办 / 多期趋势。
+/// 凭证/资金/销售/采购/仓管/生产/成本/报销/审批 域在 findb::workbench（复用既有 Perm），
+/// 报表域（语句表）在此注入——门槛 Report（人人首页可进），域内再按各域权限裁剪。
+async fn get_workbench(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<findb::workbench::WbOut>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let cur = current_period(&state, &user);
+    let n = q
+        .get("periods")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(12)
+        .clamp(3, 24);
+    let mut out = findb::workbench::collect(&db, &user.user, cur, n)?;
+    if user.can(Perm::FinReport) {
+        wb_report_domain(&db, &user, cur, n, &mut out)?;
+    }
+    Ok(Json(out))
+}
+
+/// 从语句表按行名（包含匹配）提取首个数值列，取不到 → None（前端显示 "—"）
+fn stmt_val(t: &fincore::report::ReportTable, names: &[&str]) -> Option<Money> {
+    t.rows
+        .iter()
+        .find(|r| names.iter().any(|n| r.name.contains(n)))
+        .and_then(|r| r.values.get(0))
+        .copied()
+}
+
+/// 报表域：资产/负债/权益/收入/净利润卡片 + 资产与利润多期趋势
+fn wb_report_domain(
+    db: &findb::Db,
+    user: &CurrentUser,
+    cur: Period,
+    n: i32,
+    out: &mut findb::workbench::WbOut,
+) -> Result<(), AppError> {
+    let bs_one = |p: Period| -> Result<fincore::report::ReportTable, AppError> {
+        statement_table(
+            db,
+            user,
+            "balance_sheet",
+            p,
+            p,
+            vec![
+                Box::new(fincore::report::identity),
+                Box::new(fincore::report::to_begin),
+            ],
+        )
+    };
+    let is_one = |p: Period| -> Result<fincore::report::ReportTable, AppError> {
+        statement_table(
+            db,
+            user,
+            "income_statement",
+            p,
+            p,
+            vec![Box::new(fincore::report::identity), Box::new(to_ytd)],
+        )
+    };
+    let g = |t: &fincore::report::ReportTable, names: &[&str]| -> String {
+        stmt_val(t, names)
+            .map(|m| m.fmt_money())
+            .unwrap_or_else(|| "—".to_string())
+    };
+    let bs = bs_one(cur)?;
+    let is = is_one(cur)?;
+    let push = |out: &mut findb::workbench::WbOut, key: &str, label: &str, value: String| {
+        out.cards.push(findb::workbench::WbCard {
+            domain: "报表".into(),
+            key: key.into(),
+            label: label.into(),
+            value,
+            unit: "元".into(),
+        });
+    };
+    push(out, "assets", "资产合计", g(&bs, &["资产合计", "资产总计"]));
+    push(out, "liab", "负债合计", g(&bs, &["负债合计", "负债总计"]));
+    push(
+        out,
+        "equity",
+        "所有者权益合计",
+        g(&bs, &["所有者权益合计", "所有者权益总计"]),
+    );
+    push(out, "revenue", "本期营业收入", g(&is, &["营业收入"]));
+    push(out, "profit", "本期净利润", g(&is, &["净利润"]));
+
+    let ps = findb::workbench::period_series(cur, n);
+    let labels = findb::workbench::period_labels(&ps);
+    let mut assets_pts = Vec::new();
+    let mut inc_pts = Vec::new();
+    let mut prof_pts = Vec::new();
+    for p in &ps {
+        let b = bs_one(*p)?;
+        assets_pts.push(
+            stmt_val(&b, &["资产合计", "资产总计"])
+                .map(findb::workbench::money_f64)
+                .unwrap_or(0.0),
+        );
+        let i2 = is_one(*p)?;
+        inc_pts.push(
+            stmt_val(&i2, &["营业收入"])
+                .map(findb::workbench::money_f64)
+                .unwrap_or(0.0),
+        );
+        prof_pts.push(
+            stmt_val(&i2, &["净利润"])
+                .map(findb::workbench::money_f64)
+                .unwrap_or(0.0),
+        );
+    }
+    out.trends.push(findb::workbench::WbTrend {
+        domain: "报表".into(),
+        key: "report_assets".into(),
+        title: "资产合计走势".into(),
+        unit: "元".into(),
+        periods: labels.clone(),
+        series: vec![findb::workbench::WbSeries {
+            name: "资产合计".into(),
+            color: "#1976d2".into(),
+            points: assets_pts,
+        }],
+    });
+    out.trends.push(findb::workbench::WbTrend {
+        domain: "报表".into(),
+        key: "report_profit".into(),
+        title: "收入与净利润走势".into(),
+        unit: "元".into(),
+        periods: labels,
+        series: vec![
+            findb::workbench::WbSeries {
+                name: "营业收入".into(),
+                color: "#1565c0".into(),
+                points: inc_pts,
+            },
+            findb::workbench::WbSeries {
+                name: "净利润".into(),
+                color: "#c62828".into(),
+                points: prof_pts,
+            },
+        ],
+    });
+    Ok(())
 }
 
 /// 管理员「账目总览」：只读视角的账目全貌（仅系统管理员可访问）

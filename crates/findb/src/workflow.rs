@@ -635,6 +635,33 @@ pub fn intercept(
     }
 }
 
+/// 当前用户待审批的运行中实例（节点参与人匹配，与 intercept 同一规则：
+/// 审核权限兜底 OR 命中参与人角色）。供工作台「我的待办」只读统计。
+pub fn pending_for(db: &Db, user: &User) -> DbResult<Vec<WfInstance>> {
+    let mut out = Vec::new();
+    for it in instances(db)? {
+        if it.status != "running" {
+            continue;
+        }
+        let Some(flow) = flow_of(db.conn(), it.flow_id)? else {
+            continue;
+        };
+        let Some(node) = flow.nodes.iter().find(|n| n.id == it.current_node) else {
+            continue;
+        };
+        let audit_ok = user.can(Perm::VoucherAudit);
+        let hit = !node.participants.is_empty()
+            && user
+                .all_roles()
+                .iter()
+                .any(|r| node.participants.contains(&role_code(r)));
+        if audit_ok || hit {
+            out.push(it);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

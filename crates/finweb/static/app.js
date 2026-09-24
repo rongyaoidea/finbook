@@ -354,7 +354,7 @@ const NAV_ITEMS = [
   { id: "overview", label: "账目总览", admin: true, group: "管理员" },
   { id: "platform-users", label: "平台账号", platform: true, group: "平台管理" },
   { id: "platform-books", label: "全部账套", platform: true, group: "平台管理" },
-  { id: "dashboard", label: "仪表盘", perm: null, group: "开始" },
+  { id: "dashboard", label: "工作台", perm: null, group: "开始" },
   { id: "accounts", label: "会计科目", perm: "account_edit", group: "基础资料" },
   { id: "begin", label: "期初建账", perm: "opening", group: "基础资料" },
   { id: "aux", label: "辅助档案", perm: "aux_edit", group: "基础资料" },
@@ -498,7 +498,7 @@ function renderShell() {
     <div class="app">
       <div class="topbar">
         <button class="hamburger" id="menu-btn" aria-label="打开菜单">☰</button>
-        <span class="logo" id="logo-home" title="回到仪表盘">FinBook</span>
+        <span class="logo" id="logo-home" title="回到工作台">FinBook</span>
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
@@ -579,19 +579,54 @@ async function logout() {
 }
 
 // ===========================================================================
-// 仪表盘
+// 我的工作台：账套状态（凭证数等固定卡）+ 按岗位权限动态拼装的
+// 业务卡片 / 我的待办 / 多期趋势（GET /api/workbench，无新权限位）
 // ===========================================================================
 async function viewDashboard(main) {
-  main.innerHTML = `<h2>仪表盘</h2><div class="muted">加载中…</div>`;
+  main.innerHTML = `<h2>我的工作台</h2><div class="muted">加载中…</div>`;
   let d;
-  try { d = await api("/dashboard"); } catch (e) { main.innerHTML = `<h2>仪表盘</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
+  try { d = await api("/dashboard"); } catch (e) { main.innerHTML = `<h2>我的工作台</h2><div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; return; }
   let status = { admin_set: false };
   try { status = await api("/setup/status"); } catch (e) {}
+  let wb = null;
+  try {
+    wb = await api(`/workbench?periods=${Number(state.wbPeriods) || 12}`);
+  } catch (e) { toast(`工作台数据加载失败：${e.message}`, "err"); }
   const adminBanner = status.admin_set
     ? `<div class="banner set">✅ 管理员账号已设定</div>`
     : `<div class="banner unset">🔧 管理员账号未设定 —— 首次成功登录的账号将自动成为系统管理员。</div>`;
+  const nSel = `<label style="font-size:12px;margin-left:auto">趋势期数 <select id="wb-n">${
+    [6, 12, 24].map((n) => `<option value="${n}" ${Number(state.wbPeriods || 12) === n ? "selected" : ""}>${n} 期</option>`).join("")
+  }</select></label>`;
+  const group = (arr) => { const m = {}; (arr || []).forEach((x) => { (m[x.domain] = m[x.domain] || []).push(x); }); return m; };
+  let wbHtml = "";
+  if (wb) {
+    const cg = group(wb.cards);
+    const tg = group(wb.trends);
+    const cardsHtml = Object.keys(cg).map((dom) => `
+      <div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)}</h4>
+        <div class="cards">${cg[dom].map((c) => `<div class="card"><div class="k">${esc(c.label)}</div><div class="v">${esc(c.value)}${c.unit === "元" || c.unit === "件" ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(c.unit)}</span>` : ""}</div></div>`).join("")}</div>
+      </div>`).join("");
+    const todos = wb.todos || [];
+    const todoHtml = todos.length ? `
+      <div class="wb-sec"><h4 style="margin:14px 0 6px">我的待办</h4>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">${todos.map((t) => `
+          <button class="btn ${t.count > 0 ? "primary" : "ghost"}" data-wb-go="${esc(t.view)}" ${t.count > 0 ? "" : "disabled"} style="display:inline-flex;gap:8px;align-items:center">${esc(t.label)}<b>${t.count}</b></button>`).join("")}
+        </div>
+      </div>` : "";
+    const trendHtml = Object.keys(tg).map((dom) => `
+      <div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)}</h4>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px">
+          ${tg[dom].map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
+            <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
+            ${lineChartSvg(t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 190)}
+          </div>`).join("")}
+        </div>
+      </div>`).join("");
+    wbHtml = `<div class="toolbar" style="border:0;padding:6px 0">${nSel}</div>${cardsHtml}${todoHtml}${trendHtml}`;
+  }
   main.innerHTML = `
-    <h2>仪表盘</h2>
+    <h2>我的工作台</h2>
     ${adminBanner}
     <div class="cards">
       <div class="card"><div class="k">公司名称</div><div class="v" style="font-size:16px">${esc(d.company || "—")}</div></div>
@@ -602,7 +637,10 @@ async function viewDashboard(main) {
       <div class="card"><div class="k">凭证数</div><div class="v">${esc(d.vouchers)}</div></div>
       <div class="card"><div class="k">分录数</div><div class="v">${esc(d.entries)}</div></div>
       <div class="card"><div class="k">科目数</div><div class="v">${esc(d.accounts)}</div></div>
-    </div>`;
+    </div>
+    ${wbHtml}`;
+  if ($("#wb-n")) $("#wb-n").onchange = (e) => { state.wbPeriods = Number(e.target.value); viewDashboard(main); };
+  $all("[data-wb-go]").forEach((b) => b.onclick = () => { state.view = b.dataset.wbGo; renderMain(); });
 }
 
 // ===========================================================================

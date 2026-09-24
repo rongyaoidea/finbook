@@ -5735,6 +5735,154 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 我的工作台：权限分域矩阵 + 多期趋势长度 + 待办计数联动。
+#[tokio::test]
+async fn workbench_role_matrix() {
+    let (state, _bd, _dir) = test_state();
+    let admin = boss_in_b1(&state).await;
+
+    // admin：全域 + 趋势期数 = 6
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workbench?periods=6", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "工作台端点应可用");
+    let wb: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let mut doms: Vec<&str> = wb["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["domain"].as_str().unwrap())
+        .collect();
+    doms.sort();
+    doms.dedup();
+    for expect in ["凭证", "报表", "资金", "销售", "采购", "仓管", "生产", "成本", "报销", "审批"] {
+        assert!(doms.contains(&expect), "admin 应含 {expect} 域：{doms:?}");
+    }
+    for t in wb["trends"].as_array().unwrap() {
+        assert_eq!(t["periods"].as_array().unwrap().len(), 6, "趋势期数应为 6：{}", t["key"]);
+    }
+    assert!(
+        wb["todos"].as_array().unwrap().iter().any(|t| t["key"] == "voucher_unposted"),
+        "admin 应有未记账凭证待办"
+    );
+
+    // 造一张未记账凭证 → 待办计数联动 ≥1
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &admin))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let cur_ymm: i32 = cur_label.replace('-', "").parse().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &admin,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm,
+                "date": format!("{cur_label}-05"),
+                "word": "记", "no": 1, "attachments": 0, "memo": "工作台待办造数",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "备用金", "debit": "50", "credit": "0" },
+                    { "line": 2, "account_code": "660201", "summary": "备用金", "debit": "0", "credit": "50" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let vbody = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建未记账凭证：{vbody}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workbench?periods=6", &admin))
+        .await
+        .unwrap();
+    let wb2: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let tu = wb2["todos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["key"] == "voucher_unposted")
+        .unwrap();
+    assert!(tu["count"].as_i64().unwrap() >= 1, "未记账待办应 ≥1：{tu}");
+
+    // 分域矩阵：keeper 只见 仓管/报销/审批；order_clerk 见 销售/采购
+    for (u, name, role) in [
+        ("wbk1", "仓管甲", "keeper"),
+        ("wbc1", "订单甲", "order_clerk"),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &admin,
+                serde_json::json!({ "username": u, "display_name": name, "password": "Test12345" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "开通 {u}");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &admin,
+                serde_json::json!({ "username": u, "display_name": name, "password": "", "role": role, "must_change_pwd": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {role}");
+    }
+    let mut sids: Vec<String> = Vec::new();
+    for u in ["wbk1", "wbc1"] {
+        let (st, sid) = login(&state, u, "Test12345").await;
+        assert_eq!(st, StatusCode::OK, "{u} 登录");
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/change-password",
+                &sid,
+                serde_json::json!({ "old": "Test12345", "new": "Pass123456" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{u} 首登改密");
+        assert_eq!(select_book(&state, &sid, "b1").await, StatusCode::OK, "{u} 进账套");
+        sids.push(sid);
+    }
+    let (keeper, clerk) = (sids[0].clone(), sids[1].clone());
+
+    let doms_of = |wb: &serde_json::Value| -> Vec<String> {
+        let mut d: Vec<String> = wb["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["domain"].as_str().unwrap().to_string())
+            .collect();
+        d.sort();
+        d.dedup();
+        d
+    };
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workbench?periods=6", &keeper))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "仓管可进工作台");
+    let wk = doms_of(&serde_json::from_str(&body_string(resp).await).unwrap());
+    assert!(wk.contains(&"仓管".to_string()), "仓管应含仓管域：{wk:?}");
+    assert!(wk.contains(&"报销".to_string()));
+    assert!(!wk.contains(&"凭证".to_string()), "仓管不应见凭证域：{wk:?}");
+    assert!(!wk.contains(&"资金".to_string()));
+    assert!(!wk.contains(&"销售".to_string()));
+    assert!(!wk.contains(&"报表".to_string()), "仓管无 FinReport → 无报表域");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workbench?periods=6", &clerk))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单员可进工作台");
+    let cl = doms_of(&serde_json::from_str(&body_string(resp).await).unwrap());
+    assert!(cl.contains(&"销售".to_string()) && cl.contains(&"采购".to_string()), "订单员应含销售/采购：{cl:?}");
+    assert!(!cl.contains(&"仓管".to_string()) && !cl.contains(&"凭证".to_string()) && !cl.contains(&"资金".to_string()));
+}
+
 /// 工厂生产链（对标金蝶「业务单据同步凭证」）：标准价+BOM → 下达 →（未开工完工拒）
 /// → 领料(借500101/贷140301) → 开工 → 完工(借140501/贷500101) 双凭证与状态链。
 #[tokio::test]

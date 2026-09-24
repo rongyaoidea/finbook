@@ -253,6 +253,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/procure/req", get(list_purchase_req).post(save_purchase_req))
         .route("/api/procure/req/:id/approve", post(approve_purchase_req))
         .route("/api/procure/req/:id/push-po", post(push_req_po))
+        .route("/api/procure/price-history", get(price_history_ep))
         .route("/api/procure/receipt", post(add_po_receipt))
         .route("/api/procure/payment", post(add_po_payment))
         .route("/api/procure/return", post(add_po_return))
@@ -5461,6 +5462,18 @@ async fn save_po(
         return Err(AppError::bad_request("订单至少一行明细"));
     }
     let id = findb::scm::po_save(&db, &mut po)?;
+    // 价格历史沉淀（正价行 + 有供应商）：采购编辑器「最近价带出」的数据源
+    for l in &po.lines {
+        if l.unit_price.is_positive() && !po.supplier_code.trim().is_empty() {
+            let _ = findb::procurement::price_history_record(
+                &db,
+                &l.item_code,
+                &po.supplier_code,
+                l.unit_price,
+                po.date,
+            );
+        }
+    }
     db.log(
         user.username(),
         "采购",
@@ -5932,6 +5945,27 @@ async fn get_doc_links(
     Ok(Json(json!({ "rows": rows })))
 }
 
+/// 最近采购价历史（按日期倒序）：采购订单编辑器「单价留空自动带出」数据源
+async fn price_history_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let item = q.get("item").map(|s| s.trim()).unwrap_or("");
+    if item.is_empty() {
+        return Err(AppError::bad_request("缺少 item"));
+    }
+    let rows = findb::procurement::price_history(&db, item)?;
+    Ok(Json(json!({
+        "rows": rows
+            .iter()
+            .map(|(s, p, d)| json!({ "supplier": s, "price": p.fmt_qty(), "date": d }))
+            .collect::<Vec<_>>()
+    })))
+}
+
 // ---- 生产订单：下达 / 开工 / 领料 / 完工入库 + BOM（工厂链「业务单据同步凭证」） ----
 
 #[derive(Deserialize)]
@@ -6032,6 +6066,14 @@ async fn prod_issue_ep(
         findb::scm::ProdStatus::Released | findb::scm::ProdStatus::InProgress
     ) {
         return Err(AppError::bad_request("仅已下达/生产中的订单可领料"));
+    }
+    // 按单限额领料（v1：BOM 全量一次领齐，每订单仅可领一次——重复领料按累计流水拦截；
+    // 带数量的部分领/超额补料留待领料单流程迭代）
+    let issued = findb::manufacturing::prod_issue_count(&db, &order.no)?;
+    if issued > 0 {
+        return Err(AppError::bad_request(&format!(
+            "该订单已领过料（累计 {issued} 笔流水）：按单限额只允许领料一次，补料走退料/人工调整"
+        )));
     }
     let date = prod_act_date(&req.date);
     let rows =

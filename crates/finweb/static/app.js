@@ -4656,7 +4656,27 @@ async function openOrderEditor(kind, main, id) {
       <td><button class="btn ghost sm" data-del="${i}">删</button></td>
     </tr>`).join("");
     $all("input[data-f]", tbody).forEach((inp) => {
-      inp.onchange = () => { lines[parseInt(inp.dataset.i, 10)][inp.dataset.f] = inp.value; recalc(); render(); };
+      inp.onchange = () => {
+        const i = parseInt(inp.dataset.i, 10);
+        lines[i][inp.dataset.f] = inp.value;
+        recalc();
+        render();
+        // 采购行：单价为空/0 时自动带出最近采购价（price_history 由保存订单自动沉淀）
+        if (kind === "po" && inp.dataset.f === "item_code" && inp.value.trim() &&
+            (!lines[i].unit_price || lines[i].unit_price === "0")) {
+          const item = inp.value.trim();
+          const target = i;
+          api(`/procure/price-history?item=${encodeURIComponent(item)}`).then((r2) => {
+            const h = (r2.rows || [])[0];
+            if (h && lines[target] && (!lines[target].unit_price || lines[target].unit_price === "0")) {
+              lines[target].unit_price = String(h.price);
+              recalc();
+              render();
+              toast(`已带出最近价 ${h.price}${h.supplier ? `（${h.supplier}）` : ""} ${h.date || ""}`.trim(), "ok");
+            }
+          }).catch(() => {});
+        }
+      };
     });
     $all("[data-del]", tbody).forEach((b) => b.onclick = () => {
       lines.splice(parseInt(b.dataset.del, 10), 1);

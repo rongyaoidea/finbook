@@ -688,6 +688,16 @@ pub fn completion_voucher_in(
     crate::vouchers::save_in(tx, &mut v)
 }
 
+/// 某生产订单的领料流水笔数（按单限额领料的累计口径）
+pub fn prod_issue_count(db: &Db, po_no: &str) -> DbResult<i64> {
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM stock_move WHERE kind='other_out' AND memo=?1",
+        [format!("生产领料 PO#{po_no}")],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
 /// 生产订单开工：已下达 → 生产中（条件更新防并发；完工入库的前置状态）。
 pub fn prod_start(db: &Db, po_id: i64) -> DbResult<()> {
     let tx = db.write_tx()?;

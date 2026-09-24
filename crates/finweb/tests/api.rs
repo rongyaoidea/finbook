@@ -5735,6 +5735,76 @@ async fn stock_batch_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// 最近价带出：采购订单保存自动沉淀价格历史，按日期倒序返回最新价。
+#[tokio::test]
+async fn price_history_suggest() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 初始无历史
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/price-history?item=RM77", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 0);
+
+    // 建单（9 元）→ 自动沉淀
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-15", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "RM77", "qty_ordered": "3", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/price-history?item=RM77", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "保存订单应沉淀价格历史");
+    assert_eq!(rows[0]["price"], "9");
+    assert_eq!(rows[0]["supplier"], "S01");
+
+    // 第二天 10 元 → 最新在前
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-16", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "RM77", "qty_ordered": "5", "unit_price": "10", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/price-history?item=RM77", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["price"], "10", "按日期倒序，最新价在前");
+
+    // 缺 item → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/price-history", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// 库存作业：到货即入库（补价防呆）→ 质检不合格自动退货 → 超退防呆 → 形态转换 → 低库存端点。
 #[tokio::test]
 async fn inventory_qc_convert_flow() {
@@ -6403,6 +6473,17 @@ async fn production_issue_complete_flow() {
     let r: serde_json::Value = serde_json::from_str(&issue_body).unwrap();
     assert_eq!(r["items"], 1, "一个子件一项领料");
     assert_eq!(money_num(r["total"].as_str().unwrap()), 200.0, "领料成本 = 20×10");
+
+    // 按单限额领料：重复领料 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{po_id}/issue"),
+            &sid,
+            serde_json::json!({ "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复领料应被限额拦截");
 
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(&format!("/api/prod/{po_id}/start"), &sid, serde_json::json!({})))

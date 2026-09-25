@@ -2994,8 +2994,8 @@ async function viewRouting(main) {
     try {
       const r = await api(`/routing/${encodeURIComponent(item)}`);
       const ops = r.ops || [];
-      $("#rt-result").innerHTML = `<table><thead><tr><th>序号</th><th>工序编码</th><th>工序名称</th><th>工作中心</th><th>标准工时</th><th>小时费率</th></tr></thead>
-        <tbody>${ops.map((o) => `<tr><td>${o.seq}</td><td>${esc(o.op_code)}</td><td>${esc(o.op_name)}</td><td>${esc(o.work_center)}</td><td class="r">${fmt(o.std_hours)}</td><td class="r">${fmt(o.rate)}</td></tr>`).join("")}</tbody></table>`;
+      $("#rt-result").innerHTML = `<table><thead><tr><th>序号</th><th>工序编码</th><th>工序名称</th><th>工作中心</th><th>标准工时</th><th>小时费率</th><th>检验点</th></tr></thead>
+        <tbody>${ops.map((o) => `<tr><td>${o.seq}</td><td>${esc(o.op_code)}</td><td>${esc(o.op_name)}</td><td>${esc(o.work_center)}</td><td class="r">${fmt(o.std_hours)}</td><td class="r">${fmt(o.rate)}</td><td>${o.qc_required ? '<span class="tag warn">需检验</span>' : '<span class="muted">—</span>'}</td></tr>`).join("")}</tbody></table>`;
       if (!ops.length) $("#rt-result").innerHTML = `<div class="muted">该产品暂无工艺路线。维护请调用 POST /api/routing/:item。</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
@@ -3254,6 +3254,8 @@ async function viewWorkReport(main) {
       <button class="btn ghost sm" id="wr-edit">变更</button>
       <button class="btn ghost sm" id="wr-cancel">取消</button>
       <button class="btn ghost sm" id="wr-log">变更历史</button>
+      <button class="btn ghost sm" id="wr-qc">工序检验</button>
+      <button class="btn ghost sm" id="wr-qclog">检验记录</button>
       <button class="btn ghost sm" id="wr-start">开工</button>
       <button class="btn" id="wr-issue">领料出库</button>
       <label>完工数量 <input id="wr-cq" style="width:70px" value="0" /></label>
@@ -3345,6 +3347,41 @@ async function viewWorkReport(main) {
         ? `<table class="grid"><thead><tr><th>时间</th><th>字段</th><th>改前</th><th>改后</th><th>操作人</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.changed_at)}</td><td>${esc(x.field)}</td><td class="muted">${esc(x.old_value || "—")}</td><td>${esc(x.new_value || "—")}</td><td>${esc(x.changed_by)}</td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无变更记录</div>`;
     }).catch((e) => { $("#pl-body", m).textContent = e.message; });
+  };
+  // 工序检验（生产中订单；不合格必选处置；报废扣减计划量）
+  $("#wr-qc").onclick = () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    if (String(o.status) !== "InProgress") { toast("仅「生产中」的订单可录工序检验", "err"); return; }
+    const m = modal(`<h3>工序检验 — ${esc(o.no)}</h3>
+      <div class="field"><label>检验数量 *</label><input id="qc-insp" value="${esc(String($("#wr-cq").value || "0"))}" /></div>
+      <div class="field"><label>不合格数（0 = 全合格）</label><input id="qc-fail" value="0" /></div>
+      <div class="field"><label>处置（不合格 &gt; 0 必选）</label><select id="qc-disp"><option value="">—</option><option value="rework">返修</option><option value="scrap">报废（扣减计划量）</option><option value="concession">让步接收</option></select></div>
+      <div class="field"><label>日期</label><input id="qc-date" value="${today()}" /></div>
+      <div class="field"><label>备注</label><input id="qc-memo" /></div>
+      <div class="foot"><button class="btn primary" id="qc-save">保存检验单</button><button class="btn ghost" id="qc-cancel">取消</button></div>`);
+    $("#qc-cancel", m).onclick = closeModal;
+    $("#qc-save", m).onclick = async () => {
+      try {
+        const r = await postJson(`/prod/${o.id}/qc`, { qty_insp: $("#qc-insp", m).value.trim(), qty_fail: $("#qc-fail", m).value.trim(), disposition: $("#qc-disp", m).value, date: $("#qc-date", m).value.trim(), memo: $("#qc-memo", m).value.trim() });
+        toast(`检验单 ${r.no}（${r.result === "pass" ? "合格" : r.result === "fail" ? "全不合格" : "部分合格"}）`, "ok");
+        closeModal(); reloadView();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  $("#wr-qclog").onclick = () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    const m = modal(`<h3>检验记录 — ${esc(o.no)}</h3><div id="ql-body" class="muted">加载中…</div>
+      <div class="foot"><button class="btn ghost" id="ql-close">关闭</button></div>`);
+    $("#ql-close", m).onclick = closeModal;
+    api(`/prod/${o.id}/qc`).then((r) => {
+      const rows = r.rows || [];
+      const disp = { rework: "返修", scrap: "报废", concession: "让步接收", "": "—" };
+      $("#ql-body", m).innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th class="num">检验</th><th class="num">合格</th><th class="num">不合格</th><th>处置</th><th>结论</th><th>检验员</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.no)}</td><td>${esc(x.date)}</td><td class="num">${esc(x.qty_insp)}</td><td class="num">${esc(x.qty_pass)}</td><td class="num">${esc(x.qty_fail)}</td><td>${esc(disp[x.disposition] || x.disposition || "—")}</td><td>${x.result === "pass" ? '<span class="tag ok">合格</span>' : x.result === "fail" ? '<span class="tag err">全不合格</span>' : '<span class="tag warn">部分合格</span>'}</td><td>${esc(x.inspector)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无检验记录</div>`;
+    }).catch((e) => { $("#ql-body", m).textContent = e.message; });
   };
   if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。先到「MRP」页对「生产」行点「下达」。</div>`; return; }
   const loadOps = async () => {

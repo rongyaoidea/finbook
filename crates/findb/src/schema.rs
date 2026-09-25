@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 30;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -826,9 +826,28 @@ CREATE TABLE IF NOT EXISTS routing (
     work_center TEXT NOT NULL DEFAULT '',   -- 工作中心
     std_hours   TEXT NOT NULL DEFAULT '0',  -- 标准工时（小时）
     rate        TEXT NOT NULL DEFAULT '0',  -- 小时费率（人工/制造费用）
+    qc_required INTEGER NOT NULL DEFAULT 0, -- v31: 工序检验点（完工前需录工序检验单）
     UNIQUE(item_code, version, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code, version);
+
+-- 工序检验单（v31：合格/返修/报废/让步接收；报废同步扣减计划量）
+CREATE TABLE IF NOT EXISTS prod_qc (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL DEFAULT '',
+    prod_id     INTEGER NOT NULL,
+    item_code   TEXT NOT NULL,
+    qty_insp    TEXT NOT NULL DEFAULT '0',
+    qty_pass    TEXT NOT NULL DEFAULT '0',
+    qty_fail    TEXT NOT NULL DEFAULT '0',
+    disposition TEXT NOT NULL DEFAULT '',   -- rework 返修 / scrap 报废 / concession 让步接收
+    result      TEXT NOT NULL DEFAULT 'pass', -- pass/partial/fail
+    date        TEXT NOT NULL,
+    inspector   TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_prod_qc_prod ON prod_qc(prod_id);
 
 -- 生产订单工序进度（报工记录）
 CREATE TABLE IF NOT EXISTS prod_op (
@@ -1500,6 +1519,10 @@ const MIGRATE_V24: &[(&str, &str, &str)] =
 const MIGRATE_V25: &[(&str, &str, &str)] =
     &[("inv_count_line", "batch_no", "TEXT NOT NULL DEFAULT ''")];
 
+/// v30 → v31：工序检验点（routing.qc_required；prod_qc 为纯新表走 DDL）
+const MIGRATE_V31: &[(&str, &str, &str)] =
+    &[("routing", "qc_required", "INTEGER NOT NULL DEFAULT 0")];
+
 /// v25 → v26：细排计划日期（production_order.plan_start/plan_end）
 const MIGRATE_V26: &[(&str, &str, &str)] = &[
     ("production_order", "plan_start", "TEXT NOT NULL DEFAULT ''"),
@@ -1727,6 +1750,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V24)?;
             migrate_generic(conn, MIGRATE_V25)?;
             migrate_generic(conn, MIGRATE_V26)?;
+            migrate_generic(conn, MIGRATE_V31)?;
             // v30：仓库主数据种默认仓（建表在 DDL；老账套升级即得，幂等）
             conn.execute(
                 "INSERT OR IGNORE INTO warehouse(code,name,is_default,disabled,memo)

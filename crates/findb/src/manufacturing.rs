@@ -572,6 +572,14 @@ pub fn prod_complete(
     if order.status != ProdStatus::InProgress {
         return Err(FinError::msg("只有进行中的订单才能完工入库").into());
     }
+
+    // 工序检验门槛（对标金蝶）：工艺路线含检验点且本单尚无检验记录 → 拒绝
+    if prod_qc_required(db, &order.item_code)? && prod_qc_list(db, po_id)?.is_empty() {
+        return Err(FinError::state(
+            "该产品工艺路线含工序检验点，请先录入工序检验单（工序报工页「工序检验」）",
+        )
+        .into());
+    }
     
     // 归集成本、推进订单、入库、结转凭证收进同一事务：
     // - 订单推进是条件更新（只允许 in_progress → completed），抢输的一方整体回滚，
@@ -810,6 +818,183 @@ pub fn prod_cancel(db: &Db, po_id: i64, who: &str) -> DbResult<()> {
     crate::scm2::change_log_add_conn(&tx, "prod", po_id, "状态", order.status.code(), "cancelled", who)?;
     tx.commit()?;
     Ok(())
+}
+
+// ===========================================================================
+// 工序检验（对标金蝶工序质检：合格 / 返修 / 报废 / 让步接收）
+// ===========================================================================
+
+/// 工序检验单
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProdQc {
+    pub id: i64,
+    pub no: String,
+    pub prod_id: i64,
+    pub item_code: String,
+    pub qty_insp: Money,
+    pub qty_pass: Money,
+    pub qty_fail: Money,
+    /// rework 返修 / scrap 报废 / concession 让步接收（无不合格时为空）
+    pub disposition: String,
+    /// pass / partial / fail
+    pub result: String,
+    pub date: String,
+    pub inspector: String,
+    pub memo: String,
+    pub created_at: String,
+}
+
+fn map_prod_qc(r: &rusqlite::Row) -> rusqlite::Result<ProdQc> {
+    Ok(ProdQc {
+        id: r.get(0)?,
+        no: r.get(1)?,
+        prod_id: r.get(2)?,
+        item_code: r.get(3)?,
+        qty_insp: Money::parse_or_zero(&r.get::<_, String>(4)?),
+        qty_pass: Money::parse_or_zero(&r.get::<_, String>(5)?),
+        qty_fail: Money::parse_or_zero(&r.get::<_, String>(6)?),
+        disposition: r.get(7)?,
+        result: r.get(8)?,
+        date: r.get(9)?,
+        inspector: r.get(10)?,
+        memo: r.get(11)?,
+        created_at: r.get(12)?,
+    })
+}
+
+const QC_COLS: &str =
+    "id,no,prod_id,item_code,qty_insp,qty_pass,qty_fail,disposition,result,date,inspector,memo,created_at";
+
+pub fn prod_qc_list(db: &Db, prod_id: i64) -> DbResult<Vec<ProdQc>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {QC_COLS} FROM prod_qc WHERE prod_id=?1 ORDER BY id DESC"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![prod_id], map_prod_qc)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 工艺路线是否存在工序检验点
+pub fn prod_qc_required(db: &Db, item_code: &str) -> DbResult<bool> {
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM routing WHERE item_code=?1 AND qc_required=1",
+        rusqlite::params![item_code],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn prod_qc_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let mut n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM prod_qc WHERE no LIKE ?1",
+        rusqlite::params![format!("QC{}%", period.ymm())],
+        |r| r.get(0),
+    )?;
+    loop {
+        n += 1;
+        let no = format!("QC{}{:03}", period.ymm(), n);
+        let exists: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM prod_qc WHERE no=?1",
+            rusqlite::params![no],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(no);
+        }
+    }
+}
+
+/// 录入工序检验：仅「生产中」订单；不合格必须选处置；**报废同步扣减计划量**
+/// （不得低于已完工）并写订单变更留痕。返回 (id, 单号, 结论)。
+#[allow(clippy::too_many_arguments)]
+pub fn prod_qc_save(
+    db: &Db,
+    prod_id: i64,
+    qty_insp: Money,
+    qty_fail: Money,
+    disposition: &str,
+    date: NaiveDate,
+    memo: &str,
+    who: &str,
+) -> DbResult<(i64, String, String)> {
+    let order = get_prod_order(db, prod_id)?.ok_or_else(|| FinError::not_found("生产订单"))?;
+    if order.status != ProdStatus::InProgress {
+        return Err(FinError::state("仅「生产中」的订单可录工序检验").into());
+    }
+    if !qty_insp.is_positive() {
+        return Err(FinError::msg("检验数量必须大于 0").into());
+    }
+    if qty_fail.is_negative() || qty_fail > qty_insp {
+        return Err(FinError::msg("不合格数必须在 0 ~ 检验数量之间").into());
+    }
+    let dispo = disposition.trim();
+    if !qty_fail.is_zero() && !matches!(dispo, "rework" | "scrap" | "concession") {
+        return Err(FinError::msg(
+            "存在不合格品时必须选择处置：rework 返修 / scrap 报废 / concession 让步接收",
+        )
+        .into());
+    }
+    let pass = qty_insp - qty_fail;
+    let result = if qty_fail.is_zero() {
+        "pass"
+    } else if pass.is_zero() {
+        "fail"
+    } else {
+        "partial"
+    };
+    let period = Period::from_date(date);
+    let no = prod_qc_next_no(db, period)?;
+    let tx = db.write_tx()?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // 报废：同步扣减计划量（对标金蝶：报废减少订单产出计划）
+    if dispo == "scrap" {
+        let new_planned = order.planned_qty - qty_fail;
+        if new_planned < order.completed_qty {
+            return Err(FinError::state(format!(
+                "报废 {} 后计划量 {} 低于已完工 {}，请先调整订单数量",
+                qty_fail.fmt_qty(),
+                new_planned.fmt_qty(),
+                order.completed_qty.fmt_qty()
+            ))
+            .into());
+        }
+        tx.execute(
+            "UPDATE production_order SET planned_qty=?2, updated_at=?3 WHERE id=?1",
+            rusqlite::params![prod_id, crate::exact_param(new_planned), now],
+        )?;
+        crate::scm2::change_log_add_conn(
+            &tx,
+            "prod",
+            prod_id,
+            "计划数量（报废扣减）",
+            &order.planned_qty.fmt_qty(),
+            &new_planned.fmt_qty(),
+            who,
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO prod_qc(no,prod_id,item_code,qty_insp,qty_pass,qty_fail,disposition,result,
+         date,inspector,memo,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        rusqlite::params![
+            no,
+            prod_id,
+            order.item_code,
+            crate::exact_param(qty_insp),
+            crate::exact_param(pass),
+            crate::exact_param(qty_fail),
+            dispo,
+            result,
+            date.format("%Y-%m-%d").to_string(),
+            who,
+            memo,
+            now
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok((id, no, result.to_string()))
 }
 
 /// 委外加工费确认：归集人工（CostType::Labor → 完工结转由 500102 承接）

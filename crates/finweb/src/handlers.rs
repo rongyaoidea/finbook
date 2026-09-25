@@ -318,6 +318,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/prod/:id", put(update_prod_ep))
         .route("/api/prod/:id/cancel", post(cancel_prod_ep))
         .route("/api/prod/:id/changes", get(list_prod_changes))
+        .route("/api/prod/:id/qc", get(list_prod_qc).post(prod_qc_ep))
         .route("/api/prod/:id/ops", get(get_prod_ops))
         .route("/api/prod/op/report", post(report_prod_op))
         .route("/api/prod/op/finish", post(finish_prod_op))
@@ -6267,6 +6268,9 @@ struct RoutingOpDto {
     pub std_hours: String,
     #[serde(default)]
     pub rate: String,
+    /// 工序检验点（完工前需录工序检验单）
+    #[serde(default)]
+    pub qc_required: bool,
 }
 
 async fn get_routing(
@@ -6300,6 +6304,7 @@ async fn post_routing(
             work_center: d.work_center,
             std_hours: parse_money_checked(&d.std_hours)?,
             rate: parse_money_checked(&d.rate)?,
+            qc_required: d.qc_required,
         });
     }
     advanced::routing_save(&db, &item, &ops)?;
@@ -7028,6 +7033,72 @@ async fn list_prod_changes(
         })
         .collect();
     Ok(Json(json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct ProdQcReq {
+    qty_insp: String,
+    #[serde(default)]
+    qty_fail: String,
+    #[serde(default)]
+    disposition: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 工序检验（仅生产中订单；不合格必选处置；报废同步扣减计划量）
+async fn prod_qc_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ProdQcReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::manufacturing::get_prod_order(&db, id)?.is_none() {
+        return Err(AppError::not_found("生产订单不存在"));
+    }
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let qty_fail = if req.qty_fail.trim().is_empty() {
+        Money::ZERO
+    } else {
+        parse_money_checked(&req.qty_fail)?
+    };
+    let (qid, no, result) = findb::manufacturing::prod_qc_save(
+        &db,
+        id,
+        parse_money_checked(&req.qty_insp)?,
+        qty_fail,
+        &req.disposition,
+        date,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "生产",
+        "工序检验",
+        &format!("{no} PO#{id} 结论 {result}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": qid, "no": no, "result": result })))
+}
+
+/// 工序检验记录
+async fn list_prod_qc(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::manufacturing::prod_qc_list(&db, id)? })))
 }
 
 #[derive(Deserialize)]

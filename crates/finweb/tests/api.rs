@@ -3271,6 +3271,157 @@ async fn consolidate_books() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员应 403");
 }
 
+/// P1：工序质检——检验点门槛、合格/部分/全不合格、报废扣减计划量、状态守卫。
+#[tokio::test]
+async fn prod_qc_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 工艺路线含检验点
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/routing/140501",
+            &sid,
+            serde_json::json!([{ "seq": 1, "op_code": "OP1", "op_name": "车", "work_center": "WC1", "std_hours": "1", "rate": "10", "qc_required": true }]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存工艺路线");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/routing/140501", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ops"][0]["qc_required"], true, "检验点应回显：{r}");
+
+    // 订单 10 → 开工
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "10" }),
+        ))
+        .await
+        .unwrap();
+    let pid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/start"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开工");
+
+    // 完工被工序检验门槛拦截
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/complete"),
+            &sid,
+            serde_json::json!({ "qty": "10", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "无检验记录应拦完工");
+
+    // 非法检验：不合格 > 检验 / 不合格无处置
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/qc"),
+            &sid,
+            serde_json::json!({ "qty_insp": "10", "qty_fail": "11", "disposition": "scrap", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不合格超检验量应 400");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/qc"),
+            &sid,
+            serde_json::json!({ "qty_insp": "10", "qty_fail": "2", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不合格无处置应 400");
+
+    // 正式检验：10 检 2 报废 → 计划量 8 + 变更留痕
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/qc"),
+            &sid,
+            serde_json::json!({ "qty_insp": "10", "qty_fail": "2", "disposition": "scrap", "date": d15, "memo": "首检" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "录检验单：{b}");
+    let qc: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(qc["result"], "partial", "部分合格：{qc}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/prod?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let o = r["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_i64() == Some(pid))
+        .unwrap();
+    assert_eq!(o["planned_qty"], "8", "报废扣减计划量：{o}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/prod/{pid}/changes"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["field"] == "计划数量（报废扣减）"),
+        "报废应留痕：{r}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/prod/{pid}/qc"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1, "检验记录 1 条");
+
+    // 完工 8 → 200；完工后再检验 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/complete"),
+            &sid,
+            serde_json::json!({ "qty": "8", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "有检验记录后可完工");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/qc"),
+            &sid,
+            serde_json::json!({ "qty_insp": "1", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "完工后不可再检验");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

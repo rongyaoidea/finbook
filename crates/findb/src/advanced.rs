@@ -1,4 +1,4 @@
-//! 高级功能：工艺路线 / 工序报工 / MRP / 预算多版本 / 审批流 / 报表附注 /
+﻿//! 高级功能：工艺路线 / 工序报工 / MRP / 预算多版本 / 审批流 / 报表附注 /
 //! 会计电子档案 / 摘要汇总表 / 多栏账增强
 //!
 //! 对标金蝶云星空 / 用友 U8+ 的深度功能。设计原则与核心层一致：
@@ -35,6 +35,9 @@ pub struct RoutingOp {
     pub work_center: String,
     pub std_hours: Money,
     pub rate: Money,
+    /// v31：工序检验点（完工前需录工序检验单）
+    #[serde(default)]
+    pub qc_required: bool,
 }
 
 fn map_routing(r: &rusqlite::Row) -> rusqlite::Result<RoutingOp> {
@@ -48,10 +51,11 @@ fn map_routing(r: &rusqlite::Row) -> rusqlite::Result<RoutingOp> {
         work_center: r.get(6)?,
         std_hours: read_m(&r.get::<_, String>(7)?),
         rate: read_m(&r.get::<_, String>(8)?),
+        qc_required: r.get::<_, i64>(9)? != 0,
     })
 }
 
-const RT_COLS: &str = "id,item_code,version,seq,op_code,op_name,work_center,std_hours,rate";
+const RT_COLS: &str = "id,item_code,version,seq,op_code,op_name,work_center,std_hours,rate,qc_required";
 
 pub fn routing_list(db: &Db, item_code: &str) -> DbResult<Vec<RoutingOp>> {
     routing_list_version(db, item_code, "")
@@ -93,8 +97,8 @@ pub fn routing_save_version(db: &Db, item_code: &str, version: &str, ops: &[Rout
     )?;
     for op in ops {
         tx.execute(
-            "INSERT INTO routing(item_code,version,seq,op_code,op_name,work_center,std_hours,rate)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO routing(item_code,version,seq,op_code,op_name,work_center,std_hours,rate,qc_required)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 item_code,
                 version,
@@ -103,7 +107,8 @@ pub fn routing_save_version(db: &Db, item_code: &str, version: &str, ops: &[Rout
                 op.op_name,
                 op.work_center,
                 crate::exact_param(op.std_hours),
-                crate::exact_param(op.rate)
+                crate::exact_param(op.rate),
+                op.qc_required as i64
             ],
         )?;
     }
@@ -162,6 +167,8 @@ pub fn routing_import_json(db: &Db, item_code: &str, version: &str, json: &str) 
         std_hours: String,
         #[serde(default)]
         rate: String,
+        #[serde(default)]
+        qc_required: bool,
     }
     let raw: Vec<RawOp> = serde_json::from_str(json)
         .map_err(|e| FinError::msg(format!("工艺 JSON 解析失败：{e}")))?;
@@ -177,6 +184,7 @@ pub fn routing_import_json(db: &Db, item_code: &str, version: &str, json: &str) 
             work_center: r.work_center,
             std_hours: Money::parse_or_zero(&r.std_hours),
             rate: Money::parse_or_zero(&r.rate),
+            qc_required: r.qc_required,
         })
         .collect();
     routing_save_version(db, item_code, version, &ops)?;
@@ -2246,6 +2254,7 @@ mod tests {
                     work_center: "WC1".into(),
                     std_hours: m("2"),
                     rate: m("50"),
+                    qc_required: false,
                 },
                 RoutingOp {
                     id: 0,
@@ -2257,6 +2266,7 @@ mod tests {
                     work_center: "WC2".into(),
                     std_hours: m("3"),
                     rate: m("60"),
+                    qc_required: false,
                 },
             ],
         )
@@ -2276,7 +2286,7 @@ mod tests {
             &[RoutingOp {
                 id: 0, item_code: "FG01".into(), version: "v1".into(), seq: 1,
                 op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
-                std_hours: m("2"), rate: m("50"),
+                std_hours: m("2"), rate: m("50"), qc_required: false,
             }],
         )
         .unwrap();
@@ -2287,7 +2297,7 @@ mod tests {
             &[RoutingOp {
                 id: 0, item_code: "FG01".into(), version: "v2".into(), seq: 1,
                 op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
-                std_hours: m("4"), rate: m("50"),
+                std_hours: m("4"), rate: m("50"), qc_required: false,
             }],
         )
         .unwrap();
@@ -2327,10 +2337,10 @@ mod tests {
         routing_save(&db, "FG01", &[
             RoutingOp { id: 0, item_code: "FG01".into(), version: String::new(), seq: 1,
                 op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
-                std_hours: m("2"), rate: m("50") },
+                std_hours: m("2"), rate: m("50"), qc_required: false },
             RoutingOp { id: 0, item_code: "FG01".into(), version: String::new(), seq: 2,
                 op_code: "OP2".into(), op_name: "装配".into(), work_center: "WC2".into(),
-                std_hours: m("3"), rate: m("60") },
+                std_hours: m("3"), rate: m("60"), qc_required: false },
         ]).unwrap();
         prod_op_init_from_routing(&db, po_id, "FG01").unwrap();
         let ops = prod_op_list(&db, po_id).unwrap();

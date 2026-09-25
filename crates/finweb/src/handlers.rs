@@ -406,6 +406,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/assets", get(list_assets).post(create_asset))
         .route("/api/assets/:id", put(update_asset).delete(delete_asset))
         .route("/api/assets/:id/depreciations", get(list_asset_deps))
+        .route("/api/assets/:id/changes", get(list_asset_changes))
+        .route("/api/assets/gl-reconcile", get(asset_gl_reconcile))
         .route("/api/assets/:id/dispose", post(dispose_asset))
         .route("/api/assets/depreciate", post(depreciate_assets))
         .route("/api/assets/depreciations/delete-period", post(delete_asset_deps_period))
@@ -3648,6 +3650,9 @@ async fn account_detail_ep(
     if account.is_empty() {
         return Err(AppError::bad_request("缺少 account 科目编码"));
     }
+    if !user.user.can_see_account(&account) {
+        return Err(AppError::forbidden("无权查看该科目"));
+    }
     let (begin, rows) = findb::balances::account_detail(&db, &account, from, to)?;
     let (td, tc): (Money, Money) = rows.iter().fold((Money::ZERO, Money::ZERO), |(ad, ac), r| {
         (ad + r.debit, ac + r.credit)
@@ -4335,7 +4340,7 @@ async fn get_custom_report(
         .get("period")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
-    let values = findb::mgmt::custom_report_values(&db, &r, period)?;
+    let values = findb::mgmt::custom_report_values(&db, &r, period, Some(&user.user))?;
     let matrix: Vec<Vec<String>> = values
         .iter()
         .map(|row| row.iter().map(|m| m.fmt_money()).collect())
@@ -9118,7 +9123,7 @@ async fn update_asset(
             ));
         }
     }
-    findb::assets::update(&db, &a)?;
+    findb::assets::update_logged(&db, &existing, &a, user.username(), "卡片编辑")?;
     db.log(
         user.username(),
         "固定资产",
@@ -9169,6 +9174,42 @@ async fn list_asset_deps(
     Ok(Json(json!({ "rows": rows })))
 }
 
+/// 资产卡片变更历史（对标金蝶固定资产变动历史）
+async fn list_asset_changes(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::assets::changes(&db, id)? })))
+}
+
+/// 固定资产 ↔ 总账对账（原值/累计折旧逐科目差异）
+async fn asset_gl_reconcile(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::FinReport)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let r = findb::assets::gl_reconcile(&db, period)?;
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "rows": r.rows,
+        "cost_asset": r.cost_asset.fmt_money(),
+        "cost_gl": r.cost_gl.fmt_money(),
+        "cost_diff": r.cost_diff.fmt_money(),
+        "dep_asset": r.dep_asset.fmt_money(),
+        "dep_gl": r.dep_gl.fmt_money(),
+        "dep_diff": r.dep_diff.fmt_money(),
+    })))
+}
+
 async fn dispose_asset(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -9183,14 +9224,18 @@ async fn dispose_asset(
     } else {
         parse_money_checked(&req.amount)?
     };
-    findb::assets::dispose(&db, id, period, amount)?;
+    let vid = findb::assets::dispose(&db, id, period, amount, user.username())?;
     db.log(
         user.username(),
         "固定资产",
         "资产清理",
-        &format!("#{id} {} 金额 {}", period_to_str(period), amount.fmt_money()),
+        &format!(
+            "#{id} {} 金额 {} → 转销凭证 #{vid}",
+            period_to_str(period),
+            amount.fmt_money()
+        ),
     )?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "voucher_id": vid })))
 }
 
 async fn depreciate_assets(
@@ -9970,7 +10015,12 @@ async fn list_begin(
 ) -> Result<Json<Vec<BeginRow>>, AppError> {
     user.require(Perm::Opening)?;
     let db = state.db_for(&user.book_key)?;
-    Ok(Json(balances::list_begin(&db)?))
+    // 数据范围：科目区间外的期初不可见（与账簿/报表同口径）
+    let rows = balances::list_begin(&db)?
+        .into_iter()
+        .filter(|r| user.user.can_see_account(&r.account_code))
+        .collect::<Vec<_>>();
+    Ok(Json(rows))
 }
 
 async fn save_begin(
@@ -9980,6 +10030,13 @@ async fn save_begin(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Opening)?;
     let db = state.db_for(&user.book_key)?;
+    // 数据范围：范围外的科目不得写期初（防越权维护）
+    for r in &rows {
+        let code = r.account_code.trim();
+        if !code.is_empty() && !user.user.can_see_account(code) {
+            return Err(AppError::forbidden(format!("无权维护科目 {code} 的期初余额")));
+        }
+    }
     let mut n = 0;
     for r in rows {
         let code = r.account_code.trim();
@@ -10440,6 +10497,11 @@ async fn list_payroll(
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let rows = business::payroll_list(&db, period)?;
+    // 数据范围·部门：配置了部门范围时只看本部门工资行（与 own_doc_only 叠加）
+    let rows: Vec<business::Payroll> = rows
+        .into_iter()
+        .filter(|r| user.user.data_scope.allows_dept(&r.dept))
+        .collect();
     // 「仅看本人经手的业务单据」：工资按员工姓名匹配当前登录人
     let rows: Vec<business::Payroll> = if user.user.data_scope.own_doc_only {
         rows.into_iter()

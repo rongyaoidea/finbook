@@ -559,6 +559,8 @@ pub fn dim_profit(
 /// 报表取数上下文：把 BalanceSnapshot 接到公式引擎上
 pub struct ReportCtx<'a> {
     db: &'a Db,
+    /// 数据范围用户（None = 不限制）：快照取数按科目区间 + 本人凭证过滤
+    user: Option<&'a fincore::user::User>,
     cache: std::cell::RefCell<std::collections::HashMap<i32, BalanceSnapshot>>,
 }
 
@@ -566,15 +568,25 @@ impl<'a> ReportCtx<'a> {
     pub fn new(db: &'a Db) -> Self {
         Self {
             db,
+            user: None,
             cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+    /// 套用用户数据范围（科目区间 / 仅本人凭证）
+    pub fn with_user(mut self, u: &'a fincore::user::User) -> Self {
+        self.user = Some(u);
+        self
     }
     fn snap(&self, period: Period) -> DbResult<BalanceSnapshot> {
         let mut c = self.cache.borrow_mut();
         if let Some(s) = c.get(&period.ymm()) {
             return Ok(s.clone());
         }
-        let s = BalanceSnapshot::load(self.db, &BalanceQuery::period(period))?;
+        let mut bq = BalanceQuery::period(period);
+        if let Some(u) = self.user {
+            bq = bq.with_user_scope(u);
+        }
+        let s = BalanceSnapshot::load(self.db, &bq)?;
         c.insert(period.ymm(), s.clone());
         Ok(s)
     }
@@ -653,13 +665,17 @@ impl CustomReport {
     }
 }
 
-/// 求值整个自定义报表，返回 `行 × 列` 的金额矩阵
+/// 求值整个自定义报表，返回 `行 × 列` 的金额矩阵（`user` = 数据范围，None 不限制）
 pub fn custom_report_values(
     db: &Db,
     r: &CustomReport,
     period: Period,
+    user: Option<&fincore::user::User>,
 ) -> DbResult<Vec<Vec<Money>>> {
-    let ctx = ReportCtx::new(db);
+    let mut ctx = ReportCtx::new(db);
+    if let Some(u) = user {
+        ctx = ctx.with_user(u);
+    }
     let mut out = Vec::with_capacity(r.lines.len());
     for l in &r.lines {
         let mut row = Vec::with_capacity(r.columns.len());
@@ -920,7 +936,7 @@ mod tests {
             bold: false,
         });
         custom_save(&db, &r).unwrap();
-        let vals = custom_report_values(&db, &r, p).unwrap();
+        let vals = custom_report_values(&db, &r, p, None).unwrap();
         assert_eq!(vals[0][0], m("50000"));
         assert_eq!(vals[1][0], m("50000"));
         let list = custom_list(&db).unwrap();

@@ -264,12 +264,13 @@ impl FinBookApp {
                 }
             }
             ConfirmAction::DeleteAsset(id) => {
-                // 资产清理：标记状态即可，历史折旧记录保留
+                // 资产清理：置状态 + 同事务生成清理转销凭证（历史折旧记录保留）
                 let p = ctx.st.period;
-                let r = findb::assets::dispose(ctx.db(), id, p, fincore::Money::ZERO);
+                let who = ctx.user().username.clone();
+                let r = findb::assets::dispose(ctx.db(), id, p, fincore::Money::ZERO, &who);
                 if ctx.handle(r).is_some() {
-                    ctx.log("固定资产", "资产清理", &format!("#{id}"));
-                    ctx.info("已标记为清理状态，之后不再计提折旧");
+                    ctx.log("固定资产", "资产清理", &format!("#{id}（已生成清理转销凭证）"));
+                    ctx.info("已清理并生成转销凭证草稿（变卖收款与净损益结转请另行制单）");
                     views.data_changed(crate::state::DataKind::Asset);
                 }
             }

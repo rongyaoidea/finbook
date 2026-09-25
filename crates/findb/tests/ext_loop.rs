@@ -142,8 +142,9 @@ fn t90_asset_dep_loop() {
     assets::dep_upsert(&db, &rec).unwrap();
     assert_eq!(assets::dep_list_period(&db, p).unwrap().len(), 1);
 
-    // 清理后不再计提
-    assets::dispose(&db, id, Period::new(2026, 2).unwrap(), m("1000")).unwrap();
+    // 清理后不再计提；清理同时生成转销凭证草稿（借 1602 累计折旧 + 借 1606 净值 / 贷 1601 原值）
+    let vid = assets::dispose(&db, id, Period::new(2026, 2).unwrap(), m("1000"), "tester").unwrap();
+    assert!(vid > 0, "清理应生成转销凭证");
     let g = assets::get(&db, id).unwrap().unwrap();
     assert_eq!(g.status, assets::AssetStatus::Disposed);
     assert!(!g.should_depreciate(Period::new(2026, 3).unwrap()));
@@ -548,7 +549,7 @@ fn t95_mgmt_template_summary_attach_loop() {
         }],
     };
     mgmt::custom_save(&db, &rpt).unwrap();
-    let vals = mgmt::custom_report_values(&db, &rpt, p).unwrap();
+    let vals = mgmt::custom_report_values(&db, &rpt, p, None).unwrap();
     assert_eq!(vals[0][0], m("-2000")); // 只入了管理费用那张：银行 -2000
 
     // 凭证模板：周期性

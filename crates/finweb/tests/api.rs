@@ -2046,6 +2046,361 @@ async fn cash_shift_flow() {
     assert_eq!(ar["status"], "cancelled");
 }
 
+/// P0：固定资产三件套——变更历史 + 总账对账 + 处置清理凭证。
+#[tokio::test]
+async fn asset_p0_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+    let num = |v: &serde_json::Value| -> f64 {
+        v.as_str().unwrap().replace(',', "").parse::<f64>().unwrap()
+    };
+
+    // 建卡：160101 / 1602 / 660201，原值 12000，36 期，残值 5%
+    let card = serde_json::json!({
+        "id": 0, "code": "P0A01", "name": "测试设备", "category": "电子设备", "spec": "",
+        "dept": "财务部", "asset_account": "160101", "dep_account": "1602",
+        "expense_account": "660201", "original_value": "12000", "residual_rate": "5",
+        "life_months": 36, "method": "straight", "start_period": cur_ymm, "memo": ""
+    });
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/assets", &sid, card.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建卡");
+    let id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 资本化入账：借 160101 / 贷 1002（对账基准）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记", "no": 91,
+                "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "160101", "summary": "购入资产", "debit": "12000", "credit": "0" },
+                    { "line": 2, "account_code": "1001", "summary": "购入资产", "debit": "0", "credit": "12000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "资本化凭证：{body}");
+    let cap_vid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{cap_vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "资本化凭证记账");
+
+    // 变更历史：改名 + 换部门 → 至少 2 条字段级记录
+    let mut edited = card.clone();
+    edited["id"] = serde_json::json!(id);
+    edited["name"] = serde_json::json!("测试设备-改");
+    edited["dept"] = serde_json::json!("生产部");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(&format!("/api/assets/{id}"), &sid, edited))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改卡");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/assets/{id}/changes"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let fields: Vec<String> = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["field"].as_str().unwrap().to_string())
+        .collect();
+    assert!(fields.contains(&"名称".to_string()), "应记录名称变更：{fields:?}");
+    assert!(fields.contains(&"使用部门".to_string()), "应记录部门变更：{fields:?}");
+
+    // 计提折旧（草稿）→ 记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets/depreciate",
+            &sid,
+            serde_json::json!({ "ymm": cur_ymm }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "计提折旧");
+    let dep: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let dep_vid = dep["voucher_id"].as_i64().expect("折旧凭证 id");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{dep_vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "折旧凭证记账");
+
+    // 对账（清理前）：原值 12000/12000、累计折旧 316.67/316.67，双向对平
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/assets/gl-reconcile?period={cur_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!((num(&r["cost_asset"]) - 12000.0).abs() < 0.005, "原值资产侧：{r}");
+    assert!((num(&r["cost_gl"]) - 12000.0).abs() < 0.005, "原值总账侧：{r}");
+    assert!(num(&r["cost_diff"]).abs() < 0.005, "原值应平：{r}");
+    assert!((num(&r["dep_asset"]) - 316.67).abs() < 0.005, "累计折旧资产侧：{r}");
+    assert!((num(&r["dep_gl"]) - 316.67).abs() < 0.005, "累计折旧总账侧：{r}");
+    assert!(num(&r["dep_diff"]).abs() < 0.005, "折旧应平：{r}");
+
+    // 清理 → 转销凭证（借 1602 + 借 1606 净值 / 贷 160101）→ 记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/assets/{id}/dispose"),
+            &sid,
+            serde_json::json!({ "ymm": cur_ymm, "amount": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "清理");
+    let dis: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let dis_vid = dis["voucher_id"].as_i64().expect("清理转销凭证 id");
+    assert!(dis_vid > 0);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{dis_vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "转销凭证记账");
+
+    // 对账（清理后）：资产侧与总账侧同时归零
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/assets/gl-reconcile?period={cur_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(num(&r["cost_asset"]).abs() < 0.005, "清理后原值资产侧=0：{r}");
+    assert!(num(&r["cost_gl"]).abs() < 0.005, "清理后原值总账侧=0：{r}");
+    assert!(num(&r["dep_asset"]).abs() < 0.005, "清理后折旧资产侧=0：{r}");
+    assert!(num(&r["dep_gl"]).abs() < 0.005, "清理后折旧总账侧=0：{r}");
+
+    // 重复清理 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/assets/{id}/dispose"),
+            &sid,
+            serde_json::json!({ "ymm": cur_ymm, "amount": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复清理应 400");
+}
+
+/// P0：数据范围全量接入——科目区间过滤账簿/报表/期初，范围外直接 403。
+#[tokio::test]
+async fn data_scope_ledgers() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 造凭证：借 1001 100 / 贷 2001 100 → 记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记", "no": 92,
+                "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "范围测试", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "范围测试", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "造范围测试凭证");
+    let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账");
+
+    // sc1：平台开号 → 首登改密 → 入套为会计 → 科目范围 1001..1001
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &sid,
+            serde_json::json!({ "username": "sc1", "display_name": "范围会计", "password": "Sc1@pass99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "平台开号 sc1");
+    let (_, sc1_sid) = login(&state, "sc1", "Sc1@pass99").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sc1_sid,
+            serde_json::json!({ "old": "Sc1@pass99", "new": "Sc1@pass99x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "sc1 首登改密");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &sid,
+            serde_json::json!({
+                "username": "sc1", "display_name": "范围会计", "password": "",
+                "role": "accountant", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "邀请 sc1 入套");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/sc1",
+            &sid,
+            serde_json::json!({ "data_scope": { "account_from": "1001", "account_to": "1001" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "设置科目范围");
+    assert_eq!(select_book(&state, &sc1_sid, "b1").await, StatusCode::OK);
+
+    // 试算平衡：只含 1001，不含 2001
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/reports/trial-balance?from={cur_ymm}&to={cur_ymm}"),
+            &sc1_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let codes: Vec<String> = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["account_code"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        codes.iter().all(|c| c.starts_with("1001")),
+        "范围外科目不应出现：{codes:?}"
+    );
+    assert!(!codes.iter().any(|c| c == "2001"), "2001 应不可见：{codes:?}");
+
+    // 明细账：1001 可看；2001 → 403
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/ledger/journal?code=1001&from={cur_ymm}&to={cur_ymm}"),
+            &sc1_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "范围内科目可查");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/ledger/journal?code=2001&from={cur_ymm}&to={cur_ymm}"),
+            &sc1_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "范围外科目应 403");
+
+    // 数字钻取：2001 → 403
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/reports/account-detail?account=2001&from={cur_ymm}&to={cur_ymm}"),
+            &sc1_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "范围外钻取应 403");
+
+    // 期初列表：范围外不可见
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sc1_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        rows.iter().all(|x| x["account_code"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("1001")),
+        "期初列表不应含范围外科目"
+    );
+
+    // 管理员视角：2001 正常可见
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/reports/trial-balance?from={cur_ymm}&to={cur_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["account_code"] == "2001"),
+        "管理员应可见 2001"
+    );
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

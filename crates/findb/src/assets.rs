@@ -286,6 +286,81 @@ pub fn update_on(conn: &rusqlite::Connection, a: &Asset) -> DbResult<()> {
     Ok(())
 }
 
+/// 卡片字段级变更记录（对标金蝶固定资产「变动历史」）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AssetChange {
+    pub id: i64,
+    pub asset_id: i64,
+    pub ts: String,
+    pub who: String,
+    pub field: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub memo: String,
+}
+
+fn map_change(r: &rusqlite::Row) -> rusqlite::Result<AssetChange> {
+    Ok(AssetChange {
+        id: r.get(0)?,
+        asset_id: r.get(1)?,
+        ts: r.get(2)?,
+        who: r.get(3)?,
+        field: r.get(4)?,
+        old_value: r.get(5)?,
+        new_value: r.get(6)?,
+        memo: r.get(7)?,
+    })
+}
+
+/// 某卡片的变更历史（倒序）
+pub fn changes(db: &Db, asset_id: i64) -> DbResult<Vec<AssetChange>> {
+    let mut st = db.conn().prepare(
+        "SELECT id,asset_id,ts,who,field,old_value,new_value,memo FROM asset_change
+         WHERE asset_id=?1 ORDER BY id DESC",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![asset_id], map_change)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 更新卡片并**同事务记录字段级变更**（只写实际变化的字段；`old` 为更新前快照）
+pub fn update_logged(db: &Db, old: &Asset, a: &Asset, who: &str, memo: &str) -> DbResult<()> {
+    let tx = db.write_tx()?;
+    update_on(&tx, a)?;
+    let diffs: Vec<(&str, String, String)> = vec![
+        ("名称", old.name.clone(), a.name.clone()),
+        ("类别", old.category.clone(), a.category.clone()),
+        ("规格", old.spec.clone(), a.spec.clone()),
+        ("使用部门", old.dept.clone(), a.dept.clone()),
+        ("资产科目", old.asset_account.clone(), a.asset_account.clone()),
+        ("累计折旧科目", old.dep_account.clone(), a.dep_account.clone()),
+        ("折旧费用科目", old.expense_account.clone(), a.expense_account.clone()),
+        ("原值", old.original_value.fmt_money(), a.original_value.fmt_money()),
+        ("残值率", crate::exact_param(old.residual_rate), crate::exact_param(a.residual_rate)),
+        ("使用年限（月）", old.life_months.to_string(), a.life_months.to_string()),
+        ("折旧方法", old.method.label().to_string(), a.method.label().to_string()),
+        ("启用期间", old.start_period.label(), a.start_period.label()),
+        ("状态", old.status.label().to_string(), a.status.label().to_string()),
+        ("备注", old.memo.clone(), a.memo.clone()),
+    ]
+    .into_iter()
+    .filter(|(_, o, n)| o != n)
+    .collect();
+    if !diffs.is_empty() {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        for (field, o, n) in diffs {
+            tx.execute(
+                "INSERT INTO asset_change(asset_id,ts,who,field,old_value,new_value,memo)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![a.id, ts, who, field, o, n, memo],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// 删除卡片。已提过折旧的卡片不允许直接删，避免账实不符。
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
     let n: i64 = db.conn().query_row(
@@ -651,11 +726,20 @@ pub fn ledger(db: &Db, at: Period) -> DbResult<Vec<AssetLedgerRow>> {
 }
 
 /// 资产清理：标记状态并删除清理期之后的折旧记录（同一事务，避免半更新）
-pub fn dispose(db: &Db, id: i64, period: Period, amount: Money) -> DbResult<()> {
+/// 资产清理（处置）：置状态 + 截断未来折旧 + **同事务生成清理转销凭证**（对标金蝶固定资产清理第一步）：
+/// 借 累计折旧（截至清理期已计提）/ 借 固定资产减值准备（如有）/
+/// 借或贷 固定资产清理（账面净值）/ 贷 固定资产原值。
+/// 说明：变卖收款与清理净损益结转按实际收付另行制单（1606 余额结平后转 6301/6711）；
+/// 返回本次生成的凭证 id。
+pub fn dispose(db: &Db, id: i64, period: Period, amount: Money, who: &str) -> DbResult<i64> {
     let mut a = match get(db, id)? {
         Some(a) => a,
         None => return Err(fincore::FinError::not_found("资产卡片").into()),
     };
+    if a.status == AssetStatus::Disposed {
+        return Err(fincore::FinError::state("该卡片已清理").into());
+    }
+    let chart = crate::accounts::chart(db)?;
     a.status = AssetStatus::Disposed;
     a.disposed_period = Some(period);
     a.dispose_amount = Some(amount);
@@ -665,8 +749,69 @@ pub fn dispose(db: &Db, id: i64, period: Period, amount: Money) -> DbResult<()> 
         "DELETE FROM asset_depreciation WHERE asset_id=?1 AND period>?2",
         rusqlite::params![id, period.ymm()],
     )?;
+    let accum = accum_at_conn(&tx, id, period)?;
+    let impair = impairment_sum_conn(&tx, id)?;
+    let net = a.original_value - accum - impair;
+    let memo = format!("资产清理转销 {} {}", a.code, a.name);
+    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let mut v = Voucher::new(period, period.last_day(), "记", no);
+    v.prepared_by = who.to_string();
+    v.source = VoucherSource::Business;
+    v.memo = memo.clone();
+    let mut line = 1;
+    if !accum.is_zero() {
+        let mut e = Entry::new(line, a.dep_account.as_str(), memo.as_str());
+        e.debit = accum;
+        fill_dep_aux(&chart, &mut e, &a.dep_account, &a.dept)?;
+        v.push_entry(e);
+        line += 1;
+    }
+    if !impair.is_zero() {
+        let mut e = Entry::new(line, "1603", memo.as_str());
+        e.debit = impair;
+        v.push_entry(e);
+        line += 1;
+    }
+    if !net.is_zero() {
+        let mut e = Entry::new(line, "1606", memo.as_str());
+        if net.is_positive() {
+            e.debit = net;
+        } else {
+            e.credit = -net;
+        }
+        v.push_entry(e);
+        line += 1;
+    }
+    let mut e = Entry::new(line, a.asset_account.as_str(), memo.as_str());
+    e.credit = a.original_value;
+    fill_dep_aux(&chart, &mut e, &a.asset_account, &a.dept)?;
+    v.push_entry(e);
+    v.renumber();
+    let vid = crate::vouchers::save_in(&tx, &mut v)?;
     tx.commit()?;
-    Ok(())
+    Ok(vid)
+}
+
+/// 截至指定期间（含）的累计折旧（取最近一期落库累计值）
+fn accum_at_conn(conn: &rusqlite::Connection, asset_id: i64, period: Period) -> DbResult<Money> {
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT accum FROM asset_depreciation WHERE asset_id=?1 AND period<=?2
+             ORDER BY period DESC LIMIT 1",
+            rusqlite::params![asset_id, period.ymm()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(s.map(|x| Money::parse_or_zero(&x)).unwrap_or(Money::ZERO))
+}
+
+/// 连接版减值合计（供事务内使用）
+fn impairment_sum_conn(conn: &rusqlite::Connection, asset_id: i64) -> DbResult<Money> {
+    let mut st = conn.prepare("SELECT amount FROM asset_impairment WHERE asset_id=?1")?;
+    let rows = st
+        .query_map([asset_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.iter().map(|s| Money::parse_or_zero(s)).sum())
 }
 
 /// 解析业务日期（资产模块只在导入 CSV 时用得到）
@@ -709,6 +854,114 @@ pub fn impairment_sum(db: &Db, asset_id: i64) -> DbResult<Money> {
         .query_map([asset_id], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows.iter().map(|s| Money::parse_or_zero(s)).sum())
+}
+
+/// 固定资产 ↔ 总账对账行
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AssetGlRow {
+    pub account_code: String,
+    pub account_name: String,
+    /// 原值 / 累计折旧
+    pub kind: String,
+    /// 资产模块侧金额（未清理卡片；原值为正，累计折旧取绝对值）
+    pub asset_value: Money,
+    /// 总账侧余额（仅已记账 H-3；累计折旧已取绝对值）
+    pub gl_value: Money,
+    /// 差异 = 资产侧 − 总账侧
+    pub diff: Money,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AssetGlReport {
+    pub rows: Vec<AssetGlRow>,
+    pub cost_asset: Money,
+    pub cost_gl: Money,
+    pub cost_diff: Money,
+    pub dep_asset: Money,
+    pub dep_gl: Money,
+    pub dep_diff: Money,
+}
+
+/// 固定资产 ↔ 总账对账（对标金蝶固定资产与总账对账）：
+/// 资产侧 = 启用期 ≤ 期间且未清理（清理期晚于期间）卡片的原值 / 截至期间累计折旧；
+/// 总账侧 = 各资产/累计折旧科目期末余额（仅已记账，H-3）；逐科目差异高亮。
+/// 口径说明：减值准备（1603）暂不纳入资产侧（卡片侧只记减值累计、无净值口径）。
+pub fn gl_reconcile(db: &Db, at: Period) -> DbResult<AssetGlReport> {
+    use crate::balances::{BalanceQuery, BalanceSnapshot};
+    let all = list(db)?;
+    let names: std::collections::HashMap<String, String> = crate::accounts::list(db)?
+        .into_iter()
+        .map(|a| (a.code, a.name))
+        .collect();
+    let mut cost_map: BTreeMap<String, Money> = BTreeMap::new();
+    let mut dep_map: BTreeMap<String, Money> = BTreeMap::new();
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for a in &all {
+        if !a.asset_account.is_empty() {
+            codes.insert(a.asset_account.clone());
+        }
+        if !a.dep_account.is_empty() {
+            codes.insert(a.dep_account.clone());
+        }
+        let disposed = a
+            .disposed_period
+            .map(|d| d.ymm() <= at.ymm())
+            .unwrap_or(false);
+        if a.start_period.ymm() > at.ymm() || disposed {
+            continue;
+        }
+        let e = cost_map.entry(a.asset_account.clone()).or_insert(Money::ZERO);
+        *e = *e + a.original_value;
+        let accum = accum_at_conn(db.conn(), a.id, at)?;
+        if !accum.is_zero() {
+            let e = dep_map.entry(a.dep_account.clone()).or_insert(Money::ZERO);
+            *e = *e + accum;
+        }
+    }
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::period(at))?;
+    let mut rows = Vec::new();
+    let (mut ca, mut cg, mut da, mut dg) = (
+        Money::ZERO,
+        Money::ZERO,
+        Money::ZERO,
+        Money::ZERO,
+    );
+    for code in codes {
+        let is_dep = all.iter().any(|a| a.dep_account == code)
+            && !all.iter().any(|a| a.asset_account == code);
+        let asset_value = if is_dep {
+            dep_map.get(&code).copied().unwrap_or(Money::ZERO)
+        } else {
+            cost_map.get(&code).copied().unwrap_or(Money::ZERO)
+        };
+        let end = snap.for_account(&code, None).end();
+        let gl_value = if is_dep && end.is_negative() { -end } else { end };
+        let diff = asset_value - gl_value;
+        if is_dep {
+            da = da + asset_value;
+            dg = dg + gl_value;
+        } else {
+            ca = ca + asset_value;
+            cg = cg + gl_value;
+        }
+        rows.push(AssetGlRow {
+            account_code: code.clone(),
+            account_name: names.get(&code).cloned().unwrap_or_default(),
+            kind: if is_dep { "累计折旧".into() } else { "原值".into() },
+            asset_value,
+            gl_value,
+            diff,
+        });
+    }
+    Ok(AssetGlReport {
+        rows,
+        cost_asset: ca,
+        cost_gl: cg,
+        cost_diff: ca - cg,
+        dep_asset: da,
+        dep_gl: dg,
+        dep_diff: da - dg,
+    })
 }
 
 /// 附属设备

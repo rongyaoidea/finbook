@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -346,6 +346,19 @@ CREATE TABLE IF NOT EXISTS asset_impairment (
     memo        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_imp ON asset_impairment(asset_id);
+
+-- 固定资产变更历史（字段级：改前/改后/操作人）
+CREATE TABLE IF NOT EXISTS asset_change (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id    INTEGER NOT NULL REFERENCES fixed_asset(id) ON DELETE CASCADE,
+    ts          TEXT NOT NULL DEFAULT '',
+    who         TEXT NOT NULL DEFAULT '',
+    field       TEXT NOT NULL,
+    old_value   TEXT NOT NULL DEFAULT '',
+    new_value   TEXT NOT NULL DEFAULT '',
+    memo        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_asset_change_asset ON asset_change(asset_id, id);
 
 -- 汇率表（期末调汇）
 CREATE TABLE IF NOT EXISTS fx_rate (

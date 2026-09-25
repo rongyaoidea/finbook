@@ -127,7 +127,7 @@ impl CustomReportView {
         match self.tab {
             CrTab::Preview => {
                 if let Some(c) = &cur {
-                    match mgmt::custom_report_values(ctx.db(), c, p) {
+                    match mgmt::custom_report_values(ctx.db(), c, p, Some(ctx.user())) {
                         Ok(v) => self.values = v,
                         Err(e) => ctx.error(e.to_string()),
                     }
@@ -137,7 +137,7 @@ impl CustomReportView {
                 // 先克隆出来再算，避免取数期间一直借用 self.draft
                 let d = self.draft.clone();
                 if let Some(d) = &d {
-                    match mgmt::custom_report_values(ctx.db(), d, p) {
+                    match mgmt::custom_report_values(ctx.db(), d, p, Some(ctx.user())) {
                         Ok(v) => self.preview = v,
                         Err(e) => ctx.error(e.to_string()),
                     }

@@ -3484,6 +3484,7 @@ async function viewAssets(main) {
       <button class="btn" id="as-load">查询</button>
       <div class="spacer"></div>
       <button class="btn ghost" id="as-print">打印预览</button>
+      <button class="btn ghost" id="as-recon">总账对账</button>
       ${can("voucher_new") ? `<button class="btn ghost" id="as-accrue">计提本期折旧</button>` : ""}
       ${can("account_edit") ? `<button class="btn ghost" id="as-deldep">删除本期折旧</button>` : ""}
       ${can("account_edit") ? `<button class="btn primary" id="as-new">新增卡片</button>` : ""}
@@ -3495,6 +3496,7 @@ async function viewAssets(main) {
     <div id="as-plan" style="margin-top:10px"></div>`;
   const periodOf = () => $("#as-period", main).value.trim();
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  $("#as-recon", main).onclick = openAssetRecon;
 
   async function load() {
     const p = periodOf();
@@ -3515,6 +3517,7 @@ async function viewAssets(main) {
         <td class="row-actions">
           ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="edit" data-id="${a.id}">改</button>` : ""}
           ${can("account_edit") ? `<button class="btn sm ghost" data-as="deps" data-id="${a.id}">折旧</button>` : ""}
+          ${can("account_edit") ? `<button class="btn sm ghost" data-as="changes" data-id="${a.id}">变更</button>` : ""}
           ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="dispose" data-id="${a.id}">清理</button>` : ""}
           ${can("account_edit") ? `<button class="btn sm ghost" data-as="del" data-id="${a.id}">删</button>` : ""}
         </td></tr>`;
@@ -3526,11 +3529,16 @@ async function viewAssets(main) {
       const card = (d.cards || []).find((x) => x.id === id);
       if (b.dataset.as === "edit" && card) openAssetEditor(card);
       else if (b.dataset.as === "deps") showAssetDeps(card, id);
+      else if (b.dataset.as === "changes") showAssetChanges(card, id);
       else if (b.dataset.as === "dispose") {
-        if (!(await confirmDialog(`确定对「${card ? card.name : id}」做资产清理？清理当月仍计提，次月停提。`, true))) return;
+        if (!(await confirmDialog(`确定对「${card ? card.name : id}」做资产清理？清理当月仍计提，次月停提；将生成清理转销凭证草稿。`, true))) return;
         const amt = prompt("清理金额（可留空）", "");
         if (amt === null) return;
-        try { await post(`/assets/${id}/dispose`, { ymm: parseInt(periodOf(), 10), amount: amt || "" }); toast("已清理", "ok"); load(); } catch (e) { toast(e.message, "err"); }
+        try {
+          const r = await post(`/assets/${id}/dispose`, { ymm: parseInt(periodOf(), 10), amount: amt || "" });
+          toast(`已清理，转销凭证 #${r.voucher_id}（变卖收款与净损益结转请另行制单）`, "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
       } else if (b.dataset.as === "del") {
         if (!(await confirmDialog("确定删除该资产卡片？（已计提过折旧的卡片不能删除）", true))) return;
         try { await api(`/assets/${id}`, { method: "DELETE" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); }
@@ -3548,6 +3556,41 @@ async function viewAssets(main) {
         ? `<table class="grid"><thead><tr><th>期间</th><th class="num">本期折旧</th><th class="num">累计折旧</th><th class="num">净值</th><th>凭证</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.period)}</td><td class="num">${esc(x.amount)}</td><td class="num">${esc(x.accum)}</td><td class="num">${esc(x.net_value)}</td><td>${x.voucher_id ? "#" + x.voucher_id : "—"}</td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无折旧记录</div>`;
     }).catch((e) => { $("#ad-body", m).textContent = e.message; });
+  }
+
+  function showAssetChanges(card, id) {
+    const m = modal(`<h3>变更历史 — ${esc(card ? card.name : id)}</h3><div id="ach-body" class="muted">加载中…</div>
+      <div class="foot"><button class="btn ghost" id="ach-close">关闭</button></div>`);
+    $("#ach-close", m).onclick = closeModal;
+    api(`/assets/${id}/changes`).then((r) => {
+      const rows = r.rows || [];
+      $("#ach-body", m).innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>时间</th><th>操作人</th><th>字段</th><th>改前</th><th>改后</th><th>说明</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.ts)}</td><td>${esc(x.who)}</td><td>${esc(x.field)}</td><td class="muted">${esc(x.old_value || "—")}</td><td>${esc(x.new_value || "—")}</td><td class="muted">${esc(x.memo || "")}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无变更记录</div>`;
+    }).catch((e) => { $("#ach-body", m).textContent = e.message; });
+  }
+
+  function openAssetRecon() {
+    const m = modal(`<h3>固定资产 ↔ 总账对账 <span class="muted" style="font-size:12px;font-weight:400">资产侧=未清理卡片原值/累计折旧；总账侧=科目余额（仅已记账）</span></h3>
+      <div class="toolbar"><label>期间 <input id="ar-period" value="${esc(periodOf())}" style="width:90px" /></label><button class="btn sm" id="ar-load">对账</button></div>
+      <div id="ar-body" class="muted">加载中…</div>
+      <div class="foot"><button class="btn ghost" id="ar-close">关闭</button></div>`);
+    $("#ar-close", m).onclick = closeModal;
+    const loadRecon = async () => {
+      try {
+        const r = await api(`/assets/gl-reconcile?period=${encodeURIComponent($("#ar-period", m).value.trim())}`);
+        const rows = r.rows || [];
+        const badge = (v) => Math.abs(parseFloat(String(v).replace(/,/g, "")) || 0) < 0.005 ? `<span class="tag ok">平</span>` : `<span class="tag err">差 ${esc(v)}</span>`;
+        $("#ar-body", m).innerHTML = `
+          <div class="cards" style="margin-bottom:8px">
+            <div class="card"><div class="k">原值 资产/总账</div><div class="v" style="font-size:15px">${esc(r.cost_asset)} / ${esc(r.cost_gl)}</div><div class="muted">${badge(r.cost_diff)}</div></div>
+            <div class="card"><div class="k">累计折旧 资产/总账</div><div class="v" style="font-size:15px">${esc(r.dep_asset)} / ${esc(r.dep_gl)}</div><div class="muted">${badge(r.dep_diff)}</div></div>
+          </div>
+          ${rows.length ? `<table class="grid"><thead><tr><th>科目</th><th>名称</th><th>口径</th><th class="num">资产侧</th><th class="num">总账侧</th><th class="num">差异</th></tr></thead><tbody>${rows.map((x) => `<tr style="${Math.abs(parseFloat(String(x.diff).replace(/,/g, "")) || 0) >= 0.005 ? "background:rgba(220,53,69,.08)" : ""}"><td>${esc(x.account_code)}</td><td>${esc(x.account_name || "")}</td><td>${esc(x.kind)}</td><td class="num">${esc(x.asset_value)}</td><td class="num">${esc(x.gl_value)}</td><td class="num">${esc(x.diff)}</td></tr>`).join("")}</tbody></table>` : `<div class="muted">无资产卡片/相关科目余额</div>`}`;
+      } catch (e) { $("#ar-body", m).textContent = e.message; }
+    };
+    $("#ar-load", m).onclick = loadRecon;
+    loadRecon();
   }
 
   function openAssetEditor(card) {

@@ -1745,14 +1745,25 @@ async function viewImports(main) {
     <h2>数据导入</h2>
     <div class="panel">
       <p class="muted" style="margin:0 0 12px;line-height:1.6">
-        从其他财务软件（金蝶 / 用友）或 Excel 导入数据。
-        支持导入 <b>期初余额表</b> 与 <b>记账凭证</b>；遇到账套里没有的科目可手动映射。
+        从其他财务软件（金蝶 / 用友）或 Excel 导入数据。支持 <b>基础资料</b>（辅助核算档案 / 存货 / 科目）、
+        <b>期初余额</b>、<b>期初库存</b> 与 <b>记账凭证</b>；遇到账套里没有的科目可手动映射，
+        重复编码自动跳过（幂等可重导）。
       </p>
       <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0">
         <label>导入类型</label>
         <select id="imp-kind">
-          <option value="begin">期初余额表</option>
-          <option value="voucher">记账凭证</option>
+          <optgroup label="基础资料（各岗位迁移）">
+            <option value="aux">辅助核算档案（客户/供应商/部门/存货…）</option>
+            <option value="item">存货档案</option>
+            <option value="account">会计科目</option>
+          </optgroup>
+          <optgroup label="期初（会计）">
+            <option value="begin">期初余额表</option>
+            <option value="opening_stock">期初库存（数量/批次）</option>
+          </optgroup>
+          <optgroup label="凭证（会计）">
+            <option value="voucher">记账凭证</option>
+          </optgroup>
         </select>
         <label>来源模板</label>
         <select id="imp-template">
@@ -1763,15 +1774,14 @@ async function viewImports(main) {
         <label>期间（凭证用，YYYYMM）</label>
         <input id="imp-period" placeholder="202601" value="${state.current ? String(state.current).replace('-','') : ""}" style="width:90px" />
         <div class="spacer"></div>
-        <button class="btn primary" id="imp-analyze">预检科目</button>
+        <button class="btn ghost sm" id="imp-tpl">下载模板</button>
+        <button class="btn primary" id="imp-analyze">预检</button>
         <button class="btn" id="imp-run">执行导入</button>
       </div>
       <div style="margin-top:10px">
         <label style="font-weight:600">选择 Excel 文件（.xlsx / .xls / .ods，可选）</label>
         <input type="file" id="imp-file" accept=".xlsx,.xls,.ods" style="display:block;margin:4px 0 8px" />
-        <textarea id="imp-text" rows="8" placeholder="或直接粘贴 CSV 内容…
-通用期初：科目编码, 方向(借/贷), 金额
-通用凭证：日期, 凭证字, 摘要, 科目编码, 借方, 贷方"></textarea>
+        <textarea id="imp-text" rows="8"></textarea>
       </div>
       <div id="imp-result" class="muted" style="margin-top:10px;min-height:20px;white-space:pre-wrap;font-size:13px"></div>
     </div>
@@ -1798,6 +1808,27 @@ async function viewImports(main) {
       $("#imp-result").textContent = `已选择文件：${f.name}（${(f.size / 1024).toFixed(1)} KB），点击「预检科目」或「执行导入」。`;
     };
     reader.readAsDataURL(f);
+  });
+
+  // 模板下载（当前类型）+ 列头提示随类型切换
+  const TPL_COLS = {
+    aux: "类型,编码,名称,备注（客户/供应商/部门/职员/项目/银行/存货）",
+    item: "编码,名称,保质期天,安全库存",
+    account: "编码,名称,类别,方向,备注（类别空按编码首位推）",
+    opening_stock: "存货编码,仓库,数量,单价,批次号,生产日期,备注（只入数量，不生成凭证）",
+    begin: "科目编码, 方向(借/贷), 金额（金蝶/用友用完整列）",
+    voucher: "日期, 凭证字, 摘要, 科目编码, 借方, 贷方",
+  };
+  const kindSel = $("#imp-kind");
+  const syncKind = () => {
+    const k = kindSel.value;
+    $("#imp-text").placeholder = `或直接粘贴 CSV 内容…\n列：${TPL_COLS[k] || ""}\n（或点「下载模板」拿标准模板填）`;
+    $("#imp-analyze").textContent = k === "begin" || k === "voucher" ? "预检科目" : "预检";
+  };
+  kindSel.addEventListener("change", syncKind);
+  syncKind();
+  $("#imp-tpl").addEventListener("click", () => {
+    window.location = `/api/import/template?kind=${encodeURIComponent(kindSel.value)}`;
   });
 
   $("#imp-analyze").addEventListener("click", async () => {
@@ -6410,7 +6441,12 @@ function openAuxEditor(main, ent, kind) {
     <div class="field"><label>编码 *</label><input id="au-code" value="${esc(e.code)}" /></div>
     <div class="field"><label>名称 *</label><input id="au-name" value="${esc(e.name)}" /></div>
     ${kind === "customer" ? `<div class="field"><label>信用额度（0 = 不限；超出后订单「确认」被拒）</label><input id="au-credit" value="${esc((e.props && e.props.credit_limit) || "0")}" /></div>` : ""}
-    ${kind === "item" ? `<div class="field"><label>保质期天数（0 = 不启用批次效期）</label><input id="au-shelf" value="${esc((e.props && e.props.shelf_life_days) || "0")}" /></div><div class="field"><label style="display:flex;gap:6px;align-items:center;font-weight:400"><input type="checkbox" id="au-qc" ${e.props && (e.props.qc_required === "1" || e.props.qc_required === "true") ? "checked" : ""} /> 启用来料检验（到货先入待检，质检转正后才可用）</label></div>` : ""}
+    ${kind === "item" ? `<div class="field"><label>保质期天数（0 = 不启用批次效期）</label><input id="au-shelf" value="${esc((e.props && e.props.shelf_life_days) || "0")}" /></div><div class="field"><label style="display:flex;gap:6px;align-items:center;font-weight:400"><input type="checkbox" id="au-qc" ${e.props && (e.props.qc_required === "1" || e.props.qc_required === "true") ? "checked" : ""} /> 启用来料检验（到货先入待检，质检转正后才可用）</label></div>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>安全库存（低库存预警口径）</label><input id="au-safety" placeholder="0 = 不预警" style="width:130px" /></div>
+      <div><label>前置期（天）</label><input id="au-lead" placeholder="0" style="width:90px" /></div>
+      <div><label>批量（MRP 按批量取整）</label><input id="au-lot" placeholder="0" style="width:120px" /></div>
+    </div>` : ""}
     <div class="field"><label>上级编码（分级档案用）</label><input id="au-parent" value="${esc(e.parent_code || "")}" /></div>
     <div class="field"><label>备注</label><input id="au-memo" value="${esc(e.memo)}" /></div>
     <div class="field"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="au-disabled" ${e.disabled ? "checked" : ""} />停用</label></div>
@@ -6420,6 +6456,17 @@ function openAuxEditor(main, ent, kind) {
     </div>
   `);
   $("#au-cancel", mask).addEventListener("click", closeModal);
+  // 存货计划参数回显（安全库存/前置期/批量——异步填充，无记录时留默认）
+  if (kind === "item" && isEdit) {
+    api(`/item-plan?item=${encodeURIComponent(e.code)}`).then((r) => {
+      const p = r && r.plan;
+      if (!p) return;
+      const s = $("#au-safety", mask), l = $("#au-lead", mask), t = $("#au-lot", mask);
+      if (s) s.value = p.safety_stock;
+      if (l) l.value = String(p.lead_days);
+      if (t) t.value = p.lot_size;
+    }).catch(() => {});
+  }
   $("#au-save", mask).addEventListener("click", async () => {
     const code = $("#au-code", mask).value.trim();
     const name = $("#au-name", mask).value.trim();
@@ -6435,6 +6482,17 @@ function openAuxEditor(main, ent, kind) {
     try {
       if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       else await api("/aux", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      // 存货计划参数随档案同存（低库存预警 ↔ 设置入口闭环）
+      if (kind === "item") {
+        try {
+          await postJson("/item-plan", {
+            item_code: code,
+            safety_stock: ($("#au-safety", mask).value || "0").trim(),
+            lead_days: parseInt($("#au-lead", mask).value, 10) || 0,
+            lot_size: ($("#au-lot", mask).value || "0").trim(),
+          });
+        } catch (e2) { toast(`档案已保存，计划参数保存失败：${e2.message}`, "err"); }
+      }
       toast("已保存", "ok"); closeModal(); rerenderView("aux", main);
     } catch (err) { toast(err.message, "err"); }
   });

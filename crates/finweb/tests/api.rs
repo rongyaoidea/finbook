@@ -2300,6 +2300,199 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 导入专项：各岗位基础资料（aux 重码/坏类型跳过、item 保质期+安全库存、account 类别推断、
+/// opening_stock 数量+批次且不生成凭证）+ 模板下载 + 未知 kind 拒。
+#[tokio::test]
+async fn import_master_data() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_str = dash["current_period"].as_str().unwrap().to_string();
+
+    // 模板下载：CSV + BOM；未知 kind 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/import/template?kind=aux", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "模板下载");
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ct.contains("text/csv"), "CSV 类型：{ct}");
+    let tpl = body_string(resp).await;
+    assert!(tpl.starts_with('\u{feff}'), "模板带 BOM 供 Excel 打开");
+    assert!(tpl.contains("类型,编码,名称,备注"), "aux 模板列头：{tpl}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/import/template?kind=bogus", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未知模板 kind 拒");
+
+    // aux 导入：2 行有效 + 1 行重码 + 1 行坏类型 → ok2/skipped2
+    let aux_csv = "类型,编码,名称,备注\n客户,X01,新客户一,\n供应商,XS01,新供应商,\n客户,X01,重复编码,\n不明类型,BAD1,坏行,\n";
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({ "kind": "aux", "template": "generic", "text": aux_csv }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "aux 导入");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 2, "有效 2 行：{r}");
+    assert_eq!(r["skipped"], 2, "重码+坏类型各跳 1：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/aux?kind=customer", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r.as_array().unwrap().iter().any(|a| a["code"] == "X01"), "客户已建档：{r}");
+    // 幂等重导：全部跳过
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({ "kind": "aux", "template": "generic", "text": aux_csv }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 0, "重导幂等不重复：{r}");
+    assert_eq!(r["skipped"], 4, "4 行全跳过：{r}");
+
+    // item 导入：保质期入 props、安全库存入 item_plan
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "item", "template": "generic",
+                "text": "编码,名称,保质期天,安全库存\nXI01,导入存货,30,50\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "item 导入");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 1, "{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/aux?kind=item", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let it = r
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["code"] == "XI01")
+        .unwrap()
+        .clone();
+    assert_eq!(it["props"]["shelf_life_days"], "30", "保质期入 props：{it}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/item-plan?item=XI01", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        r["plan"]["safety_stock"].as_str().unwrap().parse::<f64>().unwrap(),
+        50.0,
+        "安全库存入 item_plan：{r}"
+    );
+
+    // account 导入：类别空按编码首位推（6→费用）；已存在跳过
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "account", "template": "generic",
+                "text": "编码,名称,类别,方向,备注\n660099,导入测试费,,,\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "account 导入");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 1, "{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/accounts", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let list = r.as_array().cloned().unwrap_or_else(|| {
+        r["rows"].as_array().cloned().unwrap_or_default()
+    });
+    assert!(list.iter().any(|a| a["code"] == "660099" && a["name"] == "导入测试费"), "科目已建档：{r}");
+
+    // 未知 kind → 400（per-kind 鉴权入口）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({ "kind": "bogus", "template": "generic", "text": "x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未知 kind 拒");
+
+    // opening_stock：数量流水 + 批次建档（保质期30天推失效日）；**不生成凭证**
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "opening_stock", "template": "generic",
+                "text": "存货编码,仓库,数量,单价,批次号,生产日期,备注\nXI01,W09,40,1.5,OB001,2026-01-01,\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "期初库存导入");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 1, "{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches?item=XI01", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let bt = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["batch_no"] == "OB001")
+        .unwrap()
+        .clone();
+    assert_eq!(bt["warehouse"], "W09", "期初批次建档：{bt}");
+    assert_eq!(bt["expiry_date"], "2026-01-31", "失效日=生产日+保质期30：{bt}");
+    assert_eq!(
+        bt["balance"].as_str().unwrap().parse::<f64>().unwrap(),
+        40.0,
+        "期初数量入流水：{bt}"
+    );
+    // 期初库存不生成凭证（金额侧由科目期初负责）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/vouchers?period={}", cur_str.replace('-', "")),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let vlist = r.as_array().cloned().unwrap_or_else(|| {
+        r["rows"].as_array().cloned().unwrap_or_default()
+    });
+    assert!(vlist.is_empty(), "期初库存不应生成凭证：{r}");
+}
+
 /// 链7：数字钻取（科目明细账：期初 + 逐笔 + 运行余额 + 贷余负值）与缺参校验。
 #[tokio::test]
 async fn report_drill() {

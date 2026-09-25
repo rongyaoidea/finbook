@@ -432,6 +432,302 @@ fn collect_codes(rows: &[Vec<String>], tmpl: ImportTemplate, is_begin: bool) -> 
 ///
 /// - `tmpl`：来源模板（决定凭证的科目列位置）
 /// - `is_begin = true`：期初余额表（第 1 列是科目）；`false`：凭证
+/// 类型别名 → AuxKind（客户/供应商/部门/职员/项目/银行/存货 + 英文）
+fn aux_kind_of(s: &str) -> Option<fincore::AuxKind> {
+    let t = s.trim().to_ascii_lowercase();
+    Some(match t.as_str() {
+        "客户" | "customer" | "c" => fincore::AuxKind::Customer,
+        "供应商" | "supplier" | "s" => fincore::AuxKind::Supplier,
+        "部门" | "dept" | "d" => fincore::AuxKind::Dept,
+        "职员" | "员工" | "employee" | "e" => fincore::AuxKind::Employee,
+        "项目" | "project" | "p" => fincore::AuxKind::Project,
+        "银行" | "bank" | "b" => fincore::AuxKind::Bank,
+        "存货" | "商品" | "item" | "i" => fincore::AuxKind::Item,
+        _ => return None,
+    })
+}
+
+/// 科目类别解析：类别列空或无法识别 → 按编码首位推（1资产 2负债 3权益 4成本 5/6损益）
+fn acct_category_of(code: &str, label: &str) -> fincore::AcctCategory {
+    use fincore::AcctCategory as C;
+    let from_code = || match code.chars().next().unwrap_or('1') {
+        '1' => C::Asset,
+        '2' => C::Liability,
+        '3' => C::Equity,
+        '4' => C::Cost,
+        '5' | '6' => C::Expense,
+        _ => C::Asset,
+    };
+    match label.trim() {
+        "" => from_code(),
+        "资产" | "asset" => C::Asset,
+        "负债" | "liability" => C::Liability,
+        "共同" | "common" => C::Common,
+        "权益" | "所有者权益" | "equity" => C::Equity,
+        "成本" | "cost" => C::Cost,
+        "收入" | "income" | "收益" => C::Income,
+        "费用" | "expense" | "损益" => C::Expense,
+        _ => from_code(),
+    }
+}
+
+fn master_cell(f: &[String], i: usize) -> String {
+    f.get(i).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// 导入辅助核算档案（通用列：类型,编码,名称[,备注]；表头/短行自动跳过）。
+/// **编码已存在 → 跳过计数不覆盖**（避免误伤业务引用；改名请用页面编辑）。
+/// 逐条幂等写入：中断后重跑会跳过已导入行（与期初的整批事务不同——档案可增量）。
+pub fn import_aux(db: &Db, text: &str, who: &str) -> DbResult<ImportResult> {
+    import_aux_rows(db, &text_to_rows(text), who)
+}
+
+pub fn import_aux_bytes(db: &Db, bytes: &[u8], who: &str) -> DbResult<ImportResult> {
+    import_aux_rows(db, &read_xlsx_bytes(bytes)?, who)
+}
+
+fn import_aux_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResult<ImportResult> {
+    let mut res = ImportResult { ok: 0, skipped: 0, warnings: Vec::new() };
+    for (i, f) in rows.iter().enumerate() {
+        if f.len() < 3 {
+            continue; // 空行/说明行
+        }
+        let kind_s = master_cell(f, 0);
+        let code = master_cell(f, 1);
+        if code.is_empty() || code == "编码" || code.eq_ignore_ascii_case("code") {
+            continue; // 表头
+        }
+        let Some(kind) = aux_kind_of(&kind_s) else {
+            res.warnings.push(format!("第 {} 行：类型「{kind_s}」无法识别，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        };
+        let name = master_cell(f, 2);
+        if name.is_empty() {
+            res.warnings.push(format!("第 {} 行：{code} 名称为空，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if crate::auxs::get(db, kind, &code)?.is_some() {
+            res.skipped += 1;
+            continue; // 已存在静默跳过（重导常见）
+        }
+        let mut e = fincore::auxiliary::AuxEntity::new(kind, code.clone(), name);
+        e.memo = master_cell(f, 3);
+        crate::auxs::insert(db, &e)?;
+        res.ok += 1;
+    }
+    if res.ok > 0 {
+        db.log(who, "导入", "导入基础档案", &format!("成功 {} 条", res.ok))?;
+    }
+    Ok(res)
+}
+
+/// 导入存货档案（列：编码,名称[,保质期天,安全库存]）＝ aux(item) + props保质期 + item_plan安全库存。
+/// 单位换算请到「多单位换算」页维护；已存在跳过。
+pub fn import_items(db: &Db, text: &str, who: &str) -> DbResult<ImportResult> {
+    import_items_rows(db, &text_to_rows(text), who)
+}
+
+pub fn import_items_bytes(db: &Db, bytes: &[u8], who: &str) -> DbResult<ImportResult> {
+    import_items_rows(db, &read_xlsx_bytes(bytes)?, who)
+}
+
+fn import_items_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResult<ImportResult> {
+    let mut res = ImportResult { ok: 0, skipped: 0, warnings: Vec::new() };
+    for (i, f) in rows.iter().enumerate() {
+        if f.len() < 2 {
+            continue;
+        }
+        let code = master_cell(f, 0);
+        if code.is_empty() || code == "编码" || code.eq_ignore_ascii_case("code") {
+            continue;
+        }
+        let name = master_cell(f, 1);
+        if name.is_empty() {
+            res.warnings.push(format!("第 {} 行：{code} 名称为空，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if crate::auxs::get(db, fincore::AuxKind::Item, &code)?.is_some() {
+            res.skipped += 1;
+            continue;
+        }
+        let mut e = fincore::auxiliary::AuxEntity::new(fincore::AuxKind::Item, code.clone(), name);
+        let shelf = master_cell(f, 2);
+        if !shelf.is_empty() {
+            e.props.insert("shelf_life_days".into(), shelf);
+        }
+        crate::auxs::insert(db, &e)?;
+        // 安全库存（列4）→ item_plan（MRP/低库存预警口径）
+        let safety = master_cell(f, 3);
+        if !safety.is_empty() {
+            crate::advanced::item_plan_upsert(
+                db,
+                &crate::advanced::ItemPlan {
+                    item_code: code.clone(),
+                    safety_stock: Money::parse_or_zero(&safety),
+                    lead_days: 0,
+                    lot_size: Money::ZERO,
+                },
+            )?;
+        }
+        res.ok += 1;
+    }
+    if res.ok > 0 {
+        db.log(who, "导入", "导入存货档案", &format!("成功 {} 条", res.ok))?;
+    }
+    Ok(res)
+}
+
+/// 导入科目建档（列：编码,名称[,类别,方向,备注]）：类别空按编码首位推；已存在跳过。
+/// 逐条幂等（中断可重导）；辅助核算维度请到科目编辑器补配。
+pub fn import_accounts(db: &Db, text: &str, who: &str) -> DbResult<ImportResult> {
+    import_accounts_rows(db, &text_to_rows(text), who)
+}
+
+pub fn import_accounts_bytes(db: &Db, bytes: &[u8], who: &str) -> DbResult<ImportResult> {
+    import_accounts_rows(db, &read_xlsx_bytes(bytes)?, who)
+}
+
+fn import_accounts_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResult<ImportResult> {
+    let mut res = ImportResult { ok: 0, skipped: 0, warnings: Vec::new() };
+    for (i, f) in rows.iter().enumerate() {
+        if f.len() < 2 {
+            continue;
+        }
+        let code = master_cell(f, 0);
+        if code.is_empty() || code == "编码" || code == "科目编码" || code.eq_ignore_ascii_case("code") {
+            continue;
+        }
+        let name = master_cell(f, 1);
+        if name.is_empty() {
+            res.warnings.push(format!("第 {} 行：{code} 名称为空，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if crate::accounts::get(db, &code)?.is_some() {
+            res.skipped += 1;
+            continue;
+        }
+        let cat = acct_category_of(&code, &master_cell(f, 2));
+        let mut acc = fincore::account::Account::new(code.clone(), name, cat);
+        match master_cell(f, 3).as_str() {
+            "贷" | "credit" => acc.dir = fincore::Direction::Credit,
+            "借" | "debit" => acc.dir = fincore::Direction::Debit,
+            _ => {} // 空 = 类别默认方向
+        }
+        acc.memo = master_cell(f, 4);
+        crate::accounts::insert(db, &acc)?;
+        res.ok += 1;
+    }
+    if res.ok > 0 {
+        db.log(who, "导入", "导入科目", &format!("成功 {} 条", res.ok))?;
+    }
+    Ok(res)
+}
+
+/// 导入期初库存（列：存货编码,仓库,数量[,单价,批次号,生产日期,备注]）。
+/// **口径声明**：只入数量流水（其他入库，账期=建账首期），**不生成凭证**——
+/// 金额与存货科目期初由「科目期初」导入负责，双侧各管一段避免重复记账。
+/// 存货须已建档（先导存货档案）；批次号非空则自动建档（生产日期+档案保质期推失效日）。
+pub fn import_opening_stock(db: &Db, text: &str, who: &str) -> DbResult<ImportResult> {
+    import_opening_stock_rows(db, &text_to_rows(text), who)
+}
+
+pub fn import_opening_stock_bytes(db: &Db, bytes: &[u8], who: &str) -> DbResult<ImportResult> {
+    import_opening_stock_rows(db, &read_xlsx_bytes(bytes)?, who)
+}
+
+fn import_opening_stock_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResult<ImportResult> {
+    let mut res = ImportResult { ok: 0, skipped: 0, warnings: Vec::new() };
+    let period = db.options().start_period;
+    let date = period.first_day();
+    let tx = db.write_tx()?;
+    for (i, f) in rows.iter().enumerate() {
+        if f.len() < 3 {
+            continue;
+        }
+        let item = master_cell(f, 0);
+        if item.is_empty() || item == "存货编码" || item.eq_ignore_ascii_case("code") {
+            continue;
+        }
+        let warehouse = master_cell(f, 1);
+        let qty = Money::parse_or_zero(&master_cell(f, 2));
+        if warehouse.is_empty() || !qty.is_positive() {
+            res.warnings.push(format!("第 {} 行：仓库为空或数量非正，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if crate::auxs::get(db, fincore::AuxKind::Item, &item)?.is_none() {
+            res.warnings.push(format!("第 {} 行：存货 {item} 未建档（先导存货档案），已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        let price = Money::parse_or_zero(&master_cell(f, 3));
+        let batch_no = master_cell(f, 4);
+        let pdate = master_cell(f, 5);
+        let memo = master_cell(f, 6);
+        // 数量流水（amount=0 由计价引擎结算；金额侧不入账——口径见 doc）
+        crate::business::stock_insert_of(
+            &tx,
+            &crate::business::StockMove {
+                id: 0,
+                period,
+                biz_date: date,
+                kind: crate::business::StockKind::OtherIn,
+                item: item.clone(),
+                warehouse: warehouse.clone(),
+                batch_no: batch_no.clone(),
+                qty,
+                price,
+                amount: Money::ZERO,
+                voucher_id: None,
+                memo: if memo.is_empty() { "期初库存".into() } else { format!("期初 {memo}") },
+            },
+        )?;
+        // 批次建档（OR IGNORE；失效日=生产日期+档案保质期）
+        if !batch_no.is_empty() {
+            let pdate_s = if pdate.is_empty() {
+                date.format("%Y-%m-%d").to_string()
+            } else {
+                pdate.clone()
+            };
+            let expiry = match chrono::NaiveDate::parse_from_str(&pdate_s, "%Y-%m-%d") {
+                Ok(d) => {
+                    let days = crate::batch::shelf_life_days(db, &item);
+                    if days > 0 {
+                        (d + chrono::Duration::days(days)).format("%Y-%m-%d").to_string()
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(_) => String::new(),
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO stock_batch(item,batch_no,production_date,expiry_date,warehouse,memo,created_by,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    item,
+                    batch_no,
+                    pdate_s,
+                    expiry,
+                    warehouse,
+                    "期初批次",
+                    who,
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+                ],
+            )?;
+        }
+        res.ok += 1;
+    }
+    if res.ok > 0 {
+        db.log(who, "导入", "导入期初库存", &format!("成功 {} 条", res.ok))?;
+    }
+    tx.commit()?;
+    Ok(res)
+}
+
 pub fn analyze_missing(
     db: &Db,
     text: &str,

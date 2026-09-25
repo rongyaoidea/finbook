@@ -182,6 +182,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/invoices/:id/status", post(invoice_set_status))
         // 数据导入（其他软件 / CSV）
         .route("/api/import/analyze", post(import_analyze))
+        .route("/api/import/template", get(import_template))
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
@@ -416,6 +417,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/templates/:id", put(update_template).delete(delete_template))
         .route("/api/templates/:id/generate", post(generate_template))
         .route("/api/aux", get(list_aux).post(create_aux))
+        .route("/api/item-plan", get(get_item_plan).post(save_item_plan))
         .route("/api/aux/:id", put(update_aux).delete(delete_aux))
         .route("/api/payroll", get(list_payroll).post(save_payroll))
         .route("/api/payroll/generate", post(generate_payroll))
@@ -2874,13 +2876,83 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, AppError> {
     Ok(out)
 }
 
+/// 导入 per-kind 鉴权：页面入口宽（NAV Report），动作按 kind 严管（迁移操作者=对应岗位）
+fn import_perm(kind: &str) -> Result<Perm, AppError> {
+    Ok(match kind {
+        "voucher" | "begin" => Perm::VoucherNew,
+        "account" => Perm::AccountEdit,
+        "aux" => Perm::AuxEdit,
+        "item" | "opening_stock" => Perm::Warehouse,
+        _ => return Err(AppError::bad_request("未知导入类型 kind")),
+    })
+}
+
+/// 下载导入模板（列头 + 示例行；主数据三平台列头一致，CSV 带 BOM 供 Excel 直接打开）
+async fn import_template(
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let kind = q.get("kind").map(String::as_str).unwrap_or("");
+    let rows: Vec<Vec<&str>> = match kind {
+        "aux" => vec![
+            vec!["类型", "编码", "名称", "备注"],
+            vec!["客户", "C01", "示例客户", ""],
+            vec!["供应商", "S01", "示例供应商", ""],
+            vec!["部门", "D01", "示例部门", ""],
+            vec!["存货", "I01", "示例存货", ""],
+        ],
+        "item" => vec![
+            vec!["编码", "名称", "保质期天", "安全库存"],
+            vec!["I01", "示例存货", "365", "100"],
+        ],
+        "account" => vec![
+            vec!["编码", "名称", "类别", "方向", "备注"],
+            vec!["1001", "库存现金", "资产", "借", ""],
+            vec!["2202", "应付账款", "负债", "贷", ""],
+        ],
+        "opening_stock" => vec![
+            vec!["存货编码", "仓库", "数量", "单价", "批次号", "生产日期", "备注"],
+            vec!["I01", "W01", "100", "12.5", "BT0001", "2026-01-01", "盘点转入"],
+        ],
+        "begin" => vec![
+            vec!["科目编码", "科目名称", "方向", "期初余额", "累计借方", "累计贷方"],
+            vec!["1001", "库存现金", "借", "1000", "0", "0"],
+        ],
+        "voucher" => vec![
+            vec!["日期", "凭证字", "摘要", "科目编码", "借方", "贷方"],
+            vec!["2026-01-31", "记", "期初入库", "1001", "100", "0"],
+            vec!["2026-01-31", "记", "期初入库", "1405", "0", "100"],
+        ],
+        _ => {
+            return Err(AppError::bad_request(
+                "未知模板 kind：aux / item / account / opening_stock / begin / voucher",
+            ))
+        }
+    };
+    let mut body = String::from("\u{feff}");
+    for row in &rows {
+        body.push_str(&row.join(","));
+        body.push('\n');
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{kind}_template.csv\"").as_str(),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 /// 预检：返回文件中引用但账套不存在的科目（供用户选择映射或忽略）
 async fn import_analyze(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
     Json(req): Json<ImportAnalyzeReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherNew)?;
+    user.require(import_perm(&req.kind)?)?;
     let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     if !has_file && req.text.trim().is_empty() {
         return Err(AppError::bad_request("请选择 Excel 文件或粘贴 CSV 内容"));
@@ -2903,7 +2975,13 @@ async fn import_analyze(
         } else {
             req.text.clone()
         };
-        let missing = findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?;
+        // 主数据类（aux/item/account/opening_stock）无科目引用——预检直接返回空
+        // （行级错误由执行时 warnings 呈现；空 text 走同一条解析路径保证类型一致）
+        let missing = if matches!(req.kind.as_str(), "aux" | "item" | "account" | "opening_stock") {
+            findb::imports::analyze_missing(&db, "", tmpl, is_begin)?
+        } else {
+            findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?
+        };
         let items: Vec<serde_json::Value> = missing
             .iter()
             .map(|m| json!({ "code": m.code, "count": m.count }))
@@ -2921,7 +2999,7 @@ async fn import_run(
     user: CurrentUser,
     Json(req): Json<ImportRunReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherNew)?;
+    user.require(import_perm(&req.kind)?)?;
     let has_file = req.file.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     if !has_file && req.text.trim().is_empty() {
         return Err(AppError::bad_request("请粘贴 CSV 内容或选择 Excel 文件"));
@@ -2940,17 +3018,51 @@ async fn import_run(
     let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, AppError> {
         let db = state2.db_for(&key)?;
         let tmpl = findb::imports::ImportTemplate::parse(&req.template);
-        let res = if req.kind == "voucher" {
-            let period = fincore::Period::from_ymm(explicit_ymm.unwrap_or(fallback_ymm));
-            if let Some(bytes) = &file_bytes {
-                findb::imports::import_vouchers_bytes(&db, period, bytes, &who, &req.mapping, tmpl)?
-            } else {
-                findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping, tmpl)?
+        let res = match req.kind.as_str() {
+            "voucher" => {
+                let period = fincore::Period::from_ymm(explicit_ymm.unwrap_or(fallback_ymm));
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_vouchers_bytes(&db, period, bytes, &who, &req.mapping, tmpl)?
+                } else {
+                    findb::imports::import_vouchers(&db, period, &req.text, &who, &req.mapping, tmpl)?
+                }
             }
-        } else if let Some(bytes) = &file_bytes {
-            findb::imports::import_begin_bytes(&db, bytes, &who, &req.mapping, tmpl)?
-        } else {
-            findb::imports::import_begin(&db, &req.text, &who, &req.mapping, tmpl)?
+            "aux" => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_aux_bytes(&db, bytes, &who)?
+                } else {
+                    findb::imports::import_aux(&db, &req.text, &who)?
+                }
+            }
+            "item" => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_items_bytes(&db, bytes, &who)?
+                } else {
+                    findb::imports::import_items(&db, &req.text, &who)?
+                }
+            }
+            "account" => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_accounts_bytes(&db, bytes, &who)?
+                } else {
+                    findb::imports::import_accounts(&db, &req.text, &who)?
+                }
+            }
+            "opening_stock" => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_opening_stock_bytes(&db, bytes, &who)?
+                } else {
+                    findb::imports::import_opening_stock(&db, &req.text, &who)?
+                }
+            }
+            // "begin" 及未列出的既有类型（kind 已由 import_perm 校验，未知 kind 到不了这里）
+            _ => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_begin_bytes(&db, bytes, &who, &req.mapping, tmpl)?
+                } else {
+                    findb::imports::import_begin(&db, &req.text, &who, &req.mapping, tmpl)?
+                }
+            }
         };
         Ok(json!({
             "ok": res.ok,
@@ -9852,6 +9964,75 @@ async fn list_aux(
         .and_then(|s| AuxKind::from_code(s))
         .unwrap_or(AuxKind::Customer);
     Ok(Json(auxs::list(&db, &AuxQuery::kind(kind))?))
+}
+
+#[derive(Deserialize)]
+struct ItemPlanReq {
+    #[serde(default)]
+    item_code: String,
+    #[serde(default)]
+    safety_stock: String,
+    #[serde(default)]
+    lead_days: i32,
+    #[serde(default)]
+    lot_size: String,
+}
+
+/// 存货计划参数读取（编辑器回显）：安全库存 / 前置期 / 批量
+async fn get_item_plan(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let code = q
+        .get("item")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少 item 存货编码"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let p = findb::advanced::item_plan_get(&db, &code)?;
+    Ok(Json(json!({
+        "plan": p.as_ref().map(|p| json!({
+            "safety_stock": p.safety_stock.fmt_qty(),
+            "lead_days": p.lead_days,
+            "lot_size": p.lot_size.fmt_qty(),
+        })),
+    })))
+}
+
+/// 存货计划参数保存（补齐「低库存预警 ↔ 设置入口」断链——迁移/建档配套）
+async fn save_item_plan(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ItemPlanReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let code = req.item_code.trim().to_string();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少 item_code"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    findb::advanced::item_plan_upsert(
+        &db,
+        &findb::advanced::ItemPlan {
+            item_code: code.clone(),
+            safety_stock: parse_money_checked(&req.safety_stock)?,
+            lead_days: req.lead_days.max(0),
+            lot_size: parse_money_checked(&req.lot_size)?,
+        },
+    )?;
+    db.log(
+        user.username(),
+        "档案",
+        "存货计划参数",
+        &format!("{code} 安全库存 {} 前置期 {} 批量 {}", req.safety_stock, req.lead_days, req.lot_size),
+    )?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn create_aux(

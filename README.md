@@ -452,6 +452,22 @@
 - **顺手修**：明细 SQL 首版 `v.summary` 列不存在（voucher 表是 `memo`）——mem 单测复现定位。
 - **测试**：findb `account_detail_smoke`（手插凭证直调）1/1；web `report_drill`——三笔记账凭证（借100/借200/贷30，每笔保存即记账走 H-3 流程）→ 本期 begin=0/3行/借300/贷30/末行余额270/凭证号记82/分录摘要 → 下期 begin=270 期初累计、无行 → 缺 account 400；回归 `trial_balance_default_posted_only_h3`（口径锚）+ `web_aux_qty_and_custom_reports` + `fin_report_vs_business_report` 3/3。
 
+### 4.31 各岗位数据导入（平台迁移专项）+ 存货计划参数入口
+
+- **现状复用**：`findb::imports` 原有三平台模板（金蝶/用友/通用）、CSV/Excel 双通路、科目映射、预检/执行两段——原仅覆盖会计（期初+凭证）。本专项扩到**各岗位**。
+- **4 个新 kind**（复用两段框架，行级 warnings + 跳过计数）：
+  | kind | 岗位 | 列 | 落库 | 鉴权 |
+  |---|---|---|---|---|
+  | `aux` 档案 | 销售/采购/人力 | 类型,编码,名称,备注 | `aux_entity` upsert（**重码/坏类型跳过**） | AuxEdit |
+  | `item` 存货 | 仓管 | 编码,名称,保质期天,安全库存 | aux(item)+props + `item_plan` 安全库存 | Warehouse |
+  | `account` 科目 | 会计 | 编码,名称,类别,方向,备注 | 科目表（**类别空按编码首位推** 1资产/2负债/3权益/4成本/5,6费用） | AccountEdit |
+  | `opening_stock` 期初库存 | 仓管 | 存货,仓库,数量[,单价,批次,生产日期,备注] | **其他入库数量流水（账期=建账首期）+ 批次建档（生产日+档案保质期推失效日）**；存货未建档跳过 | Warehouse |
+- **口径声明**：期初库存**不生成凭证**——金额与存货科目期初由「科目期初」导入负责，双侧各管一段避免重复记账；档案类**逐条幂等**（中断可重导，重码静默跳过），与期初的整批事务有意不同。
+- **per-kind 鉴权**：页面入口不变，动作按 kind 分流（`import_perm`：voucher/begin→VoucherNew、account→AccountEdit、aux→AuxEdit、item/opening_stock→Warehouse、未知 kind 400）。
+- **模板下载**：`GET /api/import/template?kind=`（CSV 带 BOM Excel 直开；6 类列头+示例行）；页面 kind 下拉分组（基础资料/期初/凭证）+ 列头提示随类型切换 + 「下载模板」按钮。
+- **B 项·存货计划参数入口**（补断链）：`GET/POST /api/item-plan`（Warehouse）——存货档案编辑器新增 **安全库存/前置期/批量** 三字段（回显 GET、随档案同存 POST）——低库存预警报表 ↔ 设置入口闭环（此前 `item_plan` 只有表和 MRP 逻辑、**无 Web 入口**）。
+- **测试**：web `import_master_data`——模板 BOM/列头/未知 kind 400 → aux 导入 ok2+skip2（重码/坏类型）+幂等重导 ok0/skip4 → item 保质期入 props + 安全库存入 item_plan → account 类别推断建档 → **未知 kind 400** → opening_stock 批次建档（W09、失效日=生产+30、余额40）+ **凭证零生成断言**；既有导入回归 `import_*` 全量。
+
 ---
 
 ## 5. 关键设计约定

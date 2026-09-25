@@ -67,7 +67,7 @@ fn map_batch(r: &rusqlite::Row) -> rusqlite::Result<StockBatch> {
 }
 
 /// 存货档案保质期天数（aux props.shelf_life_days；未配置/非法 = 0）
-fn shelf_life_days(db: &Db, item: &str) -> i64 {
+pub fn shelf_life_days(db: &Db, item: &str) -> i64 {
     let props: Option<String> = db
         .conn()
         .query_row(

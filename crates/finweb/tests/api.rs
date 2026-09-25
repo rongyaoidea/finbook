@@ -2135,6 +2135,8 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     // sup9：会计 + 额外 user_manage（非管理员）；vic9：普通成员
     let _ = provision_plain_user(&state, &admin_sid, "sup9", "S912345678").await;
     let _ = provision_plain_user(&state, &admin_sid, "vic9", "V912345678").await;
+    // 账套端点需要账套上下文：先进 b1 再邀请
+    assert_eq!(select_book(&state, &admin_sid, "b1").await, StatusCode::OK);
     for (u, extra) in [("sup9", vec!["user_manage"]), ("vic9", vec![])] {
         let resp = handlers::router(state.clone())
             .oneshot(authed_post(

@@ -87,6 +87,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/setup/status", get(get_setup_status))
         // 平台账套目录：列表（按归属过滤）+ 自建账套 + 选择当前账套
         .route("/api/books", get(list_books).post(create_book))
+        .route("/api/consolidate/preview", get(consolidate_preview))
         .route("/api/books/:key/select", post(select_book))
         .route("/api/books/:key", delete(delete_book))
         .route("/api/login", post(post_login))
@@ -852,6 +853,104 @@ async fn unlock_security_user(
     }
     state.realm.unlock_user(name)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// 跨账套合并汇总（平台级，仅管理员；v1 汇总，不含内部往来抵销）
+// ---------------------------------------------------------------------------
+
+/// 合并汇总：对选中账套按期间汇总各科目期末余额（各套独立取数，仅已记账 H-3）。
+/// `books=b1,b2`；返回科目 × 账套矩阵 + 合计。
+async fn consolidate_preview(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该入口仅限系统管理员使用"));
+    }
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| {
+            Period::from_ymm(state.default_period)
+        });
+    let keys: Vec<String> = q
+        .get("books")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return Err(AppError::bad_request("请选择要合并的账套（books=b1,b2）"));
+    }
+    // 逐套取数：科目 → (名称, 期末余额)
+    let mut per_book: Vec<(String, String, std::collections::BTreeMap<String, (String, Money)>)> =
+        Vec::new();
+    let mut book_meta = Vec::new();
+    for key in &keys {
+        let db = state
+            .db_for(key)
+            .map_err(|_| AppError::bad_request(format!("账套 {key} 不存在或无法打开")))?;
+        let company = db.options().company.clone();
+        let chart = accounts::chart(&db)?;
+        let snap = BalanceSnapshot::load(&db, &BalanceQuery::period(period))?;
+        let mut map: std::collections::BTreeMap<String, (String, Money)> =
+            std::collections::BTreeMap::new();
+        for a in chart.all() {
+            if !chart.is_leaf(&a.code) {
+                continue;
+            }
+            let end = snap.for_account(&a.code, None).end();
+            if end.is_zero() {
+                continue;
+            }
+            map.insert(a.code.clone(), (a.name.clone(), end));
+        }
+        book_meta.push(json!({ "key": key, "company": company }));
+        per_book.push((key.clone(), company, map));
+    }
+    // 科目并集 → 行（账套列 + 合计）
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (_, _, m) in &per_book {
+        for c in m.keys() {
+            codes.insert(c.clone());
+        }
+    }
+    let mut rows = Vec::new();
+    for code in &codes {
+        let mut values = serde_json::Map::new();
+        let mut total = Money::ZERO;
+        let mut name = String::new();
+        for (key, _, m) in &per_book {
+            let v = m
+                .get(code)
+                .map(|(n, v)| {
+                    if name.is_empty() {
+                        name = n.clone();
+                    }
+                    *v
+                })
+                .unwrap_or(Money::ZERO);
+            values.insert(key.clone(), json!(v.fmt_money()));
+            total = total + v;
+        }
+        rows.push(json!({
+            "account_code": code,
+            "account_name": name,
+            "values": values,
+            "total": total.fmt_money(),
+        }));
+    }
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "books": book_meta,
+        "rows": rows,
+        "note": "汇总口径：各账套仅已记账余额（H-3）；v1 为跨账套汇总，内部往来抵销留待 v2",
+    })))
 }
 
 /// 生成唯一账套 key（文件名，不含扩展名）

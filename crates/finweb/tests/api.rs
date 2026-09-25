@@ -3134,6 +3134,143 @@ async fn prod_change_cancel_flow() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知订单取消应 404");
 }
 
+/// P1：合并报表（跨账套汇总）——两套独立取数按科目合计；非管理员 403；未知账套 400。
+#[tokio::test]
+async fn consolidate_books() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // b1：借 1001 100 / 贷 2001 100 → 记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-15", "word": "记", "no": 95,
+                "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "合并造数", "debit": "100", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "合并造数", "debit": "0", "credit": "100" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "b1 造数");
+    let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "b1 记账");
+
+    // 建 b2 并进入：借 1001 200 / 贷 2001 200 → 记账
+    let (st, body) = create_book(&state, &sid, "第二公司").await;
+    assert_eq!(st, StatusCode::OK, "建第二账套");
+    let b2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &sid, &b2).await, StatusCode::OK, "进入 b2");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-15", "word": "记", "no": 95,
+                "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "合并造数", "debit": "200", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "合并造数", "debit": "0", "credit": "200" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "b2 造数");
+    let vid2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid2}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "b2 记账");
+
+    // 合并汇总：1001 合计 300、2001 合计 -300（借正贷负）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/consolidate/preview?period=202601&books=b1,{b2}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "合并汇总：{body}");
+    let r: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(r["books"].as_array().unwrap().len(), 2, "两套：{r}");
+    let row = |code: &str| {
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["account_code"] == code)
+            .cloned()
+            .unwrap()
+    };
+    let n = |v: &serde_json::Value| v.as_str().unwrap().replace(',', "").parse::<f64>().unwrap();
+    assert!((n(&row("1001")["total"]) - 300.0).abs() < 0.005, "1001 合计 300：{r}");
+    assert!((n(&row("2001")["total"]) + 300.0).abs() < 0.005, "2001 合计 -300：{r}");
+
+    // 未知账套 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/consolidate/preview?period=202601&books=b1,nope",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未知账套应 400");
+
+    // 非管理员 → 403（先完成首登改密）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &sid,
+            serde_json::json!({ "username": "cu1", "display_name": "合并测试", "password": "Cu1@pass99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开号 cu1");
+    let (_, cu_sid) = login(&state, "cu1", "Cu1@pass99").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &cu_sid,
+            serde_json::json!({ "old": "Cu1@pass99", "new": "Cu1@pass99x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "cu1 改密");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/consolidate/preview?period=202601&books=b1",
+            &cu_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员应 403");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

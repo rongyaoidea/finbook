@@ -402,6 +402,7 @@ const NAV_ITEMS = [
   { id: "overview", label: "账目总览", admin: true, group: "管理员" },
   { id: "platform-users", label: "账号管理", platform: true, group: "系统管理" },
   { id: "platform-books", label: "全部账套", platform: true, group: "系统管理" },
+  { id: "consolidate", label: "合并报表", platform: true, group: "系统管理" },
   { id: "dashboard", label: "工作台", perm: null, group: "开始" },
   { id: "accounts", label: "会计科目", perm: "account_edit", group: "基础资料" },
   { id: "begin", label: "期初建账", perm: "opening", group: "基础资料" },
@@ -471,6 +472,7 @@ const VIEWS = {
   "overview": viewOverview,
   "platform-users": viewPlatformUsers,
   "platform-books": viewPlatformBooks,
+  "consolidate": viewConsolidate,
   "dashboard": viewDashboard,
   "vouchers": viewVouchers,
   "invoices": viewInvoices,
@@ -2649,6 +2651,45 @@ async function viewPlatformUsers(main) {
     }
   });
   await load();
+}
+
+// ===========================================================================
+// 合并报表（跨账套汇总，仅平台管理员；v1 汇总，不含内部往来抵销）
+// ===========================================================================
+async function viewConsolidate(main) {
+  main.innerHTML = `<h2>合并报表 <span class="muted" style="font-size:12px">跨账套汇总（管理员）</span></h2>
+    <div class="toolbar">
+      <label>期间 <input id="cs-period" value="${(state.current || "").replace("-", "")}" style="width:90px" placeholder="YYYYMM" /></label>
+      <button class="btn primary sm" id="cs-run">合并汇总</button>
+      <button class="btn ghost sm" id="cs-print">打印预览</button>
+      <span class="muted" style="font-size:12px">口径：各账套仅已记账余额；v1 为汇总，内部往来抵销留待 v2</span>
+    </div>
+    <div class="panel"><div id="cs-books" class="muted">加载账套…</div></div>
+    <div class="panel" style="margin-top:8px"><div id="cs-table" class="muted">选择账套后点「合并汇总」</div></div>`;
+  let books = [];
+  try {
+    const r = await api("/books");
+    books = r.books || [];
+  } catch (e) { $("#cs-books").textContent = e.message; }
+  $("#cs-books").innerHTML = books.length
+    ? `<b style="font-size:12.5px">选择账套</b><div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px">${books.map((b) => `<label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" class="cs-bk" value="${esc(b.key)}" checked /> ${esc(b.company || b.key)} <span class="muted">(${esc(b.key)})</span></label>`).join("")}</div>`
+    : `<div class="muted">无可合并账套</div>`;
+  $("#cs-run").onclick = async () => {
+    const keys = $all(".cs-bk").filter((x) => x.checked).map((x) => x.value);
+    if (!keys.length) { toast("请至少选择一个账套", "err"); return; }
+    try {
+      const r = await api(`/consolidate/preview?period=${encodeURIComponent($("#cs-period").value.trim())}&books=${encodeURIComponent(keys.join(","))}`);
+      const bks = r.books || [], rows = r.rows || [];
+      $("#cs-table").innerHTML = `<b>合并汇总（${esc(r.period)}）</b><table class="grid" id="cs-grid" style="margin-top:6px"><thead><tr><th>科目</th><th>名称</th>${bks.map((b) => `<th class="num">${esc(b.company || b.key)}</th>`).join("")}<th class="num">合计</th></tr></thead><tbody>${rows.length
+        ? rows.map((x) => `<tr><td>${esc(x.account_code)}</td><td>${esc(x.account_name)}</td>${bks.map((b) => `<td class="num">${fmt(x.values[b.key] || "0")}</td>`).join("")}<td class="num"><b>${fmt(x.total)}</b></td></tr>`).join("")
+        : `<tr><td colspan="${bks.length + 3}" class="muted">所选账套该期间无余额</td></tr>`}</tbody></table><p class="muted" style="font-size:12px">${esc(r.note || "")}</p>`;
+    } catch (e) { $("#cs-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#cs-print").onclick = () => {
+    const t = $("#cs-grid");
+    if (!t) { toast("先执行合并汇总", "err"); return; }
+    printPreview("合并汇总", t);
+  };
 }
 
 async function viewPlatformBooks(main) {

@@ -426,6 +426,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/settle/records", get(list_settle_records))
         .route("/api/settle/unsettle", post(unsettle_endpoint))
         .route("/api/settle/aging", get(get_settle_aging))
+        .route(
+            "/api/settle/dunnings",
+            get(list_dunnings).post(create_dunning),
+        )
+        .route("/api/settle/dunnings/:id/status", post(dunning_status_ep))
         // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
         .route("/api/accounts", post(create_account).put(update_account))
         .route("/api/accounts/:code", delete(delete_account))
@@ -9714,6 +9719,102 @@ async fn get_settle_aging(
         "buckets": labels,
         "rows": rows,
     })))
+}
+
+// ---- 催款单 / 对账函（应收催收闭环） ----
+
+#[derive(Deserialize)]
+struct DunningReq {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    account: String,
+    party_code: String,
+    #[serde(default)]
+    party_name: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct DunningStatusReq {
+    status: String,
+}
+
+/// 催款单/对账函列表（可按 kind=ar|ap 过滤）
+async fn list_dunnings(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::settle::dunning_list(&db, q.get("kind").map(String::as_str))?;
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// 生成催款单：按客商快照未核销分录 + 往来期初（服务端计算，无欠款拒绝）
+async fn create_dunning(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<DunningReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let d = findb::settle::dunning_create(
+        &db,
+        &req.kind,
+        &req.account,
+        &req.party_code,
+        &req.party_name,
+        date,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "应收",
+        "催款单",
+        &format!(
+            "{} {} {} 共 {} 笔（{}）",
+            d.no,
+            d.party_code,
+            d.amount.fmt_money(),
+            d.item_count,
+            if d.kind == "ar" { "催款" } else { "对账函" }
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "dunning": d })))
+}
+
+/// 催款单状态流转：draft → sent/settled/cancelled；sent → settled/cancelled
+async fn dunning_status_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<DunningStatusReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::settle::dunning_get(&db, id)?.is_none() {
+        return Err(AppError::not_found("催款单不存在"));
+    }
+    findb::settle::dunning_status(&db, id, req.status.trim())?;
+    db.log(
+        user.username(),
+        "应收",
+        "催款单状态",
+        &format!("#{id} → {}", req.status.trim()),
+    )?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------------

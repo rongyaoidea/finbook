@@ -2505,6 +2505,151 @@ async fn mrp_purchase_push() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "生产建议不可下推请购");
 }
 
+/// P1：催款单/对账函——按客商快照未核销、状态流转、无欠款拒绝。
+#[tokio::test]
+async fn dunning_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d13 = format!("{}-13", dash["current_period"].as_str().unwrap());
+
+    // 销售链造应收：SO C01 4×25 → 确认 → 发货（自动生成应收凭证）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d13,
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "催款造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "4", "unit_price": "25", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建销售订单");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "确认订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d13, "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货");
+
+    // 生成催款单：快照未核销应收 100
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/dunnings",
+            &sid,
+            serde_json::json!({ "kind": "ar", "account": "1122", "party_code": "C01", "party_name": "客户甲", "date": "", "memo": "首次催收" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "生成催款单：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let d = &r["dunning"];
+    let did = d["id"].as_i64().unwrap();
+    let no = d["no"].as_str().unwrap().to_string();
+    assert!(no.starts_with("CK"), "单号前缀：{no}");
+    assert_eq!(d["status"], "draft");
+    assert!(
+        (d["amount"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap() - 100.0).abs() < 0.005,
+        "应收快照 100：{d}"
+    );
+    assert!(d["item_count"].as_i64().unwrap() >= 1, "明细至少一笔");
+    assert!(!d["detail"].as_array().unwrap().is_empty(), "明细快照");
+
+    // 无欠款客商 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/dunnings",
+            &sid,
+            serde_json::json!({ "kind": "ar", "account": "1122", "party_code": "C99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "无欠款应 400");
+
+    // 状态流转：draft → sent → settled；重复/越级 → 400
+    for target in ["sent", "settled"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                &format!("/api/settle/dunnings/{did}/status"),
+                &sid,
+                serde_json::json!({ "status": target }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "流转到 {target}");
+    }
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/dunnings/{did}/status"),
+            &sid,
+            serde_json::json!({ "status": "settled" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复结清应 400");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/dunnings/{did}/status"),
+            &sid,
+            serde_json::json!({ "status": "cancelled" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已结清不可作废");
+
+    // 列表包含该单
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/dunnings?kind=ar", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["no"] == no),
+        "列表应含 {no}"
+    );
+
+    // 未知 id → 404
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/dunnings/999999/status",
+            &sid,
+            serde_json::json!({ "status": "sent" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知催款单应 404");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

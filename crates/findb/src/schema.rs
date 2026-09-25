@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 29;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -646,6 +646,27 @@ CREATE TABLE IF NOT EXISTS arap_opening (
     created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_arap_kind ON arap_opening(kind, party_code);
+
+-- 催款单 / 对账函（应收催收闭环：按客商快照未核销明细 + 期初影子挂账）
+CREATE TABLE IF NOT EXISTS dunning (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    no          TEXT NOT NULL DEFAULT '',
+    period      INTEGER NOT NULL,
+    date        TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'ar',   -- ar 催款 / ap 对账函
+    account     TEXT NOT NULL DEFAULT '',
+    party_code  TEXT NOT NULL,
+    party_name  TEXT NOT NULL DEFAULT '',
+    amount      TEXT NOT NULL DEFAULT '0',
+    item_count  INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'draft', -- draft/sent/settled/cancelled
+    memo        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    sent_at     TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_dunning_party ON dunning(kind, party_code, status);
 
 -- 生产成本归集表
 CREATE TABLE IF NOT EXISTS prod_cost (

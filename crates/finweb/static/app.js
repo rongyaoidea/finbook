@@ -3792,6 +3792,14 @@ async function viewSettle(main) {
         ${can("voucher_new") ? `<button class="btn ghost sm" id="arap-goimport">去导入</button>` : ""}
       </div>
       <div id="arap-list" class="muted" style="margin-top:8px">加载中…</div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h4 style="margin:0">催款单 / 对账函</h4><span class="grow"></span>
+        <span class="muted" style="font-size:12px" id="dn-total"></span>
+        <button class="btn ghost sm" id="dn-reload">刷新</button>
+        ${can("voucher_new") ? `<button class="btn primary sm" id="dn-new">新建催款单</button>` : ""}
+      </div>
+      <div id="dn-list" class="muted" style="margin-top:8px">加载中…</div>
     </div>`;
   let selFrom = null, selTo = null, rows = [];
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -3839,6 +3847,65 @@ async function viewSettle(main) {
   loadArap();
   if ($("#arap-reload", main)) $("#arap-reload", main).onclick = loadArap;
   if ($("#arap-goimport", main)) $("#arap-goimport", main).onclick = () => { state.view = "imports"; renderMain(); };
+
+  // 催款单 / 对账函：按客商快照未核销 + 期初；状态流转 + 打印预览
+  const loadDunnings = async () => {
+    try {
+      const r = await api("/settle/dunnings");
+      const drows = r.rows || [];
+      const stMap = { draft: ["草稿", ""], sent: ["已发出", "warn"], settled: ["已结清", "ok"], cancelled: ["已作废", ""] };
+      $("#dn-total").textContent = drows.length ? `共 ${drows.length} 张` : "";
+      $("#dn-list").innerHTML = drows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th>类型</th><th>客商</th><th class="num">金额</th><th class="num">笔数</th><th>状态</th><th>明细</th><th></th></tr></thead><tbody>${drows.map((d) => {
+            const st = stMap[d.status] || [d.status, ""];
+            const acts = can("voucher_new") ? [
+              d.status === "draft" ? `<button class="btn ghost sm" data-dn-st="${d.id}" data-to="sent">发出</button>` : "",
+              (d.status === "draft" || d.status === "sent") ? `<button class="btn ghost sm" data-dn-st="${d.id}" data-to="settled">结清</button>` : "",
+              (d.status === "draft" || d.status === "sent") ? `<button class="btn ghost sm" data-dn-st="${d.id}" data-to="cancelled">作废</button>` : "",
+            ].filter(Boolean).join(" ") : "";
+            return `<tr><td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "ar" ? '<span class="tag">催款</span>' : '<span class="tag warn">对账函</span>'}</td>
+              <td>${esc(d.party_code)} ${esc(d.party_name || "")}</td><td class="num">${fmt(d.amount)}</td><td class="num">${d.item_count}</td>
+              <td><span class="tag ${st[1]}">${st[0]}</span></td>
+              <td><button class="btn ghost sm" data-dn-detail="${d.id}">查看</button></td><td class="row-actions">${acts}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无催款单（点「新建催款单」按客商生成）</div>`;
+      window._dnCache = drows;
+      $all("[data-dn-st]", main).forEach((b) => b.onclick = async () => {
+        try { await post(`/settle/dunnings/${b.dataset.dnSt}/status`, { status: b.dataset.to }); toast("状态已更新", "ok"); loadDunnings(); }
+        catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-dn-detail]", main).forEach((b) => b.onclick = () => {
+        const d = (window._dnCache || []).find((x) => x.id === parseInt(b.dataset.dnDetail, 10));
+        if (d) openDunningDetail(d);
+      });
+    } catch (e) { $("#dn-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  function openDunningDetail(d) {
+    const m = modal(`<h3>${esc(d.no)} · ${d.kind === "ar" ? "催款单" : "对账函"} <span class="muted" style="font-size:12px">${esc(d.party_code)} ${esc(d.party_name || "")}</span></h3>
+      <table class="grid" id="dn-table"><thead><tr><th>单据</th><th>日期</th><th>摘要</th><th class="num">金额</th></tr></thead><tbody>${(d.detail || []).map((x) => `<tr><td>${esc(x.doc_no)}</td><td>${esc(x.date)}</td><td>${esc(x.summary)}</td><td class="num">${fmt(x.amount)}</td></tr>`).join("")}
+      <tr><td colspan="3"><b>合计</b></td><td class="num"><b>${fmt(d.amount)}</b></td></tr></tbody></table>
+      <div class="muted" style="font-size:12px;margin-top:6px">${esc(d.memo || "")}</div>
+      <div class="foot"><button class="btn ghost" id="dn-print">打印预览</button><button class="btn ghost" id="dn-close">关闭</button></div>`);
+    $("#dn-close", m).onclick = closeModal;
+    $("#dn-print", m).onclick = () => printPreview(`${d.kind === "ar" ? "催款单" : "对账函"} ${d.no}`, $("#dn-table", m));
+  }
+  if ($("#dn-new", main)) $("#dn-new").onclick = async () => {
+    const kind = prompt("类型：ar=催款单 / ap=对账函", "ar");
+    if (kind === null) return;
+    if (!["ar", "ap"].includes(kind.trim())) { toast("类型只能是 ar 或 ap", "err"); return; }
+    const party = prompt("客商编码（如 C01）", "");
+    if (party === null) return;
+    if (!party.trim()) { toast("客商编码不能为空", "err"); return; }
+    const pname = prompt("客商名称（可留空）", "");
+    if (pname === null) return;
+    try {
+      const r = await post("/settle/dunnings", { kind: kind.trim(), party_code: party.trim(), party_name: pname.trim(), account: acct(), date: "" });
+      toast(`已生成 ${r.dunning.no}，金额 ${fmt(r.dunning.amount)}（${r.dunning.item_count} 笔）`, "ok");
+      loadDunnings();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  loadDunnings();
+  if ($("#dn-reload", main)) $("#dn-reload", main).onclick = loadDunnings;
 
   $("#st-load", main).onclick = load;
   if ($("#st-auto", main)) $("#st-auto", main).onclick = async () => {

@@ -665,6 +665,264 @@ pub fn arap_opening_delete(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+// ---------------- 催款单 / 对账函（应收催收闭环） ----------------
+
+fn dunning_now() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 催款单明细行（快照：凭证/期初单据 + 未核销额）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DunningItem {
+    pub doc_no: String,
+    pub date: String,
+    pub summary: String,
+    pub amount: Money,
+}
+
+/// 催款单 / 对账函
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Dunning {
+    pub id: i64,
+    pub no: String,
+    pub period: Period,
+    pub date: NaiveDate,
+    /// ar 催款 / ap 对账函
+    pub kind: String,
+    pub account: String,
+    pub party_code: String,
+    pub party_name: String,
+    pub amount: Money,
+    pub item_count: i64,
+    /// draft/sent/settled/cancelled
+    pub status: String,
+    pub memo: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub sent_at: String,
+    pub detail: Vec<DunningItem>,
+}
+
+fn map_dunning(r: &rusqlite::Row) -> rusqlite::Result<Dunning> {
+    let date: String = r.get(3)?;
+    let detail_json: String = r.get(14)?;
+    Ok(Dunning {
+        id: r.get(0)?,
+        no: r.get(1)?,
+        period: Period::from_ymm(r.get(2)?),
+        date: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+        kind: r.get(4)?,
+        account: r.get(5)?,
+        party_code: r.get(6)?,
+        party_name: r.get(7)?,
+        amount: Money::parse_or_zero(&r.get::<_, String>(8)?),
+        item_count: r.get(9)?,
+        status: r.get(10)?,
+        memo: r.get(11)?,
+        created_by: r.get(12)?,
+        created_at: r.get(13)?,
+        sent_at: r.get(15)?,
+        detail: serde_json::from_str(&detail_json).unwrap_or_default(),
+    })
+}
+
+const DUN_COLS: &str = "id,no,period,date,kind,account,party_code,party_name,amount,item_count,status,memo,created_by,created_at,detail_json,sent_at";
+
+/// 催款单号：CK + 期间 + 3 位序号（按期间递增，撞号顺延）
+pub fn dunning_next_no(db: &Db, period: Period) -> DbResult<String> {
+    let mut n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM dunning WHERE period=?1",
+        rusqlite::params![period.ymm()],
+        |r| r.get(0),
+    )?;
+    loop {
+        n += 1;
+        let no = format!("CK{}{:03}", period.ymm(), n);
+        let exists: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM dunning WHERE no=?1",
+            rusqlite::params![no],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(no);
+        }
+    }
+}
+
+pub fn dunning_list(db: &Db, kind: Option<&str>) -> DbResult<Vec<Dunning>> {
+    let mut out = Vec::new();
+    match kind.filter(|k| !k.trim().is_empty()) {
+        Some(k) => {
+            let mut st = db.conn().prepare(&format!(
+                "SELECT {DUN_COLS} FROM dunning WHERE kind=?1 ORDER BY date DESC, id DESC"
+            ))?;
+            let rows = st.query_map(rusqlite::params![k], map_dunning)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        None => {
+            let mut st = db.conn().prepare(&format!(
+                "SELECT {DUN_COLS} FROM dunning ORDER BY date DESC, id DESC"
+            ))?;
+            let rows = st.query_map([], map_dunning)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn dunning_get(db: &Db, id: i64) -> DbResult<Option<Dunning>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {DUN_COLS} FROM dunning WHERE id=?1"),
+            rusqlite::params![id],
+            map_dunning,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// 生成催款单（快照）：按客商汇总所选往来科目下**未核销分录** + 往来期初影子挂账；
+/// 无任何欠款行 → 拒绝。金额与明细服务端计算，不信前端。
+#[allow(clippy::too_many_arguments)]
+pub fn dunning_create(
+    db: &Db,
+    kind: &str,
+    account: &str,
+    party_code: &str,
+    party_name: &str,
+    date: NaiveDate,
+    memo: &str,
+    who: &str,
+) -> DbResult<Dunning> {
+    let kind = match kind.trim() {
+        "ar" => "ar",
+        "ap" => "ap",
+        _ => return Err(fincore::FinError::msg("类型只能是 ar（催款）或 ap（对账函）").into()),
+    };
+    let party = party_code.trim();
+    if party.is_empty() {
+        return Err(fincore::FinError::msg("客商编码不能为空").into());
+    }
+    let account = if account.trim().is_empty() {
+        if kind == "ar" { "1122" } else { "2202" }
+    } else {
+        account.trim()
+    };
+    let upto = Period::from_date(date);
+    let mut items: Vec<DunningItem> = Vec::new();
+    let mut amount = Money::ZERO;
+    for e in open_entries(db, account, upto, false)? {
+        let aux = fincore::voucher::AuxRef::from_key(&e.aux_key);
+        let p = if kind == "ar" {
+            aux.customer.clone()
+        } else {
+            aux.supplier.clone()
+        };
+        if p.as_deref() != Some(party) {
+            continue;
+        }
+        let amt = e.open();
+        if amt.is_zero() {
+            continue;
+        }
+        amount = amount + amt;
+        items.push(DunningItem {
+            doc_no: format!("{}-{}", e.word, e.no),
+            date: e.date.format("%Y-%m-%d").to_string(),
+            summary: e.summary.clone(),
+            amount: amt,
+        });
+    }
+    for o in arap_opening_list(db, Some(kind))? {
+        if o.party_code != party {
+            continue;
+        }
+        let d = NaiveDate::parse_from_str(&o.doc_date, "%Y-%m-%d")
+            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+        if Period::from_date(d).ymm() > upto.ymm() {
+            continue;
+        }
+        amount = amount + o.amount;
+        items.push(DunningItem {
+            doc_no: format!(
+                "期初 {}",
+                if o.doc_no.is_empty() {
+                    format!("#{}", o.id)
+                } else {
+                    o.doc_no.clone()
+                }
+            ),
+            date: o.doc_date.clone(),
+            summary: "往来期初".to_string(),
+            amount: o.amount,
+        });
+    }
+    if items.is_empty() {
+        return Err(
+            fincore::FinError::msg("该客商在所选科目下无未核销单据（或期初），无需催款").into(),
+        );
+    }
+    let no = dunning_next_no(db, upto)?;
+    let detail = serde_json::to_string(&items)
+        .map_err(|e| fincore::FinError::msg(format!("明细序列化失败：{e}")))?;
+    db.conn().execute(
+        "INSERT INTO dunning(no,period,date,kind,account,party_code,party_name,amount,item_count,
+         status,memo,created_by,created_at,sent_at,detail_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'draft',?10,?11,?12,'',?13)",
+        rusqlite::params![
+            no,
+            upto.ymm(),
+            date.format("%Y-%m-%d").to_string(),
+            kind,
+            account,
+            party,
+            party_name.trim(),
+            crate::money_param(amount),
+            items.len() as i64,
+            memo,
+            who,
+            dunning_now(),
+            detail
+        ],
+    )?;
+    let id = db.conn().last_insert_rowid();
+    dunning_get(db, id)?.ok_or_else(|| fincore::FinError::msg("催款单创建失败").into())
+}
+
+/// 状态流转：draft → sent/settled/cancelled；sent → settled/cancelled（条件更新防并发）
+pub fn dunning_status(db: &Db, id: i64, status: &str) -> DbResult<()> {
+    let cur = dunning_get(db, id)?.ok_or_else(|| fincore::FinError::not_found("催款单"))?;
+    let allowed = match status {
+        "sent" => cur.status == "draft",
+        "settled" => cur.status == "draft" || cur.status == "sent",
+        "cancelled" => cur.status == "draft" || cur.status == "sent",
+        _ => false,
+    };
+    if !allowed {
+        return Err(fincore::FinError::msg(format!(
+            "状态不能从 {} 变更为 {}",
+            cur.status, status
+        ))
+        .into());
+    }
+    let ts = dunning_now();
+    let n = db.conn().execute(
+        "UPDATE dunning SET status=?2,
+         sent_at=CASE WHEN ?2='sent' THEN ?3 ELSE sent_at END
+         WHERE id=?1 AND status=?4",
+        rusqlite::params![id, status, ts, cur.status],
+    )?;
+    if n == 0 {
+        return Err(fincore::FinError::msg("催款单已被处理，请刷新").into());
+    }
+    Ok(())
+}
+
 /// 计提坏账准备：按应收（1122/1221）账龄与默认坏账比例计算**目标余额**，
 /// 与账上 1231 现有余额比对，只按差额计提/冲回，辅助核算保留往来对象。
 ///

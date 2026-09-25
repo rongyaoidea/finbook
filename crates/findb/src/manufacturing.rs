@@ -714,6 +714,104 @@ pub fn prod_start(db: &Db, po_id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 生产订单变更（仅草稿/已下达）：数量不得低于已完工数量；计划日期/备注可改；
+/// 逐字段写入 `order_change_log(order_type='prod')` 留痕。
+pub fn prod_update(
+    db: &Db,
+    po_id: i64,
+    qty: Option<Money>,
+    plan_start: Option<&str>,
+    plan_end: Option<&str>,
+    memo: Option<&str>,
+    who: &str,
+) -> DbResult<()> {
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::not_found("生产订单"))?;
+    if !matches!(order.status, ProdStatus::Draft | ProdStatus::Released) {
+        return Err(FinError::state("仅「草稿/已下达」的订单可变更（已开工请先完工）").into());
+    }
+    if let Some(q) = qty {
+        if !q.is_positive() {
+            return Err(FinError::msg("计划数量必须大于 0").into());
+        }
+        if q < order.completed_qty {
+            return Err(FinError::state(format!(
+                "计划数量 {} 不能低于已完工数量 {}",
+                q.fmt_qty(),
+                order.completed_qty.fmt_qty()
+            ))
+            .into());
+        }
+    }
+    let tx = db.write_tx()?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut logs: Vec<(&str, String, String)> = Vec::new();
+    if let Some(q) = qty {
+        if q != order.planned_qty {
+            tx.execute(
+                "UPDATE production_order SET planned_qty=?2, updated_at=?3 WHERE id=?1",
+                rusqlite::params![po_id, crate::exact_param(q), now],
+            )?;
+            logs.push(("计划数量", order.planned_qty.fmt_qty(), q.fmt_qty()));
+        }
+    }
+    if let Some(ps) = plan_start {
+        let ps = ps.trim();
+        if ps != order.plan_start {
+            tx.execute(
+                "UPDATE production_order SET plan_start=?2, updated_at=?3 WHERE id=?1",
+                rusqlite::params![po_id, ps, now],
+            )?;
+            logs.push(("计划开工", order.plan_start.clone(), ps.to_string()));
+        }
+    }
+    if let Some(pe) = plan_end {
+        let pe = pe.trim();
+        if pe != order.plan_end {
+            tx.execute(
+                "UPDATE production_order SET plan_end=?2, updated_at=?3 WHERE id=?1",
+                rusqlite::params![po_id, pe, now],
+            )?;
+            logs.push(("计划完工", order.plan_end.clone(), pe.to_string()));
+        }
+    }
+    if let Some(m) = memo {
+        let m = m.trim();
+        if m != order.memo {
+            tx.execute(
+                "UPDATE production_order SET memo=?2, updated_at=?3 WHERE id=?1",
+                rusqlite::params![po_id, m, now],
+            )?;
+            logs.push(("备注", order.memo.clone(), m.to_string()));
+        }
+    }
+    for (field, old_v, new_v) in logs {
+        crate::scm2::change_log_add_conn(&tx, "prod", po_id, field, &old_v, &new_v, who)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 生产订单取消（仅草稿/已下达；已开工/完工拒绝——先完工或退料）。
+pub fn prod_cancel(db: &Db, po_id: i64, who: &str) -> DbResult<()> {
+    let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::not_found("生产订单"))?;
+    if !matches!(order.status, ProdStatus::Draft | ProdStatus::Released) {
+        return Err(FinError::state("仅「草稿/已下达」的订单可取消（已开工请先完工/退料）").into());
+    }
+    let tx = db.write_tx()?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let n = tx.execute(
+        "UPDATE production_order SET status='cancelled', updated_at=?2
+         WHERE id=?1 AND status IN ('draft','released')",
+        rusqlite::params![po_id, now],
+    )?;
+    if n == 0 {
+        return Err(FinError::state("状态已被他人变更，请刷新后重试").into());
+    }
+    crate::scm2::change_log_add_conn(&tx, "prod", po_id, "状态", order.status.code(), "cancelled", who)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// 委外加工费确认：归集人工（CostType::Labor → 完工结转由 500102 承接）
 /// + 生成应付凭证 借 500102 / 贷 应付科目（供应商辅助）。仅委外订单、金额 > 0；期间随订单。
 pub fn outsource_fee(db: &Db, po_id: i64, amount: Money, date: NaiveDate, who: &str) -> DbResult<i64> {

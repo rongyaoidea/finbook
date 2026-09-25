@@ -2988,6 +2988,152 @@ async fn warehouse_master_flow() {
     assert_eq!(resp.status(), StatusCode::OK, "未引用仓可删");
 }
 
+/// P1：生产订单变更/取消——变更留痕、状态守卫、未知订单 404。
+#[tokio::test]
+async fn prod_change_cancel_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建单（已下达）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "10", "date": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "下达生产订单");
+    let pid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 变更：数量 + 计划日期 + 备注 → 变更历史至少 4 条
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            &format!("/api/prod/{pid}"),
+            &sid,
+            serde_json::json!({ "qty": "12", "plan_start": "2026-01-10", "plan_end": "2026-01-20", "memo": "改期" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "变更订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/prod/{pid}/changes"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let fields: Vec<String> = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["field"].as_str().unwrap().to_string())
+        .collect();
+    for f in ["计划数量", "计划开工", "计划完工", "备注"] {
+        assert!(fields.contains(&f.to_string()), "变更历史应含 {f}：{fields:?}");
+    }
+
+    // 非法数量 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            &format!("/api/prod/{pid}"),
+            &sid,
+            serde_json::json!({ "qty": "0" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "数量 0 应 400");
+
+    // 取消 → 200；取消后不可再变更/取消
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/cancel"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "取消订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            &format!("/api/prod/{pid}"),
+            &sid,
+            serde_json::json!({ "qty": "13" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已取消不可变更");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/cancel"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复取消应 400");
+
+    // 已开工订单：变更/取消均 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "5", "date": "" }),
+        ))
+        .await
+        .unwrap();
+    let pid2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid2}/start"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开工");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            &format!("/api/prod/{pid2}"),
+            &sid,
+            serde_json::json!({ "qty": "6" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已开工不可变更");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid2}/cancel"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已开工不可取消");
+
+    // 未知订单 → 404
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/prod/999999",
+            &sid,
+            serde_json::json!({ "qty": "1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知订单变更应 404");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/999999/cancel",
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知订单取消应 404");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，
@@ -4196,6 +4342,19 @@ async fn chain5_batch_stock() {
     let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
     let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 仓库主数据（v30）：调拨用的 W01/W02 先建档
+    for (code, name) in [("W01", "一号仓"), ("W02", "二号仓")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/warehouses",
+                &sid,
+                serde_json::json!({ "code": code, "name": name }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "建仓 {code}");
+    }
 
     // 造批次：W01 入 10（BT500）
     let resp = handlers::router(state.clone())

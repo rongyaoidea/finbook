@@ -314,6 +314,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
         .route("/api/prod", get(list_prod_orders).post(create_prod_ep))
+        .route("/api/prod/:id", put(update_prod_ep))
+        .route("/api/prod/:id/cancel", post(cancel_prod_ep))
+        .route("/api/prod/:id/changes", get(list_prod_changes))
         .route("/api/prod/:id/ops", get(get_prod_ops))
         .route("/api/prod/op/report", post(report_prod_op))
         .route("/api/prod/op/finish", post(finish_prod_op))
@@ -6846,6 +6849,86 @@ async fn prod_start_ep(
     findb::manufacturing::prod_start(&db, id)?;
     db.log(user.username(), "生产", "开工", &format!("PO#{id}"))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ProdUpdateReq {
+    #[serde(default)]
+    qty: String,
+    /// 缺省=不变；传空串=清空计划日期
+    #[serde(default)]
+    plan_start: Option<String>,
+    #[serde(default)]
+    plan_end: Option<String>,
+    /// 缺省=不变
+    #[serde(default)]
+    memo: Option<String>,
+}
+
+/// 生产订单变更（草稿/已下达）：数量不得低于已完工；逐字段留痕
+async fn update_prod_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ProdUpdateReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::manufacturing::get_prod_order(&db, id)?.is_none() {
+        return Err(AppError::not_found("生产订单不存在"));
+    }
+    let qty = if req.qty.trim().is_empty() {
+        None
+    } else {
+        Some(parse_money_checked(&req.qty)?)
+    };
+    findb::manufacturing::prod_update(
+        &db,
+        id,
+        qty,
+        req.plan_start.as_deref(),
+        req.plan_end.as_deref(),
+        req.memo.as_deref(),
+        user.username(),
+    )?;
+    db.log(user.username(), "生产", "生产订单变更", &format!("PO#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 生产订单取消（仅草稿/已下达）
+async fn cancel_prod_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::manufacturing::get_prod_order(&db, id)?.is_none() {
+        return Err(AppError::not_found("生产订单不存在"));
+    }
+    findb::manufacturing::prod_cancel(&db, id, user.username())?;
+    db.log(user.username(), "生产", "生产订单取消", &format!("PO#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 生产订单变更历史
+async fn list_prod_changes(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let rows: Vec<serde_json::Value> = findb::scm2::change_log_list(&db, "prod", id)?
+        .iter()
+        .map(|(field, old_v, new_v, by, at)| {
+            json!({
+                "field": field, "old_value": old_v, "new_value": new_v,
+                "changed_by": by, "changed_at": at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "rows": rows })))
 }
 
 #[derive(Deserialize)]

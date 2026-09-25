@@ -329,7 +329,20 @@ pub fn quota_remaining(db: &Db, period: Period, supplier: &str, item: &str) -> D
 // ===========================================================================
 
 pub fn change_log_add(db: &Db, order_type: &str, order_id: i64, field: &str, old_value: &str, new_value: &str, who: &str) -> DbResult<()> {
-    db.conn().execute(
+    change_log_add_conn(db.conn(), order_type, order_id, field, old_value, new_value, who)
+}
+
+/// 连接版（事务内可用）
+pub fn change_log_add_conn(
+    conn: &rusqlite::Connection,
+    order_type: &str,
+    order_id: i64,
+    field: &str,
+    old_value: &str,
+    new_value: &str,
+    who: &str,
+) -> DbResult<()> {
+    conn.execute(
         "INSERT INTO order_change_log(order_type,order_id,field,old_value,new_value,changed_by,changed_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
         rusqlite::params![order_type, order_id, field, old_value, new_value, who, now()],

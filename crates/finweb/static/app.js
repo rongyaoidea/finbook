@@ -3210,6 +3210,9 @@ async function viewWorkReport(main) {
       <button class="btn primary" id="wr-load">加载工序</button>
       <span class="grow"></span>
       <button class="btn ghost sm" id="wr-bom">维护BOM</button>
+      <button class="btn ghost sm" id="wr-edit">变更</button>
+      <button class="btn ghost sm" id="wr-cancel">取消</button>
+      <button class="btn ghost sm" id="wr-log">变更历史</button>
       <button class="btn ghost sm" id="wr-start">开工</button>
       <button class="btn" id="wr-issue">领料出库</button>
       <label>完工数量 <input id="wr-cq" style="width:70px" value="0" /></label>
@@ -3261,6 +3264,47 @@ async function viewWorkReport(main) {
   };
   $("#wr-out").onclick = () => openOutsourceEditor(reloadView);
   $("#wr-fee").onclick = () => openFeeEditor(selOrder(), reloadView);
+  // 生产订单变更 / 取消 / 变更历史（草稿/已下达可变更；数量不得低于已完工）
+  $("#wr-edit").onclick = () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    if (!["Draft", "Released"].includes(String(o.status))) { toast("仅草稿/已下达的订单可变更", "err"); return; }
+    const m = modal(`<h3>生产订单变更 — ${esc(o.no)}</h3>
+      <div class="field"><label>计划数量（现 ${esc(String(o.planned_qty))}，已完工 ${esc(String(o.completed_qty))}）</label><input id="pe-qty" value="${esc(String(o.planned_qty))}" /></div>
+      <div class="field"><label>计划开工（YYYY-MM-DD，留空清除）</label><input id="pe-start" value="${esc(o.plan_start || "")}" /></div>
+      <div class="field"><label>计划完工（YYYY-MM-DD，留空清除）</label><input id="pe-end" value="${esc(o.plan_end || "")}" /></div>
+      <div class="field"><label>备注</label><input id="pe-memo" value="${esc(o.memo || "")}" /></div>
+      <div class="foot"><button class="btn primary" id="pe-save">保存</button><button class="btn ghost" id="pe-cancel">取消</button></div>`);
+    $("#pe-cancel", m).onclick = closeModal;
+    $("#pe-save", m).onclick = async () => {
+      try {
+        await api(`/prod/${o.id}`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ qty: $("#pe-qty", m).value.trim(), plan_start: $("#pe-start", m).value.trim(), plan_end: $("#pe-end", m).value.trim(), memo: $("#pe-memo", m).value.trim() }),
+        });
+        toast("已保存变更（留痕可在「变更历史」查看）", "ok"); closeModal(); reloadView();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  $("#wr-cancel").onclick = async () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    if (!(await confirmDialog(`取消生产订单 ${o.no}？仅草稿/已下达可取消（已开工需先完工/退料）。`, true))) return;
+    try { await postJson(`/prod/${o.id}/cancel`, {}); toast("已取消", "ok"); reloadView(); } catch (e) { toast(e.message, "err"); }
+  };
+  $("#wr-log").onclick = () => {
+    const o = selOrder();
+    if (!o) { toast("请先选择生产订单", "err"); return; }
+    const m = modal(`<h3>变更历史 — ${esc(o.no)}</h3><div id="pl-body" class="muted">加载中…</div>
+      <div class="foot"><button class="btn ghost" id="pl-close">关闭</button></div>`);
+    $("#pl-close", m).onclick = closeModal;
+    api(`/prod/${o.id}/changes`).then((r) => {
+      const rows = r.rows || [];
+      $("#pl-body", m).innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>时间</th><th>字段</th><th>改前</th><th>改后</th><th>操作人</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.changed_at)}</td><td>${esc(x.field)}</td><td class="muted">${esc(x.old_value || "—")}</td><td>${esc(x.new_value || "—")}</td><td>${esc(x.changed_by)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无变更记录</div>`;
+    }).catch((e) => { $("#pl-body", m).textContent = e.message; });
+  };
   if (!orders.length) { $("#wr-ops").innerHTML = `<div class="muted">当前期间没有生产订单。先到「MRP」页对「生产」行点「下达」。</div>`; return; }
   const loadOps = async () => {
     const poId = $("#wr-po").value;

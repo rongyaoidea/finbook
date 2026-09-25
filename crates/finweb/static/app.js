@@ -1394,6 +1394,8 @@ async function openVoucherEditor(id, seedEntries) {
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
       ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
       ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
+      ${can("voucher_delete") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-void">作废</button>` : ""}
+      ${can("voucher_delete") && id > 0 && status === "void" ? `<button class="btn ghost" id="v-void-back">恢复作废</button>` : ""}
       ${can("voucher_delete") && (status === "draft" || status === "audited") ? `<button class="btn danger" id="v-del">删除</button>` : ""}
       <button class="btn ghost" id="v-close">关闭</button>
     </div>
@@ -1528,6 +1530,13 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-sign", mask)) $("#v-sign", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/sign`, { method: "POST" }); toast("已出纳签字", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unsign", mask)) $("#v-unsign", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unsign`, { method: "POST" }); toast("已取消签字", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
+  if ($("#v-void", mask)) $("#v-void", mask).onclick = async () => {
+    if (!(await confirmDialog("作废该凭证？作废后不参与账簿汇总，可在同一弹窗恢复。", true))) return;
+    try { await api(`/vouchers/${v.id}/void`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ void: true }) }); toast("已作废", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#v-void-back", mask)) $("#v-void-back", mask).onclick = async () => {
+    try { await api(`/vouchers/${v.id}/void`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ void: false }) }); toast("已恢复作废凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); }
+  };
   if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: "" }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-del", mask)) $("#v-del", mask).onclick = async () => { if (!(await confirmDialog("确定删除该凭证？", true))) return; try { await api(`/vouchers/${v.id}/delete`, { method: "POST" }); toast("已删除", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
@@ -3616,6 +3625,7 @@ async function viewAssets(main) {
       <div class="spacer"></div>
       <button class="btn ghost" id="as-print">打印预览</button>
       <button class="btn ghost" id="as-recon">总账对账</button>
+      ${can("account_edit") ? `<button class="btn ghost" id="as-count">资产盘点</button>` : ""}
       ${can("voucher_new") ? `<button class="btn ghost" id="as-accrue">计提本期折旧</button>` : ""}
       ${can("account_edit") ? `<button class="btn ghost" id="as-deldep">删除本期折旧</button>` : ""}
       ${can("account_edit") ? `<button class="btn primary" id="as-new">新增卡片</button>` : ""}
@@ -3628,6 +3638,32 @@ async function viewAssets(main) {
   const periodOf = () => $("#as-period", main).value.trim();
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
   $("#as-recon", main).onclick = openAssetRecon;
+  if ($("#as-count", main)) $("#as-count").onclick = () => {
+    api(`/assets?period=${encodeURIComponent(periodOf())}`).then((d) => {
+      const cards = (d.ledger || []).filter((r) => r.asset.status !== "disposed");
+      if (!cards.length) { toast("无可盘点卡片", "err"); return; }
+      const m = modal(`<h3>资产盘点</h3>
+        <div class="muted" style="font-size:12px;margin-bottom:6px">默认全部盘实；取消勾选 = 盘亏（过账后卡片置停用）</div>
+        <table class="grid"><thead><tr><th>编码</th><th>名称</th><th>盘实</th></tr></thead><tbody>${cards.map((r) => `<tr><td>${esc(r.asset.code)}</td><td>${esc(r.asset.name)}</td><td><input type="checkbox" class="ac-f" data-id="${r.asset.id}" checked /></td></tr>`).join("")}</tbody></table>
+        <div class="field"><label>备注</label><input id="ac-memo" /></div>
+        <div class="foot"><button class="btn primary" id="ac-save">保存盘点单</button><button class="btn ghost" id="ac-cancel">取消</button></div>`);
+      $("#ac-cancel", m).onclick = closeModal;
+      $("#ac-save", m).onclick = async () => {
+        const lines = $all(".ac-f", m).map((x) => ({ asset_id: parseInt(x.dataset.id, 10), found: x.checked }));
+        try {
+          const r = await post("/assets/counts", { period: parseInt(periodOf(), 10), date: today(), memo: $("#ac-memo", m).value.trim(), lines });
+          if (await confirmDialog(`盘点单 ${r.no} 已保存，立即过账（盘亏置停用）？`, false)) {
+            const pr = await post(`/assets/counts/${r.id}/post`, {});
+            toast(`已过账，盘亏 ${pr.lost} 张`, "ok");
+          } else {
+            toast("已保存草稿", "ok");
+          }
+          closeModal();
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      };
+    }).catch((e) => toast(e.message, "err"));
+  };
 
   async function load() {
     const p = periodOf();
@@ -3649,6 +3685,7 @@ async function viewAssets(main) {
           ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="edit" data-id="${a.id}">改</button>` : ""}
           ${can("account_edit") ? `<button class="btn sm ghost" data-as="deps" data-id="${a.id}">折旧</button>` : ""}
           ${can("account_edit") ? `<button class="btn sm ghost" data-as="changes" data-id="${a.id}">变更</button>` : ""}
+          ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="impair" data-id="${a.id}">减值</button>` : ""}
           ${can("account_edit") && !disposed ? `<button class="btn sm ghost" data-as="dispose" data-id="${a.id}">清理</button>` : ""}
           ${can("account_edit") ? `<button class="btn sm ghost" data-as="del" data-id="${a.id}">删</button>` : ""}
         </td></tr>`;
@@ -3661,6 +3698,16 @@ async function viewAssets(main) {
       if (b.dataset.as === "edit" && card) openAssetEditor(card);
       else if (b.dataset.as === "deps") showAssetDeps(card, id);
       else if (b.dataset.as === "changes") showAssetChanges(card, id);
+      else if (b.dataset.as === "impair") {
+        const amt = prompt(`对「${card ? card.name : id}」计提减值金额`, "");
+        if (amt === null) return;
+        if (!amt.trim()) { toast("减值金额不能为空", "err"); return; }
+        try {
+          await post(`/assets/${id}/impair`, { amount: amt.trim(), period: parseInt(periodOf(), 10), memo: "" });
+          toast("已计提减值", "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      }
       else if (b.dataset.as === "dispose") {
         if (!(await confirmDialog(`确定对「${card ? card.name : id}」做资产清理？清理当月仍计提，次月停提；将生成清理转销凭证草稿。`, true))) return;
         const amt = prompt("清理金额（可留空）", "");

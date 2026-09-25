@@ -1008,7 +1008,7 @@ pub fn accessory_delete(db: &Db, id: i64) -> DbResult<()> {
 }
 
 /// 资产盘点单
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct AssetCount {
     pub id: i64,
     pub no: String,
@@ -1083,6 +1083,41 @@ pub fn ac_post(db: &Db, id: i64) -> DbResult<usize> {
     tx.execute("UPDATE asset_count SET status='posted' WHERE id=?1", [id])?;
     tx.commit()?;
     Ok(n)
+}
+
+/// 资产盘点单列表（含明细，倒序，最近 200 张）
+pub fn ac_list(db: &Db) -> DbResult<Vec<AssetCount>> {
+    let mut st = db.conn().prepare(
+        "SELECT id,no,period,date,status,prepared_by,memo FROM asset_count ORDER BY id DESC LIMIT 200",
+    )?;
+    let mut out: Vec<AssetCount> = st
+        .query_map([], |r| {
+            let date: String = r.get(3)?;
+            Ok(AssetCount {
+                id: r.get(0)?,
+                no: r.get(1)?,
+                period: Period::from_ymm(r.get(2)?),
+                date: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                status: r.get(4)?,
+                prepared_by: r.get(5)?,
+                memo: r.get(6)?,
+                lines: Vec::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
+    let mut lst = db
+        .conn()
+        .prepare("SELECT asset_id, found, memo FROM asset_count_line WHERE ac_id=?1")?;
+    for c in out.iter_mut() {
+        c.lines = lst
+            .query_map([c.id], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

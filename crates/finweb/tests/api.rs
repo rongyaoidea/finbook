@@ -3422,6 +3422,175 @@ async fn prod_qc_flow() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "完工后不可再检验");
 }
 
+/// P2：补口子——凭证作废/恢复、资产减值、资产盘点接线。
+#[tokio::test]
+async fn p2_gap_fill_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 1) 凭证作废 / 恢复（引擎口径：未记账可作废；已记账请先反记账）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记", "no": 96,
+                "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "作废测试", "debit": "10", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "作废测试", "debit": "0", "credit": "10" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/void"),
+            &sid,
+            serde_json::json!({ "void": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "未记账作废");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["status"], "void", "作废后状态：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/void"),
+            &sid,
+            serde_json::json!({ "void": false }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "恢复作废");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["status"], "draft", "恢复后回到草稿：{r}");
+    // 已记账 → 作废被引擎拒绝（先反记账）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/void"),
+            &sid,
+            serde_json::json!({ "void": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "已记账应先反记账");
+
+    // 2) 资产减值
+    let card = serde_json::json!({
+        "id": 0, "code": "P2A01", "name": "减值测试资产", "category": "电子设备", "spec": "",
+        "dept": "财务部", "asset_account": "160101", "dep_account": "1602",
+        "expense_account": "660201", "original_value": "12000", "residual_rate": "5",
+        "life_months": 36, "method": "straight", "start_period": cur_ymm, "memo": ""
+    });
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/assets", &sid, card))
+        .await
+        .unwrap();
+    let aid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/assets/{aid}/impair"),
+            &sid,
+            serde_json::json!({ "amount": "500", "period": cur_ymm, "memo": "测试减值" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "资产减值");
+
+    // 3) 资产盘点：盘亏 → 过账置停用
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets/counts",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "date": d15, "memo": "测试盘点", "lines": [{ "asset_id": aid, "found": false }] }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建盘点单：{b}");
+    let cid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/assets/counts/{cid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let pr: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(pr["lost"], 1, "盘亏 1 张：{pr}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/assets?period={cur_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let a = r["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_i64() == Some(aid))
+        .unwrap();
+    assert_eq!(a["status"], "idle", "盘亏后置停用：{a}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/assets/counts", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["id"].as_i64() == Some(cid)),
+        "盘点单列表应含：{r}"
+    );
+    // 未知资产 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets/counts",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "lines": [{ "asset_id": 999999 }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未知资产应 400");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

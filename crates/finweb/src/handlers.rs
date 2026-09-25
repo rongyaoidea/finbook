@@ -163,6 +163,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
+        .route("/api/vouchers/:id/void", post(voucher_void))
         .route("/api/vouchers/:id/audit", post(voucher_audit))
         .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
         .route("/api/vouchers/:id/sign", post(voucher_sign))
@@ -420,6 +421,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/assets/:id/depreciations", get(list_asset_deps))
         .route("/api/assets/:id/changes", get(list_asset_changes))
         .route("/api/assets/gl-reconcile", get(asset_gl_reconcile))
+        .route("/api/assets/:id/impair", post(impair_asset))
+        .route(
+            "/api/assets/counts",
+            get(list_asset_counts).post(save_asset_count),
+        )
+        .route("/api/assets/counts/:id/post", post(post_asset_count))
         .route("/api/assets/:id/dispose", post(dispose_asset))
         .route("/api/assets/depreciate", post(depreciate_assets))
         .route("/api/assets/depreciations/delete-period", post(delete_asset_deps_period))
@@ -2498,6 +2505,41 @@ async fn save_voucher(
         &v.voucher_no(),
     )?;
     Ok(Json(json!({"id": id})))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct VoidReq {
+    /// 缺省 = true（作废）；恢复请显式传 false
+    #[serde(default = "default_true")]
+    void: bool,
+}
+
+/// 凭证作废 / 恢复（已结账期间拒绝；作废后不参与账簿汇总，可恢复）
+async fn voucher_void(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<VoidReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherDelete)?;
+    let db = state.db_for(&user.book_key)?;
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权操作该凭证"));
+    }
+    vouchers::set_void(&db, id, req.void, user.username())?;
+    db.log(
+        user.username(),
+        "凭证",
+        if req.void { "作废" } else { "恢复作废" },
+        &format!("凭证 #{id}"),
+    )?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn voucher_post(
@@ -9543,6 +9585,136 @@ async fn asset_gl_reconcile(
         "dep_gl": r.dep_gl.fmt_money(),
         "dep_diff": r.dep_diff.fmt_money(),
     })))
+}
+
+#[derive(Deserialize)]
+struct AssetImpairReq {
+    #[serde(default)]
+    period: i32,
+    amount: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 资产减值（记录减值累计；净值口径由卡片原值-累计折旧-减值体现）
+async fn impair_asset(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<AssetImpairReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::assets::get(&db, id)?.is_none() {
+        return Err(AppError::not_found("资产卡片不存在"));
+    }
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let amount = parse_money_checked(&req.amount)?;
+    let aid = findb::assets::impair(&db, id, period, amount, &req.memo)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "资产减值",
+        &format!("#{id} {} {}", period_to_str(period), amount.fmt_money()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": aid })))
+}
+
+#[derive(Deserialize)]
+struct AssetCountLineReq {
+    asset_id: i64,
+    /// 缺省 = true（盘实）
+    #[serde(default)]
+    found: Option<bool>,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct AssetCountReq {
+    #[serde(default)]
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+    lines: Vec<AssetCountLineReq>,
+}
+
+/// 资产盘点单（草稿）：行 = 卡片 + 是否盘实
+async fn save_asset_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<AssetCountReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    if req.lines.is_empty() {
+        return Err(AppError::bad_request("盘点明细不能为空"));
+    }
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let mut lines = Vec::with_capacity(req.lines.len());
+    for l in &req.lines {
+        if findb::assets::get(&db, l.asset_id)?.is_none() {
+            return Err(AppError::bad_request(format!("资产 #{} 不存在", l.asset_id)));
+        }
+        lines.push((l.asset_id, l.found.unwrap_or(true), l.memo.clone()));
+    }
+    let mut c = findb::assets::AssetCount {
+        id: 0,
+        no: findb::assets::ac_next_no(&db, period)?,
+        period,
+        date,
+        status: "draft".into(),
+        prepared_by: user.username().to_string(),
+        memo: req.memo,
+        lines,
+    };
+    let id = findb::assets::ac_save(&db, &mut c)?;
+    db.log(
+        user.username(),
+        "固定资产",
+        "资产盘点",
+        &format!("{} 共 {} 行", c.no, c.lines.len()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "no": c.no })))
+}
+
+/// 资产盘点过账：盘亏（found=false）标记为停用
+async fn post_asset_count(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let n = findb::assets::ac_post(&db, id)?;
+    db.log(user.username(), "固定资产", "资产盘点过账", &format!("#{id} 盘亏 {n}"))?;
+    Ok(Json(json!({ "ok": true, "lost": n })))
+}
+
+/// 资产盘点单列表（含明细）
+async fn list_asset_counts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::assets::ac_list(&db)? })))
 }
 
 async fn dispose_asset(

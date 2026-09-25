@@ -422,6 +422,12 @@
 - **票↔款勾稽**：订单页收款/付款生成收付款单后，自动与该订单**已下推的发票**建 `doc_link(invoice→receipt)` 边（`link_receipt_to_src_invoice`，已链跳过）——发票「链」面板直达收付款单，`doc_chain` 新增 receipt/notice 节点、`doc-links` 白名单扩 receipt。
 - **测试**：web `ship_notice_flow`（未确认拒通知 → 超未发量拒 → 通知入 pending → 出库自动完成 → 下推销票+订单收款后发票上游见收付款单）。
 
+### 4.27 界面字号调节 + 移动端适配增强
+
+- **字号四档循环**：顶栏「Aa」按钮循环 小 90% → 标准 100% → 大 115% → 特大 130%（toast 提示当前档）；字号全为 px 硬编码（rem 改造不现实）→ **`html.zoom` 整体缩放**（Chrome/Edge/新 Firefox 支持，不支持的浏览器无害回退不缩放）；档位存 localStorage、脚本加载即应用防登录前闪烁，renderShell 时刷新按钮文字。
+- **移动端增强**（≤600px 段，P2-7 基础上补三个真缺口）：① `input/select/textarea { font-size:16px }`——**iOS 聚焦防自动放大整页**（Safari 对 <16px 输入强制缩放）；② `.btn.sm { min-height:36px }`——触摸目标从 ~28px 提到 36px；③ `table.grid { font-size:14px }` 手机可读性；④ 通知抽屉手机上全宽（100vw）。
+- **已有基础复核**：viewport meta、≤900px 侧栏抽屉+hamburger、≤600px topbar 换行/卡片单列/弹窗全宽、表格横向滚动、抽屉 92vw 均已具备，本轮零改动。
+
 ---
 
 ## 5. 关键设计约定

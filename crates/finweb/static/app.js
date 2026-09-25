@@ -536,6 +536,35 @@ function rerenderView(id, main) {
 let shellBuilt = false;
 
 // 骨架只渲染一次；切换视图只更新 .main，不再重建 topbar/sidebar
+// ---------------- 界面字号调节（四档循环 90/100/115/130%，localStorage 持久化） ----------------
+// 字号全为 px 硬编码（rem 改造不现实）→ html.zoom 整体缩放；不支持的浏览器无害回退。
+const UI_SCALES = [
+  { v: 0.9, label: "小" },
+  { v: 1, label: "标准" },
+  { v: 1.15, label: "大" },
+  { v: 1.3, label: "特大" },
+];
+function uiScaleIdx() {
+  try {
+    const s = parseFloat(localStorage.getItem("ui_scale"));
+    const i = UI_SCALES.findIndex((x) => x.v === s);
+    return i >= 0 ? i : 1;
+  } catch (e) { return 1; }
+}
+function applyUiScale(idx) {
+  const d = UI_SCALES[idx] || UI_SCALES[1];
+  try { localStorage.setItem("ui_scale", String(d.v)); } catch (e) {}
+  document.documentElement.style.zoom = String(d.v);
+  const el = document.getElementById("ui-scale-btn");
+  if (el) { el.textContent = `Aa ${d.label}`; el.title = `界面字号：${d.label}（点击切换）`; }
+}
+function cycleUiScale() {
+  const next = (uiScaleIdx() + 1) % UI_SCALES.length;
+  applyUiScale(next);
+  toast(`界面字号：${UI_SCALES[next].label}`, "ok");
+}
+applyUiScale(uiScaleIdx()); // 脚本加载即应用，防登录前闪烁
+
 // ---------------- 通知中心（铃铛 + 右侧抽屉）：待办实时聚合 + 审计动态 + 水位已读 ----------------
 // 动态=审计日志按可见性过滤（AuditLog 权看全量，否则自己的操作）；已读=localStorage 水位
 // （存服务端 now，同钟同格式保证字典序=时间序）；60s 轮询仅页面可见时执行。
@@ -670,6 +699,7 @@ function renderShell() {
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
+        <button class="btn ghost sm" id="ui-scale-btn" title="界面字号（点击切换）">Aa 标准</button>
         <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
         <button class="btn ghost sm" id="switch-book">切换账套</button>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
@@ -730,7 +760,9 @@ function renderShell() {
     await showBookPicker();
   });
   $("#change-pwd").addEventListener("click", () => openChangePwd(false));
-  // 通知中心：铃铛/抽屉/轮询
+  // 界面字号四档循环 + 通知中心：铃铛/抽屉/轮询
+  $("#ui-scale-btn").addEventListener("click", cycleUiScale);
+  applyUiScale(uiScaleIdx()); // 刷新按钮档位文字
   $("#bell").addEventListener("click", ntOpenDrawer);
   $("#nt-close").addEventListener("click", ntCloseDrawer);
   $("#nt-mask").addEventListener("click", ntCloseDrawer);

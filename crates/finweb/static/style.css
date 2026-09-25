@@ -500,6 +500,12 @@ table.grid { min-width: 100%; }
   .login-card { width: 100%; max-width: 92vw; padding: 24px 20px; }
   .modal { padding: 18px 16px; }
   .modal.wide { width: 100%; }
+  /* iOS：输入框 <16px 聚焦会被 Safari 强制放大整页——锁定 16px */
+  input, select, textarea { font-size: 16px; }
+  /* 触摸目标（原 ~28px 太小）与手机可读性 */
+  .btn.sm { min-height: 36px; }
+  table.grid { font-size: 14px; }
+  .nt-drawer { width: 100vw; max-width: 100vw; }
 }
 
 /* ── P2-7 暗色模式：复用调色板变量覆写 ──────────────────────── */

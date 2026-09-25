@@ -2300,6 +2300,145 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 通知中心：结构/水位已读/可见性过滤 + 单据流程条数据源（instance-for）。
+#[tokio::test]
+async fn notices_endpoint() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 结构：todos/events/unread_events/now（now=YYYY-MM-DD HH:MM:SS）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/notices", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "通知端点可用");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["todos"].as_array().is_some(), "待办段");
+    assert!(r["events"].as_array().is_some(), "动态段");
+    let now = r["now"].as_str().unwrap().to_string();
+    assert_eq!(now.len(), 19, "now 为 YYYY-MM-DD HH:MM:SS：{now}");
+
+    // 水位推进 → 未读动态归零
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/notices?since={}", now.replace(' ', "%20")),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["unread_events"], 0, "水位后无新动态");
+
+    // 造一条动态（保存工作流会写审计日志）→ 未读 ≥1
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows",
+            &sid,
+            serde_json::json!({
+                "id": 0, "name": "通知造数流", "biz_type": "quotation",
+                "nodes": [
+                    { "id": "n1", "type": "start", "name": "开始" },
+                    { "id": "n2", "type": "approve", "name": "初审" },
+                    { "id": "n3", "type": "approve", "name": "复核" }
+                ],
+                "edges": [
+                    { "id": "e1", "from": "n1", "to": "n2", "kind": "normal" },
+                    { "id": "e2", "from": "n2", "to": "n3", "kind": "normal" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "造流程（产生审计动态）");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/notices", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["unread_events"].as_i64().unwrap() >= 1, "应有新动态未读：{r}");
+
+    // instance-for：发布流程 → 建报价审批 → running 实例节点可查（流程条/行徽标数据源）
+    let flow_id = /* 用返回 id */ {
+        let resp2 = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/workflows",
+                &sid,
+                serde_json::json!({
+                    "id": 0, "name": "通知流程条", "biz_type": "quotation",
+                    "nodes": [
+                        { "id": "n1", "type": "start", "name": "开始" },
+                        { "id": "n2", "type": "approve", "name": "初审" },
+                        { "id": "n3", "type": "approve", "name": "复核" }
+                    ],
+                    "edges": [
+                        { "id": "e1", "from": "n1", "to": "n2", "kind": "normal" },
+                        { "id": "e2", "from": "n2", "to": "n3", "kind": "normal" }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&body_string(resp2).await).unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/workflows/{flow_id}/publish"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发布流程");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-20",
+                "customer_code": "C09", "customer_name": "客户九",
+                "item_code": "140301", "item_name": "原料", "qty": "3", "unit_price": "2",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let qid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/sales/quote/{qid}/approve"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "首次审批（入流）");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/workflows/instance-for?biz_type=quotation&id={qid}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["found"], serde_json::json!(true), "实例应存在：{r}");
+    assert_eq!(r["status"], "running");
+    assert_eq!(r["current_label"], "复核", "首节点推进后当前=复核：{r}");
+
+    // 无实例的单据 → found=false
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/workflows/instance-for?biz_type=quotation&id=99999",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["found"], serde_json::json!(false));
+    // 非法业务类型 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workflows/instance-for?biz_type=bogus&id=1", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// 发票↔单据勾稽 + 进项认证：订单下推发票（doc_link 双向）→ 认证流转。
 #[tokio::test]
 async fn invoice_push_and_certify() {

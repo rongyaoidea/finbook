@@ -508,6 +508,96 @@ pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
     Ok(out)
 }
 
+/// 待办聚合（轻量版，供通知中心 60s 轮询——不含卡片与趋势计算）。
+/// 权限门槛、状态过滤与 collect 完全一致（同一套 Perm 口径，保持同步维护）。
+pub fn collect_todos(db: &Db, user: &User, cur: Period) -> DbResult<Vec<WbTodo>> {
+    let mut todos = Vec::new();
+    // 凭证：未记账待记账
+    if user.can(Perm::VoucherNew) || user.can(Perm::VoucherAudit) {
+        let (unposted, _): (i64, i64) = db.conn().query_row(
+            "SELECT COALESCE(SUM(CASE WHEN status IN ('draft','audited') THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN status='posted' THEN 1 ELSE 0 END),0)
+             FROM voucher WHERE period=?1 AND status<>'void'",
+            [cur.ymm()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if user.can(Perm::VoucherPost) {
+            todos.push(todo("凭证", "voucher_unposted", "未记账凭证待记账", unposted, "vouchers"));
+        }
+    }
+    // 资金：待审核收付款
+    if user.can(Perm::CashierSign) {
+        let draft = crate::receipt::receipt_list(db)?
+            .iter()
+            .filter(|d| d.status == "draft" && d.period == cur)
+            .count() as i64;
+        if user.can(Perm::VoucherAudit) {
+            todos.push(todo("资金", "receipt_todo", "待审核收付款单", draft, "funds"));
+        }
+    }
+    // 销售 / 采购
+    if user.can(Perm::OrderOps) {
+        let q_pending = crate::sales::quo_list(db, cur)?
+            .iter()
+            .filter(|q| q.status == "draft")
+            .count() as i64;
+        let sos = crate::scm::so_list(db, cur, None)?;
+        let so_pending = sos
+            .iter()
+            .filter(|o| matches!(o.status, crate::scm::SoStatus::Draft))
+            .count() as i64;
+        todos.push(todo("销售", "quote_todo", "待审批报价单", q_pending, "so-doc"));
+        todos.push(todo("销售", "so_todo", "待确认销售订单", so_pending, "so-doc"));
+        let pr_pending = crate::procurement::pr_list(db, cur)?
+            .iter()
+            .filter(|p| p.status == "draft")
+            .count() as i64;
+        todos.push(todo("采购", "pr_todo", "待审批请购单", pr_pending, "po-doc"));
+    }
+    // 仓管
+    if user.can(Perm::Warehouse) {
+        let exp = crate::batch::expiring_batches(db, 30)?;
+        let pending = crate::stocktake::count_list(db)?
+            .iter()
+            .filter(|c| c.status == "draft")
+            .count() as i64;
+        let low = crate::inventory2::below_safety(db)?;
+        todos.push(todo("仓管", "expiry_todo", "临期批次处理", exp.len() as i64, "inv-batch"));
+        todos.push(todo("仓管", "count_todo", "未完成盘点单", pending, "inv-count"));
+        todos.push(todo("仓管", "safety_todo", "低于安全库存", low.len() as i64, "inv-warehouse"));
+    }
+    // 生产
+    if user.can(Perm::ProductionOps) {
+        let running = crate::scm::prod_list(db, cur, None)?
+            .iter()
+            .filter(|o| matches!(o.status, crate::scm::ProdStatus::InProgress))
+            .count() as i64;
+        todos.push(todo("生产", "prod_todo", "在产生产订单", running, "work-report"));
+    }
+    // 报销（本人视角）
+    {
+        let (mut sub, mut rej) = (0i64, 0i64);
+        for c in crate::business::claim_list(db, cur, None)? {
+            if c.applicant != user.username {
+                continue;
+            }
+            if matches!(c.status, crate::business::ClaimStatus::Submitted) {
+                sub += 1;
+            }
+            if matches!(c.status, crate::business::ClaimStatus::Rejected) {
+                rej += 1;
+            }
+        }
+        todos.push(todo("报销", "claim_todo", "我的报销 待审批/被驳回", sub + rej, "claims"));
+    }
+    // 审批：待我审批的流程实例
+    {
+        let pend = crate::workflow::pending_for(db, user)?.len() as i64;
+        todos.push(todo("审批", "wf_pending", "待我审批的流程", pend, "workflow"));
+    }
+    Ok(todos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

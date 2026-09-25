@@ -406,6 +406,16 @@
 - **进项认证流**：既有状态机（`pending 待认证 → verified 已认证 / rejected 已作废`）+ 既有端点 `/api/invoices/:id/status` 与页面「认证/作废」按钮保持——下推的发票落 pending，进入认证闭环。
 - **测试**：web `invoice_push_and_certify`（采购链：到货→下推进票 amount90/supplier/pending → PO↔发票双向勾稽 → 认证 verified；0额拒；销售链：确认发货→销项票整单20/客户甲 + SO→发票勾稽）。
 
+### 4.25 通知中心 + 单据流程条 + 审批快捷键（动态通知与点击直达）
+
+- **铃铛 + 右侧抽屉**：顶栏 🔔 未读红点（>99 显 99+，新事件脉冲动画）→ 三段抽屉：**我的待办**（`collect_todos` 实时聚合，count>0 才显示，点击直达处理页）、**动态**（审计日志按可见性——有 AuditLog 权看全量、否则只看自己的操作；按服务端时钟分 今天/昨天/更早）、**全部已读**。
+- **已读水位**：localStorage 记服务端 `now`（同钟同格式 ⇒ 字典序=时间序）；未读 = 水位后动态 + 待办项数；**零服务端状态**。
+- **动态推送**：60s 轮询（`visibilitychange` 不可见挂起），新事件铃铛脉冲 + 轻 toast（5 分钟节流）；打开抽屉即拉取。
+- **单据流程条**：报销编辑器头部横幅（审批中/已通过/已驳回 + 当前节点 + 最近动作 + 流程名）；请购/报价/收付款**列表行徽标**（`data-wftag` 占位 + `fillWfTags` 异步填充，如「流程:审批中 · 复核」）——单据走到哪一步一眼可见、免跳实例页。
+- **审批快捷键**：工作流实例页 **J/K 上下选行**（首行默认选中）、**A 通过 / R 驳回**（输入框、弹窗、组合键时失效），表格顶部提示条。
+- **端点**：`GET /api/notices`（Report）、`GET /api/workflows/instance-for`（Report，四类业务白名单）；findb 新增 `workbench::collect_todos`（轮询轻量版，权限与状态口径与 collect 一致）与 `workflow::instance_for`。
+- **测试**：web `notices_endpoint`（结构/now 格式/水位归零/造审计动态后未读≥1/流程条 found+running+节点推进复核/无实例 found=false/非法类型400）。
+
 ---
 
 ## 5. 关键设计约定

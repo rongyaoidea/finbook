@@ -858,6 +858,54 @@ pub fn pending_for(db: &Db, user: &User) -> DbResult<Vec<WfInstance>> {
     Ok(out)
 }
 
+/// 单据的流程实例状态（供单据流程条 / 列表行徽标）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WfStatus {
+    pub found: bool,
+    /// running / approved / rejected（found=false 时为空串）
+    pub status: String,
+    pub flow_name: String,
+    pub current_label: String,
+    pub log: Vec<WfLogEntry>,
+}
+
+pub fn instance_for(db: &Db, biz_type: &str, biz_id: i64) -> DbResult<WfStatus> {
+    let Some((id, status, cur, log_s)) = instance_of(db.conn(), biz_type, biz_id)? else {
+        return Ok(WfStatus {
+            found: false,
+            status: String::new(),
+            flow_name: String::new(),
+            current_label: String::new(),
+            log: Vec::new(),
+        });
+    };
+    let flow_id: i64 = db.conn().query_row(
+        "SELECT flow_id FROM workflow_instance WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let flow = flow_of(db.conn(), flow_id)?;
+    let (flow_name, current_label) = match &flow {
+        Some(f) => (
+            f.name.clone(),
+            f.nodes
+                .iter()
+                .find(|n| n.id == cur)
+                .map(node_label)
+                .unwrap_or(cur.clone()),
+        ),
+        None => (String::new(), cur.clone()),
+    };
+    let log: Vec<WfLogEntry> = serde_json::from_str(&log_s).unwrap_or_default();
+    Ok(WfStatus {
+        found: true,
+        status,
+        flow_name,
+        current_label,
+        log,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

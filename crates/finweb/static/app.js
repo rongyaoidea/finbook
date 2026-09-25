@@ -536,6 +536,128 @@ function rerenderView(id, main) {
 let shellBuilt = false;
 
 // 骨架只渲染一次；切换视图只更新 .main，不再重建 topbar/sidebar
+// ---------------- 通知中心（铃铛 + 右侧抽屉）：待办实时聚合 + 审计动态 + 水位已读 ----------------
+// 动态=审计日志按可见性过滤（AuditLog 权看全量，否则自己的操作）；已读=localStorage 水位
+// （存服务端 now，同钟同格式保证字典序=时间序）；60s 轮询仅页面可见时执行。
+let _ntTimer = null;
+let _ntToastAt = 0;
+function ntMark() { try { return localStorage.getItem("nt_mark") || ""; } catch (e) { return ""; } }
+function ntSetMark(ts) { try { localStorage.setItem("nt_mark", ts); } catch (e) {} }
+function ntBadge(n) {
+  const el = document.getElementById("bell-n");
+  if (!el) return;
+  el.textContent = n > 99 ? "99+" : String(n);
+  el.dataset.zero = n > 0 ? "0" : "1";
+}
+function ntPulse() {
+  const b = document.getElementById("bell");
+  if (!b) return;
+  b.classList.add("pulse");
+  setTimeout(() => b.classList.remove("pulse"), 1500);
+}
+async function ntPoll(first) {
+  try {
+    const r = await api(`/notices?since=${encodeURIComponent(ntMark())}`);
+    const todoN = (r.todos || []).filter((t) => t.count > 0).length;
+    const unread = (r.unread_events || 0) + todoN;
+    const was = parseInt(document.getElementById("bell-n")?.textContent || "0", 10) || 0;
+    ntBadge(unread);
+    if (!first && unread > was) {
+      ntPulse();
+      const now = Date.now();
+      if (now - _ntToastAt > 5 * 60 * 1000) {
+        _ntToastAt = now;
+        toast(`通知：新动态 ${r.unread_events} 条 · 待办 ${todoN} 项`, "ok");
+      }
+    }
+    return r;
+  } catch (e) { return null; }
+}
+function ntStart() {
+  if (_ntTimer) return;
+  ntPoll(true);
+  _ntTimer = setInterval(() => { if (!document.hidden) ntPoll(false); }, 60000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) ntPoll(false); });
+}
+async function ntOpenDrawer() {
+  const drawer = document.getElementById("nt-drawer");
+  const mask = document.getElementById("nt-mask");
+  if (!drawer) return;
+  const r = await ntPoll(false);
+  if (r) ntRender(r);
+  drawer.classList.add("open");
+  mask.classList.add("open");
+}
+function ntCloseDrawer() {
+  document.getElementById("nt-drawer")?.classList.remove("open");
+  document.getElementById("nt-mask")?.classList.remove("open");
+}
+function ntRender(r) {
+  const body = document.getElementById("nt-body");
+  if (!body) return;
+  const todos = (r.todos || []).filter((t) => t.count > 0);
+  let html = todos.length
+    ? `<div class="nt-sec">我的待办（点击处理）</div>` + todos.map((t) => `
+        <button class="nt-item" data-nt-view="${esc(t.view)}"><div class="nt-t"><span class="nt-dot"></span><b>${esc(t.label)}</b><span class="tag" style="margin-left:auto">${t.count}</span></div><div class="nt-m">${esc(t.domain)} · 直达处理页</div></div>`).join("")
+    : "";
+  // 动态按服务端时钟分组：今天 / 昨天 / 更早
+  const dayOf = (ts) => (ts || "").slice(0, 10);
+  const nowD = (r.now || "").slice(0, 10);
+  const yd = new Date(nowD + "T00:00:00");
+  yd.setDate(yd.getDate() - 1);
+  const yD = `${yd.getFullYear()}-${String(yd.getMonth() + 1).padStart(2, "0")}-${String(yd.getDate()).padStart(2, "0")}`;
+  const groups = { today: [], yday: [], older: [] };
+  (r.events || []).forEach((ev) => {
+    const d = dayOf(ev.ts);
+    (d === nowD ? groups.today : d === yD ? groups.yday : groups.older).push(ev);
+  });
+  const G = (list, label) => list.length
+    ? `<div class="nt-sec">${label}</div>` + list.map((ev) => `
+        <div class="nt-item"><div class="nt-t"><span class="nt-dot"></span><b>${esc(ev.user || "系统")}</b> ${esc(ev.action)}<span class="muted" style="margin-left:auto;font-size:11px">${esc((ev.ts || "").slice(11, 16))}</span></div><div class="nt-m">${esc(ev.module)} · ${esc(ev.detail)}</div></div>`).join("")
+    : "";
+  html += G(groups.today, "今天") + G(groups.yday, "昨天") + G(groups.older, "更早");
+  if (!html) html = `<div class="nt-empty">没有待办，也暂无动态</div>`;
+  body.innerHTML = html;
+  $all("[data-nt-view]", body).forEach((b) => b.onclick = () => {
+    state.view = b.dataset.ntView;
+    ntCloseDrawer();
+    renderMain();
+  });
+}
+async function ntMarkRead() {
+  // 已读 = 水位推到服务端当前时间（notices 返回的 now 与日志同钟同格式）
+  try {
+    const r = await api(`/notices?since=${encodeURIComponent(ntMark())}`);
+    if (r && r.now) {
+      ntSetMark(r.now);
+      ntBadge((r.todos || []).filter((t) => t.count > 0).length);
+      toast("已全部标为已读", "ok");
+      const body = document.getElementById("nt-body");
+      if (body) $all(".nt-dot", body).forEach((d) => d.style.visibility = "hidden");
+    }
+  } catch (e) { toast(e.message, "err"); }
+}
+// ---------------- 通知中心 END ----------------
+
+// 单据行内流程徽标：按业务类型拉取流程实例状态，填充 [data-wftag="类型:id"] 占位
+async function fillWfTags(root) {
+  const els = $all("[data-wftag]", root || document);
+  if (!els.length) return;
+  await Promise.all(
+    els.map(async (el) => {
+      const parts = (el.dataset.wftag || "").split(":");
+      if (parts.length !== 2) return;
+      try {
+        const f = await api(`/workflows/instance-for?biz_type=${encodeURIComponent(parts[0])}&id=${parts[1]}`);
+        if (!f.found) { el.innerHTML = ""; return; }
+        const label = { running: "审批中", approved: "已通过", rejected: "已驳回" }[f.status] || f.status;
+        const ok = f.status === "approved" ? " ok" : "";
+        el.innerHTML = `<span class="wf-tag${ok}">流程:${label}${f.status === "running" ? ` · ${esc(f.current_label)}` : ""}</span>`;
+      } catch (e) { el.innerHTML = ""; }
+    })
+  );
+}
+
 function renderShell() {
   const u = session.user;
   const app = document.getElementById("app");
@@ -548,6 +670,7 @@ function renderShell() {
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
+        <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
         <button class="btn ghost sm" id="switch-book">切换账套</button>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
         <button class="btn ghost sm" id="logout">退出登录</button>
@@ -569,6 +692,13 @@ function renderShell() {
         })()}
       </div>
       <div class="side-mask" id="side-mask"></div>
+      <div class="nt-mask" id="nt-mask"></div>
+      <aside class="nt-drawer" id="nt-drawer">
+        <div class="nt-head"><b>通知</b><span class="grow"></span>
+          <button class="btn ghost sm" id="nt-allread">全部已读</button>
+          <button class="btn ghost sm" id="nt-close">✕</button></div>
+        <div class="nt-body" id="nt-body"><div class="nt-empty">加载中…</div></div>
+      </aside>
       <div class="main" id="main"></div>
     </div>`;
 
@@ -600,6 +730,13 @@ function renderShell() {
     await showBookPicker();
   });
   $("#change-pwd").addEventListener("click", () => openChangePwd(false));
+  // 通知中心：铃铛/抽屉/轮询
+  $("#bell").addEventListener("click", ntOpenDrawer);
+  $("#nt-close").addEventListener("click", ntCloseDrawer);
+  $("#nt-mask").addEventListener("click", ntCloseDrawer);
+  $("#nt-allread").addEventListener("click", ntMarkRead);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") ntCloseDrawer(); });
+  ntStart();
   shellBuilt = true;
 }
 
@@ -3935,7 +4072,7 @@ async function viewPoDoc(main) {
   let lastReq = null; // 最近一条请购（「复制上一条」数据源）
   const table = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>单号</th><th>存货</th><th>数量</th><th>状态</th><th>请购人</th><th>备注</th><th></th></tr></thead>
-      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td>${r.status === "ordered" ? `<span class="tag ok">已下推</span>` : esc(r.status)}</td><td>${esc(r.requester)}</td><td>${esc(r.memo)}</td><td class="row-actions">${r.status === "draft" ? `<button class="btn ghost sm" data-req-approve="${r.id}">审批</button>` : ""}${r.status === "approved" || r.status === "ordered" ? `<button class="btn primary sm" data-req-push="${r.id}">下推采购订单</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td>${r.status === "ordered" ? `<span class="tag ok">已下推</span>` : esc(r.status)}<span data-wftag="purchase_req:${r.id}"></span></td><td>${esc(r.requester)}</td><td>${esc(r.memo)}</td><td class="row-actions">${r.status === "draft" ? `<button class="btn ghost sm" data-req-approve="${r.id}">审批</button>` : ""}${r.status === "approved" || r.status === "ordered" ? `<button class="btn primary sm" data-req-push="${r.id}">下推采购订单</button>` : ""}</td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">暂无请购单</div>`;
   const poTrack = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>订单号</th><th>供应商</th><th>订单数量</th><th>到货数量</th><th>执行率</th></tr></thead>
@@ -3992,6 +4129,7 @@ async function viewPoDoc(main) {
       const r = await api(`/procure/req?period=${period}`);
       $("#pd-list").innerHTML = table(r.rows || []);
       lastReq = (r.rows || [])[0] || null;
+      fillWfTags($("#pd-list"));
       $all("[data-req-approve]").forEach((b) => b.onclick = async () => {
         try { const r = await api(`/procure/req/${b.dataset.reqApprove}/approve`, { method: "POST" }); toast(r && r.pending ? `已审批 → 下一节点：${r.pending}` : "已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
@@ -4039,7 +4177,7 @@ async function viewSoDoc(main) {
   const period = encodeURIComponent(state.current || "");
   const table = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>单号</th><th>客户</th><th>存货</th><th>数量</th><th>单价</th><th>状态</th><th></th></tr></thead>
-      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.customer_name)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td class="num">${esc(r.unit_price)}</td><td>${esc(({ draft: "草稿", approved: "已审批", converted: "已转订单", cancelled: "已作废" })[r.status] || r.status)}</td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-quo-approve="${r.id}">审批</button>` : ""}${r.status === "approved" ? `<button class="btn ghost sm" data-quo-toorder="${r.id}">转订单</button>` : ""}${r.status === "converted" ? `<span class="tag ok">已转订单</span>` : ""}</td></tr>`).join("")}</tbody></table>`
+      <tbody>${rows.map((r) => `<tr><td>${esc(r.no)}</td><td>${esc(r.customer_name)}</td><td>${esc(r.item_name)}</td><td class="num">${esc(r.qty)}</td><td class="num">${esc(r.unit_price)}</td><td>${esc(({ draft: "草稿", approved: "已审批", converted: "已转订单", cancelled: "已作废" })[r.status] || r.status)}<span data-wftag="quotation:${r.id}"></span></td><td>${r.status === "draft" ? `<button class="btn ghost sm" data-quo-approve="${r.id}">审批</button>` : ""}${r.status === "approved" ? `<button class="btn ghost sm" data-quo-toorder="${r.id}">转订单</button>` : ""}${r.status === "converted" ? `<span class="tag ok">已转订单</span>` : ""}</td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">暂无报价单</div>`;
   const soTrack = (rows) => rows.length
     ? `<table class="grid"><thead><tr><th>订单号</th><th>客户</th><th>订单数量</th><th>发货数量</th><th>执行率</th></tr></thead>
@@ -4101,6 +4239,7 @@ async function viewSoDoc(main) {
       $all("[data-quo-approve]").forEach((b) => b.onclick = async () => {
         try { const r = await api(`/sales/quote/${b.dataset.quoApprove}/approve`, { method: "POST" }); toast(r && r.pending ? `已审批 → 下一节点：${r.pending}` : "已审批", "ok"); load(); } catch (e) { toast(e.message, "err"); }
       });
+      fillWfTags($("#sd-list"));
       $all("[data-quo-toorder]").forEach((b) => b.onclick = async () => {
         try {
           const r = await postJson(`/sales/quote/${b.dataset.quoToorder}/to-order`, {});
@@ -4170,10 +4309,10 @@ async function renderWfInstances(body) {
     const rows = r.rows || [];
     body.className = "";
     body.innerHTML = rows.length
-      ? `<table class="grid"><thead><tr><th>#</th><th>类型</th><th>单据</th><th>流程</th><th>当前节点</th><th>状态</th><th>轨迹</th><th></th></tr></thead><tbody>${rows.map((it) => {
+      ? `<div class="muted" style="font-size:12px;margin-bottom:6px">键盘：J / K 上下选择 · A 通过 · R 驳回（焦点不在输入框时）</div><table class="grid"><thead><tr><th>#</th><th>类型</th><th>单据</th><th>流程</th><th>当前节点</th><th>状态</th><th>轨迹</th><th></th></tr></thead><tbody>${rows.map((it) => {
           const st = it.status === "running" ? '<span class="tag">进行中</span>' : it.status === "approved" ? '<span class="tag ok">已通过</span>' : '<span class="tag warn">已驳回</span>';
           const track = (it.log || []).map((l) => `<div>${esc(l.at)} · ${esc(l.who)} · ${l.action === "approve" ? "通过" : "驳回"}</div>`).join("") || "<div class='muted'>无</div>";
-          return `<tr><td>${it.id}</td><td>${esc(it.biz_label)}</td><td>#${it.biz_id}</td><td>${esc(it.flow_name)}</td><td>${esc(it.current_label)}</td><td>${st}</td>
+          return `<tr data-kb="${it.id}" style="cursor:pointer"><td>${it.id}</td><td>${esc(it.biz_label)}</td><td>#${it.biz_id}</td><td>${esc(it.flow_name)}</td><td>${esc(it.current_label)}</td><td>${st}</td>
             <td><details><summary class="muted">查看</summary><div style="font-size:12px">${track}</div></details></td>
             <td class="row-actions">${it.status === "running" ? `<button class="btn ghost sm" data-wf-ok='{"bt":"${it.biz_type}","bi":${it.biz_id}}'>通过</button><button class="btn ghost sm" data-wf-no='{"bt":"${it.biz_type}","bi":${it.biz_id}}'>驳回</button>` : ""}</td></tr>`;
         }).join("")}</tbody></table>`
@@ -4194,8 +4333,45 @@ async function renderWfInstances(body) {
     };
     $all("[data-wf-ok]").forEach((b) => b.onclick = () => { const d = JSON.parse(b.dataset.wfOk); act(d.bt, d.bi, true); });
     $all("[data-wf-no]").forEach((b) => b.onclick = async () => { if (await confirmDialog("确认驳回该单据？", true)) { const d = JSON.parse(b.dataset.wfNo); act(d.bt, d.bi, false); } });
+    // 行点击选中（键盘 J/K/A/R 的作用对象）
+    $all("[data-kb]").forEach((tr) => tr.onclick = (e) => {
+      if (e.target.closest("button") || e.target.closest("a") || e.target.closest("summary")) return;
+      $all("[data-kb]").forEach((x) => x.classList.remove("kb-sel"));
+      tr.classList.add("kb-sel");
+    });
+    if (rows.some((x) => x.status === "running")) {
+      const first = body.querySelector("[data-kb]");
+      if (first) first.classList.add("kb-sel");
+    }
   } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
 }
+
+// 实例页快捷键：J/K 上下选择 · A 通过 · R 驳回（焦点在输入框或弹窗打开时不生效）
+document.addEventListener("keydown", (e) => {
+  const t = (e.target.tagName || "").toLowerCase();
+  if (t === "input" || t === "select" || t === "textarea") return;
+  if (document.querySelector(".modal-mask")) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (state.view !== "workflow" || (state.wfMode || "design") !== "instances") return;
+  const rowsKb = $all("[data-kb]");
+  if (!rowsKb.length) return;
+  let idx = rowsKb.findIndex((r) => r.classList.contains("kb-sel"));
+  const key = e.key.toLowerCase();
+  if (key === "j") { e.preventDefault(); idx = idx < 0 ? 0 : Math.min(rowsKb.length - 1, idx + 1); }
+  else if (key === "k") { e.preventDefault(); idx = idx <= 0 ? 0 : idx - 1; }
+  else if (key === "a" && idx >= 0) {
+    e.preventDefault();
+    rowsKb[idx].querySelector("[data-wf-ok]")?.click();
+    return;
+  } else if (key === "r" && idx >= 0) {
+    e.preventDefault();
+    if (rowsKb[idx].querySelector("[data-wf-no]")) rowsKb[idx].querySelector("[data-wf-no]").click();
+    return;
+  } else return;
+  rowsKb.forEach((r) => r.classList.remove("kb-sel"));
+  rowsKb[idx].classList.add("kb-sel");
+  rowsKb[idx].scrollIntoView({ block: "nearest" });
+});
 
 async function renderWfDesign(body) {
   body.className = "";
@@ -5039,10 +5215,11 @@ async function renderReceipts(body) {
             <td><input type="checkbox" class="rc-chk" value="${d.id}" /></td><td>${esc(d.no)}</td><td>${esc(d.date)}</td><td>${d.kind === "receipt" ? "收款" : "付款"}</td>
             <td>${esc(d.fund_account)}</td><td>${esc(d.party)}</td><td class="num">${fmt(d.amount)}</td>
             <td>${d.voucher_id ? `<a href="#" data-rc-v="${d.voucher_id}">凭证 #${d.voucher_id}</a>` : "—"}</td>
-            <td>${d.status === "audited" ? '<span class="tag ok">已审核</span>' : '<span class="tag warn">待审核</span>'}</td>
+            <td>${d.status === "audited" ? '<span class="tag ok">已审核</span>' : '<span class="tag warn">待审核</span>'}<span data-wftag="receipt:${d.id}"></span></td>
             <td>${esc(d.memo || "")}</td>
             <td class="row-actions">${can("voucher_audit") ? (d.status === "draft" ? `<button class="btn ghost sm" data-rc-audit="${d.id}">审核</button>` : `<button class="btn ghost sm" data-rc-unaudit="${d.id}">撤审</button>`) : ""}<button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无收付款单</div>`;
+      fillWfTags($("#rc-list"));
       $all("[data-rc-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.rcV, 10)); });
       $all("[data-rc-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该收付款单？其凭证需先作废或删除", true))) return; try { await api(`/funds/receipts/${b.dataset.rcD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#rc-chkall")) $("#rc-chkall").onclick = (e) => { $all(".rc-chk").forEach((c) => { c.checked = e.target.checked; }); };
@@ -6579,6 +6756,7 @@ function openClaimEditor(main, claim, period) {
   };
   const mask = modal(`
     <h3>${isEdit ? `编辑报销单 ${esc(claim.no)}` : "新增报销单"} · ${esc(period)}</h3>
+    <div id="cm-flow"></div>
     <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
       <div><label>业务日期 *</label><input id="cm-date" type="date" value="${esc(c.biz_date)}" style="width:150px" /></div>
       <div><label>申请人 *</label><input id="cm-applicant" value="${esc(c.applicant)}" style="width:110px" /></div>
@@ -6597,6 +6775,18 @@ function openClaimEditor(main, claim, period) {
     </div>
   `, true);
   const tbody = $("#cm-items tbody", mask);
+  // 单据流程条：审批进度横幅（当前节点/最近动作，未配置流程不显示）
+  if (isEdit && claim && claim.id) {
+    api(`/workflows/instance-for?biz_type=claim&id=${claim.id}`).then((f) => {
+      if (!f.found) return;
+      const el = $("#cm-flow", mask);
+      if (!el) return;
+      const cls = f.status === "approved" ? "ok" : f.status === "rejected" ? "bad" : "";
+      const label = { running: "审批中", approved: "已通过", rejected: "已驳回" }[f.status] || f.status;
+      const last = (f.log || [])[f.log.length - 1];
+      el.innerHTML = `<div class="flow-bar ${cls}"><b>流程</b> ${esc(label)} · 当前节点「${esc(f.current_label)}」${last ? ` · 最近 ${esc(last.who)} ${last.action === "approve" ? "通过" : "驳回"} @ ${esc(last.at)}` : ""}<span class="muted" style="margin-left:auto">${esc(f.flow_name)}</span></div>`;
+    }).catch(() => {});
+  }
   function renderRows() {
     tbody.innerHTML = c.items.map((i, k) => `
       <tr>

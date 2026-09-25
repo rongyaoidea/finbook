@@ -133,6 +133,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/options", get(get_options).put(put_options))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/workbench", get(get_workbench))
+        .route("/api/notices", get(get_notices))
+        .route("/api/workflows/instance-for", get(get_wf_instance_for))
         .route("/api/quick-search", get(quick_search))
         .route("/api/overview", get(get_overview))
         .route("/api/periods", get(get_periods))
@@ -7906,6 +7908,87 @@ async fn clear_cost_method(
     let db = state.db_for(&user.book_key)?;
     findb::business::item_cost_method_clear(&db, &item)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 通知中心：待办（按岗位实时聚合）+ 动态（审计日志按可见性过滤：AuditLog 权看全量，
+/// 否则只看自己的操作）+ 未读计数。since=上次已读水位（前端 localStorage 存服务端 now，
+/// 同格式同钟保证字典序=时间序）；缺省=今天内未读。
+async fn get_notices(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let cur = current_period(&state, &user);
+    let todos = findb::workbench::collect_todos(&db, &user.user, cur)?;
+    let see_all = user.can(Perm::AuditLog);
+    let me = user.username().to_string();
+    let events = db
+        .recent_logs(50)?
+        .into_iter()
+        .filter(|l| see_all || l.user == me)
+        .collect::<Vec<_>>();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let since = q.get("since").cloned().filter(|s| !s.is_empty());
+    let today = now.get(..10).unwrap_or("").to_string();
+    let unread_events = events
+        .iter()
+        .filter(|l| match &since {
+            Some(s) => l.ts.as_str() > s.as_str(),
+            None => l.ts.starts_with(&today),
+        })
+        .count();
+    let ev: Vec<serde_json::Value> = events
+        .iter()
+        .map(|l| {
+            json!({
+                "id": l.id,
+                "ts": l.ts,
+                "user": l.user,
+                "module": l.module,
+                "action": l.action,
+                "detail": l.detail,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "todos": todos,
+        "events": ev,
+        "unread_events": unread_events,
+        "now": now,
+    })))
+}
+
+/// 单据的流程实例状态（流程条 / 列表行徽标）：仅工作流四类业务
+async fn get_wf_instance_for(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let biz_type = q.get("biz_type").map(String::as_str).unwrap_or("");
+    if !matches!(
+        biz_type,
+        "quotation" | "purchase_req" | "claim" | "receipt"
+    ) {
+        return Err(AppError::bad_request(
+            "biz_type 只能是 quotation / purchase_req / claim / receipt",
+        ));
+    }
+    let biz_id: i64 = q
+        .get("id")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AppError::bad_request("缺少 id"))?;
+    let st = findb::workflow::instance_for(&db, biz_type, biz_id)?;
+    Ok(Json(json!({
+        "found": st.found,
+        "status": st.status,
+        "flow_name": st.flow_name,
+        "current_label": st.current_label,
+        "log": st.log,
+    })))
 }
 
 /// 存货核算 ↔ 总账 对账（CostOps）：库存流水金额 vs 存货辅助余额，差异定位

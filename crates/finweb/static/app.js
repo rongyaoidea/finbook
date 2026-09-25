@@ -29,6 +29,9 @@ async function api(path, opts = {}) {
   }
   // 列偏好：每次数据到达后重挂（异步填充的表格也能获得列菜单与隐藏样式）
   try { autoColPrefs(); } catch (e) {}
+  // 通用列头排序 + 列宽拖拽（同点补挂，异步表也能获得）
+  try { autoColSort(); } catch (e) {}
+  try { autoColResize(); } catch (e) {}
   return data;
 }
 
@@ -757,6 +760,79 @@ document.addEventListener("click", (e) => {
   if (e.target && e.target.closest && e.target.closest(".col-bar")) return;
   $all(".col-menu").forEach((m) => { m.hidden = true; });
 });
+// ---------------- 通用列头排序 + 列宽拖拽 ----------------
+// 排序：table.grid 列头可点（自带 data-sort 的用户列表除外；操作/选择类列跳过）；
+// 数字感知（去千分位比较），升/降切换，▲▼ 标记。
+function autoColSort() {
+  $all("#main table.grid").forEach((tbl) => {
+    if (tbl.dataset.colsort) return;
+    tbl.dataset.colsort = "1";
+    const ths = [...tbl.querySelectorAll("thead th")];
+    ths.forEach((th, idx) => {
+      if (th.dataset.sort) return;
+      const label = (th.textContent || "").trim();
+      if (!label || /操作|选择|明细/.test(label)) return;
+      th.classList.add("sortable");
+      th.title = "点击排序";
+      th.addEventListener("click", () => {
+        const tb = tbl.tBodies[0];
+        if (!tb) return;
+        const asc = th.dataset.asc !== "1";
+        ths.forEach((h) => { if (h !== th) { h.dataset.asc = ""; h.classList.remove("sort-asc", "sort-desc"); } });
+        th.dataset.asc = asc ? "1" : "0";
+        th.classList.toggle("sort-asc", asc);
+        th.classList.toggle("sort-desc", !asc);
+        const cellVal = (tr) => { const td = tr.cells[idx]; return td ? td.textContent.trim() : ""; };
+        const num = (s) => { const v = parseFloat(String(s).replace(/[,\s¥%]/g, "")); return Number.isFinite(v) ? v : null; };
+        const rows = [...tb.rows];
+        rows.sort((a, b) => {
+          const av = cellVal(a), bv = cellVal(b);
+          const an = num(av), bn = num(bv);
+          const r = an !== null && bn !== null ? an - bn : av.localeCompare(bv, "zh-Hans-CN");
+          return asc ? r : -r;
+        });
+        rows.forEach((r) => tb.appendChild(r));
+      });
+    });
+  });
+}
+
+// 列宽拖拽：拖 th 右缘调宽；localStorage 按 视图#表序号 持久化
+function autoColResize() {
+  $all("#main table.grid").forEach((tbl, i) => {
+    if (tbl.dataset.colresize) return;
+    tbl.dataset.colresize = "1";
+    const key = `colw:${state.view}#${i}`;
+    let widths = [];
+    try { widths = JSON.parse(localStorage.getItem(key) || "[]"); } catch (e) {}
+    const ths = [...tbl.querySelectorAll("thead th")];
+    ths.forEach((th, ci) => {
+      if (widths[ci]) { th.style.width = widths[ci] + "px"; th.style.minWidth = widths[ci] + "px"; }
+      th.addEventListener("mousemove", (e) => {
+        const r = th.getBoundingClientRect();
+        th.style.cursor = e.clientX > r.right - 6 ? "col-resize" : "";
+      });
+      th.addEventListener("mousedown", (e) => {
+        const r = th.getBoundingClientRect();
+        if (e.clientX <= r.right - 6) return;
+        e.preventDefault();
+        const startX = e.clientX, startW = r.width;
+        const move = (ev) => {
+          const w = Math.max(48, Math.round(startW + ev.clientX - startX));
+          th.style.width = w + "px"; th.style.minWidth = w + "px";
+        };
+        const up = () => {
+          document.removeEventListener("mousemove", move);
+          document.removeEventListener("mouseup", up);
+          const arr = ths.map((h) => Math.round(h.getBoundingClientRect().width));
+          try { localStorage.setItem(key, JSON.stringify(arr)); } catch (e2) {}
+        };
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      });
+    });
+  });
+}
 // ---------------- 列偏好 END ----------------
 
 // 单据行内流程徽标：按业务类型拉取流程实例状态，填充 [data-wftag="类型:id"] 占位
@@ -877,6 +953,8 @@ function renderMain() {
   const r = fn(main);
   // 列偏好：同步表结构先挂一次（async 表由 api() 回调补挂）
   try { autoColPrefs(); } catch (e) {}
+  try { autoColSort(); } catch (e) {}
+  try { autoColResize(); } catch (e) {}
   return r;
 }
 
@@ -1387,6 +1465,7 @@ async function openVoucherEditor(id, seedEntries) {
     <div id="v-attach" class="muted" style="margin-top:8px">附件加载中…</div>
     <div class="foot">
       ${editable ? `<button class="btn" id="v-save">保存</button>` : ""}
+      ${editable ? `<button class="btn ghost" id="v-save-new">保存并新增</button>` : ""}
       ${can("voucher_audit") && id > 0 && status === "draft" ? `<button class="btn ghost" id="v-audit">审核</button>` : ""}
       ${can("voucher_unaudit") && id > 0 && status === "audited" ? `<button class="btn ghost" id="v-unaudit">反审核</button>` : ""}
       ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}
@@ -1492,7 +1571,7 @@ async function openVoucherEditor(id, seedEntries) {
   }
   if (editable) $("#v-date", mask).addEventListener("change", updateDateHint);
 
-  const save = async () => {
+  const save = async (keepOpen) => {
     const dateVal = $("#v-date", mask).value;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateVal)) { toast("日期格式应为 YYYY-MM-DD", "err"); return; }
     const payload = {
@@ -1521,10 +1600,20 @@ async function openVoucherEditor(id, seedEntries) {
     if (!payload.entries.some((e) => e.account_code)) { toast("请至少选择一条科目", "err"); return; }
     try {
       await api("/vouchers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      toast("已保存", "ok"); closeModal(); loadVouchers();
+      if (keepOpen) {
+        toast("已保存，继续录入下一张", "ok");
+        closeModal();
+        loadVouchers();
+        openVoucherEditor(null);
+      } else {
+        toast("已保存", "ok");
+        closeModal();
+        loadVouchers();
+      }
     } catch (e) { toast(e.message, "err"); }
   };
-  if (editable) $("#v-save", mask).onclick = save;
+  if (editable) $("#v-save", mask).onclick = () => save(false);
+  if ($("#v-save-new", mask)) $("#v-save-new", mask).onclick = () => save(true);
   if ($("#v-post", mask)) $("#v-post", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/post`, { method: "POST" }); toast("已记账", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-unpost", mask)) $("#v-unpost", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unpost`, { method: "POST" }); toast("已反记账，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-audit", mask)) $("#v-audit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/audit`, { method: "POST" }); toast("已审核", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };

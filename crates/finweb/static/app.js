@@ -5610,6 +5610,7 @@ async function viewFunds(main) {
       <button class="btn sm ${state.fundsTab === "check" ? "primary" : "ghost"}" id="ft-check">支票簿</button>
       <button class="btn sm ${state.fundsTab === "journal" ? "primary" : "ghost"}" id="ft-journal">日记账</button>
       <button class="btn sm ${state.fundsTab === "advance" ? "primary" : "ghost"}" id="ft-advance">借支</button>
+      <button class="btn sm ${state.fundsTab === "shift" ? "primary" : "ghost"}" id="ft-shift">交接班</button>
       <button class="btn sm ${state.fundsTab === "budget" ? "primary" : "ghost"}" id="ft-budget">资金预算</button>
       <button class="btn sm ${state.fundsTab === "receipt" ? "primary" : "ghost"}" id="ft-receipt">收付款</button>
       <button class="btn sm ${state.fundsTab === "forecast" ? "primary" : "ghost"}" id="ft-forecast">资金预测</button>
@@ -5632,6 +5633,7 @@ async function viewFunds(main) {
   $("#ft-check").onclick = () => switchTab("check");
   $("#ft-journal").onclick = () => switchTab("journal");
   $("#ft-advance").onclick = () => switchTab("advance");
+  $("#ft-shift").onclick = () => switchTab("shift");
   $("#ft-budget").onclick = () => switchTab("budget");
   $("#ft-receipt").onclick = () => switchTab("receipt");
   $("#ft-forecast").onclick = () => switchTab("forecast");
@@ -5674,6 +5676,8 @@ async function viewFunds(main) {
     renderJournal(body);
   } else if (tab === "advance") {
     renderAdvances(body);
+  } else if (tab === "shift") {
+    renderCashShifts(body);
   } else if (tab === "budget") {
     renderBudget(body);
   } else if (tab === "receipt") {
@@ -5903,6 +5907,71 @@ async function renderChecks(body) {
       $all("[data-ck-d]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该支票记录？", true))) return; try { await api(`/funds/checks/${b.dataset.ckD}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
     } catch (e) { $("#ck-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   }
+}
+
+// 出纳交接班：交班快照（现金/银行结存、在库票据、未日清）+ 接班人确认
+async function renderCashShifts(body) {
+  body.className = "";
+  const canWrite = can("cashier_sign");
+  body.innerHTML = `<div class="toolbar">
+      <label>日期 <input type="date" id="cs-date" value="${today()}" /></label>
+      <label>接班人 <input id="cs-to" style="width:120px" placeholder="留空 = 待定" /></label>
+      <label>备注 <input id="cs-memo" style="width:180px" /></label>
+      <button class="btn sm primary" id="cs-new">新建交班单</button>
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">交班单快照当日现金/银行结存（仅已记账口径）、在库票据与未日清账户数；由接班人确认，交班人不能自确认。</div>
+    <div id="cs-table" class="muted">加载中…</div>`;
+  const load = async () => {
+    try {
+      const r = await api("/funds/shifts");
+      const rows = r.rows || [];
+      const stMap = { open: ["待确认", "warn"], confirmed: ["已确认", "ok"], cancelled: ["已取消", ""] };
+      $("#cs-table").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>日期</th><th>交班人</th><th>接班人</th><th class="num">现金结存</th><th class="num">银行结存</th><th class="num">在库票据</th><th class="num">未日清</th><th>状态</th><th>确认</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((s) => {
+            const st = stMap[s.status] || [s.status, ""];
+            const acts = s.status === "open" && canWrite
+              ? `<button class="btn ghost sm" data-cs-confirm="${s.id}">确认接班</button> <button class="btn ghost sm" data-cs-cancel="${s.id}">取消</button>` : "";
+            return `<tr>
+              <td>${esc(s.date)}</td><td>${esc(s.from_user)}</td><td>${esc(s.to_user || "—")}</td>
+              <td class="num">${fmt(s.cash_balance)}</td><td class="num">${fmt(s.bank_balance)}</td>
+              <td class="num">${s.bill_count} 张 / ${fmt(s.bill_amount)}</td>
+              <td class="num">${s.uncleared}</td>
+              <td><span class="tag ${st[1]}">${st[0]}</span></td>
+              <td>${s.confirmed_by ? `${esc(s.confirmed_by)}<div class="muted" style="font-size:11px">${esc(s.confirmed_at || "")}</div>` : `<span class="muted">—</span>`}</td>
+              <td>${esc(s.memo)}</td><td class="row-actions">${acts}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无交班记录</div>`;
+      $all("[data-cs-confirm]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("确认接班？确认后该交班单不可再修改。"))) return;
+        try {
+          await api(`/funds/shifts/${b.dataset.csConfirm}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+          toast("已确认接班", "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-cs-cancel]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("取消该交班单？"))) return;
+        try {
+          await api(`/funds/shifts/${b.dataset.csCancel}/cancel`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+          toast("已取消", "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#cs-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  if (canWrite) {
+    $("#cs-new").onclick = async () => {
+      try {
+        await api("/funds/shifts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date: $("#cs-date").value, to_user: $("#cs-to").value.trim(), memo: $("#cs-memo").value.trim() }) });
+        toast("交班单已创建，等待接班人确认", "ok");
+        $("#cs-to").value = ""; $("#cs-memo").value = "";
+        load();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  } else {
+    const b = $("#cs-new"); if (b) b.remove();
+  }
+  load();
 }
 
 // 出纳日记账：本期已记账逐笔滚动 + 日清标记 + 收付登记（跳凭证录入预填科目）

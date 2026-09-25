@@ -1501,6 +1501,176 @@ pub fn advance_delete(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+// ===========================================================================
+// 出纳交接班（现金/银行/票据/日清快照 + 接班人确认）
+// ===========================================================================
+
+/// 交班单（对标金蝶出纳交接：交班快照 + 接班确认，防止责任不清）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CashShift {
+    pub id: i64,
+    pub period: Period,
+    pub date: NaiveDate,
+    pub from_user: String,
+    pub to_user: String,
+    /// 当日现金科目日末结存（已记账 H-3 口径，下同）
+    pub cash_balance: Money,
+    /// 当日银行科目日末结存
+    pub bank_balance: Money,
+    /// 在库票据张数（应收 + 应付）
+    pub bill_count: i64,
+    /// 在库票据面值合计
+    pub bill_amount: Money,
+    /// 当日未日清的现金/银行账户数
+    pub uncleared: i64,
+    pub memo: String,
+    /// open / confirmed / cancelled
+    pub status: String,
+    pub created_at: String,
+    pub confirmed_by: String,
+    pub confirmed_at: String,
+}
+
+fn map_shift(r: &rusqlite::Row) -> rusqlite::Result<CashShift> {
+    let date: String = r.get(2)?;
+    let confirmed_at: Option<String> = r.get(14)?;
+    Ok(CashShift {
+        id: r.get(0)?,
+        period: Period::from_ymm(r.get(1)?),
+        date: NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+        from_user: r.get(3)?,
+        to_user: r.get(4)?,
+        cash_balance: m(&r.get::<_, String>(5)?),
+        bank_balance: m(&r.get::<_, String>(6)?),
+        bill_count: r.get(7)?,
+        bill_amount: m(&r.get::<_, String>(8)?),
+        uncleared: r.get(9)?,
+        memo: r.get(10)?,
+        status: r.get(11)?,
+        created_at: r.get(12)?,
+        confirmed_by: r.get(13)?,
+        confirmed_at: confirmed_at.unwrap_or_default(),
+    })
+}
+
+const S_COLS: &str = "id,period,date,from_user,to_user,cash_balance,bank_balance,bill_count,bill_amount,uncleared,memo,status,created_at,confirmed_by,confirmed_at";
+
+pub fn cash_shift_list(db: &Db, limit: usize) -> DbResult<Vec<CashShift>> {
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {S_COLS} FROM cash_shift ORDER BY date DESC, id DESC LIMIT ?1"
+    ))?;
+    let rows = st
+        .query_map(rusqlite::params![limit.clamp(1, 500) as i64], map_shift)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn cash_shift_get(db: &Db, id: i64) -> DbResult<Option<CashShift>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {S_COLS} FROM cash_shift WHERE id=?1"),
+            rusqlite::params![id],
+            map_shift,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// 创建交班单：服务端快照当日数据（现金/银行结存按已记账口径、在库票据、未日清账户数），
+/// 不信前端传值；账期随交班日期。
+pub fn cash_shift_create(
+    db: &Db,
+    date: NaiveDate,
+    from_user: &str,
+    to_user: &str,
+    memo: &str,
+) -> DbResult<i64> {
+    let rows = funds_daily_by_date(db, date)?;
+    let accounts = crate::accounts::list(db)?;
+    let day = date.format("%Y-%m-%d").to_string();
+    let mut cash = Money::ZERO;
+    let mut bank = Money::ZERO;
+    let mut uncleared = 0i64;
+    for row in &rows {
+        let Some(acc) = accounts.iter().find(|a| a.code == row.account_code) else {
+            continue;
+        };
+        if !(acc.is_cash || acc.is_bank) {
+            continue;
+        }
+        if acc.is_cash {
+            cash = cash + row.end;
+        }
+        if acc.is_bank {
+            bank = bank + row.end;
+        }
+        // 日清状态：该账户当日是否已标记（出纳确认账实相符）
+        let cleared = day_clear_dates(db, &row.account_code, date, date)?;
+        if !cleared.contains(&day) {
+            uncleared += 1;
+        }
+    }
+    let bills = bill_list(db, None)?;
+    let in_hand: Vec<_> = bills.iter().filter(|b| b.status == "in_hand").collect();
+    let bill_count = in_hand.len() as i64;
+    let bill_amount = in_hand.iter().fold(Money::ZERO, |acc, b| acc + b.amount);
+    let period = Period::from_date(date);
+    db.conn().execute(
+        "INSERT INTO cash_shift(period,date,from_user,to_user,cash_balance,bank_balance,
+         bill_count,bill_amount,uncleared,memo,status,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'open',?11)",
+        rusqlite::params![
+            period.ymm(),
+            day,
+            from_user,
+            to_user,
+            crate::money_param(cash),
+            crate::money_param(bank),
+            bill_count,
+            crate::money_param(bill_amount),
+            uncleared,
+            memo,
+            now()
+        ],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+/// 接班确认：仅 open 状态；交班人不能自我确认（防自交自接）；条件更新防并发。
+pub fn cash_shift_confirm(db: &Db, id: i64, who: &str) -> DbResult<()> {
+    let s = cash_shift_get(db, id)?.ok_or_else(|| fincore::FinError::not_found("交班单"))?;
+    if s.status != "open" {
+        return Err(fincore::FinError::state("该交班单已确认或已取消").into());
+    }
+    if who == s.from_user {
+        return Err(
+            fincore::FinError::state("交班人不能确认自己的交班单，请由接班人确认").into(),
+        );
+    }
+    let n = db.conn().execute(
+        "UPDATE cash_shift SET status='confirmed', confirmed_by=?2, confirmed_at=?3
+         WHERE id=?1 AND status='open'",
+        rusqlite::params![id, who, now()],
+    )?;
+    if n == 0 {
+        return Err(fincore::FinError::state("交班单已被处理").into());
+    }
+    Ok(())
+}
+
+/// 取消交班单（仅 open 状态）
+pub fn cash_shift_cancel(db: &Db, id: i64) -> DbResult<()> {
+    let n = db.conn().execute(
+        "UPDATE cash_shift SET status='cancelled' WHERE id=?1 AND status='open'",
+        rusqlite::params![id],
+    )?;
+    if n == 0 {
+        return Err(fincore::FinError::state("仅待确认的交班单可取消").into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

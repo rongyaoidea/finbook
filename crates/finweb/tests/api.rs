@@ -1877,6 +1877,175 @@ async fn web_security_center() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "解锁陌生账号应 404");
 }
 
+/// P0：出纳交接班——交班快照（现金结存/在库票据/未日清）+ 接班确认（不能自确认）。
+#[tokio::test]
+async fn cash_shift_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    // 当期与测试日期
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 造一笔现金收款（借 1001 500 / 贷 2001 500）并记账 → 快照应有 500
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记",
+                "no": 90, "attachments": 0, "memo": "", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "shift-in", "debit": "500", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "shift-in", "debit": "0", "credit": "500" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "造现金凭证");
+    let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账");
+
+    // 交班单 A：快照 + 自己不能确认 → 取消
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/shifts",
+            &sid,
+            serde_json::json!({ "date": d15, "to_user": "sh1", "memo": "晚班交接" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "创建交班单 A");
+    let a: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let aid = a["id"].as_i64().unwrap();
+    assert_eq!(
+        a["shift"]["cash_balance"].as_str().unwrap().parse::<f64>().unwrap(),
+        500.0,
+        "现金结存快照：{a}"
+    );
+    assert_eq!(a["shift"]["status"], "open");
+    assert!(
+        a["shift"]["uncleared"].as_i64().unwrap() >= 1,
+        "未日清账户数应 ≥1：{a}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/shifts/{aid}/confirm"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "交班人不能自确认");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/shifts/{aid}/cancel"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "取消交班单 A");
+
+    // 出纳 sh1（平台开号 → 首登改密 → 加入账套 cashier）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &sid,
+            serde_json::json!({ "username": "sh1", "display_name": "出纳一", "password": "Sh1@pass99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "平台开号 sh1");
+    let (_, sh1_sid) = login(&state, "sh1", "Sh1@pass99").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sh1_sid,
+            serde_json::json!({ "old": "Sh1@pass99", "new": "Sh1@pass99x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "sh1 首登改密");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &sid,
+            serde_json::json!({
+                "username": "sh1", "display_name": "出纳一", "password": "",
+                "role": "cashier", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "邀请 sh1 入套为出纳");
+    assert_eq!(select_book(&state, &sh1_sid, "b1").await, StatusCode::OK);
+
+    // 交班单 B：boss 交班 → sh1 确认 → 重复确认 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/shifts",
+            &sid,
+            serde_json::json!({ "date": d15, "to_user": "sh1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "创建交班单 B");
+    let b: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let bid = b["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/shifts/{bid}/confirm"),
+            &sh1_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "接班人确认");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/shifts/{bid}/confirm"),
+            &sh1_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复确认应 400");
+
+    // 列表：B 已确认（确认人 sh1），A 已取消
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/funds/shifts", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    let br = rows.iter().find(|x| x["id"] == bid).expect("列表应含交班单 B");
+    assert_eq!(br["status"], "confirmed");
+    assert_eq!(br["confirmed_by"], "sh1");
+    let ar = rows.iter().find(|x| x["id"] == aid).expect("列表应含交班单 A");
+    assert_eq!(ar["status"], "cancelled");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -1086,6 +1086,26 @@ CREATE TABLE IF NOT EXISTS advance (
     created_at        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_advance_status ON advance(status, date);
+
+-- 出纳交接班（对标金蝶出纳交接：交班快照现金/银行结存、在库票据、未日清账户，接班人确认）
+CREATE TABLE IF NOT EXISTS cash_shift (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period          INTEGER NOT NULL,
+    date            TEXT NOT NULL,
+    from_user       TEXT NOT NULL,
+    to_user         TEXT NOT NULL DEFAULT '',
+    cash_balance    TEXT NOT NULL DEFAULT '0',
+    bank_balance    TEXT NOT NULL DEFAULT '0',
+    bill_count      INTEGER NOT NULL DEFAULT 0,
+    bill_amount     TEXT NOT NULL DEFAULT '0',
+    uncleared       INTEGER NOT NULL DEFAULT 0,
+    memo            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'open',   -- open/confirmed/cancelled
+    created_at      TEXT NOT NULL DEFAULT '',
+    confirmed_by    TEXT NOT NULL DEFAULT '',
+    confirmed_at    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_cash_shift_date ON cash_shift(date, status);
 
 -- 收付款单（对标金蝶收款单/付款单：出纳资金动作 → 凭证 + 自动核销）
 CREATE TABLE IF NOT EXISTS receipt_doc (

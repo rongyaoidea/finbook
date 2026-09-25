@@ -368,6 +368,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/funds/advances/:id/pay", post(pay_advance))
         .route("/api/funds/advances/:id/settle", post(settle_advance))
         .route("/api/funds/advances/:id/delete", post(delete_advance))
+        // 出纳交接班：交班快照 + 接班确认 + 取消
+        .route(
+            "/api/funds/shifts",
+            get(list_cash_shifts).post(create_cash_shift),
+        )
+        .route("/api/funds/shifts/:id/confirm", post(confirm_cash_shift))
+        .route("/api/funds/shifts/:id/cancel", post(cancel_cash_shift))
         .route("/api/funds/receipts", get(list_receipts).post(create_receipt))
         .route("/api/funds/receipts/:id/delete", post(delete_receipt))
         .route("/api/funds/receipts/print-form", get(print_receipt_form))
@@ -7619,6 +7626,97 @@ struct DayClearReq {
     date: String,
     #[serde(default)]
     clear: bool,
+}
+
+#[derive(Deserialize)]
+struct CashShiftReq {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    to_user: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 交接班列表（只读，财务报表权限）
+async fn list_cash_shifts(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::FinReport)?;
+    let db = state.db_for(&user.book_key)?;
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100);
+    Ok(Json(json!({ "rows": findb::funds::cash_shift_list(&db, limit)? })))
+}
+
+/// 新建交班单：快照当日现金/银行结存、在库票据、未日清账户（服务端计算）
+async fn create_cash_shift(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<CashShiftReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CashierSign)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        chrono::NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let id = findb::funds::cash_shift_create(
+        &db,
+        date,
+        user.username(),
+        req.to_user.trim(),
+        req.memo.trim(),
+    )?;
+    let s = findb::funds::cash_shift_get(&db, id)?
+        .ok_or_else(|| AppError::from(fincore::FinError::msg("交班单创建失败")))?;
+    db.log(
+        user.username(),
+        "资金",
+        "交接班",
+        &format!(
+            "交班 {} 现金 {} 银行 {} 票据 {} 张 {} / 未日清 {} 户",
+            date.format("%Y-%m-%d"),
+            s.cash_balance.fmt_money(),
+            s.bank_balance.fmt_money(),
+            s.bill_count,
+            s.bill_amount.fmt_money(),
+            s.uncleared
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id, "shift": s })))
+}
+
+/// 接班确认（交班人不能自我确认）
+async fn confirm_cash_shift(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CashierSign)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::cash_shift_confirm(&db, id, user.username())?;
+    db.log(user.username(), "资金", "交接班确认", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 取消交班单（仅待确认状态）
+async fn cancel_cash_shift(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CashierSign)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::funds::cash_shift_cancel(&db, id)?;
+    db.log(user.username(), "资金", "交接班取消", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// 日清日期查询：?account=&from=YYYY-MM-DD&to=YYYY-MM-DD（缺省 today~today）

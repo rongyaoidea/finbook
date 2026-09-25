@@ -1125,6 +1125,12 @@ async fn reset_user_password(
     Json(req): Json<ResetPwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
+    // 口令即身份：与建号/改权/删号同口径收归套内管理员（持有 UserManage 的非管理员
+    // 不得改写任何成员的全局口令——口令同步全部账套）
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("只有管理员可以重置账号口令"));
+    }
+    let db = state.db_for(&user.book_key)?;
     // 单密码统一：账套内没有独立口令，重置即重置该用户的平台口令，
     // 再同步到其出现过的所有账套。目标必须是当前账套成员，防越权重置陌生人口令。
     let db = state.db_for(&user.book_key)?;
@@ -1183,6 +1189,10 @@ async fn reset_user_device(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
+    // 设备绑定 + 会话下线 = 账号安全操作，收归套内管理员（非管理员可借此踢任意成员下线）
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("只有管理员可以重置设备绑定"));
+    }
     let db = state.db_for(&user.book_key)?;
     // 目标必须是本账套成员：否则凭用户名即可强制下线任意平台用户的全部会话
     if users::get(&db, &username)?.is_none() {
@@ -1201,6 +1211,10 @@ async fn unlock_user(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::UserManage)?;
+    // 解锁被停用账号 = 抵消管理员的停用决定，属授权变更，收归套内管理员
+    if !user.user.is_admin() {
+        return Err(AppError::forbidden("只有管理员可以解锁账号"));
+    }
     let db = state.db_for(&user.book_key)?;
     security::unlock_user(&db, &username)?;
     db.log(user.username(), "安全", "解锁用户", &format!("解锁「{username}」"))?;
@@ -4679,7 +4693,7 @@ async fn add_so_shipment(
     }
     // 确认收入与应收（比例法；先出凭证再落发货流水，金额为零时无凭证）
     let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty, date, user.username())?;
-    let id = findb::sales::so_shipment_add(&db, req.so_id, period, date, qty, &req.memo)?;
+    let id = findb::sales::so_shipment_with_stock(&db, req.so_id, period, date, qty, &req.memo)?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }
@@ -4712,7 +4726,7 @@ async fn add_so_return(
     }
     // 冲回收入与应收（负向比例；封顶已发货量）
     let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty.negated(), date, user.username())?;
-    let id = findb::sales::so_return_add(&db, req.so_id, period, date, qty, &req.memo)?;
+    let id = findb::sales::so_return_with_stock(&db, req.so_id, period, date, qty, &req.memo)?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }

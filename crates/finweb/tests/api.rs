@@ -2125,6 +2125,81 @@ async fn backups_isolated_per_book() {
     assert!(own.contains(&zname), "自己的备份应可见：{own}");
 }
 
+/// 身份操作收归套内管理员：持有 UserManage 的**非管理员**不能重置口令 / 重置设备 /
+/// 解锁停用账号（与建号/改权/删号的既有 admin 闸同口径）；套内管理员正常能力保留。
+#[tokio::test]
+async fn non_admin_usermanage_cannot_touch_identities() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // sup9：会计 + 额外 user_manage（非管理员）；vic9：普通成员
+    let _ = provision_plain_user(&state, &admin_sid, "sup9", "S912345678").await;
+    let _ = provision_plain_user(&state, &admin_sid, "vic9", "V912345678").await;
+    for (u, extra) in [("sup9", vec!["user_manage"]), ("vic9", vec![])] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &admin_sid,
+                serde_json::json!({
+                    "username": u, "display_name": u, "password": "Init123456",
+                    "role": "accountant", "must_change_pwd": false, "extra_perms": extra
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "邀请 {u}");
+    }
+    let (st, sup_sid) = login(&state, "sup9", "S912345678x").await;
+    assert_eq!(st, StatusCode::OK, "sup9 登录");
+    let (st, vic_sid) = login(&state, "vic9", "V912345678x").await;
+    assert_eq!(st, StatusCode::OK, "vic9 登录");
+    assert_eq!(select_book(&state, &sup_sid, "b1").await, StatusCode::OK);
+    assert_eq!(select_book(&state, &vic_sid, "b1").await, StatusCode::OK);
+
+    // 非管理员 + UserManage：三项身份操作全拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users/vic9/reset-password",
+            &sup_sid,
+            serde_json::json!({ "new": "Hacked9999999" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员不能重置口令");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/users/vic9/reset-device", &sup_sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员不能重置设备");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/users/vic9/unlock", &sup_sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员不能解锁停用账号");
+
+    // 闸精准：非授权字段（显示名）仍可代改
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/vic9",
+            &sup_sid,
+            serde_json::json!({ "display_name": "改名九" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "显示名代改不受影响");
+
+    // 套内管理员正常能力保留：boss 重置套内普通成员口令 → 成功
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users/vic9/reset-password",
+            &admin_sid,
+            serde_json::json!({ "new": "NewPass123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
+}
+
 /// 跨租户口令接管回归：账套管理员不能重置「其他账套归属者」的平台口令。
 ///
 /// 历史漏洞：任意自建账套的用户（天然拥有 UserManage）可把受害者平台账号
@@ -5733,6 +5808,146 @@ async fn stock_batch_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// 销售出库闭环（与采购侧对称）：未确认拒发 → 发货写库存出库流水 → 超退防呆 → 退货回库。
+#[tokio::test]
+async fn so_shipment_stock_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let cur_ymm: i32 = cur_label.replace('-', "").parse().unwrap();
+    let d12 = format!("{cur_label}-12");
+    let d13 = format!("{cur_label}-13");
+    let d14 = format!("{cur_label}-14");
+
+    // 采购入库 10×9（库存基线 10）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d12.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d12.clone(), "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购入库");
+
+    // 销售订单（C01，6 件 × 5）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d13.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "出库造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "6", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建销售订单");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 未确认订单 → 发货拒绝
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d14.clone(), "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未确认不能发货");
+
+    // 确认 → 发货 4：库存 10-4=6 + 收入凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "确认订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d14.clone(), "qty": "4", "memo": "首批" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["voucher_id"].as_i64().unwrap_or(0) > 0, "发货应生成收入凭证：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let on_hand: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(on_hand, 6.0, "发货 4 → 库存 10-4=6（销售出库流水生效）");
+
+    // 超退 8（净发货 4）→ 拒；退货 2 → 库存回 8
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/return",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d14.clone(), "qty": "8", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超退应拒");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/return",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d14.clone(), "qty": "2", "memo": "部分退回" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "退货");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let on_hand: f64 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap()))
+        .sum();
+    assert_eq!(on_hand, 8.0, "退货 2 → 库存回 8（销售流水回库）");
 }
 
 /// 存货核算↔总账对账：采购到货（有流水无凭证）差异 90 → 暂估凭证记账后对平。

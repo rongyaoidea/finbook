@@ -203,6 +203,140 @@ pub fn so_return_add(db: &Db, so_id: i64, period: Period, date: NaiveDate, qty: 
     Ok(db.conn().last_insert_rowid())
 }
 
+// ---- 发货/退货 × 库存（Web 入口：执行行 + 销售出库流水同事务，与采购侧对称）----
+
+/// 销售出库流水（调用方事务内）：出库负 / 退货正；price=amount=0 ——发出成本由
+/// 「销售成本结转」（stock_summary 按计价方法回写）确定，与领料/组装同口径。
+fn stock_sale_in(
+    tx: &rusqlite::Transaction,
+    so_no: &str,
+    item: &str,
+    qty: Money,
+    period: Period,
+    date: NaiveDate,
+    memo: &str,
+) -> DbResult<()> {
+    let mut mv = crate::business::StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: crate::business::StockKind::Sale,
+        item: item.to_string(),
+        warehouse: String::new(),
+        batch_no: String::new(),
+        qty,
+        price: Money::ZERO,
+        amount: Money::ZERO,
+        voucher_id: None,
+        memo: if memo.is_empty() {
+            format!("销售出库 {so_no}")
+        } else {
+            memo.to_string()
+        },
+    };
+    crate::business::stock_insert_of(tx, &mut mv)?;
+    Ok(())
+}
+
+fn first_so_line(so: &crate::scm::SalesOrder) -> Result<&crate::scm::SoLine, fincore::FinError> {
+    so.lines
+        .first()
+        .ok_or_else(|| fincore::FinError::msg("销售订单没有明细行，不能出库"))
+}
+
+/// 发货：执行行 + 销售出库流水（负数量）**同事务**。
+/// 品名取订单首行（多行订单按首行出库）；无明细行拒绝。
+pub fn so_shipment_with_stock(
+    db: &Db,
+    so_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    if qty.is_negative() || qty.is_zero() {
+        return Err(fincore::FinError::msg("发货数量必须为正数").into());
+    }
+    let so = crate::scm::so_get(db, so_id)?
+        .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
+    let line = first_so_line(&so)?;
+    let item = line.item_code.clone();
+    let tx = db.write_tx()?;
+    tx.execute(
+        "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            so_id,
+            period.ymm(),
+            date.format("%Y-%m-%d").to_string(),
+            crate::exact_param(qty),
+            memo
+        ],
+    )?;
+    let rid = tx.last_insert_rowid();
+    stock_sale_in(
+        &tx,
+        &so.no,
+        &item,
+        qty.negated(),
+        period,
+        date,
+        &format!("销售出库 {}", so.no),
+    )?;
+    tx.commit()?;
+    Ok(rid)
+}
+
+/// 退货：负执行行 + 销售流水回库（正数量）同事务；**超退防呆**（本次 ≤ 净发货，
+/// 净发货 = 发货 − 历史退货，与采购侧 po_receipt_sum 对称）。
+pub fn so_return_with_stock(
+    db: &Db,
+    so_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    if qty.is_negative() || qty.is_zero() {
+        return Err(fincore::FinError::msg("退货数量必须为正数").into());
+    }
+    let so = crate::scm::so_get(db, so_id)?
+        .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
+    let line = first_so_line(&so)?;
+    let item = line.item_code.clone();
+    let shipped = so_shipment_sum(db, so_id)?;
+    if qty > shipped {
+        return Err(fincore::FinError::state(format!(
+            "退货数量 {} 超过净发货 {}",
+            qty.fmt_qty(),
+            shipped.fmt_qty()
+        ))
+        .into());
+    }
+    let tx = db.write_tx()?;
+    tx.execute(
+        "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            so_id,
+            period.ymm(),
+            date.format("%Y-%m-%d").to_string(),
+            qty.negated().to_string(),
+            format!("退货 {memo}")
+        ],
+    )?;
+    let rid = tx.last_insert_rowid();
+    stock_sale_in(
+        &tx,
+        &so.no,
+        &item,
+        qty,
+        period,
+        date,
+        &format!("销售退货 {}", so.no),
+    )?;
+    tx.commit()?;
+    Ok(rid)
+}
+
 pub fn so_shipment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
     let mut st = db.conn().prepare("SELECT qty FROM so_shipment WHERE so_id=?1")?;
     let rows = st

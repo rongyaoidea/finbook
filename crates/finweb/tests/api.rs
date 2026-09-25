@@ -1702,12 +1702,13 @@ async fn claim_lifecycle_to_voucher() {
 #[tokio::test]
 async fn login_rate_limited_after_repeated_failures() {
     let (state, _bd, _dir) = test_state();
-    // 连续失败 10 次（阈值内），每次都应是 401
-    for i in 0..10 {
+    // 连续失败达到平台策略阈值（默认 max_fail=5，与桌面默认一致）→ 写入持久锁；
+    // 阈值内每次都应是 401
+    for i in 0..5 {
         let (status, _sid) = login(&state, "boss", "WrongPass!").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "第 {} 次失败应 401", i + 1);
     }
-    // 第 11 次即使密码正确，也被限流 → 429 + Retry-After
+    // 第 6 次即使密码正确，也被持久锁拦截 → 429 + Retry-After（锁定前置，不再做 argon2）
     let resp = handlers::router(state.clone())
         .oneshot(post_json(
             "/api/login",
@@ -1720,7 +1721,7 @@ async fn login_rate_limited_after_repeated_failures() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "超过阈值应 429");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "锁定后应 429");
     assert!(
         resp.headers().contains_key(header::RETRY_AFTER),
         "429 响应应带 Retry-After 头"

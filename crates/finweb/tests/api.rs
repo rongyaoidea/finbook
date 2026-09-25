@@ -2300,6 +2300,190 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 发票↔单据勾稽 + 进项认证：订单下推发票（doc_link 双向）→ 认证流转。
+#[tokio::test]
+async fn invoice_push_and_certify() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 采购链：带价 PO → 到货 → 下推进项发票（金额=整单 90，待认证）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d15.clone(), "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/invoices/from-po", &sid, serde_json::json!({ "po_id": po_id })))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let ib = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "PUSH_INV_ERR={ib}");
+    let inv_id = serde_json::from_str::<serde_json::Value>(&ib).unwrap()["invoice_id"]
+        .as_i64()
+        .unwrap();
+
+    // 发票内容：进项、供应商、金额90、待认证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices?kind=in", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let inv = r["rows"].as_array().unwrap().iter().find(|x| x["id"].as_i64() == Some(inv_id)).unwrap();
+    assert_eq!(inv["kind"], "in");
+    assert_eq!(inv["seller"], "供应商甲");
+    assert_eq!(money_num(inv["amount"].as_str().unwrap()), 90.0);
+    assert_eq!(inv["status"], "pending", "下推即待认证");
+
+    // 勾稽双向：PO 下游见发票；发票上游见 PO
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=po&id={po_id}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "invoice" && n["dir"] == "down" && n["id"].as_i64() == Some(inv_id)),
+        "PO 下游应见发票：{r}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=invoice&id={inv_id}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "po" && n["dir"] == "up" && n["id"].as_i64() == Some(po_id)),
+        "发票上游应见 PO：{r}"
+    );
+
+    // 进项认证流转：pending → verified
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/invoices/{inv_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "verified" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "认证");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices?kind=in", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let inv = r["rows"].as_array().unwrap().iter().find(|x| x["id"].as_i64() == Some(inv_id)).unwrap();
+    assert_eq!(inv["status"], "verified", "认证后状态");
+
+    // 0 额订单 → 下推拒绝
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "1", "unit_price": "0", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let zero_po = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/invoices/from-po", &sid, serde_json::json!({ "po_id": zero_po })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "0额订单不能下推发票");
+
+    // 销售链：SO 确认发货 → 下推销项发票（整单金额 20）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "开票造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "4", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/invoices/from-so", &sid, serde_json::json!({ "so_id": so_id })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "下推销售发票");
+    let out_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["invoice_id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices?kind=out", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let inv = r["rows"].as_array().unwrap().iter().find(|x| x["id"].as_i64() == Some(out_id)).unwrap();
+    assert_eq!(inv["kind"], "out");
+    assert_eq!(money_num(inv["amount"].as_str().unwrap()), 20.0, "销项金额=订单整单");
+    assert_eq!(inv["buyer"], "客户甲");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=so&id={so_id}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "invoice" && n["dir"] == "down"),
+        "SO 下游应见发票：{r}"
+    );
+}
+
 /// 来料检验状态机（对标金蝶质检管理）：qc_required 存货到货入待检 →
 /// 合格转正/不合格隔离（部分不合格拆分）→ 可用/待检/隔离三口径；非检验存货直通。
 #[tokio::test]

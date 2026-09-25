@@ -162,6 +162,25 @@ fn node_of(tx: &rusqlite::Connection, kind: &str, id: i64, dir: &str) -> DbResul
                 },
             )
             .optional()?,
+        "invoice" => tx
+            .query_row(
+                "SELECT number, date, buyer, seller, amount, status FROM invoice WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(DocNode {
+                        kind: "invoice".into(),
+                        id,
+                        no: r.get(0)?,
+                        date: r.get(1)?,
+                        title: r.get::<_, String>(2)?,
+                        qty: "0".into(),
+                        amount: r.get(3)?,
+                        memo: r.get::<_, String>(4)?,
+                        dir: dir.to_string(),
+                    })
+                },
+            )
+            .optional()?,
         _ => None,
     };
     Ok(row)

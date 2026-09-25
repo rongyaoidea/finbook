@@ -1381,6 +1381,7 @@ function renderInvoices(main, d) {
               <td class="num">${esc(r.amount_tax)}</td>
               <td>${statusBadge(r.status)}</td>
               <td class="row-actions">
+                <button class="btn sm ghost" data-inv-chain="${r.id}">链</button>
                 ${can("voucher_edit") ? `<button class="btn sm ghost" data-act="edit" data-id="${r.id}">编辑</button>` : ""}
                 ${r.status === "pending" && can("voucher_edit") ? `<button class="btn sm ghost" data-act="verify" data-id="${r.id}">认证</button>` : ""}
                 ${r.status !== "rejected" && can("voucher_edit") ? `<button class="btn sm ghost" data-act="reject" data-id="${r.id}">作废</button>` : ""}
@@ -1395,6 +1396,7 @@ function renderInvoices(main, d) {
     renderInvoices(main, d2);
   });
   if ($("#inv-new")) $("#inv-new").addEventListener("click", () => openInvoiceEditor(main, null));
+  $all("[data-inv-chain]", main).forEach((b) => b.addEventListener("click", () => openDocChain("invoice", parseInt(b.dataset.invChain, 10), "发票")));
   $all("[data-act]", main).forEach((b) => b.addEventListener("click", async () => {
     const id = parseInt(b.dataset.id, 10);
     const act = b.dataset.act;
@@ -3965,12 +3967,18 @@ async function viewPoDoc(main) {
       const s = await api(`/procure/po?period=${period}`);
       const orows = s.rows || [];
       $("#po-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="po-chkall" title="全选" /></th><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="po-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-chain="${o.id}">链</button>${can("warehouse") ? `<button class="btn ghost sm" data-po-qc="${o.id}">质检</button>` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="po-chkall" title="全选" /></th><th>单号</th><th>供应商</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="po-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.supplier_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-po-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-po-confirm="${o.id}">确认</button><button class="btn ghost sm" data-po-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-po-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-po-chain="${o.id}">链</button>${can("warehouse") ? `<button class="btn ghost sm" data-po-qc="${o.id}">质检</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-po-inv="${o.id}">票</button>` : ""}` : ""}<button class="btn ghost sm" data-po-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无采购订单，点右上「新建采购订单」</div>`;
       $all("[data-po-edit]").forEach((b) => b.onclick = () => openOrderEditor("po", main, parseInt(b.dataset.poEdit, 10)));
       $all("[data-po-confirm]").forEach((b) => b.onclick = () => poTransition(b.dataset.poConfirm, "Confirmed"));
       $all("[data-po-cancel]").forEach((b) => b.onclick = () => poTransition(b.dataset.poCancel, "Cancelled"));
       $all("[data-po-chain]").forEach((b) => b.onclick = () => openDocChain("po", b.dataset.poChain, "采购订单"));
+      $all("[data-po-inv]").forEach((b) => b.onclick = async () => {
+        try {
+          const r = await postJson("/invoices/from-po", { po_id: Number(b.dataset.poInv) });
+          toast(`已下推采购发票 #${r.invoice_id}（待认证，到发票管理认证）`, "ok");
+        } catch (e) { toast(e.message, "err"); }
+      });
       $all("[data-po-qc]").forEach((b) => b.onclick = () => openQcEditor(b.dataset.poQc, load));
       $all("[data-po-exec]").forEach((b) => b.onclick = () => { $("#pd-poid").value = b.dataset.poExec; toast(`已填入订单ID ${b.dataset.poExec}，可到货/付款`, "ok"); });
       $all("[data-po-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该采购订单？", true))) return; try { await api(`/procure/po/${b.dataset.poDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
@@ -4067,12 +4075,18 @@ async function viewSoDoc(main) {
       const s = await api(`/sales/so?period=${period}`);
       const orows = s.rows || [];
       $("#so-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button><button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-so-inv="${o.id}">票</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无销售订单，点右上「新建销售订单」</div>`;
       $all("[data-so-edit]").forEach((b) => b.onclick = () => openOrderEditor("so", main, parseInt(b.dataset.soEdit, 10)));
       $all("[data-so-confirm]").forEach((b) => b.onclick = () => soTransition(b.dataset.soConfirm, "Confirmed"));
       $all("[data-so-cancel]").forEach((b) => b.onclick = () => soTransition(b.dataset.soCancel, "Cancelled"));
       $all("[data-so-chain]").forEach((b) => b.onclick = () => openDocChain("so", b.dataset.soChain, "销售订单"));
+      $all("[data-so-inv]").forEach((b) => b.onclick = async () => {
+        try {
+          const r = await postJson("/invoices/from-so", { so_id: Number(b.dataset.soInv) });
+          toast(`已下推销售发票 #${r.invoice_id}（待认证，到发票管理认证）`, "ok");
+        } catch (e) { toast(e.message, "err"); }
+      });
       $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
       $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#so-chkall")) $("#so-chkall").onclick = (e) => { $all(".so-chk").forEach((c) => { c.checked = e.target.checked; }); };

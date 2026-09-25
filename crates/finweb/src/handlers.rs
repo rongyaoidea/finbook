@@ -171,6 +171,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 发票管理
         .route("/api/invoices", get(list_invoices).post(create_invoice))
         .route("/api/invoices/summary", get(invoice_summary))
+        .route("/api/invoices/from-po", post(invoice_from_po))
+        .route("/api/invoices/from-so", post(invoice_from_so))
         .route(
             "/api/invoices/:id",
             put(update_invoice).delete(delete_invoice),
@@ -2707,6 +2709,42 @@ async fn invoice_summary(
         })
         .collect();
     Ok(Json(json!({ "by_kind": by_kind })))
+}
+
+#[derive(Deserialize)]
+struct InvoiceFromPo {
+    po_id: i64,
+}
+
+#[derive(Deserialize)]
+struct InvoiceFromSo {
+    so_id: i64,
+}
+
+/// 下推开票：采购订单 → 进项发票（金额=订单整单，状态=待认证），记录单据勾稽
+async fn invoice_from_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<InvoiceFromPo>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = findb::invoices::push_from_po(&db, req.po_id, user.username())?;
+    db.log(user.username(), "发票", "下推采购发票", &format!("PO#{} → 发票#{id}", req.po_id))?;
+    Ok(Json(json!({ "ok": true, "invoice_id": id })))
+}
+
+/// 下推开票：销售订单 → 销项发票（金额=订单整单，状态=待认证），记录单据勾稽
+async fn invoice_from_so(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<InvoiceFromSo>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let id = findb::invoices::push_from_so(&db, req.so_id, user.username())?;
+    db.log(user.username(), "发票", "下推销售发票", &format!("SO#{} → 发票#{id}", req.so_id))?;
+    Ok(Json(json!({ "ok": true, "invoice_id": id })))
 }
 
 async fn create_invoice(
@@ -5965,8 +6003,8 @@ async fn get_doc_links(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let kind = q.get("kind").cloned().unwrap_or_default();
-    if !matches!(kind.as_str(), "req" | "po" | "so") {
-        return Err(AppError::bad_request("kind 只能是 req / po / so"));
+    if !matches!(kind.as_str(), "req" | "po" | "so" | "invoice") {
+        return Err(AppError::bad_request("kind 只能是 req / po / so / invoice"));
     }
     let id: i64 = q
         .get("id")

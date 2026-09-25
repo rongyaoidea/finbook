@@ -399,6 +399,13 @@
 - **可用量三口径**：`warehouse_stock` 扩展 `{qty 结存, available 可用, pending 待检, quarantine 隔离}` 四桶——分仓库库存页新增三列；**低库存预警改按可用量**（`below_safety` 过滤 qc_status=''），待检/隔离不参与。
 - **测试**：web `qc_state_machine`（建档勾检验 → 到货10待检三口径断言 → 质检 partial 3：可用7/隔离3/待检0 → 第二单全不良：隔离累计8 → 未勾检验存货直通 available=结存）。
 
+### 4.24 发票↔单据勾稽 + 进项认证（对标金蝶发票管理）
+
+- **下推开票**：`POST /api/invoices/from-po {po_id}`（采购订单→进项发票）/ `POST /api/invoices/from-so {so_id}`（销售订单→销项发票，金额=订单整单）——金额=订单不含税/税额/价税合计、购销双方自动带出、状态=**待认证**、票面代码/号码留空后补；0 额订单 400 拒绝；权限 `VoucherNew`，采购/销售订单行「票」按钮按 `voucher_new && order_ops` 显示（会计/主管/管理员/应付会计可用）。
+- **勾稽**：复用 `doc_link`——PO/SO 下游、发票上游双向可在单据链面板查看；发票列表行新增「链」按钮（`openDocChain("invoice")`，含订单与发票互查）。
+- **进项认证流**：既有状态机（`pending 待认证 → verified 已认证 / rejected 已作废`）+ 既有端点 `/api/invoices/:id/status` 与页面「认证/作废」按钮保持——下推的发票落 pending，进入认证闭环。
+- **测试**：web `invoice_push_and_certify`（采购链：到货→下推进票 amount90/supplier/pending → PO↔发票双向勾稽 → 认证 verified；0额拒；销售链：确认发货→销项票整单20/客户甲 + SO→发票勾稽）。
+
 ---
 
 ## 5. 关键设计约定

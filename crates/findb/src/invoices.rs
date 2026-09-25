@@ -232,6 +232,95 @@ pub fn delete(db: &Db, id: i64) -> DbResult<()> {
     Ok(())
 }
 
+/// 下推发票的自动票号：FP+6位全局序号（撞号顺延——删除后重建的重号窗口）
+fn next_invoice_no(db: &Db) -> DbResult<String> {
+    let base: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM invoice", [], |r| r.get(0))?;
+    let mut n = base + 1;
+    loop {
+        let no = format!("FP{n:06}");
+        let exists: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT id FROM invoice WHERE number=?1",
+                [&no],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(no);
+        }
+        n += 1;
+    }
+}
+
+/// 下推：采购订单 → 采购（进项）发票——金额=订单不含税/税额/价税合计，卖方=供应商、
+/// 买方=本企业，状态 pending（待认证），票面代码留空、号码自动 FP 序号；记录 doc_link 勾稽。
+pub fn push_from_po(db: &Db, po_id: i64, who: &str) -> DbResult<i64> {
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| FinError::not_found("采购订单不存在"))?;
+    if !po.total_amount.is_positive() {
+        return Err(FinError::state("采购订单金额为 0，请先补价再下推发票").into());
+    }
+    let company = db.options().company.clone();
+    let inv = Invoice {
+        id: 0,
+        kind: "in".to_string(),
+        code: String::new(),
+        number: next_invoice_no(db)?,
+        date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        buyer: company,
+        seller: po.supplier_name.clone(),
+        amount_tax: po.total_amount + po.total_tax,
+        amount: po.total_amount,
+        tax: po.total_tax,
+        tax_rate: String::new(),
+        status: "pending".to_string(),
+        memo: format!("下推自采购订单 {}", po.no),
+        attach_id: 0,
+        created_by: who.to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let id = insert(db, &inv, who)?;
+    crate::docflow::link_add(db, "po", po_id, "invoice", id, "采购订单下推发票")?;
+    Ok(id)
+}
+
+/// 下推：销售订单 → 销售（销项）发票——金额=订单整单（不含税/税额），买方=客户、
+/// 卖方=本企业；状态 pending；记录 doc_link 勾稽。
+pub fn push_from_so(db: &Db, so_id: i64, who: &str) -> DbResult<i64> {
+    let so = crate::scm::so_get(db, so_id)?
+        .ok_or_else(|| FinError::not_found("销售订单不存在"))?;
+    if !so.total_amount.is_positive() {
+        return Err(FinError::state("销售订单金额为 0，无法下推发票").into());
+    }
+    let company = db.options().company.clone();
+    let inv = Invoice {
+        id: 0,
+        kind: "out".to_string(),
+        code: String::new(),
+        number: next_invoice_no(db)?,
+        date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        buyer: so.customer_name.clone(),
+        seller: company,
+        amount_tax: so.total_amount + so.total_tax,
+        amount: so.total_amount,
+        tax: so.total_tax,
+        tax_rate: String::new(),
+        status: "pending".to_string(),
+        memo: format!("下推自销售订单 {}", so.no),
+        attach_id: 0,
+        created_by: who.to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let id = insert(db, &inv, who)?;
+    crate::docflow::link_add(db, "so", so_id, "invoice", id, "销售订单下推发票")?;
+    Ok(id)
+}
+
 /// 汇总：进项/销项各自的金额与税额（用于发票台账统计）
 /// 遵循全库约定：金额存 TEXT、不在 SQL 里 SUM，Rust 侧用 Decimal 累加。
 pub fn summary(db: &Db) -> DbResult<Vec<(String, Money, Money, i64)>> {

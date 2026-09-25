@@ -616,6 +616,14 @@
 - **UI**：资金管理 → 资金预测页新增「滚动预测」面板（起期 / 期数 + 表格）。
 - **测试**：web `funds_rolling_forecast`——应收票据 1000 到期 202602 + 借款 500（202602 起 / 202603 止）→ 2 月净 1500 / 结存 1500，3 月净 -500 / 结存 1000。
 
+### 4.52 导出计划任务（P2 收官）
+
+- **模型**：新表 `export_schedule`（schema v32，纯新表）——kind（vouchers/trial/payroll/claims）、period_mode（current/last）、at_time（HH:MM）、enabled、last_run（同日去重）、备注。
+- **端点**：`GET/POST /api/export/schedules` + `POST /api/export/schedules/:id/delete` + `POST /api/export/schedules/:id/run`（均 Export 权限）——立即执行写 `books_dir/exports/<prefix>_<时间戳>.csv`（带 BOM、Rust 侧金额格式化）。
+- **调度**：Web 启动时后台任务每 60s 轮询全部账套，`enabled && last_run != 今天 && at_time <= 当前 HH:MM` 即执行并更新 last_run（执行失败仅日志，不影响服务）。
+- **UI**：数据导入页新增「导出计划任务」面板（列表/新增/立即执行/删除）。
+- **测试**：web `export_schedule_flow`——新增 → 列表 → 立即执行（路径位于 exports 且文件存在）→ 未知类型/非法时刻 400 → 删除。
+
 ---
 
 ## 5. 关键设计约定

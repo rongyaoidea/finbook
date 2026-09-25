@@ -1894,6 +1894,14 @@ async function viewImports(main) {
       <h3 style="margin:0 0 10px">缺失科目映射</h3>
       <p class="muted" style="margin:0 0 10px">以下科目在当前账套中不存在，请为每个选择目标科目（留空 = 忽略该科目对应行）。</p>
       <div id="imp-mapping"></div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h3 style="margin:0">导出计划任务</h3><span class="grow"></span>
+        <span class="muted" style="font-size:12px">每日定时写 CSV 到服务器 books/exports/（需「导出」权限）</span>
+        ${can("export") ? `<button class="btn primary sm" id="ex-new">新增任务</button>` : ""}
+        <button class="btn ghost sm" id="ex-reload">刷新</button>
+      </div>
+      <div id="ex-list" class="muted" style="margin-top:8px">加载中…</div>
     </div>`;
   let mapping = {};
   let fileB64 = "";
@@ -1987,6 +1995,47 @@ async function viewImports(main) {
       state.view = "dashboard";
     } catch (e) { $("#imp-result").textContent = "导入失败：" + e.message; }
   });
+
+  // 导出计划任务：列表 / 新增 / 立即执行 / 删除
+  const EX_KINDS = { vouchers: "记账凭证", trial: "科目余额表", payroll: "工资表", claims: "报销单" };
+  const loadEx = async () => {
+    try {
+      const r = await api("/export/schedules");
+      const rows = r.rows || [];
+      $("#ex-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>类型</th><th>期间</th><th>执行时刻</th><th>状态</th><th>最近执行</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((x) => `<tr>
+            <td>${esc(EX_KINDS[x.kind] || x.kind)}</td><td>${x.period_mode === "last" ? "上一期间" : "当前期间"}</td><td>${esc(x.at_time)}</td>
+            <td>${x.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag">停用</span>'}</td>
+            <td>${esc(x.last_run || "—")}</td><td>${esc(x.memo || "")}</td>
+            <td class="row-actions">${can("export") ? `<button class="btn ghost sm" data-ex-run="${x.id}">立即执行</button><button class="btn danger sm" data-ex-del="${x.id}">删</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无导出计划任务</div>`;
+      $all("[data-ex-run]").forEach((b) => b.onclick = async () => {
+        try { const r = await postJson(`/export/schedules/${b.dataset.exRun}/run`, {}); toast(`已导出：${r.path}`, "ok"); loadEx(); } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-ex-del]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("删除该导出计划任务？", true))) return;
+        try { await api(`/export/schedules/${b.dataset.exDel}/delete`, { method: "POST" }); toast("已删除", "ok"); loadEx(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#ex-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  if ($("#ex-new")) $("#ex-new").onclick = () => {
+    const m = modal(`<h3>新增导出计划任务</h3>
+      <div class="field"><label>导出内容</label><select id="ex-kind"><option value="vouchers">记账凭证</option><option value="trial">科目余额表</option><option value="payroll">工资表</option><option value="claims">报销单</option></select></div>
+      <div class="field"><label>期间口径</label><select id="ex-mode"><option value="current">当前期间</option><option value="last">上一期间</option></select></div>
+      <div class="field"><label>每日执行时刻（HH:MM）</label><input id="ex-time" value="08:00" style="width:90px" /></div>
+      <div class="field"><label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="ex-enabled" checked /> 启用</label></div>
+      <div class="field"><label>备注</label><input id="ex-memo" /></div>
+      <div class="foot"><button class="btn primary" id="ex-save">保存</button><button class="btn ghost" id="ex-cancel">取消</button></div>`);
+    $("#ex-cancel", m).onclick = closeModal;
+    $("#ex-save", m).onclick = async () => {
+      try {
+        await postJson("/export/schedules", { kind: $("#ex-kind", m).value, period_mode: $("#ex-mode", m).value, at_time: $("#ex-time", m).value.trim(), enabled: $("#ex-enabled", m).checked, memo: $("#ex-memo", m).value.trim() });
+        toast("已保存计划任务", "ok"); closeModal(); loadEx();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  $("#ex-reload").onclick = loadEx;
+  loadEx();
 }
 
 // ===========================================================================

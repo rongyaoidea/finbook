@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 32;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -676,6 +676,19 @@ CREATE TABLE IF NOT EXISTS dunning (
     detail_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_dunning_party ON dunning(kind, party_code, status);
+
+-- 导出计划任务（v32：每日定时写 CSV 到 books_dir/exports/）
+CREATE TABLE IF NOT EXISTS export_schedule (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    period_mode TEXT NOT NULL DEFAULT 'current', -- current / last
+    at_time     TEXT NOT NULL DEFAULT '08:00',   -- 每日执行时刻 HH:MM
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    last_run    TEXT NOT NULL DEFAULT '',        -- 最近执行日期 YYYY-MM-DD（当日去重）
+    memo        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT ''
+);
 
 -- 生产成本归集表
 CREATE TABLE IF NOT EXISTS prod_cost (

@@ -222,6 +222,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/export/ledger", get(export_ledger))
         .route("/api/export/payroll", get(export_payroll))
         .route("/api/export/claims", get(export_claims))
+        .route(
+            "/api/export/schedules",
+            get(list_export_schedules).post(save_export_schedule),
+        )
+        .route("/api/export/schedules/:id/delete", post(delete_export_schedule))
+        .route("/api/export/schedules/:id/run", post(run_export_schedule))
         // 高级功能：多栏账 / 摘要汇总表 / 财务指标
         .route("/api/reports/multi-column", get(get_multi_column))
         .route("/api/reports/summary-table", get(get_summary_table))
@@ -1172,6 +1178,88 @@ async fn delete_budget_row(
     findb::mgmt::budget_delete(&db, id)?;
     db.log(user.username(), "预算", "删除预算行", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---- 导出计划任务（每日定时 CSV） ----
+
+/// 计划任务列表
+async fn list_export_schedules(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::exports::sched_list(&db)? })))
+}
+
+#[derive(Deserialize)]
+struct ExportScheduleReq {
+    #[serde(default)]
+    id: i64,
+    kind: String,
+    #[serde(default)]
+    period_mode: String,
+    #[serde(default)]
+    at_time: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 新增/修改计划任务
+async fn save_export_schedule(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ExportScheduleReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let s = findb::exports::ExportSchedule {
+        id: req.id,
+        kind: req.kind.trim().to_string(),
+        period_mode: req.period_mode.trim().to_string(),
+        at_time: if req.at_time.trim().is_empty() {
+            "08:00".to_string()
+        } else {
+            req.at_time.trim().to_string()
+        },
+        enabled: req.enabled.unwrap_or(true),
+        last_run: String::new(),
+        memo: req.memo,
+        created_by: String::new(),
+        created_at: String::new(),
+    };
+    let id = findb::exports::sched_save(&db, &s, user.username())?;
+    db.log(user.username(), "导出", "计划任务", &format!("#{id} {} {}", s.kind, s.at_time))?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// 删除计划任务
+async fn delete_export_schedule(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::exports::sched_delete(&db, id)?;
+    db.log(user.username(), "导出", "删除计划任务", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 立即执行计划任务（写 books_dir/exports/）
+async fn run_export_schedule(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let dir = state.books_dir.join("exports");
+    let path = findb::exports::sched_run(&db, id, &dir)?;
+    db.log(user.username(), "导出", "立即执行计划任务", &path)?;
+    Ok(Json(json!({ "ok": true, "path": path })))
 }
 
 /// 生成唯一账套 key（文件名，不含扩展名）

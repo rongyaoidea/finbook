@@ -85,6 +85,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 账套归属迁移（账号模型二元化，幂等）：普通账号名下的存量账套 → 管理员名下
     let _ = state.migrate_book_owners_to_admin();
 
+    // 导出计划任务：每 60s 轮询（到期即写 books_dir/exports/，同日去重）
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let now = chrono::Local::now();
+                let hhmm = now.format("%H:%M").to_string();
+                let today = now.format("%Y-%m-%d").to_string();
+                let keys: Vec<String> = st.books.list().into_iter().map(|(k, _)| k).collect();
+                for key in keys {
+                    if let Ok(db) = st.db_for(&key) {
+                        if let Ok(due) = findb::exports::sched_due(&db, &hhmm, &today) {
+                            for s in due {
+                                if let Err(e) =
+                                    findb::exports::sched_run(&db, s.id, &st.books_dir.join("exports"))
+                                {
+                                    eprintln!("[export] 计划任务 #{} 执行失败：{e}", s.id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let app = build_app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;

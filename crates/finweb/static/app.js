@@ -6646,14 +6646,70 @@ async function viewCost(main) {
       <button class="btn sm ${state.costTab === "config" ? "primary" : "ghost"}" id="ct-config">计价方式</button>
       <button class="btn sm ${state.costTab === "close" ? "primary" : "ghost"}" id="ct-close">期末结价</button>
       <button class="btn sm ${state.costTab === "recon" ? "primary" : "ghost"}" id="ct-recon">总账对账</button>
+      <button class="btn sm ${state.costTab === "mfg" ? "primary" : "ghost"}" id="ct-mfg">制造成本</button>
     </div>
     <div id="cost-body" class="muted">加载中…</div>`;
   const tab = state.costTab || "config";
   $("#ct-config").onclick = () => { state.costTab = "config"; viewCost(main); };
   $("#ct-close").onclick = () => { state.costTab = "close"; viewCost(main); };
   $("#ct-recon").onclick = () => { state.costTab = "recon"; viewCost(main); };
+  $("#ct-mfg").onclick = () => { state.costTab = "mfg"; viewCost(main); };
   const body = $("#cost-body");
-  if (tab === "config") {
+  if (tab === "mfg") {
+    body.className = "";
+    body.innerHTML = `<div class="toolbar">
+        <label>期间 <input id="mf-per" value="${esc(state.current)}" style="width:90px" /></label>
+        <button class="btn sm" id="mf-wip">在产品（WIP）</button>
+        <button class="btn sm" id="mf-var">差异分析</button>
+        <button class="btn sm" id="mf-fc">成本预测</button>
+        <span class="grow"></span>
+        <label>分摊金额 <input id="mf-amt" style="width:90px" /></label>
+        <label>基准 <select id="mf-base"><option value="cost">按成本占比</option><option value="labor">按直接人工</option><option value="qty">按计划产量</option></select></label>
+        <button class="btn ghost sm" id="mf-try">试算分摊</button>
+        <button class="btn sm" id="mf-apply">应用分摊</button>
+      </div>
+      <div id="mf-out" class="muted">选择动作后显示结果（WIP/差异/预测/分摊，与桌面端同源）</div>`;
+    const per = () => $("#mf-per").value.trim();
+    const show = (html) => { $("#mf-out").innerHTML = html; };
+    const errBox = (e) => show(`<span style="color:var(--err)">${esc(e.message)}</span>`);
+    $("#mf-wip").onclick = async () => {
+      try {
+        const r = await api(`/cost/wip?period=${encodeURIComponent(per())}`);
+        const rows = r.rows || [];
+        show(rows.length
+          ? `<b>在产品（${esc(r.period)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>订单</th><th>产品</th><th class="num">数量</th><th class="num">材料</th><th class="num">人工</th><th class="num">制造费用</th><th class="num">合计</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.no)}</td><td>${esc(x.item_name)}</td><td class="num">${fmt(x.qty)}</td><td class="num">${fmt(x.material)}</td><td class="num">${fmt(x.labor)}</td><td class="num">${fmt(x.overhead)}</td><td class="num"><b>${fmt(x.total)}</b></td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">该期间无未完工订单</div>`);
+      } catch (e) { errBox(e); }
+    };
+    $("#mf-var").onclick = async () => {
+      try {
+        const r = await api(`/cost/variance?period=${encodeURIComponent(per())}`);
+        const rows = r.rows || [];
+        show(rows.length
+          ? `<b>成本差异（实际 vs 标准，${esc(r.period)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>订单</th><th>产品</th><th class="num">计划量</th><th class="num">实际</th><th class="num">标准</th><th class="num">差异</th><th class="num">差异率</th></tr></thead><tbody>${rows.map((x) => `<tr${moneyNum(x.variance) !== 0 ? ` style="background:rgba(220,50,40,.07)"` : ""}><td>${esc(x.no)}</td><td>${esc(x.item_name)}</td><td class="num">${fmt(x.planned_qty)}</td><td class="num">${fmt(x.actual)}</td><td class="num">${fmt(x.standard)}</td><td class="num"><b>${fmt(x.variance)}</b></td><td class="num">${(x.variance_pct || 0).toFixed(2)}%</td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">该期间无可分析订单</div>`);
+      } catch (e) { errBox(e); }
+    };
+    $("#mf-fc").onclick = async () => {
+      try {
+        const r = await api(`/cost/forecast?period=${encodeURIComponent(per())}`);
+        const rows = r.rows || [];
+        show(rows.length
+          ? `<b>成本预测（BOM 参考料本 × 计划量，${esc(r.period)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>订单</th><th>产品</th><th class="num">计划量</th><th class="num">预测料本</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.no)}</td><td>${esc(x.item_name)}</td><td class="num">${fmt(x.planned_qty)}</td><td class="num"><b>${fmt(x.forecast)}</b></td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">该期间无可预测订单</div>`);
+      } catch (e) { errBox(e); }
+    };
+    const doAlloc = async (apply) => {
+      try {
+        const r = await postJson("/cost/overhead", { period: parseInt(per(), 10) || 0, amount: $("#mf-amt").value.trim(), base: $("#mf-base").value, apply });
+        const rows = r.rows || [];
+        show(`<b>制造费用${apply ? "已应用" : "试算"}（${esc(r.base)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>订单</th><th class="num">分摊额</th></tr></thead><tbody>${rows.map((x) => `<tr><td>#${x.po_id}</td><td class="num">${fmt(x.amount)}</td></tr>`).join("")}</tbody></table>${apply ? "" : `<div class="muted" style="font-size:12px;margin-top:4px">试算未落库；点「应用分摊」写入归集</div>`}`);
+        if (apply) toast("已应用制造费用分摊", "ok");
+      } catch (e) { errBox(e); }
+    };
+    $("#mf-try").onclick = () => doAlloc(false);
+    $("#mf-apply").onclick = () => doAlloc(true);
+  } else if (tab === "config") {
     body.className = "";
     body.innerHTML = `<div class="toolbar"><button class="btn sm" id="cost-new">新增配置</button></div><div id="cost-list" class="muted">加载中…</div>`;
     $("#cost-new").onclick = () => openCostConfig(null);

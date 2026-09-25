@@ -3591,6 +3591,181 @@ async fn p2_gap_fill_flow() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未知资产应 400");
 }
 
+/// P2：制造成本 Web 化——WIP / 差异 / 预测 / 制造费用分摊（试算与应用）。
+#[tokio::test]
+async fn cost_web_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 标准价 + BOM + 订单 → 开工 → 领料（材料成本 5×2×10 = 100）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "moving_average", "standard_cost": "10" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "标准价");
+    // 存货档案参考成本（BOM 成本汇总口径：props.ref_cost）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/aux",
+            &sid,
+            serde_json::json!({
+                "id": 0, "kind": "item", "code": "140301", "name": "原料",
+                "parent_code": null, "disabled": false, "props": { "ref_cost": "10" }, "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "存货参考成本");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bom",
+            &sid,
+            serde_json::json!({ "parent": "140501", "children": [{ "child": "140301", "qty": "2", "loss": "0" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "BOM");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "5", "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    let pid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/start"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开工");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/issue"),
+            &sid,
+            serde_json::json!({ "date": d15 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "领料");
+
+    // WIP：材料 100
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/wip?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let w = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["po_id"].as_i64() == Some(pid))
+        .expect("WIP 应含该订单");
+    assert!(
+        (w["material"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap() - 100.0).abs() < 0.005,
+        "WIP 材料 100：{w}"
+    );
+
+    // 差异 + 预测
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/variance?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["po_id"].as_i64() == Some(pid)),
+        "差异应含该订单：{r}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/forecast?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let f = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["po_id"].as_i64() == Some(pid))
+        .expect("预测应含该订单");
+    assert!(
+        (f["forecast"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap() - 100.0).abs() < 0.005,
+        "预测料本 100：{f}"
+    );
+
+    // 制造费用分摊：试算 50（按成本占比，唯一订单全额）→ 应用 → WIP overhead 50
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/overhead",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "amount": "50", "base": "cost", "apply": false }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["applied"], false);
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1, "试算 1 单：{r}");
+    assert!(
+        (r["rows"][0]["amount"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap() - 50.0).abs() < 0.005,
+        "试算 50：{r}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/overhead",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "amount": "50", "base": "cost", "apply": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "应用分摊");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/cost/wip?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let w = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["po_id"].as_i64() == Some(pid))
+        .unwrap();
+    assert!(
+        (w["overhead"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap() - 50.0).abs() < 0.005,
+        "应用后 WIP 制造费用 50：{w}"
+    );
+    // 金额 0 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/overhead",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "amount": "0", "base": "cost", "apply": false }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "分摊金额 0 应 400");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

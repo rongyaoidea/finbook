@@ -415,6 +415,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/cost/gl-reconcile", get(gl_reconcile_ep))
         .route("/api/cost/sales-cost", post(sales_cost_ep))
         .route("/api/cost/period-end", get(run_period_end_cost).post(run_period_end_cost))
+        .route("/api/cost/wip", get(cost_wip_ep))
+        .route("/api/cost/variance", get(cost_variance_ep))
+        .route("/api/cost/forecast", get(cost_forecast_ep))
+        .route("/api/cost/overhead", post(cost_overhead_ep))
         // 固定资产（与桌面端对齐）：卡片 / 折旧计划 / 计提 / 清理
         .route("/api/assets", get(list_assets).post(create_asset))
         .route("/api/assets/:id", put(update_asset).delete(delete_asset))
@@ -958,6 +962,108 @@ async fn consolidate_preview(
         "books": book_meta,
         "rows": rows,
         "note": "汇总口径：各账套仅已记账余额（H-3）；v1 为跨账套汇总，内部往来抵销留待 v2",
+    })))
+}
+
+/// 在制品成本（WIP）：按期间列未完工订单的料/工/费
+async fn cost_wip_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "rows": findb::manufacturing::wip_cost(&db, period)?,
+    })))
+}
+
+/// 成本差异：实际 vs 标准（按订单）
+async fn cost_variance_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "rows": findb::manufacturing::cost_variance_report(&db, period)?,
+    })))
+}
+
+/// 成本预测：BOM 参考料本 × 计划量
+async fn cost_forecast_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "rows": findb::manufacturing::cost_forecast_report(&db, period)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct OverheadReq {
+    period: i32,
+    amount: String,
+    /// cost（默认，按已归集成本）/ labor（按直接人工）/ qty（按计划产量）
+    #[serde(default)]
+    base: String,
+    /// true = 写入归集；false = 仅试算
+    #[serde(default)]
+    apply: bool,
+}
+
+/// 制造费用分摊：按基准试算/应用（写入 CostType::Overhead 归集）
+async fn cost_overhead_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<OverheadReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = period_checked(req.period)?;
+    let amount = parse_money_checked(&req.amount)?;
+    if !amount.is_positive() {
+        return Err(AppError::bad_request("分摊金额必须大于 0"));
+    }
+    let base = findb::manufacturing::OverheadBase::parse(&req.base);
+    let rows =
+        findb::manufacturing::overhead_allocate_with(&db, period, amount, base, req.apply)?;
+    if req.apply {
+        db.log(
+            user.username(),
+            "成本",
+            "制造费用分摊",
+            &format!("{} {} {} 笔", period_to_str(period), amount.fmt_money(), rows.len()),
+        )?;
+    }
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, m)| json!({ "po_id": id, "amount": m.fmt_money() }))
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "applied": req.apply,
+        "base": base.label(),
+        "rows": items,
     })))
 }
 

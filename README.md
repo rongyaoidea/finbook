@@ -574,6 +574,13 @@
 - **资产盘点**：`GET/POST /api/assets/counts` + `POST /api/assets/counts/:id/post`（读 Report / 写 AccountEdit）——盘点单（行 = 卡片 + 是否盘实，未知资产 400）；过账将盘亏卡片置停用（既有 `ac_post` 语义）；资产页「资产盘点」按钮（默认全盘实，取消勾选即盘亏，保存后可立即过账）。
 - **测试**：web `p2_gap_fill_flow`——凭证记账→作废（状态 void）→恢复（回 posted）；资产减值 200；盘点单盘亏 1 → 过账 → 卡片 idle；未知资产 400。
 
+### 4.46 制造成本 Web 化（WIP / 差异 / 预测 / 分摊）
+
+- **端点**（CostOps）：`GET /api/cost/wip`、`GET /api/cost/variance`、`GET /api/cost/forecast`（期间参数，默认当前期）；`POST /api/cost/overhead {period, amount, base, apply}`——基准 cost（按已归集成本，默认）/ labor（按直接人工）/ qty（按计划产量）；`apply=false` 仅试算、`true` 写入归集并审计。
+- **口径**：与桌面端同源（`wip_cost` / `cost_variance_report` / `cost_forecast_report` / `overhead_allocate_with`）；差异 = 实际 − 标准（标准按 BOM 参考价），预测 = BOM 参考料本 × 计划量。
+- **UI**：成本核算页新增「制造成本」页签——在产品 / 差异 / 预测表格 + 分摊试算与应用。
+- **测试**：web `cost_web_flow`——领料后 WIP 材料 100、差异/预测含单、分摊试算 50 → 应用后 WIP 费用 50、金额 0 → 400。
+
 ---
 
 ## 5. 关键设计约定

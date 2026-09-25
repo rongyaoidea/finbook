@@ -12,8 +12,6 @@ use axum::Router;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
-use fincore::user::PasswordPolicy;
-
 use finweb::handlers;
 use finweb::realm::RealmDb;
 use finweb::state::{BookRegistry, SessionStore, WebState};
@@ -51,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FINBOOK_ADMIN_MUST_CHANGE")
             .map(|v| v != "0" && v != "false")
             .unwrap_or(false),
-        &PasswordPolicy::default(),
+        &realm.policy().unwrap_or_default(),
     )?;
 
     // 账套注册表：启动时把平台账套目录全量载入（key → path）
@@ -76,7 +74,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = WebState::new(
         books,
         SessionStore::new(),
-        PasswordPolicy::default(),
         realm,
         books_dir.clone(),
         env!("CARGO_PKG_VERSION").to_string(),

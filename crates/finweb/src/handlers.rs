@@ -91,6 +91,14 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/books/:key", delete(delete_book))
         .route("/api/login", post(post_login))
         .route("/api/logout", post(post_logout))
+        // 平台安全中心（仅管理员）：口令策略 / 登录审计 / 锁定账号
+        .route(
+            "/api/security/policy",
+            get(get_security_policy).post(set_security_policy),
+        )
+        .route("/api/security/login-attempts", get(list_security_attempts))
+        .route("/api/security/locked-users", get(list_locked_security_users))
+        .route("/api/security/unlock", post(unlock_security_user))
         .route("/api/me", get(get_me))
         .route("/api/change-password", post(post_change_password))
         // 账号管理（仅管理员，作用于全局身份库）
@@ -608,6 +616,16 @@ async fn post_login(
         return Err(AppError::bad_request("缺少有效的设备标识，请刷新页面后重试"));
     }
     let ip = client_ip(&headers);
+    // 平台持久锁（realm 层，跨重启生效）：策略 max_fail 次连续失败后由本接口写入
+    let policy = state.policy();
+    if let Ok(remain) = state.realm.lock_remaining_min(&username) {
+        if remain > 0 {
+            return Err(AppError::rate_limited(
+                format!("账号已锁定，请约 {remain} 分钟后再试（管理员可在安全中心解锁）"),
+                (remain as u64) * 60,
+            ));
+        }
+    }
     // 登录限流：先查是否已被锁定，避免锁定期内继续做昂贵/可枚举的密码校验
     if let Err(secs) = state.login_limiter.check(&username) {
         let mins = secs.div_ceil(60).max(1);
@@ -632,15 +650,28 @@ async fn post_login(
             if let Some(ip) = &ip {
                 state.login_ip_limiter.record_failure(ip);
             }
+            // 登录审计（平台层）+ 连续失败达标 → 持久锁
+            let _ = state
+                .realm
+                .record_login_attempt(&username, false, ip.as_deref().unwrap_or(""));
+            if let Ok(fails) = state.realm.recent_fail_count(&username) {
+                if fails >= policy.max_fail.max(1) {
+                    let _ = state.realm.lock_user(&username, policy.lock_minutes);
+                }
+            }
             return Err(AppError::unauthorized("用户名或口令错误"));
         }
         Err(e) => return Err(AppError::from(e)),
     };
-    // 登录成功，清空该账号的失败计数
+    // 登录成功，清空该账号的失败计数（内存限流 + 平台失败记录 + 遗留锁）
     state.login_limiter.clear(&username);
     if let Some(ip) = &ip {
         state.login_ip_limiter.clear(ip);
     }
+    let _ = state.realm.unlock_user(&username);
+    let _ = state
+        .realm
+        .record_login_attempt(&username, true, ip.as_deref().unwrap_or(""));
     // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
     if !ru.is_admin {
         match state.realm.bind_device(&username, &device_id)? {
@@ -680,6 +711,123 @@ async fn post_login(
     r.headers_mut()
         .insert(header::SET_COOKIE, crate::state::cookie_header(&token, SESSION_SECS));
     Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// 平台安全中心（口令策略 / 登录审计 / 账号解锁；均仅管理员）
+// ---------------------------------------------------------------------------
+
+/// 口令策略读取
+async fn get_security_policy(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限管理员"));
+    }
+    Ok(Json(json!(state.realm.policy()?)))
+}
+
+/// 口令策略保存（值域校验：过小会把全员锁死，过大等于策略失效）
+async fn set_security_policy(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Json(p): Json<fincore::user::PasswordPolicy>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限管理员"));
+    }
+    if !(1..=64).contains(&p.min_len) {
+        return Err(AppError::bad_request("最小口令长度需在 1-64 之间"));
+    }
+    if !(1..=20).contains(&p.max_fail) {
+        return Err(AppError::bad_request("连续失败次数需在 1-20 之间"));
+    }
+    if !(1..=1440).contains(&p.lock_minutes) {
+        return Err(AppError::bad_request("锁定时长需在 1-1440 分钟之间"));
+    }
+    if !(0..=1440).contains(&p.idle_minutes) {
+        return Err(AppError::bad_request("空闲超时需在 0-1440 分钟之间（0=不自动登出）"));
+    }
+    if !(0..=3650).contains(&p.max_age_days) {
+        return Err(AppError::bad_request("口令有效期需在 0-3650 天之间（0=永不过期）"));
+    }
+    state.realm.set_policy(&p)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LoginAttemptsQuery {
+    username: Option<String>,
+    limit: Option<u32>,
+}
+
+/// 登录审计：最近 N 条平台登录尝试（成功/失败 + 来源 IP）
+async fn list_security_attempts(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Query(q): Query<LoginAttemptsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限管理员"));
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 500) as usize;
+    let rows = state.realm.login_attempts(q.username.as_deref(), limit)?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, username, ts, ok, ip)| {
+            json!({ "id": id, "username": username, "ts": ts, "ok": ok, "ip": ip })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// 当前处于锁定状态的平台账号
+async fn list_locked_security_users(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限管理员"));
+    }
+    let mut items = Vec::new();
+    for u in state.realm.list_users()? {
+        let remain = state.realm.lock_remaining_min(&u.username)?;
+        if remain > 0 {
+            items.push(json!({
+                "username": u.username,
+                "display_name": u.display_name,
+                "locked_until": u.locked_until,
+                "remaining_min": remain,
+            }));
+        }
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+struct UnlockSecurityReq {
+    username: String,
+}
+
+/// 解锁平台账号（同时清空失败计数）
+async fn unlock_security_user(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Json(req): Json<UnlockSecurityReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该操作仅限管理员"));
+    }
+    let name = req.username.trim();
+    if name.is_empty() {
+        return Err(AppError::bad_request("账号不能为空"));
+    }
+    if state.realm.get_user(name)?.is_none() {
+        return Err(AppError::not_found("账号不存在"));
+    }
+    state.realm.unlock_user(name)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// 生成唯一账套 key（文件名，不含扩展名）
@@ -844,7 +992,7 @@ async fn get_me(
 /// 单密码统一后所有口令入口都走应用级 PasswordPolicy（默认 8 位且需含字母+数字）：
 /// Web 层先由本函数做 400 校验，realm 层再以 policy 参数复核，双层一致。
 fn check_password(state: &WebState, pwd: &str) -> Result<(), AppError> {
-    state.policy.check(pwd).map_err(AppError::bad_request)
+    state.policy().check(pwd).map_err(AppError::bad_request)
 }
 
 async fn post_change_password(
@@ -854,7 +1002,7 @@ async fn post_change_password(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // 改的是平台口令（与登录身份一致）
     check_password(&state, &req.new)?;
-    let r = state.realm.change_password(&user.username, &req.old, &req.new, &state.policy)?;
+    let r = state.realm.change_password(&user.username, &req.old, &req.new, &state.policy())?;
     match r {
         Ok(()) => {
             // 同步到该用户出现过的所有账套内的同名用户行，保持单密码一致
@@ -909,7 +1057,7 @@ async fn create_platform_user(
     // 管理员开的号，口令是管理员定的——首次登录必须自己改一次
     let id = state
         .realm
-        .create_user(&req.username, &req.display_name, &req.password, req.is_admin, true, &state.policy)?;
+        .create_user(&req.username, &req.display_name, &req.password, req.is_admin, true, &state.policy())?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -960,7 +1108,7 @@ async fn reset_platform_password(
         return Err(AppError::forbidden("该操作仅限管理员"));
     }
     check_password(&state, &req.new)?;
-    state.realm.reset_password(&username, &req.new, &state.policy)?;
+    state.realm.reset_password(&username, &req.new, &state.policy())?;
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
         let _ = state.realm.sync_password_to_books(
             &state.books_dir,
@@ -1159,7 +1307,6 @@ async fn reset_user_password(
     let db = state.db_for(&user.book_key)?;
     // 单密码统一：账套内没有独立口令，重置即重置该用户的平台口令，
     // 再同步到其出现过的所有账套。目标必须是当前账套成员，防越权重置陌生人口令。
-    let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_none() {
         return Err(AppError::not_found("该用户不在当前账套"));
     }
@@ -1194,7 +1341,7 @@ async fn reset_user_password(
         }
     }
     check_password(&state, &req.new)?;
-    state.realm.reset_password(&username, &req.new, &state.policy)?;
+    state.realm.reset_password(&username, &req.new, &state.policy())?;
     // 口令已变，立即吊销该账号的全部旧会话（被盗会话不能继续用满 7 天）
     state.sessions.remove_by_username(&username);
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
@@ -2882,9 +3029,7 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, AppError> {
 /// 导入 per-kind 鉴权：页面入口宽（NAV Report），动作按 kind 严管（迁移操作者=对应岗位）
 fn import_perm(kind: &str) -> Result<Perm, AppError> {
     Ok(match kind {
-        "voucher" | "begin" => Perm::VoucherNew,
-        "begin" => Perm::VoucherNew,
-        "arap_opening" => Perm::VoucherNew,
+        "voucher" | "begin" | "arap_opening" => Perm::VoucherNew,
         "account" => Perm::AccountEdit,
         "aux" => Perm::AuxEdit,
         "item" | "opening_stock" => Perm::Warehouse,

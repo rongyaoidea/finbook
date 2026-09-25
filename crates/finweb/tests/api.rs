@@ -49,7 +49,6 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     let state = WebState::new(
         reg,
         SessionStore::new(),
-        PasswordPolicy::default(),
         realm,
         books_dir.clone(),
         "test".to_string(),
@@ -1730,6 +1729,154 @@ async fn login_rate_limited_after_repeated_failures() {
     assert!(s.contains("retry_after"), "响应体应含剩余等待秒数：{s}");
 }
 
+/// P0：Web 平台安全中心——口令策略可配（值域校验）+ 登录审计 + 持久锁定/解锁。
+#[tokio::test]
+async fn web_security_center() {
+    let (state, _bd, _dir) = test_state();
+    let (_, boss_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // 默认策略（与桌面默认一致）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/security/policy", &boss_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let p: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(p["min_len"], 8);
+    assert_eq!(p["max_fail"], 5);
+
+    // 保存自定义策略（max_fail=3 便于测锁定）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/security/policy",
+            &boss_sid,
+            serde_json::json!({
+                "min_len": 10, "need_letter": true, "need_digit": true, "need_symbol": true,
+                "max_age_days": 90, "max_fail": 3, "lock_minutes": 15, "idle_minutes": 30
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存自定义策略");
+    // 回读生效
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/security/policy", &boss_sid))
+        .await
+        .unwrap();
+    let p: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(p["min_len"], 10);
+    assert_eq!(p["max_fail"], 3);
+    // 非法值 400（min_len/max_fail 超界）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/security/policy",
+            &boss_sid,
+            serde_json::json!({
+                "min_len": 0, "need_letter": true, "need_digit": true, "need_symbol": false,
+                "max_age_days": 90, "max_fail": 0, "lock_minutes": 15, "idle_minutes": 30
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "非法策略应 400");
+
+    // 开一个测试账号
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid,
+            serde_json::json!({ "username": "sec1", "display_name": "安全测试", "password": "Init@123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通 sec1");
+
+    // 连续 3 次错 → 触发持久锁（策略 max_fail=3）
+    for i in 0..3 {
+        let (status, _) = login_with_device(&state, "sec1", "WrongPass123", "dev-sec1-0001").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "第 {} 次失败应 401", i + 1);
+    }
+    // 第 4 次即使口令正确也被锁 → 429
+    let (status, _) = login_with_device(&state, "sec1", "Init@123456", "dev-sec1-0001").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "锁定后正确口令也应 429");
+
+    // 登录审计：sec1 的失败记录齐全
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/security/login-attempts?username=sec1&limit=50",
+            &boss_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let items = r["items"].as_array().unwrap();
+    assert!(items.len() >= 3, "审计应含 3 次失败记录：{}", items.len());
+    assert!(items.iter().all(|x| x["ok"] == false), "锁定前应全为失败记录");
+
+    // 锁定名单可见
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/security/locked-users", &boss_sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["items"].as_array().unwrap().iter().any(|x| x["username"] == "sec1"),
+        "锁定名单应含 sec1"
+    );
+
+    // 解锁 → 正确口令可登录
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/security/unlock",
+            &boss_sid,
+            serde_json::json!({ "username": "sec1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "解锁");
+    let (status, sec1_sid) = login_with_device(&state, "sec1", "Init@123456", "dev-sec1-0001").await;
+    assert_eq!(status, StatusCode::OK, "解锁后应能登录");
+
+    // 审计含本次成功记录
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/security/login-attempts?username=sec1", &boss_sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["items"].as_array().unwrap().iter().any(|x| x["ok"] == true),
+        "应有成功登录记录"
+    );
+
+    // 非管理员不得读策略/审计（先完成首登改密，否则会先被强制改密拦截为 401）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sec1_sid,
+            serde_json::json!({ "old": "Init@123456", "new": "Sec1@pass99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "首登改密应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/security/policy", &sec1_sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "非管理员读策略应 403");
+
+    // 解锁不存在的账号 → 404
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/security/unlock",
+            &boss_sid,
+            serde_json::json!({ "username": "ghost99" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "解锁陌生账号应 404");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，
@@ -1747,7 +1894,7 @@ async fn readonly_roles_cannot_write() {
             .oneshot(authed_post(
                 "/api/platform/users",
                 &boss_sid,
-                serde_json::json!({ "username": u, "display_name": u, "password": "Init123456" }),
+                serde_json::json!({ "username": u, "display_name": u, "password": "Init@123456" }),
             ))
             .await
             .unwrap();
@@ -1765,7 +1912,7 @@ async fn readonly_roles_cannot_write() {
                 "/api/users",
                 &boss_sid,
                 serde_json::json!({
-                    "username": u, "display_name": u, "password": "Init123456",
+                    "username": u, "display_name": u, "password": "Init@123456",
                     "role": role, "must_change_pwd": false,
                 }),
             ))
@@ -1776,13 +1923,13 @@ async fn readonly_roles_cannot_write() {
 
     let mut sids = Vec::new();
     for u in ["view1", "cash1"] {
-        let (st, sid) = login(&state, u, "Init123456").await;
+        let (st, sid) = login(&state, u, "Init@123456").await;
         assert_eq!(st, StatusCode::OK, "{u} 平台登录");
         let resp = handlers::router(state.clone())
             .oneshot(authed_post(
                 "/api/change-password",
                 &sid,
-                serde_json::json!({ "old": "Init123456", "new": "Pass123456" }),
+                serde_json::json!({ "old": "Init@123456", "new": "Pass123456" }),
             ))
             .await
             .unwrap();
@@ -1848,7 +1995,7 @@ async fn user_manager_cannot_escalate_self() {
             .oneshot(authed_post(
                 "/api/platform/users",
                 &boss_sid,
-                serde_json::json!({ "username": u, "display_name": u, "password": "Init123456" }),
+                serde_json::json!({ "username": u, "display_name": u, "password": "Init@123456" }),
             ))
             .await
             .unwrap();
@@ -1864,7 +2011,7 @@ async fn user_manager_cannot_escalate_self() {
                 "/api/users",
                 &boss_sid,
                 serde_json::json!({
-                    "username": u, "display_name": u, "password": "Init123456",
+                    "username": u, "display_name": u, "password": "Init@123456",
                     "role": role, "must_change_pwd": false, "extra_perms": extra,
                 }),
             ))
@@ -1875,14 +2022,14 @@ async fn user_manager_cannot_escalate_self() {
 
     let mut sid_sup = String::new();
     for u in ["sup1", "acc9"] {
-        let (st, sid) = login(&state, u, "Init123456").await;
+        let (st, sid) = login(&state, u, "Init@123456").await;
         assert_eq!(st, StatusCode::OK, "{u} 登录");
         // 平台账号建号时强制首登改密，不改密会被拦在账套之外
         let resp = handlers::router(state.clone())
             .oneshot(authed_post(
                 "/api/change-password",
                 &sid,
-                serde_json::json!({ "old": "Init123456", "new": "Pass123456" }),
+                serde_json::json!({ "old": "Init@123456", "new": "Pass123456" }),
             ))
             .await
             .unwrap();
@@ -2241,7 +2388,7 @@ async fn non_admin_usermanage_cannot_touch_identities() {
                 "/api/users",
                 &admin_sid,
                 serde_json::json!({
-                    "username": u, "display_name": u, "password": "Init123456",
+                    "username": u, "display_name": u, "password": "Init@123456",
                     "role": "accountant", "must_change_pwd": false, "extra_perms": extra
                 }),
             ))
@@ -3991,7 +4138,7 @@ async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
             "/api/users",
             &attacker,
             serde_json::json!({
-                "username": "vic1", "display_name": "受害者", "password": "Init123456",
+                "username": "vic1", "display_name": "受害者", "password": "Init@123456",
                 "role": "accountant", "must_change_pwd": false,
             }),
         ))
@@ -6484,7 +6631,7 @@ async fn cashier_sign_and_unsign() {
             "/api/platform/users",
             &sid,
             serde_json::json!({
-                "username": "nosign", "display_name": "nosign", "password": "Init123456"
+                "username": "nosign", "display_name": "nosign", "password": "Init@123456"
             }),
         ))
         .await
@@ -6502,14 +6649,14 @@ async fn cashier_sign_and_unsign() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "邀请 nosign 为 viewer");
-    let (st, vsid) = login(&state, "nosign", "Init123456").await;
+    let (st, vsid) = login(&state, "nosign", "Init@123456").await;
     assert_eq!(st, StatusCode::OK, "nosign 平台登录");
     // 平台账号默认首登强制改密；改密前只能访问改密/退出/登录（服务端拦截）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/change-password",
             &vsid,
-            serde_json::json!({ "old": "Init123456", "new": "Pass123456" }),
+            serde_json::json!({ "old": "Init@123456", "new": "Pass123456" }),
         ))
         .await
         .unwrap();
@@ -9622,12 +9769,12 @@ async fn web_security_boundaries() {
         .oneshot(authed_post(
             "/api/platform/users",
             &admin_sid,
-            serde_json::json!({ "username": "mc1", "display_name": "待改密", "password": "Init123456" }),
+            serde_json::json!({ "username": "mc1", "display_name": "待改密", "password": "Init@123456" }),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let (st, mc_sid) = login(&state, "mc1", "Init123456").await;
+    let (st, mc_sid) = login(&state, "mc1", "Init@123456").await;
     assert_eq!(st, StatusCode::OK);
     let resp = handlers::router(state.clone())
         .oneshot(authed_get("/api/books", &mc_sid))
@@ -9638,7 +9785,7 @@ async fn web_security_boundaries() {
         .oneshot(authed_post(
             "/api/change-password",
             &mc_sid,
-            serde_json::json!({ "old": "Init123456", "new": "Init654321" }),
+            serde_json::json!({ "old": "Init@123456", "new": "Init654321" }),
         ))
         .await
         .unwrap();

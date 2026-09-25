@@ -27,6 +27,8 @@ pub struct RealmUser {
     /// 绑定的设备指纹（Web 端"一人一机"）；空 = 尚未绑定，下次登录自动绑定
     pub device_id: String,
     pub created_at: String,
+    /// 锁定截止时间（`%Y-%m-%d %H:%M:%S`，空 = 未锁定）；由平台口令策略 max_fail/lock_minutes 驱动
+    pub locked_until: String,
 }
 
 /// 账套目录项（平台层）
@@ -50,7 +52,19 @@ CREATE TABLE IF NOT EXISTS realm_user (
     disabled        INTEGER NOT NULL DEFAULT 0,
     must_change_pwd INTEGER NOT NULL DEFAULT 0,
     device_id       TEXT NOT NULL DEFAULT '',
-    created_at      TEXT NOT NULL DEFAULT ''
+    created_at      TEXT NOT NULL DEFAULT '',
+    locked_until    TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS realm_option (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS realm_login_attempt (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    ok          INTEGER NOT NULL,
+    ip          TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS realm_book (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,17 +116,23 @@ impl RealmDb {
         Ok(())
     }
 
-    /// 轻量迁移：为早期创建的库补上后加的列（device_id）
+    /// 轻量迁移：为早期创建的库补上后加的列（device_id / locked_until）
     fn migrate(&self) -> DbResult<()> {
         let conn = self.inner.lock().unwrap();
-        let has: bool = conn
+        let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(realm_user)")?
             .query_map([], |r| r.get::<_, String>(1))?
             .filter_map(Result::ok)
-            .any(|c| c == "device_id");
-        if !has {
+            .collect();
+        if !cols.iter().any(|c| c == "device_id") {
             conn.execute(
                 "ALTER TABLE realm_user ADD COLUMN device_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "locked_until") {
+            conn.execute(
+                "ALTER TABLE realm_user ADD COLUMN locked_until TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -226,7 +246,7 @@ impl RealmDb {
     pub fn get_user(&self, username: &str) -> DbResult<Option<RealmUser>> {
         let conn = self.inner.lock().unwrap();
         conn.query_row(
-            "SELECT id,username,display_name,password_hash,is_admin,disabled,must_change_pwd,device_id,created_at
+            "SELECT id,username,display_name,password_hash,is_admin,disabled,must_change_pwd,device_id,created_at,locked_until
              FROM realm_user WHERE username=?1",
             rusqlite::params![username],
             map_user,
@@ -238,11 +258,182 @@ impl RealmDb {
     pub fn list_users(&self) -> DbResult<Vec<RealmUser>> {
         let conn = self.inner.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,username,display_name,password_hash,is_admin,disabled,must_change_pwd,device_id,created_at
+            "SELECT id,username,display_name,password_hash,is_admin,disabled,must_change_pwd,device_id,created_at,locked_until
              FROM realm_user ORDER BY id",
         )?;
         let rows = stmt.query_map([], map_user)?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // ---------------------------------------------------------------
+    // 平台安全：口令策略 / 登录审计 / 账号锁定（Web 安全中心）
+    // ---------------------------------------------------------------
+
+    /// 平台口令策略（realm_option 存储；缺省 = 与桌面端一致的默认策略）
+    pub fn policy(&self) -> DbResult<PasswordPolicy> {
+        let conn = self.inner.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM realm_option WHERE key='password_policy'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<PasswordPolicy>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    /// 保存平台口令策略（幂等 upsert）
+    pub fn set_policy(&self, p: &PasswordPolicy) -> DbResult<()> {
+        let json = serde_json::to_string(p)
+            .map_err(|e| DbError::Fin(fincore::FinError::msg(format!("策略序列化失败：{e}"))))?;
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "INSERT INTO realm_option(key,value) VALUES('password_policy',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![json],
+        )?;
+        Ok(())
+    }
+
+    /// 记录一次登录尝试（成功/失败），并只保留最近 500 条防膨胀
+    pub fn record_login_attempt(&self, username: &str, ok: bool, ip: &str) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "INSERT INTO realm_login_attempt(username,ts,ok,ip) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![username, now(), ok as i64, ip],
+        )?;
+        conn.execute(
+            "DELETE FROM realm_login_attempt WHERE id NOT IN (
+                 SELECT id FROM realm_login_attempt ORDER BY id DESC LIMIT 500
+             )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// 自上次成功登录以来的连续失败次数（与桌面 findb::security 同口径）
+    pub fn recent_fail_count(&self, username: &str) -> DbResult<i64> {
+        let conn = self.inner.lock().unwrap();
+        let last_ok: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(id),0) FROM realm_login_attempt WHERE username=?1 AND ok=1",
+            rusqlite::params![username],
+            |r| r.get(0),
+        )?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM realm_login_attempt WHERE username=?1 AND ok=0 AND id>?2",
+            rusqlite::params![username, last_ok],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// 清空某账号的登录尝试记录（登录成功 / 管理员解锁时调用）
+    pub fn clear_login_attempts(&self, username: &str) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "DELETE FROM realm_login_attempt WHERE username=?1",
+            rusqlite::params![username],
+        )?;
+        Ok(())
+    }
+
+    /// 最近登录记录（可按账号过滤，倒序）——(id, username, ts, ok, ip)
+    pub fn login_attempts(
+        &self,
+        username: Option<&str>,
+        limit: usize,
+    ) -> DbResult<Vec<(i64, String, String, bool, String)>> {
+        let conn = self.inner.lock().unwrap();
+        let limit = limit.clamp(1, 500) as i64;
+        let mut out = Vec::new();
+        let filter = username.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(u) = filter {
+            let mut stmt = conn.prepare(
+                "SELECT id,username,ts,ok,ip FROM realm_login_attempt
+                 WHERE username=?1 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![u, limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get(4)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id,username,ts,ok,ip FROM realm_login_attempt ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get(4)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 锁定账号 N 分钟（写入持久化截止时间）
+    pub fn lock_user(&self, username: &str, minutes: i64) -> DbResult<()> {
+        let until = (chrono::Local::now() + chrono::Duration::minutes(minutes.max(1)))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "UPDATE realm_user SET locked_until=?2 WHERE username=?1",
+            rusqlite::params![username, until],
+        )?;
+        Ok(())
+    }
+
+    /// 解锁账号（同时清空失败计数）
+    pub fn unlock_user(&self, username: &str) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "UPDATE realm_user SET locked_until='' WHERE username=?1",
+            rusqlite::params![username],
+        )?;
+        drop(conn);
+        self.clear_login_attempts(username)
+    }
+
+    /// 剩余锁定分钟（未锁定/已过期 = 0；过期顺手清锁）
+    pub fn lock_remaining_min(&self, username: &str) -> DbResult<i64> {
+        let conn = self.inner.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT COALESCE(locked_until,'') FROM realm_user WHERE username=?1",
+                rusqlite::params![username],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Ok(0);
+        }
+        let remain = chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S")
+            .map(|t| (t - chrono::Local::now().naive_local()).num_minutes().max(0))
+            .unwrap_or(0);
+        if remain == 0 {
+            conn.execute(
+                "UPDATE realm_user SET locked_until='' WHERE username=?1",
+                rusqlite::params![username],
+            )?;
+        }
+        Ok(remain)
     }
 
     /// 仅更新展示名 / 停用状态 / 是否管理员（不改口令）
@@ -625,6 +816,7 @@ fn map_user(r: &rusqlite::Row) -> rusqlite::Result<RealmUser> {
         must_change_pwd: r.get::<_, i64>(6)? != 0,
         device_id: r.get(7)?,
         created_at: r.get(8)?,
+        locked_until: r.get(9)?,
     })
 }
 

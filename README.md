@@ -476,6 +476,15 @@
 - **口径声明**：期初明细为**影子挂账**——进账龄展示与管理，**暂不参与自动核销**（收期初款的 FIFO 核销留 v2，需 settle 对伪 entry 的支持）；金额总额仍以科目期初为准，本表承载逐单欠款信息。
 - **测试**：web `items_master_and_arap_opening`——arap 导入 ok3/skip1 + 幂等 ok0/skip4 → 列表合计 8000/2000 → **1122 账龄含期初客商 Q01** → 删除后 2 行；存货建档（导入保质期45）+ item-plan（safety30/lead3/lot10）+ 期初数量 25 → master 聚合字段全断言（shelf/safety/lead/lot/qty/disabled）；回归 web settle 3/3 + findb aging 1/1。
 
+### 4.33 Web 平台安全中心（口令策略可配 + 登录审计 + 持久锁定）
+
+- **背景**：Web 登录是**平台层**（认账号库 realm）——此前口令策略硬编码默认值（不可配）、登录只走内存限流（重启即忘、不留审计），与桌面端账套级策略/锁定语义不一致。
+- **策略可配**：`GET/POST /api/security/policy`（仅平台管理员；值域校验：长度 1-64、失败次数 1-20、锁定时长 1-1440 分、空闲登出 0-1440 分、有效期 0-3650 天）→ 存 realm `realm_option`；**改密校验 / 空闲登出 / 登录锁定统一走该策略**（`WebState::policy()`，读取失败回退默认，不因策略库异常阻断登录）。
+- **登录审计**：realm 新表 `realm_login_attempt`（只留最近 500 条）+ `GET /api/security/login-attempts?username=&limit=`；成功登录亦留一条（先 `unlock` 清失败再记成功，成功记录不被清理）。
+- **持久锁定**：`realm_user.locked_until`（老库启动自动补列）+ `GET /api/security/locked-users` + `POST /api/security/unlock`——连续失败达策略阈值写锁，**跨进程/重启生效**；锁定期间口令正确也 429（不再做昂贵 argon2 校验）；解锁同时清空失败计数。
+- **UI**：「系统 → 安全中心」新增两块（仅平台管理员可见）——**口令策略表单** + **平台登录审计**（锁定账号 🔒 红标 + 一键解锁）；账号管理/账套成员锁定解锁保持原样。
+- **测试**：web `web_security_center`——默认策略 → 保存 max_fail=3 → 非法值 400 → 3 次错锁定 → 正确口令也 429 → 审计含失败记录 → 锁定名单可见 → 解锁后登录成功 + 审计含成功记录 → 非管理员 403 → 解锁陌生账号 404。
+
 ---
 
 ## 5. 关键设计约定

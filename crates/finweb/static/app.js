@@ -2223,8 +2223,34 @@ async function viewSecurity(main) {
     ${can("user_manage") ? `<div class="panel"><table class="grid" id="u-table"><thead><tr>
       <th data-sort="username" class="sortable" title="点击排序">账号</th><th>姓名</th><th>角色</th>
       <th data-sort="last_login_at" class="sortable" title="点击排序">最近登录</th><th>锁定</th><th>强制改密</th><th>绑定设备</th><th>状态</th><th></th>
-    </tr></thead><tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody></table></div>` : `<div class="panel muted">您没有用户管理权限，仅可修改自己的口令。</div>`}`;
+    </tr></thead><tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody></table></div>` : `<div class="panel muted">您没有用户管理权限，仅可修改自己的口令。</div>`}
+    ${session.platformAdmin ? `
+    <div class="panel">
+      <h3 style="margin-top:0">口令策略（平台账号）</h3>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">对 Web 平台账号生效：登录锁定、改密校验、空闲登出。桌面端账套口令策略在各账套「安全中心」单独设置。</div>
+      <div id="sec-pol-form" class="muted">加载中…</div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">平台登录审计</h3>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <label>账号 <input id="sec-att-user" style="width:140px" placeholder="留空 = 全部" /></label>
+        <label>条数 <select id="sec-att-limit"><option>50</option><option>200</option></select></label>
+        <button class="btn sm" id="sec-att-load">刷新</button>
+        <span class="spacer"></span>
+        <label>解锁账号 <input id="sec-unlock-user" style="width:140px" placeholder="账号" /></label>
+        <button class="btn sm" id="sec-unlock">解锁</button>
+      </div>
+      <div id="sec-locked-box"></div>
+      <div id="sec-att-table" class="muted">加载中…</div>
+    </div>` : ""}`;
   $("#me-pwd").addEventListener("click", () => openChangePwd(false));
+  if (session.platformAdmin) {
+    loadSecPolicy();
+    loadSecAudit();
+    $("#sec-att-load").addEventListener("click", loadSecAudit);
+    $("#sec-att-user").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSecAudit(); });
+    $("#sec-unlock").addEventListener("click", doSecUnlock);
+  }
   if (can("user_manage")) {
     $("#new-user").addEventListener("click", openNewUser);
     $("#u-kw").addEventListener("input", loadUsers);
@@ -2239,6 +2265,86 @@ async function viewSecurity(main) {
     }));
     loadUsers();
   }
+}
+
+// ===========================================================================
+// 平台安全中心（口令策略 / 登录审计 / 解锁；仅平台管理员）
+// ===========================================================================
+async function loadSecPolicy() {
+  const box = $("#sec-pol-form");
+  if (!box) return;
+  let p;
+  try { p = await api("/security/policy"); }
+  catch (e) { box.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; return; }
+  box.innerHTML = `
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>最小口令长度</label><input id="sp-len" type="number" min="1" max="64" value="${p.min_len}" style="width:90px" /></div>
+      <div><label>连续失败次数</label><input id="sp-fail" type="number" min="1" max="20" value="${p.max_fail}" style="width:90px" /></div>
+      <div><label>锁定时长（分钟）</label><input id="sp-lock" type="number" min="1" max="1440" value="${p.lock_minutes}" style="width:100px" /></div>
+      <div><label>空闲登出（分钟，0=不登出）</label><input id="sp-idle" type="number" min="0" max="1440" value="${p.idle_minutes}" style="width:100px" /></div>
+      <div><label>口令有效期（天，0=永不过期）</label><input id="sp-age" type="number" min="0" max="3650" value="${p.max_age_days}" style="width:100px" /></div>
+    </div>
+    <div style="display:flex;gap:14px;align-items:center;margin:10px 0;flex-wrap:wrap">
+      <label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="sp-letter" ${p.need_letter ? "checked" : ""}/> 必须含字母</label>
+      <label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="sp-digit" ${p.need_digit ? "checked" : ""}/> 必须含数字</label>
+      <label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="sp-symbol" ${p.need_symbol ? "checked" : ""}/> 必须含特殊字符</label>
+      <span class="spacer"></span>
+      <button class="btn primary sm" id="sp-save">保存策略</button>
+    </div>
+    <div class="muted" style="font-size:12px">锁定语义：连续失败达阈值后账号写入持久锁（跨重启生效），可在下方「解锁账号」解除；策略同时约束改密校验与空闲登出。</div>`;
+  $("#sp-save").addEventListener("click", async () => {
+    const numv = (id) => Number($(id).value);
+    const body = {
+      min_len: numv("#sp-len"), need_letter: $("#sp-letter").checked, need_digit: $("#sp-digit").checked,
+      need_symbol: $("#sp-symbol").checked, max_age_days: numv("#sp-age"), max_fail: numv("#sp-fail"),
+      lock_minutes: numv("#sp-lock"), idle_minutes: numv("#sp-idle"),
+    };
+    try {
+      await api("/security/policy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("口令策略已保存", "ok");
+      loadSecPolicy();
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+async function loadSecAudit() {
+  const box = $("#sec-att-table");
+  if (!box) return;
+  const u = ($("#sec-att-user").value || "").trim();
+  const limit = $("#sec-att-limit").value || "50";
+  let r;
+  try { r = await api(`/security/login-attempts?limit=${limit}${u ? `&username=${encodeURIComponent(u)}` : ""}`); }
+  catch (e) { box.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; return; }
+  // 锁定账号条（与审计分开接口，失败不阻塞审计展示）
+  const lockBox = $("#sec-locked-box");
+  if (lockBox) {
+    try {
+      const lk = await api("/security/locked-users");
+      lockBox.innerHTML = (lk.items || []).length
+        ? `<div style="margin-bottom:8px">🔒 当前锁定：${lk.items.map((x) => `<span class="tag warn">${esc(x.username)}（剩 ${x.remaining_min} 分钟）</span>`).join(" ")}</div>`
+        : "";
+    } catch (e) { lockBox.innerHTML = ""; }
+  }
+  const items = r.items || [];
+  if (!items.length) { box.innerHTML = `<div class="muted">暂无登录记录</div>`; return; }
+  box.innerHTML = `<table class="grid"><thead><tr><th>时间</th><th>账号</th><th>结果</th><th>来源 IP</th></tr></thead><tbody>${
+    items.map((x) => `<tr>
+      <td>${esc(x.ts)}</td><td>${esc(x.username)}</td>
+      <td>${x.ok ? `<span class="tag ok">成功</span>` : `<span class="tag err">失败</span>`}</td>
+      <td class="muted">${esc(x.ip || "—")}</td>
+    </tr>`).join("")
+  }</tbody></table>`;
+}
+
+async function doSecUnlock() {
+  const u = ($("#sec-unlock-user").value || "").trim();
+  if (!u) { toast("请输入要解锁的账号", "err"); return; }
+  try {
+    await api("/security/unlock", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: u }) });
+    toast(`已解锁 ${u}`, "ok");
+    $("#sec-unlock-user").value = "";
+    loadSecAudit();
+  } catch (e) { toast(e.message, "err"); }
 }
 
 // 角色 → 权限矩阵（/api/roles），缓存一次

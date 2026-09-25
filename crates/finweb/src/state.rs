@@ -27,7 +27,6 @@ pub struct WebState {
     /// 账套注册表（多账套支持）：key → 文件路径
     pub books: BookRegistry,
     pub sessions: SessionStore,
-    pub policy: PasswordPolicy,
     /// 登录限流（账号维度）
     pub login_limiter: LoginLimiter,
     /// 登录限流（来源 IP 维度，防同一出口跨账号扫号）
@@ -52,7 +51,6 @@ impl WebState {
     pub fn new(
         books: BookRegistry,
         sessions: SessionStore,
-        policy: PasswordPolicy,
         realm: RealmDb,
         books_dir: PathBuf,
         version: String,
@@ -63,7 +61,6 @@ impl WebState {
         Arc::new(Self {
             books,
             sessions,
-            policy,
             login_limiter: LoginLimiter::new(),
             login_ip_limiter: LoginLimiter::with_max(LOGIN_IP_MAX_FAILURES),
             realm,
@@ -74,6 +71,11 @@ impl WebState {
             static_dir,
             assets_ver,
         })
+    }
+
+    /// 平台口令策略（读账号库；读取失败回退默认策略，不因策略库异常阻断登录）
+    pub fn policy(&self) -> PasswordPolicy {
+        self.realm.policy().unwrap_or_default()
     }
 
     /// 读取公司名
@@ -470,7 +472,7 @@ pub(crate) fn session_of(
         .ok_or_else(|| AppError::unauthorized("未登录或会话已失效"))?;
     let info = state
         .sessions
-        .get(&token, state.policy.idle_minutes)
+        .get(&token, state.policy().idle_minutes)
         .ok_or_else(|| AppError::unauthorized("会话已过期，请重新登录"))?;
     Ok((token, info))
 }

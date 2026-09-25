@@ -345,6 +345,101 @@ pub fn so_shipment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
     Ok(rows.iter().map(|s| m(s)).sum())
 }
 
+// ---------------- 发货通知（对标金蝶发货通知单） ----------------
+
+/// 发货通知单：订单确认后备货指令；出库后自动完成
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ShipNotice {
+    pub id: i64,
+    pub so_id: i64,
+    pub qty: Money,
+    pub date: String,
+    /// pending / shipped
+    pub status: String,
+    pub memo: String,
+    pub created_by: String,
+}
+
+/// 通知列表（待发优先，近期 50 条）
+pub fn notice_list(db: &Db) -> DbResult<Vec<ShipNotice>> {
+    let mut st = db.conn().prepare(
+        "SELECT id,so_id,qty,date,status,memo,created_by FROM ship_notice
+         ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC LIMIT 50",
+    )?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(ShipNotice {
+                id: r.get(0)?,
+                so_id: r.get(1)?,
+                qty: m(&r.get::<_, String>(2)?),
+                date: r.get(3)?,
+                status: r.get(4)?,
+                memo: r.get(5)?,
+                created_by: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 建发货通知：订单需已确认；数量 ≤ 未发量（Σ行 qty_ordered - qty_shipped）
+pub fn notice_create(
+    db: &Db,
+    so_id: i64,
+    qty: Money,
+    date: NaiveDate,
+    memo: &str,
+    who: &str,
+) -> DbResult<i64> {
+    if !qty.is_positive() {
+        return Err(fincore::FinError::msg("通知数量必须大于 0").into());
+    }
+    let so = crate::scm::so_get(db, so_id)?
+        .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
+    if matches!(so.status, crate::scm::SoStatus::Draft | crate::scm::SoStatus::Cancelled) {
+        return Err(
+            fincore::FinError::state("订单未确认，确认后才能发出发货通知").into(),
+        );
+    }
+    let unshipped: Money = so
+        .lines
+        .iter()
+        .map(|l| l.qty_ordered - l.qty_shipped)
+        .sum();
+    if qty > unshipped {
+        return Err(fincore::FinError::state(format!(
+            "通知数量 {} 超过未发量 {}",
+            qty.fmt_qty(),
+            unshipped.fmt_qty()
+        ))
+        .into());
+    }
+    db.conn().execute(
+        "INSERT INTO ship_notice(so_id,qty,date,status,memo,created_by,created_at)
+         VALUES(?1,?2,?3,'pending',?4,?5,?6)",
+        rusqlite::params![
+            so_id,
+            crate::exact_param(qty),
+            date.format("%Y-%m-%d").to_string(),
+            memo,
+            who,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+/// 发货成功后完成该订单最早一条待发通知（v1：通知=备货指令，出库即完成；
+/// 逐条数量对齐留待迭代）。返回是否有通知被完成。
+pub fn notice_fulfill_on_shipment(db: &Db, so_id: i64) -> DbResult<bool> {
+    let n = db.conn().execute(
+        "UPDATE ship_notice SET status='shipped'
+         WHERE id = (SELECT id FROM ship_notice WHERE so_id=?1 AND status='pending' ORDER BY id LIMIT 1)",
+        [so_id],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn so_payment_add(db: &Db, so_id: i64, period: Period, date: NaiveDate, amount: Money, memo: &str) -> DbResult<i64> {
     db.conn().execute(
         "INSERT INTO so_payment(so_id,period,date,amount,memo) VALUES(?1,?2,?3,?4,?5)",

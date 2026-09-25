@@ -181,6 +181,44 @@ fn node_of(tx: &rusqlite::Connection, kind: &str, id: i64, dir: &str) -> DbResul
                 },
             )
             .optional()?,
+        "receipt" => tx
+            .query_row(
+                "SELECT no, date, party, amount, status FROM receipt_doc WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(DocNode {
+                        kind: "receipt".into(),
+                        id,
+                        no: r.get(0)?,
+                        date: r.get(1)?,
+                        title: r.get::<_, String>(2)?,
+                        qty: "0".into(),
+                        amount: r.get(3)?,
+                        memo: r.get::<_, String>(4)?,
+                        dir: dir.to_string(),
+                    })
+                },
+            )
+            .optional()?,
+        "notice" => tx
+            .query_row(
+                "SELECT qty, date, memo FROM ship_notice WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(DocNode {
+                        kind: "notice".into(),
+                        id,
+                        no: String::new(),
+                        date: r.get(1)?,
+                        title: "发货通知".into(),
+                        qty: r.get(0)?,
+                        amount: "0".into(),
+                        memo: r.get::<_, String>(2)?,
+                        dir: dir.to_string(),
+                    })
+                },
+            )
+            .optional()?,
         _ => None,
     };
     Ok(row)
@@ -219,6 +257,37 @@ fn q_rows(
         });
     }
     Ok(out)
+}
+
+/// 收付款单与源单已下推发票自动勾稽（订单页收款/付款动作后调用）：取源单 → invoice
+/// 的发票中尚未与该收付款单建边的第一张，建立 (invoice→receipt) 边——票↔款链直达。
+pub fn link_receipt_to_src_invoice(
+    db: &Db,
+    src_type: &str,
+    src_id: i64,
+    receipt_id: i64,
+) -> DbResult<()> {
+    let mut st = db.conn().prepare(
+        "SELECT dst_id FROM doc_link WHERE src_type=?1 AND src_id=?2 AND dst_type='invoice'",
+    )?;
+    let invoices: Vec<i64> = st
+        .query_map(rusqlite::params![src_type, src_id], |r| r.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for inv in invoices {
+        let exists: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT id FROM doc_link
+                 WHERE src_type='invoice' AND src_id=?1 AND dst_type='receipt' AND dst_id=?2",
+                rusqlite::params![inv, receipt_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return link_add(db, "invoice", inv, "receipt", receipt_id, "收付款勾稽");
+        }
+    }
+    Ok(())
 }
 
 /// 单据链：doc_link 上/下游 + 该单固有执行子单据，合并返回（up 在前）。
@@ -284,6 +353,13 @@ pub fn doc_chain(db: &Db, kind: &str, id: i64) -> DbResult<Vec<DocNode>> {
                 id,
                 "so_payment",
                 false,
+            )?);
+            out.extend(q_rows(
+                db.conn(),
+                "SELECT id, date, CAST(qty AS TEXT), memo FROM ship_notice WHERE so_id=?1 ORDER BY id",
+                id,
+                "notice",
+                true,
             )?);
         }
         _ => {}

@@ -279,6 +279,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/sales/stats", get(get_sales_stats))
         .route("/api/sales/so", get(list_so).post(save_so))
         .route("/api/sales/so/:id/transition", post(transition_so))
+        .route("/api/sales/so/:id/notice", post(create_notice))
+        .route("/api/sales/notices", get(list_notices))
         .route("/api/sales/so/:id/delete", post(delete_so))
         .route("/api/sales/so/print-form", get(print_so_form))
         // 预算预警
@@ -4588,6 +4590,8 @@ async fn add_po_payment(
         &req.memo,
         user.username(),
     )?;
+    // 票↔款勾稽：本订单已下推进项发票与本次收付款单自动建边
+    findb::docflow::link_receipt_to_src_invoice(&db, "po", req.po_id, doc_id)?;
     let id = findb::procurement::po_payment_add(
         &db,
         &findb::procurement::PoPayment {
@@ -4748,6 +4752,8 @@ async fn add_so_shipment(
     let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty, date, user.username())?;
     let id = findb::sales::so_shipment_with_stock(&db, req.so_id, period, date, qty, &req.memo)?;
     findb::scm::so_progress_update(&db, req.so_id)?;
+    // 出库成功 → 完成该订单最早一条待发通知（备货指令闭环）
+    let _ = findb::sales::notice_fulfill_on_shipment(&db, req.so_id)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }
 
@@ -4824,6 +4830,8 @@ async fn add_so_payment(
         &req.memo,
         user.username(),
     )?;
+    // 票↔款勾稽：本订单已下推的销项发票与本次收付款单自动建边
+    findb::docflow::link_receipt_to_src_invoice(&db, "so", req.so_id, doc_id)?;
     let id =
         findb::sales::so_payment_add(&db, req.so_id, period, date, amount, &req.memo)?;
     db.log(
@@ -5276,6 +5284,51 @@ async fn list_so(
         }
     }
     Ok(Json(json!({ "rows": rows })))
+}
+
+#[derive(Deserialize)]
+struct NoticeReq {
+    qty: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 发货通知（订单确认后）：仓库备货指令，出库后自动完成最早一条待发通知
+async fn create_notice(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<NoticeReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let date = if req.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let qty = parse_money_checked(&req.qty)?;
+    let nid = findb::sales::notice_create(&db, id, qty, date, &req.memo, user.username())?;
+    db.log(
+        user.username(),
+        "销售",
+        "发货通知",
+        &format!("SO#{id} ×{} 通知#{nid}", qty.fmt_qty()),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": nid })))
+}
+
+/// 待发/历史发货通知列表
+async fn list_notices(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::sales::notice_list(&db)? })))
 }
 
 /// 保存销售订单：服务端计算行金额（数量×单价）与税额（金额×税率）；
@@ -6005,8 +6058,8 @@ async fn get_doc_links(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let kind = q.get("kind").cloned().unwrap_or_default();
-    if !matches!(kind.as_str(), "req" | "po" | "so" | "invoice") {
-        return Err(AppError::bad_request("kind 只能是 req / po / so / invoice"));
+    if !matches!(kind.as_str(), "req" | "po" | "so" | "invoice" | "receipt") {
+        return Err(AppError::bad_request("kind 只能是 req / po / so / invoice / receipt"));
     }
     let id: i64 = q
         .get("id")

@@ -2300,6 +2300,140 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 发货通知 + 票款勾稽：未确认拒通知/超未发量拒 → 出库自动完成通知 → 收款与发票建边。
+#[tokio::test]
+async fn ship_notice_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 销售订单（6 件，未发量 6）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "通知造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "6", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 未确认 → 拒通知
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/notice"),
+            &sid,
+            serde_json::json!({ "qty": "4", "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "未确认不能发通知");
+
+    // 确认 → 超未发量拒 → 正常通知 4
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/notice"),
+            &sid,
+            serde_json::json!({ "qty": "9", "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超未发量拒");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/notice"),
+            &sid,
+            serde_json::json!({ "qty": "4", "date": d15.clone(), "memo": "备货" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "通知发出");
+
+    // 列表 pending 含本单
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/notices", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|n| n["so_id"].as_i64() == Some(so_id) && n["status"] == "pending"),
+        "待发通知应含本单：{r}"
+    );
+
+    // 出库 → 通知自动完成（pending 不再含本单）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "出库");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/notices", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        !r["rows"].as_array().unwrap().iter().any(|n| n["so_id"].as_i64() == Some(so_id) && n["status"] == "pending"),
+        "出库后通知应自动完成：{r}"
+    );
+
+    // 票款勾稽：下推销项发票 → 订单页收款 → 发票上游见收付款单
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/invoices/from-so", &sid, serde_json::json!({ "so_id": so_id })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "下推销项发票");
+    let inv_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["invoice_id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/payment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "amount": "10", "memo": "部分收款" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "订单页收款");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/doc-links?kind=invoice&id={inv_id}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|n| n["kind"] == "receipt" && n["dir"] == "down"),
+        "发票下游应见收付款单（票↔款勾稽）：{r}"
+    );
+}
+
 /// 通知中心：结构/水位已读/可见性过滤 + 单据流程条数据源（instance-for）。
 #[tokio::test]
 async fn notices_endpoint() {

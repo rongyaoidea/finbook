@@ -4045,6 +4045,54 @@ function openQcEditor(poId, reload) {
   };
 }
 
+// 发货通知（对标金蝶发货通知单）：订单确认后备货指令；出库后自动完成
+function openNoticeEditor(soId, unshipped, reload) {
+  const qtyDefault = unshipped > 0 ? String(unshipped) : "";
+  const mask = modal(`<h3>发货通知 · 订单 #${esc(String(soId))}</h3>
+    <div class="field"><label>通知数量 *</label><input id="sn-qty" value="${esc(qtyDefault)}" placeholder="未发量 ${unshipped}" /></div>
+    <div class="field"><label>通知日期</label><input type="date" id="sn-date" value="${today()}" /></div>
+    <div class="field"><label>备注</label><input id="sn-memo" placeholder="如：备货送仓 A 区" /></div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">通知数量 ≤ 未发量；仓库在「待发通知」面板点「去出库」预填执行坞，发货成功后通知自动完成。</p>
+    <div class="foot"><button class="btn primary" id="sn-save">发出通知</button><button class="btn ghost" id="sn-cancel">取消</button></div>`);
+  $("#sn-cancel", mask).onclick = closeModal;
+  $("#sn-save", mask).onclick = async () => {
+    const q = $("#sn-qty", mask).value.trim();
+    if (!q) { toast("请填写通知数量", "err"); return; }
+    try {
+      await postJson(`/sales/so/${Number(soId)}/notice`, { qty: q, date: $("#sn-date", mask).value, memo: $("#sn-memo", mask).value.trim() });
+      toast("已发出发货通知（见「待发通知」面板）", "ok");
+      closeModal();
+      reload && reload();
+      snLoad();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+// 待发通知面板：pending 列表 → 「去出库」预填执行坞（发货成功后通知自动完成）
+async function snLoad() {
+  const box = document.getElementById("sn-list");
+  if (!box) return;
+  try {
+    const r = await api("/sales/notices");
+    const rows = (r.rows || []).filter((n) => n.status === "pending");
+    box.innerHTML = rows.length
+      ? `<table class="grid"><thead><tr><th>订单</th><th class="num">数量</th><th>通知日期</th><th>备注</th><th>通知人</th><th></th></tr></thead><tbody>${rows.map((n) => `<tr><td>#${n.so_id}</td><td class="num">${esc(String(n.qty))}</td><td>${esc(n.date)}</td><td>${esc(n.memo || "—")}</td><td>${esc(n.created_by)}</td>
+          <td class="row-actions"><button class="btn ghost sm" data-sn-go="${esc(JSON.stringify({ so: n.so_id, qty: n.qty }))}">去出库</button></td></tr>`).join("")}</tbody></table>`
+      : `<div class="muted">暂无待发通知（销售订单行「通知」按钮创建）</div>`;
+    $all("[data-sn-go]", box).forEach((b) => b.onclick = () => {
+      const d = JSON.parse(b.dataset.snGo);
+      const soid = document.getElementById("sd-soid");
+      const amtv = document.getElementById("sd-amt");
+      const memoEl = document.getElementById("sd-memo");
+      if (soid) soid.value = String(d.so);
+      if (amtv) amtv.value = String(d.qty);
+      if (memoEl) memoEl.value = "发货通知";
+      toast(`已填入执行坞（订单 ${d.so} × ${d.qty}），点「发货」完成出库`, "ok");
+      if (soid && soid.scrollIntoView) soid.scrollIntoView({ block: "center" });
+    });
+  } catch (e) { box.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+
 // 单据链追溯面板（对标金蝶 源单/目标单 追溯）：上游源单 + 下游执行流水合并展示
 async function openDocChain(kind, id, title) {
   const mask = modal(`<h3>单据链 · ${esc(title || kind)} #${esc(String(id))}</h3>
@@ -4204,6 +4252,7 @@ async function viewSoDoc(main) {
       <button class="btn" id="sd-credit">信用检查</button>
     </div>
     <div id="sd-credit-result" class="muted" style="margin-top:6px"></div>
+    <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">发货通知（待发）</h4><span class="grow"></span><button class="btn ghost sm" id="sn-reload">刷新</button></div><div id="sn-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">销售订单</h4><span class="grow"></span>${sizeSel("so-size")}<button class="btn ghost sm" id="so-print">打印所选</button><button class="btn ghost sm" id="so-deli">送货单(跟车)</button><button class="btn ghost sm" id="so-printcfg">打印设置</button><button class="btn primary sm" id="so-new">新建销售订单</button></div><div id="so-list" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>报价单</h4><div id="sd-list">加载中…</div></div>
     <div class="panel" style="margin-top:12px"><h4>销售订单执行跟踪</h4><div id="sd-track">加载中…</div></div>`;
@@ -4213,7 +4262,7 @@ async function viewSoDoc(main) {
       const s = await api(`/sales/so?period=${period}`);
       const orows = s.rows || [];
       $("#so-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-so-inv="${o.id}">票</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-so-inv="${o.id}">票</button>` : ""}${o.status !== "Draft" && o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-notice="${o.id}">通知</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无销售订单，点右上「新建销售订单」</div>`;
       $all("[data-so-edit]").forEach((b) => b.onclick = () => openOrderEditor("so", main, parseInt(b.dataset.soEdit, 10)));
       $all("[data-so-confirm]").forEach((b) => b.onclick = () => soTransition(b.dataset.soConfirm, "Confirmed"));
@@ -4224,6 +4273,13 @@ async function viewSoDoc(main) {
           const r = await postJson("/invoices/from-so", { so_id: Number(b.dataset.soInv) });
           toast(`已下推销售发票 #${r.invoice_id}（待认证，到发票管理认证）`, "ok");
         } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-so-notice]").forEach((b) => b.onclick = () => {
+        const row = orows.find((x) => String(x.id) === b.dataset.soNotice);
+        const un = ((row && row.lines) || []).reduce(
+          (s, l) => s + (Number(l.qty_ordered) || 0) - (Number(l.qty_shipped) || 0), 0
+        );
+        openNoticeEditor(b.dataset.soNotice, un, load);
       });
       $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
       $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
@@ -4257,6 +4313,8 @@ async function viewSoDoc(main) {
     try { await api(`/sales/so/${id}/transition`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); toast("已更新订单状态", "ok"); load(); } catch (e) { toast(e.message, "err"); }
   };
   $("#so-new").onclick = () => openOrderEditor("so", main, null);
+  $("#sn-reload").addEventListener("click", snLoad);
+  snLoad();
   $("#sd-save").addEventListener("click", async () => {
     try {
       await postJson("/sales/quote", { id: 0, period: ymm(state.current || ""), date: today(), customer_code: $("#sd-cust").value.trim(), customer_name: $("#sd-cust").value.trim(), item_code: $("#sd-item").value.trim(), item_name: $("#sd-item").value.trim(), qty: $("#sd-qty").value.trim() || "0", unit_price: $("#sd-price").value.trim() || "0", status: "draft", prepared_by: "", memo: "" });
@@ -4266,7 +4324,7 @@ async function viewSoDoc(main) {
   const soid = () => parseInt($("#sd-soid").value.trim(), 10) || 0;
   const amt = () => $("#sd-amt").value.trim();
   const memo = () => $("#sd-memo").value.trim();
-  $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已发货，确认收入凭证 #${r.voucher_id}` : "已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已发货，确认收入凭证 #${r.voucher_id}` : "已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); snLoad(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-return").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/return", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已退货，冲回凭证 #${r.voucher_id}` : "已退货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已收款，收款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-credit").addEventListener("click", async () => {

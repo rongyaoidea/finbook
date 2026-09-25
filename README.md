@@ -416,6 +416,12 @@
 - **端点**：`GET /api/notices`（Report）、`GET /api/workflows/instance-for`（Report，四类业务白名单）；findb 新增 `workbench::collect_todos`（轮询轻量版，权限与状态口径与 collect 一致）与 `workflow::instance_for`。
 - **测试**：web `notices_endpoint`（结构/now 格式/水位归零/造审计动态后未读≥1/流程条 found+running+节点推进复核/无实例 found=false/非法类型400）。
 
+### 4.26 发货通知单 + 票款勾稽（对标金蝶发货通知，下推矩阵①）
+
+- **发货通知**：新表 `ship_notice`（pending/shipped）——销售订单行「通知」按钮（非草稿显示，数量默认=行未发量）发出备货指令；**通知 ≤ 未发量、未确认订单 400**；「待发通知」面板（so-doc 页，待发优先）+「去出库」预填执行坞；**出库成功自动完成最早一条待发通知**（`notice_fulfill_on_shipment`，逐条数量对齐留待迭代）。
+- **票↔款勾稽**：订单页收款/付款生成收付款单后，自动与该订单**已下推的发票**建 `doc_link(invoice→receipt)` 边（`link_receipt_to_src_invoice`，已链跳过）——发票「链」面板直达收付款单，`doc_chain` 新增 receipt/notice 节点、`doc-links` 白名单扩 receipt。
+- **测试**：web `ship_notice_flow`（未确认拒通知 → 超未发量拒 → 通知入 pending → 出库自动完成 → 下推销票+订单收款后发票上游见收付款单）。
+
 ---
 
 ## 5. 关键设计约定

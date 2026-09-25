@@ -1149,6 +1149,19 @@ CREATE TABLE IF NOT EXISTS qc_order (
 );
 CREATE INDEX IF NOT EXISTS idx_qc_po ON qc_order(po_id);
 
+-- 发货通知单（对标金蝶发货通知：订单确认后的备货指令，出库后自动完成）
+CREATE TABLE IF NOT EXISTS ship_notice (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_id      INTEGER NOT NULL,
+    qty        TEXT NOT NULL,
+    date       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending', -- pending / shipped
+    memo       TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sn_so ON ship_notice(so_id);
+
 -- 可视化工作流（对标金蝶审批流设计器）：流程定义 + 节点 + 连线 + 运行实例
 CREATE TABLE IF NOT EXISTS workflow_flow (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

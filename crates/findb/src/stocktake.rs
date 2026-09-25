@@ -41,6 +41,8 @@ pub struct StockCountLine {
     pub id: i64,
     pub count_id: i64,
     pub item: String,
+    /// 批次号（空 = 整仓口径，v25 批次盘点）
+    pub batch_no: String,
     pub book_qty: Money,
     pub count_qty: Money,
     pub memo: String,
@@ -55,7 +57,7 @@ impl StockCountLine {
 
 const C_COLS: &str =
     "id,no,period,date,warehouse,memo,status,voucher_id,applied_at,created_by,created_at";
-const L_COLS: &str = "id,count_id,item,book_qty,count_qty,memo";
+const L_COLS: &str = "id,count_id,item,batch_no,book_qty,count_qty,memo";
 
 fn map_count(r: &rusqlite::Row) -> rusqlite::Result<StockCount> {
     let d: String = r.get(3)?;
@@ -81,9 +83,10 @@ fn map_line(r: &rusqlite::Row) -> rusqlite::Result<StockCountLine> {
         id: r.get(0)?,
         count_id: r.get(1)?,
         item: r.get(2)?,
-        book_qty: Money::parse_or_zero(&r.get::<_, String>(3)?),
-        count_qty: Money::parse_or_zero(&r.get::<_, String>(4)?),
-        memo: r.get(5)?,
+        batch_no: r.get(3)?,
+        book_qty: Money::parse_or_zero(&r.get::<_, String>(4)?),
+        count_qty: Money::parse_or_zero(&r.get::<_, String>(5)?),
+        memo: r.get(6)?,
     })
 }
 
@@ -99,6 +102,18 @@ fn book_qty(db: &Db, item: &str, warehouse: &str) -> DbResult<Money> {
             .map(|w| w.qty)
             .unwrap_or(Money::ZERO))
     }
+}
+
+/// 某存货+批次在指定仓库的账面数量（warehouse 空 = 全部仓库合计）。
+/// 出负入正的净额即余额——逐行取文本再汇总（与 batch_balance 同模式，避免 SUM 类型亲和问题）。
+fn batch_book_qty(db: &Db, item: &str, batch_no: &str, warehouse: &str) -> DbResult<Money> {
+    let mut st = db.conn().prepare(
+        "SELECT qty FROM stock_move WHERE item=?1 AND batch_no=?2 AND (?3='' OR warehouse=?3)",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![item, batch_no, warehouse], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.iter().map(|s| Money::parse_or_zero(s)).sum())
 }
 
 /// 盘点单列表（含明细）
@@ -133,17 +148,28 @@ pub fn count_create(
     date: NaiveDate,
     warehouse: &str,
     memo: &str,
-    lines: &[(String, Money, String)],
+    lines: &[(String, String, Money, String)],
     who: &str,
 ) -> DbResult<(i64, String)> {
     if lines.is_empty() {
         return Err(fincore::FinError::msg("盘点单至少一行存货").into());
     }
-    // 先快照账面（事务外读，随后写入同一事务——时点一致）
-    let snaps: Vec<(String, Money, Money, String)> = lines
+    // 先快照账面（事务外读，随后写入同一事务——时点一致）；批次行按流水净额快照
+    let snaps: Vec<(String, String, Money, Money, String)> = lines
         .iter()
-        .map(|(item, count_qty, lmemo)| {
-            Ok((item.clone(), book_qty(db, item, warehouse)?, *count_qty, lmemo.clone()))
+        .map(|(item, batch_no, count_qty, lmemo)| {
+            let book = if batch_no.trim().is_empty() {
+                book_qty(db, item, warehouse)?
+            } else {
+                batch_book_qty(db, item, batch_no.trim(), warehouse)?
+            };
+            Ok((
+                item.clone(),
+                batch_no.trim().to_string(),
+                book,
+                *count_qty,
+                lmemo.clone(),
+            ))
         })
         .collect::<DbResult<Vec<_>>>()?;
     let no = format!(
@@ -166,12 +192,14 @@ pub fn count_create(
         ],
     )?;
     let id = tx.last_insert_rowid();
-    for (item, book, count_qty, lmemo) in &snaps {
+    for (item, batch_no, book, count_qty, lmemo) in &snaps {
         tx.execute(
-            "INSERT INTO inv_count_line(count_id,item,book_qty,count_qty,memo) VALUES(?1,?2,?3,?4,?5)",
+            "INSERT INTO inv_count_line(count_id,item,batch_no,book_qty,count_qty,memo)
+             VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![
                 id,
                 item,
+                batch_no,
                 crate::money_param(*book),
                 crate::money_param(*count_qty),
                 lmemo
@@ -210,6 +238,8 @@ pub fn count_get(db: &Db, id: i64) -> DbResult<Option<StockCount>> {
 
 struct DiffRow {
     item: String,
+    /// 批次号（空 = 整仓口径）
+    batch_no: String,
     diff: Money,
     /// 差异 × 标准价（未配置标准价 = 0 → 不进凭证价值）
     value: Money,
@@ -234,6 +264,7 @@ pub fn count_apply(db: &Db, id: i64, who: &str) -> DbResult<(i64, Option<i64>, M
             let std = crate::business::item_standard_cost(db, &l.item).unwrap_or(Money::ZERO);
             DiffRow {
                 item: l.item.clone(),
+                batch_no: l.batch_no.clone(),
                 diff: l.diff(),
                 value: (l.diff().abs() * std).round2(),
             }
@@ -295,7 +326,7 @@ pub fn count_apply(db: &Db, id: i64, who: &str) -> DbResult<(i64, Option<i64>, M
                 kind,
                 item: r.item.clone(),
                 warehouse: doc.warehouse.clone(),
-                batch_no: String::new(),
+                batch_no: r.batch_no.clone(),
                 qty: r.diff,
                 price: std,
                 amount: Money::ZERO,
@@ -303,6 +334,21 @@ pub fn count_apply(db: &Db, id: i64, who: &str) -> DbResult<(i64, Option<i64>, M
                 memo: format!("盘点 {}", doc.no),
             },
         )?;
+        // 盘盈行带批次 → 批次不存在则建档（主仓 = 单据仓库；批次全仓唯一，OR IGNORE 防重）
+        if !r.batch_no.is_empty() && r.diff.is_positive() {
+            tx.execute(
+                "INSERT OR IGNORE INTO stock_batch(item,batch_no,warehouse,memo,created_by,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    r.item,
+                    r.batch_no,
+                    doc.warehouse,
+                    format!("盘点盘盈 {}", doc.no),
+                    who,
+                    now()
+                ],
+            )?;
+        }
     }
     // 盘盈盘亏凭证（总价值>0 才出）
     let total_value = gain + loss;
@@ -383,7 +429,7 @@ mod tests {
             d(2026, 1, 10),
             "",
             "一月盘点",
-            &[("P001".to_string(), m("15"), String::new())],
+            &[("P001".to_string(), String::new(), m("15"), String::new())],
             "u",
         )
         .unwrap();
@@ -420,7 +466,7 @@ mod tests {
             d(2026, 1, 12),
             "",
             "复盘",
-            &[("P001".to_string(), m("25"), String::new())],
+            &[("P001".to_string(), String::new(), m("25"), String::new())],
             "u",
         )
         .unwrap();
@@ -439,7 +485,7 @@ mod tests {
             d(2026, 1, 13),
             "",
             "无差异",
-            &[("P001".to_string(), m("25"), String::new())],
+            &[("P001".to_string(), String::new(), m("25"), String::new())],
             "u",
         )
         .unwrap();
@@ -453,7 +499,7 @@ mod tests {
             d(2026, 1, 14),
             "",
             "无标准价",
-            &[("NO_COST".to_string(), m("3"), String::new())],
+            &[("NO_COST".to_string(), String::new(), m("3"), String::new())],
             "u",
         )
         .unwrap();

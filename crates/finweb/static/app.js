@@ -3778,8 +3778,8 @@ async function viewInvTransfer(main) {
     const r = await api("/inventory/transfer");
     const rows = r.rows || [];
     $("#it-result").innerHTML = rows.length
-      ? `<table><thead><tr><th>日期</th><th>存货</th><th>仓库</th><th>数量</th><th>备注</th></tr></thead>
-        <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.item)}</td><td>${esc(x.warehouse)}</td><td class="r">${fmt(x.qty)}</td><td>${esc(x.memo || "")}</td></tr>`).join("")}</tbody></table>`
+      ? `<table><thead><tr><th>日期</th><th>存货</th><th>批号</th><th>仓库</th><th>数量</th><th>备注</th></tr></thead>
+        <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.item)}</td><td>${esc(x.batch_no || "—")}</td><td>${esc(x.warehouse)}</td><td class="r">${fmt(x.qty)}</td><td>${esc(x.memo || "")}</td></tr>`).join("")}</tbody></table>`
       : `<div class="muted">本期间无调拨流水</div>`;
   } catch (e) { $("#it-result").innerHTML = `<div class="muted" style="color:var(--err)">${esc(e.message)}</div>`; }
 }
@@ -3803,7 +3803,7 @@ async function viewInvCount(main) {
       const rows = r.rows || [];
       $("#ic-list").innerHTML = rows.length
         ? `<table class="grid"><thead><tr><th>单号</th><th>日期</th><th>仓库</th><th>明细（账面 → 实盘）</th><th>状态</th><th>凭证</th><th></th></tr></thead><tbody>${rows.map((c) => {
-            const lines = (c.lines || []).map((l) => `${esc(l.item)} ${fmt(l.book_qty)} → <b>${fmt(l.count_qty)}</b>${Number(l.count_qty) - Number(l.book_qty) !== 0 ? `（${(Number(l.count_qty) - Number(l.book_qty)) > 0 ? "+" : ""}${Number(l.count_qty) - Number(l.book_qty)}）` : ""}`).join("；");
+            const lines = (c.lines || []).map((l) => `${esc(l.item)}${l.batch_no ? `#${esc(l.batch_no)}` : ""} ${fmt(l.book_qty)} → <b>${fmt(l.count_qty)}</b>${Number(l.count_qty) - Number(l.book_qty) !== 0 ? `（${(Number(l.count_qty) - Number(l.book_qty)) > 0 ? "+" : ""}${Number(l.count_qty) - Number(l.book_qty)}）` : ""}`).join("；");
             return `<tr><td>${esc(c.no)}</td><td>${esc(c.date)}</td><td>${esc(c.warehouse || "全部")}</td><td>${lines || "—"}</td>
               <td>${c.status === "applied" ? '<span class="tag ok">已应用</span>' : '<span class="tag warn">草稿</span>'}</td>
               <td>${c.voucher_id ? `<a href="#" data-ic-v="${c.voucher_id}">凭证 #${c.voucher_id}</a>` : "—"}</td>
@@ -3829,14 +3829,14 @@ async function viewInvCount(main) {
 }
 
 function openCountEditor(warehouse, reload) {
-  let lines = [{ item: "", count_qty: "", memo: "" }];
+  let lines = [{ item: "", batch_no: "", count_qty: "", memo: "" }];
   const mask = modal(`<h3>新建盘点单</h3>
     <div class="toolbar">
       <label>日期 <input type="date" id="cn-date" value="${today()}" /></label>
       <label>仓库 <input id="cn-wh" value="${esc(warehouse)}" style="width:110px" placeholder="空 = 全部仓库" /></label>
       <label>备注 <input id="cn-memo" style="width:150px" /></label>
     </div>
-    <table class="grid" id="cn-tbl"><thead><tr><th>存货编码 *</th><th>实盘数量 *</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+    <table class="grid" id="cn-tbl"><thead><tr><th>存货编码 *</th><th>批次号</th><th>实盘数量 *</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
     <button class="btn ghost sm" id="cn-add">+ 增加行</button>
     <p class="muted" style="font-size:12px;margin:6px 0 0">保存时服务端按仓库快照账面数量（快照后可看到 账面→实盘 差异）；应用后不可修改。</p>
     <div class="foot"><button class="btn primary" id="cn-save">保存盘点单</button><button class="btn ghost" id="cn-cancel">取消</button></div>`);
@@ -3844,18 +3844,19 @@ function openCountEditor(warehouse, reload) {
   const render = () => {
     tbody.innerHTML = lines.map((l, i) => `<tr>
       <td><input data-f="item" data-i="${i}" value="${esc(l.item)}" style="width:130px" /></td>
+      <td><input data-f="batch_no" data-i="${i}" value="${esc(l.batch_no)}" placeholder="留空=整仓" style="width:110px" /></td>
       <td><input data-f="count_qty" data-i="${i}" value="${esc(l.count_qty)}" style="width:95px" /></td>
       <td><input data-f="memo" data-i="${i}" value="${esc(l.memo)}" style="width:140px" /></td>
       <td><button class="btn ghost sm" data-del="${i}">删</button></td></tr>`).join("");
     $all("input[data-f]", tbody).forEach((inp) => { inp.onchange = () => { lines[parseInt(inp.dataset.i, 10)][inp.dataset.f] = inp.value; }; });
     $all("[data-del]", tbody).forEach((b) => b.onclick = () => {
       lines.splice(parseInt(b.dataset.del, 10), 1);
-      if (!lines.length) lines.push({ item: "", count_qty: "", memo: "" });
+      if (!lines.length) lines.push({ item: "", batch_no: "", count_qty: "", memo: "" });
       render();
     });
   };
   render();
-  $("#cn-add", mask).onclick = () => { lines.push({ item: "", count_qty: "", memo: "" }); render(); };
+  $("#cn-add", mask).onclick = () => { lines.push({ item: "", batch_no: "", count_qty: "", memo: "" }); render(); };
   $("#cn-cancel", mask).onclick = closeModal;
   $("#cn-save", mask).onclick = async () => {
     const clean = lines.filter((l) => l.item.trim());
@@ -3866,7 +3867,7 @@ function openCountEditor(warehouse, reload) {
         date: $("#cn-date", mask).value,
         warehouse: $("#cn-wh", mask).value.trim(),
         memo: $("#cn-memo", mask).value.trim(),
-        lines: clean.map((l) => ({ item: l.item.trim(), count_qty: l.count_qty, memo: l.memo })),
+        lines: clean.map((l) => ({ item: l.item.trim(), batch_no: (l.batch_no || "").trim(), count_qty: l.count_qty, memo: l.memo })),
       });
       toast(`已保存盘点单 ${r.no}`, "ok");
       closeModal();
@@ -3895,6 +3896,7 @@ async function viewBatch(main) {
     </div>
     <div id="bt-fefo-out" class="muted" style="margin-bottom:6px"></div>
     <div class="panel"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">批次台账</h4><span class="grow"></span><label style="font-size:12px">临期窗口 <input id="bt-days" value="30" style="width:56px" /> 天 <button class="btn ghost sm" id="bt-exp">刷新</button></label></div><div id="bt-list" class="muted" style="margin-top:6px">加载中…</div></div>
+    <div class="panel"><div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">批次成本勾稽</h4><span class="grow"></span><span class="muted" style="font-size:12px">Σ批次价值 vs 存货辅助账期末</span></div><div id="bt-cost" class="muted" style="margin-top:8px">加载中…</div></div>
     <div class="panel"><h4 style="margin-top:12px">库位主数据（存储 / 拣货 / 隔离）</h4><div id="bt-locs" class="muted">加载中…</div></div>`;
   const loadLocs = async () => {
     try {
@@ -3920,12 +3922,32 @@ async function viewBatch(main) {
       const rows = r1.rows || [];
       const exp = new Set((r2.rows || []).map((b) => `${b.item}|${b.batch_no}`));
       $("#bt-list").innerHTML = rows.length
-        ? `<table class="grid"><thead><tr><th>存货</th><th>批号</th><th>生产日期</th><th>失效日期</th><th>仓库</th><th>库位</th><th class="num">余额</th><th>状态</th></tr></thead><tbody>${rows.map((b) => {
+        ? `<table class="grid"><thead><tr><th>存货</th><th>批号</th><th>生产日期</th><th>失效日期</th><th>仓库</th><th>库位</th><th class="num">余额</th><th>状态</th><th></th></tr></thead><tbody>${rows.map((b) => {
             const isExp = exp.has(`${b.item}|${b.batch_no}`);
-            return `<tr><td>${esc(b.item)}</td><td>${esc(b.batch_no)}</td><td>${esc(b.production_date || "—")}</td><td>${esc(b.expiry_date || "—")}</td><td>${esc(b.warehouse || "默认仓")}</td><td>${esc(b.location || "—")}</td><td class="num">${fmt(b.balance)}</td><td>${isExp ? '<span class="tag warn">临期</span>' : Number(b.balance) > 0 ? '<span class="tag ok">在库</span>' : '<span class="muted">已清</span>'}</td></tr>`;
+            return `<tr><td>${esc(b.item)}</td><td>${esc(b.batch_no)}</td><td>${esc(b.production_date || "—")}</td><td>${esc(b.expiry_date || "—")}</td><td>${esc(b.warehouse || "默认仓")}</td><td>${esc(b.location || "—")}</td><td class="num">${fmt(b.balance)}</td><td>${isExp ? '<span class="tag warn">临期</span>' : Number(b.balance) > 0 ? '<span class="tag ok">在库</span>' : '<span class="muted">已清</span>'}</td><td class="row-actions">${Number(b.balance) > 0 ? `<button class="btn ghost sm" data-tr="${esc(b.item)}|${esc(b.batch_no)}|${esc(b.warehouse || "")}">调拨</button>` : ""}</td></tr>`;
           }).join("")}</tbody></table>`
         : `<div class="muted">暂无批次，左上「登记」入库（批号留空自动生成）</div>`;
+      $all("[data-tr]", $("#bt-list")).forEach((btn) => btn.onclick = () => {
+        const p = btn.dataset.tr.split("|");
+        openTransferEditor(p[0], p[1], p[2], load);
+      });
     } catch (e) { $("#bt-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  // 批次成本勾稽：Σ批次价值 vs 存货辅助账期末，差异行高亮；明细折叠
+  const loadBc = async () => {
+    const box = $("#bt-cost");
+    if (!box) return;
+    try {
+      const r = await api("/inventory/batch-cost");
+      const tot = r.totals || [];
+      const detail = r.detail || [];
+      box.innerHTML = (tot.length
+        ? `<table class="grid"><thead><tr><th>存货</th><th class="num">Σ批次数量</th><th class="num">Σ批次价值</th><th class="num">账面（辅助期末）</th><th class="num">差异</th></tr></thead><tbody>${tot.map((t) => `<tr><td>${esc(t.item)}</td><td class="num">${fmt(t.qty)}</td><td class="num">${fmt(t.amount)}</td><td class="num">${fmt(t.book)}</td><td class="num" style="${Number(t.diff) !== 0 ? "color:var(--err);font-weight:600" : ""}">${fmt(t.diff)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无批次流水</div>`)
+        + (detail.length
+          ? `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:12px">批次成本明细（${detail.length} 条）</summary><table class="grid" style="margin-top:4px"><thead><tr><th>存货</th><th>批号</th><th class="num">数量</th><th class="num">金额</th></tr></thead><tbody>${detail.map((d) => `<tr><td>${esc(d.item)}</td><td>${esc(d.batch_no)}</td><td class="num">${fmt(d.qty)}</td><td class="num">${fmt(d.amount)}</td></tr>`).join("")}</tbody></table></details>`
+          : "");
+    } catch (e) { box.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   };
   $("#bt-reg").onclick = async () => {
     const item = $("#bt-item").value.trim();
@@ -3958,7 +3980,43 @@ async function viewBatch(main) {
   };
   $("#bt-exp").onclick = () => load();
   $("#bt-loc-new").onclick = () => openLocEditor(loadLocs);
-  await Promise.all([loadLocs(), load()]);
+  await Promise.all([loadLocs(), load(), loadBc()]);
+}
+
+// 批次调拨（对标金蝶调拨单 v1）：源仓默认=批次主仓（可改，服务端按分仓余额校验）；
+// 批号留空 = FEFO 近效期自动选批（近效期批次不足量时 400 提示分批）。
+function openTransferEditor(item, batchNo, warehouse, reload) {
+  const mask = modal(`<h3>批次调拨 · ${esc(item)}</h3>
+    <div class="field"><label>批号</label><input id="tf-no" value="${esc(batchNo || "")}" placeholder="留空 = FEFO 近效期自动选批" style="width:220px" /></div>
+    <div class="field" style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label>源仓 *</label><input id="tf-from" value="${esc(warehouse || "")}" style="width:110px" /></div>
+      <div><label>目标仓 *</label><input id="tf-to" style="width:110px" /></div>
+      <div><label>数量 *</label><input id="tf-qty" style="width:100px" /></div>
+      <div><label>日期</label><input type="date" id="tf-date" value="${today()}" /></div>
+    </div>
+    <div class="field"><label>备注</label><input id="tf-memo" style="width:100%" /></div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">调出/调入同事务生成两条调拨流水（标准价，金额由计价引擎结算）；分仓数量按流水分账，批次主仓标签改写为目标仓。</p>
+    <div class="foot"><button class="btn primary" id="tf-ok">执行调拨</button><button class="btn ghost" id="tf-cancel">取消</button></div>`);
+  $("#tf-cancel", mask).onclick = closeModal;
+  $("#tf-ok", mask).onclick = async () => {
+    const bn = $("#tf-no", mask).value.trim();
+    const fw = $("#tf-from", mask).value.trim();
+    const tw = $("#tf-to", mask).value.trim();
+    const q = $("#tf-qty", mask).value.trim();
+    if (!fw || !tw) { toast("源仓与目标仓必填", "err"); return; }
+    if (fw === tw) { toast("源仓与目标仓不能相同", "err"); return; }
+    if (!q) { toast("请填写调拨数量", "err"); return; }
+    try {
+      const r = await postJson("/inventory/transfer", {
+        period: ymm(state.current || ""), date: $("#tf-date", mask).value,
+        item, batch_no: bn, from_warehouse: fw, to_warehouse: tw, qty: q,
+        memo: $("#tf-memo", mask).value.trim(),
+      });
+      toast(`已调拨 ${item} ${r.batch_no} ${fw}→${tw} ×${q}（流水 ${r.out_id}/${r.in_id}）`, "ok");
+      closeModal();
+      reload && reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
 }
 
 function openLocEditor(reload) {

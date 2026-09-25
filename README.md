@@ -428,6 +428,13 @@
 - **移动端增强**（≤600px 段，P2-7 基础上补三个真缺口）：① `input/select/textarea { font-size:16px }`——**iOS 聚焦防自动放大整页**（Safari 对 <16px 输入强制缩放）；② `.btn.sm { min-height:36px }`——触摸目标从 ~28px 提到 36px；③ `table.grid { font-size:14px }` 手机可读性；④ 通知抽屉手机上全宽（100vw）。
 - **已有基础复核**：viewport meta、≤900px 侧栏抽屉+hamburger、≤600px topbar 换行/卡片单列/弹窗全宽、表格横向滚动、抽屉 92vw 均已具备，本轮零改动。
 
+### 4.28 批次盘点 + 批次成本勾稽 + 批次调拨（对标金蝶批次管理，清单⑤）
+
+- **批次盘点**（schema v25：`inv_count_line.batch_no`，空=整仓口径向后兼容）：盘点行可填批次号——**账面服务端按批次快照**（`batch_book_qty`：分仓/全仓流水净额，不信前端）；应用时差异流水带 `batch_no`（原硬编码空）、**盘盈新批次自动建档**（INSERT OR IGNORE，主仓=单据仓库）；列表行显示 `存货#批号`。UI 盘点表单加批次列（留空=整仓）。
+- **批次成本勾稽**：`GET /api/inventory/batch-cost`（CostOps）——批次层价值（建账以来流水按 item+batch 聚合）vs **存货辅助账期末**（aux kind=Item），逐存货 diff 高亮 + 批次明细折叠；批次页新增「批次成本勾稽」面板。**口径声明**：两侧期间起点不同（批次侧不含期初历史、账面侧含期初），差异本身即定位信号（期初未建批次/辅助手工调整/未结算流水）。
+- **批次调拨**（Web 此前只有报表无创建）：`POST /api/inventory/transfer`（Warehouse）——源仓分仓余额校验（不足 400）→ **调出（qty 负）/调入（qty 正）两条 Transfer 流水**（标准价、amount=0 计价引擎结算参与成本序列）→ **批次主仓标签改写**（`stock_batch UNIQUE(item,batch_no)` 全仓一行，分仓数量以流水分账）；批号留空 = **FEFO 近效期自动选批**（首条不足量 400 提示分批）。批次台账行「调拨」按钮 + modal（源仓默认主仓/目标仓/数量/日期）；调拨报表新增批号列。
+- **测试**：web `chain5_batch_stock` 一件串三——造批次 W01×10 → 批次盘点（快照=10 断言/应用后余额 8）→ 成本勾稽（detail 含批次、Σqty=8、book/diff 列）→ 调拨 W01→W02×3（双流水断言、主仓改写 W02、总量仍 8、超额 400、FEFO 自动选中 BT500）；回归 findb `count_apply_loss_gain_and_guards` 1/1 + web `stock_count_flow`/`stock_batch_flow`/`workbench_role_matrix` 3/3。
+
 ---
 
 ## 5. 关键设计约定

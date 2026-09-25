@@ -425,6 +425,198 @@ pub fn transfer_report(db: &Db, period: Period) -> DbResult<Vec<crate::business:
     Ok(rows.into_iter().filter(|r| r.kind == crate::business::StockKind::Transfer).collect())
 }
 
+// ---------------- 批次成本勾稽 / 批次调拨（链5） ----------------
+
+/// 批次成本明细（item+batch 层，流水金额聚合）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BatchCostDetail {
+    pub item: String,
+    pub batch_no: String,
+    pub qty: Money,
+    pub amount: Money,
+}
+
+/// 逐存货勾稽行：Σ批次价值 vs 账面（存货辅助账期末）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BatchCostTotal {
+    pub item: String,
+    pub qty: Money,
+    pub amount: Money,
+    pub book: Money,
+    pub diff: Money,
+}
+
+/// 批次成本勾稽：批次层价值（建账以来全部流水按 item+batch 聚合，金额=计价引擎结算后）
+/// vs 存货辅助账期末余额（aux end，kind=Item，期初取极早期）。**口径声明**：两侧期间起点
+/// 不同（批次侧不含期初手工建账前历史、账面侧含期初），差异本身即定位信号
+/// （期初未建批次、辅助手工调整、未结算流水等）。
+pub fn batch_cost_report(
+    db: &Db,
+    to: Period,
+) -> DbResult<(Vec<BatchCostDetail>, Vec<BatchCostTotal>)> {
+    // 批次侧：逐行取文本内存聚合（与 batch_balance 同模式，避免 SUM 类型亲和问题）
+    let mut st = db
+        .conn()
+        .prepare("SELECT item, batch_no, qty, amount FROM stock_move WHERE batch_no <> ''")?;
+    let raw: Vec<(String, String, String, String)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    use std::collections::HashMap;
+    let mut agg: HashMap<(String, String), (Money, Money)> = HashMap::new();
+    for (item, bn, q, a) in raw {
+        let e = agg.entry((item, bn)).or_insert((Money::ZERO, Money::ZERO));
+        e.0 += Money::parse_or_zero(&q);
+        e.1 += Money::parse_or_zero(&a);
+    }
+    let mut detail: Vec<BatchCostDetail> = agg
+        .iter()
+        .map(|((item, bn), (q, a))| BatchCostDetail {
+            item: item.clone(),
+            batch_no: bn.clone(),
+            qty: *q,
+            amount: *a,
+        })
+        .collect();
+    detail.sort_by(|a, b| a.item.cmp(&b.item).then_with(|| a.batch_no.cmp(&b.batch_no)));
+
+    // 逐存货合计
+    let mut tot: HashMap<String, (Money, Money)> = HashMap::new();
+    for (k, (q, a)) in &agg {
+        let e = tot.entry(k.0.clone()).or_insert((Money::ZERO, Money::ZERO));
+        e.0 += *q;
+        e.1 += *a;
+    }
+    // 账面侧：存货辅助账期末（from 取极早期覆盖全部历史）
+    let book_rows = crate::balances::aux_balance(
+        db,
+        fincore::AuxKind::Item,
+        Period::from_ymm(195001),
+        to,
+        None,
+    )?;
+    let book: HashMap<String, Money> = book_rows.into_iter().map(|r| (r.key, r.end)).collect();
+    let mut items: Vec<String> = tot.keys().cloned().collect();
+    items.extend(book.keys().cloned());
+    items.sort();
+    items.dedup();
+    let mut totals: Vec<BatchCostTotal> = items
+        .into_iter()
+        .map(|item| {
+            let (q, a) = tot.get(&item).copied().unwrap_or((Money::ZERO, Money::ZERO));
+            let b = book.get(&item).copied().unwrap_or(Money::ZERO);
+            BatchCostTotal {
+                diff: a - b,
+                item,
+                qty: q,
+                amount: a,
+                book: b,
+            }
+        })
+        .collect();
+    totals.retain(|t| !t.qty.is_zero() || !t.book.is_zero() || !t.amount.is_zero());
+    Ok((detail, totals))
+}
+
+/// 批次调拨（对标金蝶调拨单 v1）：源仓分仓余额校验 → 调出（qty 负）/ 调入（qty 正）两条
+/// Transfer 流水（标准价口径，amount=0 由计价引擎结算参与成本序列）→ 批次主仓标签改写
+/// （stock_batch 全仓唯一，warehouse 仅为主仓标签；分仓数量以流水分账为准）。
+/// 返回 (调出流水 id, 调入流水 id)。
+pub fn transfer_do(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    item: &str,
+    batch_no: &str,
+    from_wh: &str,
+    to_wh: &str,
+    qty: Money,
+    memo: &str,
+) -> DbResult<(i64, i64)> {
+    let item = item.trim();
+    let bn = batch_no.trim();
+    let from = from_wh.trim();
+    let to = to_wh.trim();
+    if item.is_empty() || bn.is_empty() {
+        return Err(fincore::FinError::msg("存货编码与批号必填").into());
+    }
+    if from.is_empty() || to.is_empty() {
+        return Err(fincore::FinError::state("源仓与目标仓必填").into());
+    }
+    if from == to {
+        return Err(fincore::FinError::state("源仓与目标仓不能相同").into());
+    }
+    if !qty.is_positive() {
+        return Err(fincore::FinError::msg("调拨数量必须大于 0").into());
+    }
+    let cnt: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM stock_batch WHERE item=?1 AND batch_no=?2",
+        rusqlite::params![item, bn],
+        |r| r.get(0),
+    )?;
+    if cnt == 0 {
+        return Err(fincore::FinError::not_found("批次不存在").into());
+    }
+    // 源仓分仓余额（出负入正净额）
+    let mut st = db.conn().prepare(
+        "SELECT qty FROM stock_move WHERE item=?1 AND batch_no=?2 AND warehouse=?3",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![item, bn, from], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let bal: Money = rows.iter().map(|s| Money::parse_or_zero(s)).sum();
+    if qty > bal {
+        return Err(fincore::FinError::state(format!(
+            "源仓 {from} 该批次余额 {} 不足（待调 {}）",
+            bal.fmt_qty(),
+            qty.fmt_qty()
+        ))
+        .into());
+    }
+    let price = crate::business::item_standard_cost(db, item).unwrap_or(Money::ZERO);
+    let tag = format!("调拨 {from}→{to} {memo}");
+    let tx = db.write_tx()?;
+    let out_id = crate::business::stock_insert_of(
+        &tx,
+        &crate::business::StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: crate::business::StockKind::Transfer,
+            item: item.to_string(),
+            warehouse: from.to_string(),
+            batch_no: bn.to_string(),
+            qty: qty.negated(),
+            price,
+            amount: Money::ZERO,
+            voucher_id: None,
+            memo: tag.clone(),
+        },
+    )?;
+    let in_id = crate::business::stock_insert_of(
+        &tx,
+        &crate::business::StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: crate::business::StockKind::Transfer,
+            item: item.to_string(),
+            warehouse: to.to_string(),
+            batch_no: bn.to_string(),
+            qty,
+            price,
+            amount: Money::ZERO,
+            voucher_id: None,
+            memo: tag,
+        },
+    )?;
+    tx.execute(
+        "UPDATE stock_batch SET warehouse=?3 WHERE item=?1 AND batch_no=?2",
+        rusqlite::params![item, bn, to],
+    )?;
+    tx.commit()?;
+    Ok((out_id, in_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

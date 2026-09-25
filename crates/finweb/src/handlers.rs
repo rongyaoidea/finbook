@@ -245,7 +245,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/assemble", post(assemble_endpoint))
         .route("/api/inventory/disassemble", post(disassemble_endpoint))
         .route("/api/inventory/warehouse-stock", get(get_warehouse_stock))
-        .route("/api/inventory/transfer", get(get_transfer_report))
+        .route(
+            "/api/inventory/transfer",
+            get(get_transfer_report).post(do_transfer),
+        )
+        .route("/api/inventory/batch-cost", get(batch_cost))
         // 采购/销售深度：暂估 / 对账 / 配额 / 订单变更
         .route("/api/procure/estimate", get(list_estimates).post(add_estimate))
         .route("/api/procure/estimate/:id/settle", post(settle_estimate))
@@ -4274,6 +4278,7 @@ async fn get_transfer_report(
             serde_json::json!({
                 "date": m.biz_date.format("%Y-%m-%d").to_string(),
                 "item": m.item,
+                "batch_no": m.batch_no,
                 "warehouse": m.warehouse,
                 "qty": m.qty.fmt_qty(),
                 "memo": m.memo,
@@ -7560,6 +7565,8 @@ struct CountLineInput {
     #[serde(default)]
     item: String,
     #[serde(default)]
+    batch_no: String,
+    #[serde(default)]
     count_qty: String,
     #[serde(default)]
     memo: String,
@@ -7608,13 +7615,14 @@ async fn create_count(
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
             .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
     };
-    let mut lines: Vec<(String, Money, String)> = Vec::new();
+    let mut lines: Vec<(String, String, Money, String)> = Vec::new();
     for l in &req.lines {
         if l.item.trim().is_empty() {
             continue;
         }
         lines.push((
             l.item.trim().to_string(),
+            l.batch_no.trim().to_string(),
             parse_money_checked(&l.count_qty)?,
             l.memo.clone(),
         ));
@@ -7727,6 +7735,108 @@ async fn register_batch(
         &format!("{} {} ×{} 余额 {}", req.item, no, req.qty, bal.fmt_qty()),
     )?;
     Ok(Json(json!({ "ok": true, "id": id, "batch_no": no, "balance": bal.fmt_qty() })))
+}
+
+#[derive(Deserialize)]
+struct TransferReq {
+    #[serde(default)]
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    item: String,
+    #[serde(default)]
+    batch_no: String,
+    #[serde(default)]
+    from_warehouse: String,
+    #[serde(default)]
+    to_warehouse: String,
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 批次调拨（Warehouse）：batch_no 空 → FEFO 近效期自动选批（首条不足量 400 提示分批）
+async fn do_transfer(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<TransferReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.trim().is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let qty = parse_money_checked(&req.qty)?;
+    let mut bn = req.batch_no.trim().to_string();
+    if bn.is_empty() {
+        let rec = findb::batch::fefo_recommend(&db, &req.item, qty)?;
+        let first = rec
+            .first()
+            .ok_or_else(|| AppError::not_found("该存货没有可用批次"))?;
+        if first.2 < qty {
+            return Err(AppError::bad_request(format!(
+                "近效期批次仅余 {}，不足调拨 {}——请分批调拨或指定批号",
+                first.2.fmt_qty(),
+                qty.fmt_qty()
+            )));
+        }
+        bn = first.0.clone();
+    }
+    let (out_id, in_id) = findb::inventory2::transfer_do(
+        &db,
+        period,
+        date,
+        &req.item,
+        &bn,
+        &req.from_warehouse,
+        &req.to_warehouse,
+        qty,
+        &req.memo,
+    )?;
+    db.log(
+        user.username(),
+        "库存",
+        "批次调拨",
+        &format!(
+            "{} {} {}→{} ×{}（流水 {out_id}/{in_id}）",
+            req.item,
+            bn,
+            req.from_warehouse,
+            req.to_warehouse,
+            qty.fmt_qty()
+        ),
+    )?;
+    Ok(Json(
+        json!({ "ok": true, "out_id": out_id, "in_id": in_id, "batch_no": bn }),
+    ))
+}
+
+/// 批次成本勾稽（CostOps）：批次层价值 vs 存货辅助账期末，逐存货差异
+async fn batch_cost(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let to = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let (detail, totals) = findb::inventory2::batch_cost_report(&db, to)?;
+    Ok(Json(
+        json!({ "detail": detail, "totals": totals, "period": to.ymm() }),
+    ))
 }
 
 /// 批次列表（含余额；?item= 过滤）

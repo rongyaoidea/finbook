@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -1089,6 +1089,7 @@ CREATE TABLE IF NOT EXISTS inv_count_line (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     count_id  INTEGER NOT NULL,
     item      TEXT NOT NULL,
+    batch_no  TEXT NOT NULL DEFAULT '',
     book_qty  TEXT NOT NULL DEFAULT '0',
     count_qty TEXT NOT NULL DEFAULT '0',
     memo      TEXT NOT NULL DEFAULT ''
@@ -1398,6 +1399,10 @@ const MIGRATE_V23: &[(&str, &str, &str)] = &[
 const MIGRATE_V24: &[(&str, &str, &str)] =
     &[("stock_move", "qc_status", "TEXT NOT NULL DEFAULT ''")];
 
+/// v24 → v25：批次盘点（inv_count_line.batch_no：空 = 整仓口径，向后兼容）
+const MIGRATE_V25: &[(&str, &str, &str)] =
+    &[("inv_count_line", "batch_no", "TEXT NOT NULL DEFAULT ''")];
+
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "bom", "version")? {
@@ -1617,6 +1622,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V22)?;
             migrate_generic(conn, MIGRATE_V23)?;
             migrate_generic(conn, MIGRATE_V24)?;
+            migrate_generic(conn, MIGRATE_V25)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

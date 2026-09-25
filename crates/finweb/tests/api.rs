@@ -2300,6 +2300,198 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 链5：批次盘点（批次账面快照/差异流水带批次/盘盈建档）→ 批次成本勾稽 → 批次调拨（双流水+主仓改写+FEFO）。
+#[tokio::test]
+async fn chain5_batch_stock() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 造批次：W01 入 10（BT500）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/batch",
+            &sid,
+            serde_json::json!({
+                "item": "RM10", "batch_no": "BT500", "production_date": "",
+                "warehouse": "W01", "location": "", "qty": "10",
+                "direction": "in", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "批次建档");
+
+    // ---- 5a 批次盘点：行带 batch_no → 服务端按批次快照账面（W01=10）----
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/count",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "warehouse": "W01",
+                "memo": "批次盘点造数",
+                "lines": [{ "item": "RM10", "batch_no": "BT500", "count_qty": "8" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建盘点单");
+    let cid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/counts", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let doc = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"].as_i64() == Some(cid))
+        .unwrap()
+        .clone();
+    assert_eq!(doc["lines"][0]["batch_no"], "BT500", "行带批次号");
+    assert_eq!(
+        doc["lines"][0]["book_qty"].as_str().unwrap().parse::<f64>().unwrap(),
+        10.0,
+        "批次账面快照 = W01 分仓余额 10：{doc}"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/inventory/count/{cid}/apply"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "应用盘点");
+    // 批次余额 = 8（差异流水带 batch_no）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches?item=RM10", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let bt = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["batch_no"] == "BT500")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        bt["balance"].as_str().unwrap().parse::<f64>().unwrap(),
+        8.0,
+        "盘点后批次余额 8：{bt}"
+    );
+
+    // ---- 5b 批次成本勾稽：明细 + 逐存货合计 ----
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batch-cost", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "批次成本勾稽可用");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["detail"].as_array().unwrap().iter().any(|d| d["item"] == "RM10" && d["batch_no"] == "BT500"),
+        "明细含该批次：{r}"
+    );
+    let t = r["totals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["item"] == "RM10")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        t["qty"].as_str().unwrap().parse::<f64>().unwrap(),
+        8.0,
+        "Σ批次数量 = 8：{t}"
+    );
+    assert!(t.get("book").is_some() && t.get("diff").is_some(), "账面与差异列");
+
+    // ---- 5c 批次调拨：W01→W02 双流水 + 主仓改写；超额 400；FEFO 自动选批 ----
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/transfer",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(),
+                "item": "RM10", "batch_no": "BT500",
+                "from_warehouse": "W01", "to_warehouse": "W02",
+                "qty": "3", "memo": "库间调拨"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "调拨执行");
+    let tr: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(tr["batch_no"], "BT500");
+    assert!(tr["out_id"].as_i64().is_some() && tr["in_id"].as_i64().is_some(), "两条流水 id");
+
+    // 调拨报表：期间内 Transfer 行含 -3(W01) 与 +3(W02)
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/transfer", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    let out = rows.iter().find(|m| m["warehouse"] == "W01" && m["batch_no"] == "BT500" && m["qty"].as_str().map(|q| q.starts_with('-')) == Some(true));
+    let inn = rows.iter().find(|m| m["warehouse"] == "W02" && m["batch_no"] == "BT500" && m["qty"].as_str().map(|q| !q.starts_with('-')) == Some(true) && m["qty"].as_str() != Some("0"));
+    assert!(out.is_some(), "调出行（W01 负数）应在报表：{r}");
+    assert!(inn.is_some(), "调入行（W02 正数）应在报表：{r}");
+
+    // 批次主仓标签改写 = W02，总量仍 8
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/batches?item=RM10", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let bt = r["rows"].as_array().unwrap().iter().find(|b| b["batch_no"] == "BT500").unwrap().clone();
+    assert_eq!(bt["warehouse"], "W02", "主仓标签改写：{bt}");
+    assert_eq!(bt["balance"].as_str().unwrap().parse::<f64>().unwrap(), 8.0, "调拨不改变总量");
+
+    // 超额（分仓余额不足）→ 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/transfer",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(),
+                "item": "RM10", "batch_no": "BT500",
+                "from_warehouse": "W01", "to_warehouse": "W02",
+                "qty": "100", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "W01 余额 5 < 100 应拒");
+
+    // FEFO 自动选批（batch_no 空）：W02→W01 ×2，返回选中批号
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/transfer",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(),
+                "item": "RM10", "batch_no": "",
+                "from_warehouse": "W02", "to_warehouse": "W01",
+                "qty": "2", "memo": "FEFO 自动"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "FEFO 自动选批");
+    let tr: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(tr["batch_no"], "BT500", "唯一可用批次被 FEFO 选中");
+}
+
 /// 发货通知 + 票款勾稽：未确认拒通知/超未发量拒 → 出库自动完成通知 → 收款与发票建边。
 #[tokio::test]
 async fn ship_notice_flow() {

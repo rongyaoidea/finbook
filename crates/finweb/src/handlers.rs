@@ -409,6 +409,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/qc", post(qc_order_ep))
         .route("/api/inventory/below-safety", get(below_safety_ep))
         .route("/api/funds/forecast", get(get_funds_forecast))
+        .route("/api/funds/forecast-rolling", get(funds_forecast_rolling_ep))
         // 预算分析
         .route("/api/budget/analysis", get(get_budget_analysis))
         // 成本：计价配置 + 期末结价
@@ -9277,6 +9278,28 @@ async fn get_funds_forecast(
     let period = current_period(&state, &user);
     let fc = findb::funds::funds_forecast(&db, period)?;
     Ok(Json(serde_json::json!({ "period": period.label(), "forecast": fc })))
+}
+
+/// 滚动资金预测（票据到期 + 融资起止按期间展开）
+async fn funds_forecast_rolling_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::FinReport)?;
+    let db = state.db_for(&user.book_key)?;
+    let from = q
+        .get("from")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let n = q
+        .get("periods")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(6);
+    Ok(Json(json!({
+        "from": period_to_str(from),
+        "rows": findb::funds::funds_forecast_rolling(&db, from, n)?,
+    })))
 }
 
 // ---------------------------------------------------------------------------

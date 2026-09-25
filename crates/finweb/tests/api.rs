@@ -4096,6 +4096,66 @@ async fn doc_prefix_and_wf_message() {
     assert!(r["ok"] == true, "终态批准：{r}");
 }
 
+/// P2：滚动资金预测——票据到期 + 融资起止按期间展开。
+#[tokio::test]
+async fn funds_rolling_forecast() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 应收票据 1000 到期 202602；借款 500 起 202602 止 202603
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/bills",
+            &sid,
+            serde_json::json!({
+                "kind": "receivable", "no": "B1", "period": 202601,
+                "issue_date": "2026-01-05", "due_date": "2026-02-20",
+                "counterpart": "客户甲", "bank": "工行", "amount": "1000", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建票据");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/loans",
+            &sid,
+            serde_json::json!({
+                "kind": "borrow", "no": "L1", "bank": "工行", "principal": "500",
+                "rate_pct": "4.5", "start_date": "2026-02-01", "end_date": "2026-03-31", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建融资");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/funds/forecast-rolling?from=202601&periods=3",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "滚动预测：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let n = |v: &serde_json::Value| v.as_str().unwrap().replace(',', "").parse::<f64>().unwrap();
+    // 202602：票据收 1000 + 融资到账 500 → 净 1500
+    let feb = &rows[1];
+    assert!((n(&feb["bill_in"]) - 1000.0).abs() < 0.005, "2 月票据到期：{feb}");
+    assert!((n(&feb["loan_in"]) - 500.0).abs() < 0.005, "2 月融资到账：{feb}");
+    assert!((n(&feb["net"]) - 1500.0).abs() < 0.005, "2 月净流 1500：{feb}");
+    assert!((n(&feb["balance"]) - 1500.0).abs() < 0.005, "2 月结存 1500：{feb}");
+    // 202603：融资偿还 500 → 净 -500、结存 1000
+    let mar = &rows[2];
+    assert!((n(&mar["loan_out"]) - 500.0).abs() < 0.005, "3 月偿还：{mar}");
+    assert!((n(&mar["net"]) + 500.0).abs() < 0.005, "3 月净流 -500：{mar}");
+    assert!((n(&mar["balance"]) - 1000.0).abs() < 0.005, "3 月结存 1000：{mar}");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

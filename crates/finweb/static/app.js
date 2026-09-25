@@ -6189,6 +6189,23 @@ async function viewFunds(main) {
         }).join("")}
       </div>`;
     } catch (e) { body.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+    body.innerHTML += `<div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><b>滚动预测（票据到期 + 融资起止按期间展开）</b><span class="grow"></span>
+        <label style="font-size:12px">起 <input id="fr-from" value="${esc((state.current || "").replace("-", ""))}" style="width:90px" /></label>
+        <label style="font-size:12px">期数 <input id="fr-n" value="6" style="width:50px" /></label>
+        <button class="btn ghost sm" id="fr-run">滚动预测</button>
+      </div>
+      <div id="fr-out" class="muted" style="margin-top:6px">口径：期初结存=该期现金/银行期末（已记账）；不含未到期未核销往来</div>
+    </div>`;
+    $("#fr-run").onclick = async () => {
+      try {
+        const r = await api(`/funds/forecast-rolling?from=${encodeURIComponent($("#fr-from").value.trim())}&periods=${encodeURIComponent($("#fr-n").value.trim())}`);
+        const rows = r.rows || [];
+        $("#fr-out").innerHTML = rows.length
+          ? `<table class="grid"><thead><tr><th>期间</th><th class="num">票据到期(收)</th><th class="num">票据到期(付)</th><th class="num">融资到账</th><th class="num">融资偿还</th><th class="num">净流</th><th class="num">期末结存</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.period)}</td><td class="num">${fmt(x.bill_in)}</td><td class="num">${fmt(x.bill_out)}</td><td class="num">${fmt(x.loan_in)}</td><td class="num">${fmt(x.loan_out)}</td><td class="num"><b>${fmt(x.net)}</b></td><td class="num"><b>${fmt(x.balance)}</b></td></tr>`).join("")}</tbody></table>`
+          : `<div class="muted">无数据</div>`;
+      } catch (e) { $("#fr-out").innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+    };
   }
   // 页内写按钮按 voucher_new 显隐（初始进入与切页签都会经过）
   gateFundsWrites();

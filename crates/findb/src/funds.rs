@@ -884,6 +884,81 @@ pub fn funds_forecast(db: &Db, period: Period) -> DbResult<FundsForecast> {
     Ok(fc)
 }
 
+/// 滚动资金预测行（按期间展开：票据到期 + 融资到/还款 → 期末结存）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RollingRow {
+    pub period: Period,
+    pub bill_in: Money,
+    pub bill_out: Money,
+    pub loan_in: Money,
+    pub loan_out: Money,
+    pub net: Money,
+    pub balance: Money,
+}
+
+/// 滚动资金预测：从 `from` 起 N 期，按**到期日/起止日**展开在库票据与存续融资，
+/// 逐期结存 = 上期结存 + 本期净流。口径声明：不含未到期未核销往来（应收/应付按账龄
+/// 分布预测留待 v2）；起始结存 = 该期现金/银行科目期末（已记账 H-3）。
+pub fn funds_forecast_rolling(db: &Db, from: Period, periods: usize) -> DbResult<Vec<RollingRow>> {
+    let daily = funds_daily(db, from)?;
+    let mut balance: Money = daily.iter().map(|d| d.end).sum();
+    let n = periods.clamp(1, 24);
+    let mut out = Vec::with_capacity(n);
+    let mut p = from;
+    for _ in 0..n {
+        let mut bill_in = Money::ZERO;
+        let mut bill_out = Money::ZERO;
+        for b in bill_list(db, None)? {
+            if b.status != BillStatus::InHand.code() {
+                continue;
+            }
+            if Period::from_date(b.due_date).ymm() != p.ymm() {
+                continue;
+            }
+            if b.kind == "receivable" {
+                bill_in = bill_in + b.amount;
+            } else {
+                bill_out = bill_out + b.amount;
+            }
+        }
+        let mut loan_in = Money::ZERO;
+        let mut loan_out = Money::ZERO;
+        for l in loan_list(db, None)? {
+            if l.status != "active" {
+                continue;
+            }
+            // 放款（lend）在 start 日出账、end 日收回；借款（borrow）反之
+            if Period::from_date(l.start_date).ymm() == p.ymm() {
+                if l.kind == "lend" {
+                    loan_out = loan_out + l.principal;
+                } else {
+                    loan_in = loan_in + l.principal;
+                }
+            }
+            if Period::from_date(l.end_date).ymm() == p.ymm() {
+                if l.kind == "lend" {
+                    loan_in = loan_in + l.principal;
+                } else {
+                    loan_out = loan_out + l.principal;
+                }
+            }
+        }
+        let net = bill_in - bill_out + loan_in - loan_out;
+        balance = balance + net;
+        out.push(RollingRow {
+            period: p,
+            bill_in,
+            bill_out,
+            loan_in,
+            loan_out,
+            net,
+            balance,
+        });
+        p = p.next();
+    }
+    Ok(out)
+}
+
 // ===========================================================================
 // 现金盘点（出纳）
 // ===========================================================================

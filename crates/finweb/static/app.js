@@ -453,6 +453,7 @@ const NAV_ITEMS = [
   { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
   { id: "inv-serial", label: "序列号", perm: "warehouse", group: "库存" },
   { id: "inv-unit", label: "多单位换算", perm: "warehouse", group: "库存" },
+  { id: "warehouses", label: "仓库档案", perm: "warehouse", group: "库存" },
   { id: "inv-assemble", label: "组装拆卸", perm: "warehouse", group: "库存" },
   { id: "inv-warehouse", label: "分仓库库存", perm: "report", group: "库存" },
   { id: "inv-transfer", label: "调拨报表", perm: "report", group: "库存" },
@@ -506,6 +507,7 @@ const VIEWS = {
   "inv-serial": viewInvSerial,
   "inv-unit": viewInvUnit,
   "inv-assemble": viewInvAssemble,
+  "warehouses": viewWarehouses,
   "inv-warehouse": viewInvWarehouse,
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
@@ -4271,6 +4273,78 @@ async function viewInvAssemble(main) {
   $("#ia-undo").addEventListener("click", () => doOp(true));
 }
 
+// ===========================================================================
+// 仓库档案（主数据，v30）：默认仓/停用/删除守卫
+// ===========================================================================
+async function viewWarehouses(main) {
+  main.innerHTML = `<h2>仓库档案</h2>
+    <div class="toolbar">
+      <button class="btn ghost sm" id="wh-reload">刷新</button>
+      ${can("warehouse") ? `<button class="btn primary sm" id="wh-new">新增仓库</button>` : ""}
+      <span class="muted" style="font-size:12px">出入库未填仓库时按默认仓入账；默认仓不可删除，被流水引用的仓不可删除（可停用）</span>
+    </div>
+    <div class="panel"><div id="wh-list" class="muted">加载中…</div></div>`;
+  const load = async () => {
+    try {
+      const r = await api("/warehouses");
+      const rows = r.rows || [];
+      $("#wh-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>编码</th><th>名称</th><th>默认</th><th>状态</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((w) => `<tr>
+            <td>${esc(w.code)}</td><td>${esc(w.name)}</td>
+            <td>${w.is_default ? '<span class="tag ok">默认</span>' : ""}</td>
+            <td>${w.disabled ? '<span class="tag err">停用</span>' : '<span class="tag">启用</span>'}</td>
+            <td>${esc(w.memo || "")}</td>
+            <td class="row-actions">${can("warehouse") ? `${w.is_default ? "" : `<button class="btn ghost sm" data-wh-def="${esc(w.code)}">设默认</button>`}<button class="btn ghost sm" data-wh-edit="${esc(w.code)}">编辑</button>${w.is_default ? "" : `<button class="btn danger sm" data-wh-del="${esc(w.code)}">删</button>`}` : ""}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无仓库（升级后应自动有默认仓「01 主仓」）</div>`;
+      window._whCache = rows;
+      $all("[data-wh-def]", main).forEach((b) => b.onclick = async () => {
+        const w = (window._whCache || []).find((x) => x.code === b.dataset.whDef);
+        if (!w) return;
+        try {
+          await api("/warehouses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({}, w, { is_default: true })) });
+          toast("已设为默认仓", "ok");
+          load();
+        } catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-wh-edit]", main).forEach((b) => b.onclick = () => {
+        const w = (window._whCache || []).find((x) => x.code === b.dataset.whEdit);
+        if (w) openWhEditor(w);
+      });
+      $all("[data-wh-del]", main).forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog(`删除仓库 ${b.dataset.whDel}？被流水引用过将无法删除。`, true))) return;
+        try { await api(`/warehouses/${encodeURIComponent(b.dataset.whDel)}`, { method: "DELETE" }); toast("已删除", "ok"); load(); }
+        catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#wh-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  function openWhEditor(w) {
+    const isNew = !w;
+    const c = w || { code: "", name: "", is_default: false, disabled: false, memo: "" };
+    const m = modal(`<h3>${isNew ? "新增" : "编辑"}仓库</h3>
+      <div class="field"><label>编码 *</label><input id="wh-code" value="${esc(c.code)}" ${isNew ? "" : "disabled"} /></div>
+      <div class="field"><label>名称 *</label><input id="wh-name" value="${esc(c.name)}" /></div>
+      <div class="field"><label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="wh-def" ${c.is_default ? "checked" : ""}/> 设为默认仓（出入库未填仓库时使用）</label></div>
+      <div class="field"><label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" id="wh-dis" ${c.disabled ? "checked" : ""}/> 停用（不可再入账）</label></div>
+      <div class="field"><label>备注</label><input id="wh-memo" value="${esc(c.memo || "")}" /></div>
+      <div class="foot"><button class="btn primary" id="wh-save">保存</button><button class="btn ghost" id="wh-cancel">取消</button></div>`);
+    $("#wh-cancel", m).onclick = closeModal;
+    $("#wh-save", m).onclick = async () => {
+      const body = {
+        code: $("#wh-code", m).value.trim(), name: $("#wh-name", m).value.trim(),
+        is_default: $("#wh-def", m).checked, disabled: $("#wh-dis", m).checked, memo: $("#wh-memo", m).value.trim(),
+      };
+      if (!body.code || !body.name) { toast("编码与名称必填", "err"); return; }
+      try {
+        await api("/warehouses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        toast("已保存", "ok"); closeModal(); load();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  }
+  if ($("#wh-new", main)) $("#wh-new").onclick = () => openWhEditor(null);
+  $("#wh-reload", main).onclick = load;
+  load();
+}
+
 async function viewInvWarehouse(main) {
   main.innerHTML = `<h2>分仓库库存</h2>
     <div class="toolbar">
@@ -4816,6 +4890,7 @@ async function viewPoDoc(main) {
     <div class="toolbar">
       <label>采购订单ID <input id="pd-poid" style="width:80px" /></label>
       <label>数量/金额 <input id="pd-amt" style="width:100px" /></label>
+      <label>仓库 <input id="pd-wh" style="width:90px" placeholder="默认仓" /></label>
       <label>备注 <input id="pd-memo2" style="width:120px" /></label>
       <button class="btn" id="pd-receipt">到货</button>
       <button class="btn" id="pd-return">退货</button>
@@ -4893,8 +4968,8 @@ async function viewPoDoc(main) {
   const poid = () => parseInt($("#pd-poid").value.trim(), 10) || 0;
   const amt = () => $("#pd-amt").value.trim();
   const memo = () => $("#pd-memo2").value.trim();
-  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const rr = await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(rr && rr.qc_pending ? "已到货（待检入库，待质检转正后可用）" : "已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const rr = await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), memo: memo() }); toast(rr && rr.qc_pending ? "已到货（待检入库，待质检转正后可用）" : "已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已付款，付款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   load();
 }
@@ -4921,6 +4996,7 @@ async function viewSoDoc(main) {
     <div class="toolbar">
       <label>销售订单ID <input id="sd-soid" style="width:80px" /></label>
       <label>数量/金额 <input id="sd-amt" style="width:100px" /></label>
+      <label>仓库 <input id="sd-wh" style="width:90px" placeholder="默认仓" /></label>
       <label>备注 <input id="sd-memo" style="width:120px" /></label>
       <button class="btn" id="sd-ship">发货</button>
       <button class="btn" id="sd-return">退货</button>
@@ -5002,7 +5078,7 @@ async function viewSoDoc(main) {
   const soid = () => parseInt($("#sd-soid").value.trim(), 10) || 0;
   const amt = () => $("#sd-amt").value.trim();
   const memo = () => $("#sd-memo").value.trim();
-  $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已发货，确认收入凭证 #${r.voucher_id}` : "已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); snLoad(); } catch (e) { toast(e.message, "err"); } });
+  $("#sd-ship").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/shipment", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#sd-wh").value.trim(), memo: memo() }); toast(r && r.voucher_id ? `已发货，确认收入凭证 #${r.voucher_id}` : "已发货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); snLoad(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-return").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/return", { so_id: soid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(r && r.voucher_id ? `已退货，冲回凭证 #${r.voucher_id}` : "已退货", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-pay").addEventListener("click", async () => { if (!soid()) { toast("请填写销售订单ID", "err"); return; } try { const r = await postJson("/sales/payment", { so_id: soid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已收款，收款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已收款", "ok"); $("#sd-amt").value=""; $("#sd-memo").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#sd-credit").addEventListener("click", async () => {

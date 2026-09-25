@@ -258,6 +258,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/assemble", post(assemble_endpoint))
         .route("/api/inventory/disassemble", post(disassemble_endpoint))
         .route("/api/inventory/warehouse-stock", get(get_warehouse_stock))
+        // 仓库主数据（v30）
+        .route(
+            "/api/warehouses",
+            get(list_warehouses).post(save_warehouse),
+        )
+        .route("/api/warehouses/:code", delete(delete_warehouse))
         .route(
             "/api/inventory/transfer",
             get(get_transfer_report).post(do_transfer),
@@ -4673,6 +4679,49 @@ async fn get_transfer_report(
     Ok(Json(serde_json::json!({ "rows": items })))
 }
 
+// ---- 仓库主数据（v30） ----
+
+/// 仓库档案列表（读：Report；默认仓在前）
+async fn list_warehouses(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::warehouse::list(&db)? })))
+}
+
+/// 新增/修改仓库（写：Warehouse；设默认仓自动清其它默认标记）
+async fn save_warehouse(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(w): Json<findb::warehouse::Warehouse>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::warehouse::save(&db, &w)?;
+    db.log(
+        user.username(),
+        "库存",
+        "仓库档案",
+        &format!("{} {}（默认={}）", w.code, w.name, w.is_default),
+    )?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 删除仓库：默认仓不可删、被流水/盘点引用不可删
+async fn delete_warehouse(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::warehouse::delete(&db, &code)?;
+    db.log(user.username(), "库存", "删除仓库", &code)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ---- 采购/销售深度：暂估 / 对账 / 配额 / 订单变更 ----
 
 #[derive(Deserialize)]
@@ -4894,6 +4943,9 @@ struct ReceiptReq {
     pub qty: String,
     #[serde(default)]
     pub memo: String,
+    /// 仓库编码（留空 = 默认仓）
+    #[serde(default)]
+    pub warehouse: String,
 }
 
 async fn add_po_receipt(
@@ -4911,7 +4963,7 @@ async fn add_po_receipt(
     };
     let id = findb::procurement::po_receipt_with_stock(&db, &findb::procurement::PoReceipt {
         id: 0, po_id: req.po_id, period, date, qty: parse_money_checked(&req.qty)?, memo: req.memo,
-    })?;
+    }, &req.warehouse)?;
     // 待检提示：首行存货勾选了来料检验 → 入库为待检状态（质检转正后方可领用）
     let qc_pending = findb::scm::po_get(&db, req.po_id)?
         .and_then(|p| {
@@ -4936,7 +4988,7 @@ async fn add_po_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_return_with_stock(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo)?;
+    let id = findb::procurement::po_return_with_stock(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo, &req.warehouse)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -5110,6 +5162,9 @@ struct ShipmentReq {
     pub qty: String,
     #[serde(default)]
     pub memo: String,
+    /// 仓库编码（留空 = 默认仓）
+    #[serde(default)]
+    pub warehouse: String,
 }
 
 async fn add_so_shipment(
@@ -5140,7 +5195,7 @@ async fn add_so_shipment(
     }
     // 确认收入与应收（比例法；先出凭证再落发货流水，金额为零时无凭证）
     let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty, date, user.username())?;
-    let id = findb::sales::so_shipment_with_stock(&db, req.so_id, period, date, qty, &req.memo)?;
+    let id = findb::sales::so_shipment_with_stock(&db, req.so_id, period, date, qty, &req.memo, &req.warehouse)?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     // 出库成功 → 完成该订单最早一条待发通知（备货指令闭环）
     let _ = findb::sales::notice_fulfill_on_shipment(&db, req.so_id)?;
@@ -5175,7 +5230,7 @@ async fn add_so_return(
     }
     // 冲回收入与应收（负向比例；封顶已发货量）
     let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty.negated(), date, user.username())?;
-    let id = findb::sales::so_return_with_stock(&db, req.so_id, period, date, qty, &req.memo)?;
+    let id = findb::sales::so_return_with_stock(&db, req.so_id, period, date, qty, &req.memo, &req.warehouse)?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }

@@ -222,14 +222,17 @@ fn stock_purchase_in(
     period: Period,
     date: NaiveDate,
     memo: &str,
+    warehouse: &str,
 ) -> DbResult<i64> {
+    // 仓库：空 = 默认仓；非空必须存在且未停用（仓库主数据 v30）
+    let wh = crate::warehouse::resolve_conn(tx, warehouse)?;
     let mut mv = crate::business::StockMove {
         id: 0,
         period,
         biz_date: date,
         kind: crate::business::StockKind::Purchase,
         item: item.to_string(),
-        warehouse: String::new(),
+        warehouse: wh,
         batch_no: String::new(),
         qty,
         price,
@@ -275,7 +278,7 @@ fn refresh_po_status(db: &Db, po_id: i64) -> DbResult<()> {
     Ok(())
 }
 
-pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
+pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt, warehouse: &str) -> DbResult<i64> {
     if r.qty.is_negative() || r.qty.is_zero() {
         return Err(fincore::FinError::msg("到货数量必须为正数").into());
     }
@@ -301,6 +304,7 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
         r.period,
         r.date,
         &format!("采购入库 {}", po.no),
+        warehouse,
     )?;
     // 来料检验（存货档案 qc_required=1）→ 入库标记待检：可用量口径排除，质检转正后方可领用
     if crate::business::item_qc_required(db, &item) {
@@ -320,6 +324,7 @@ pub fn po_return_with_stock(
     date: NaiveDate,
     qty: Money,
     memo: &str,
+    warehouse: &str,
 ) -> DbResult<i64> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("退货数量必须为正数").into());
@@ -352,6 +357,7 @@ pub fn po_return_with_stock(
         period,
         date,
         &format!("采购退货 {}", po.no),
+        warehouse,
     )?;
     tx.commit()?;
     // 退货后重算订单执行状态（可能从「已完成」回落到「部分入库」/「已确认」）
@@ -534,6 +540,7 @@ pub fn qc_save(
                 Period::from_date(date),
                 date,
                 &format!("质检退货 {}", po.no),
+                "",
             )?;
         }
         (qty_insp, qty_fail, r)

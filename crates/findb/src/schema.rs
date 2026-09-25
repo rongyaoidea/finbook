@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 29;
+pub const SCHEMA_VERSION: i64 = 30;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -410,6 +410,15 @@ CREATE TABLE IF NOT EXISTS stock_move (
 );
 CREATE INDEX IF NOT EXISTS idx_stock_period ON stock_move(period, item);
 CREATE INDEX IF NOT EXISTS idx_stock_item ON stock_move(item, biz_date);
+
+-- 仓库主数据（v30；建账/升级自动种默认仓「01 主仓」，见迁移链）
+CREATE TABLE IF NOT EXISTS warehouse (
+    code        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    is_default  INTEGER NOT NULL DEFAULT 0,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    memo        TEXT NOT NULL DEFAULT ''
+);
 
 -- 工资表
 CREATE TABLE IF NOT EXISTS payroll (
@@ -1718,6 +1727,12 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V24)?;
             migrate_generic(conn, MIGRATE_V25)?;
             migrate_generic(conn, MIGRATE_V26)?;
+            // v30：仓库主数据种默认仓（建表在 DDL；老账套升级即得，幂等）
+            conn.execute(
+                "INSERT OR IGNORE INTO warehouse(code,name,is_default,disabled,memo)
+                 VALUES('01','主仓',1,0,'')",
+                [],
+            )?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

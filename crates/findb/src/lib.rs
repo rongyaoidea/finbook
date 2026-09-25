@@ -45,6 +45,7 @@ pub mod manufacturing;
 pub mod stock;
 pub mod users;
 pub mod vouchers;
+pub mod warehouse;
 
 use std::path::{Path, PathBuf};
 

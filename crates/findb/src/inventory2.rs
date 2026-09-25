@@ -266,6 +266,7 @@ pub fn assemble(
         total = total + amount;
         plan.push((item.clone(), *qty, unit, amount));
     }
+    let wh = crate::warehouse::resolve(db, "")?;
     for (item, qty, unit, amount) in &plan {
         stock_insert(
             db,
@@ -275,7 +276,7 @@ pub fn assemble(
                 biz_date: date,
                 kind: StockKind::OtherOut,
                 item: item.clone(),
-                warehouse: String::new(),
+                warehouse: wh.clone(),
                 batch_no: String::new(),
                 qty: qty.negated(),
                 price: *unit,
@@ -293,7 +294,7 @@ pub fn assemble(
             biz_date: date,
             kind: StockKind::OtherIn,
             item: parent.to_string(),
-            warehouse: String::new(),
+            warehouse: wh,
             batch_no: String::new(),
             qty: Money::ONE,
             price: total,
@@ -341,6 +342,7 @@ pub fn disassemble(
         .into());
     }
     let total = unit; // 成品出库 1 件
+    let wh = crate::warehouse::resolve(db, "")?;
     // 成品出库
     stock_insert(
         db,
@@ -350,7 +352,7 @@ pub fn disassemble(
             biz_date: date,
             kind: StockKind::OtherOut,
             item: parent.to_string(),
-            warehouse: String::new(),
+            warehouse: wh.clone(),
             batch_no: String::new(),
             qty: Money::ONE.negated(),
             price: unit,
@@ -382,7 +384,7 @@ pub fn disassemble(
                 biz_date: date,
                 kind: StockKind::OtherIn,
                 item: item.clone(),
-                warehouse: String::new(),
+                warehouse: wh.clone(),
                 batch_no: String::new(),
                 qty: *qty,
                 price,
@@ -427,6 +429,7 @@ pub fn form_convert(
         .into());
     }
     let amount = qty * unit;
+    let wh = crate::warehouse::resolve(db, "")?;
     use crate::business::{stock_insert, StockKind, StockMove};
     stock_insert(
         db,
@@ -436,7 +439,7 @@ pub fn form_convert(
             biz_date: date,
             kind: StockKind::OtherOut,
             item: from_item.to_string(),
-            warehouse: String::new(),
+            warehouse: wh.clone(),
             batch_no: String::new(),
             qty: qty.negated(),
             price: unit,
@@ -661,12 +664,13 @@ pub fn transfer_do(
 ) -> DbResult<(i64, i64)> {
     let item = item.trim();
     let bn = batch_no.trim();
-    let from = from_wh.trim();
-    let to = to_wh.trim();
+    // 仓库主数据校验：源/目标仓必须存在且未停用（空值已在下方拒绝）
+    let from = crate::warehouse::resolve(db, from_wh)?;
+    let to = crate::warehouse::resolve(db, to_wh)?;
     if item.is_empty() || bn.is_empty() {
         return Err(fincore::FinError::msg("存货编码与批号必填").into());
     }
-    if from.is_empty() || to.is_empty() {
+    if from_wh.trim().is_empty() || to_wh.trim().is_empty() {
         return Err(fincore::FinError::state("源仓与目标仓必填").into());
     }
     if from == to {

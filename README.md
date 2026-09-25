@@ -535,6 +535,15 @@
 - **采购订单执行状态自动推进**（对标金蝶）：`po_receipt_with_stock` / `po_return_with_stock` 结束后按**累计净收货**刷新——≥ 订购量 → `Completed`、>0 → `PartialIn`、=0 → `Confirmed`；已取消不回退（`WHERE status <> 'Cancelled'`）。
 - **测试**：web `quote_link_and_po_status`——报价→审批→转订单→链上游见报价；PO 10 @9：到货 4 → PartialIn → 到货 6 → Completed → 退货 2 → PartialIn。
 
+### 4.41 仓库主数据（对标金蝶仓库档案，schema v30）
+
+- **模型**：新表 `warehouse`（编码/名称/默认/停用/备注）；建账与老账套升级**自动种默认仓「01 主仓」**（幂等）。
+- **写入口径**：出入库统一走 `warehouse::resolve`——**空 = 默认仓**；非空必须存在且未停用（400）。覆盖：采购到货/退货、销售发货/退货、组装/拆卸、形态转换、调拨（源/目标校验）、质检退货。
+- **守卫**：默认仓不可删除；被 `stock_move`/`inv_count_line` 引用过的仓不可删除（可停用）；设为默认仓自动清其它默认标记（单默认）。
+- **端点**：`GET /api/warehouses`（Report）+ `POST /api/warehouses`（Warehouse，upsert）+ `DELETE /api/warehouses/:code`（Warehouse）。
+- **UI**：库存组新增「仓库档案」页（列表/新增/编辑/设默认/删）；采购与销售执行坞新增「仓库」输入（留空 = 默认仓）。
+- **测试**：web `warehouse_master_flow`——默认仓 01 → 新增/改名 02 → 到货指定 02 分仓可见 → 留空走默认 01 → 非法仓 400 → 停用仓 400 → 默认仓/被引用仓不可删、未引用仓可删。
+
 ---
 
 ## 5. 关键设计约定

@@ -2803,6 +2803,191 @@ async fn quote_link_and_po_status() {
     );
 }
 
+/// P1：仓库主数据——默认仓、CRUD 守卫、出入库带仓/非法仓拒绝、默认仓兜底。
+#[tokio::test]
+async fn warehouse_master_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d13 = format!("{}-13", dash["current_period"].as_str().unwrap());
+
+    // 默认仓已种（01 主仓）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/warehouses", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let def = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["code"] == "01")
+        .expect("应有默认仓 01");
+    assert_eq!(def["is_default"], true);
+    assert_eq!(def["name"], "主仓");
+
+    // 新增 02 成品仓 → upsert 改名
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/warehouses",
+            &sid,
+            serde_json::json!({ "code": "02", "name": "成品仓" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增仓库 02");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/warehouses",
+            &sid,
+            serde_json::json!({ "code": "02", "name": "成品仓A", "is_default": false, "disabled": false, "memo": "m" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改名 upsert");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/warehouses", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().iter().any(|x| x["code"] == "02" && x["name"] == "成品仓A"),
+        "名称应已更新：{r}"
+    );
+
+    // 采购 5@9：到货指定 02 → 分仓库存可见 02
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d13, "supplier_code": "S01", "supplier_name": "供应商甲",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "5", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "5", "warehouse": "02", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货指定仓库 02");
+    let wh_qty = |state: Arc<WebState>, sid: String| async move {
+        let resp = handlers::router(state)
+            .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+            .await
+            .unwrap();
+        let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                (
+                    x["warehouse"].as_str().unwrap().to_string(),
+                    x["qty"].as_str().unwrap().replace(',', "").parse::<f64>().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let rows = wh_qty(state.clone(), sid.clone()).await;
+    assert!(
+        rows.iter().any(|(w, q)| w == "02" && (*q - 5.0).abs() < 0.005),
+        "02 仓应有 5：{rows:?}"
+    );
+
+    // 不填仓库 → 默认仓 01 兜底
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "1", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "默认仓到货");
+    let rows = wh_qty(state.clone(), sid.clone()).await;
+    assert!(
+        rows.iter().any(|(w, q)| w == "01" && (*q - 1.0).abs() < 0.005),
+        "默认仓 01 应有 1：{rows:?}"
+    );
+
+    // 非法仓 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "1", "warehouse": "ZZ" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不存在仓库应 400");
+
+    // 停用后写入 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/warehouses",
+            &sid,
+            serde_json::json!({ "code": "02", "name": "成品仓A", "disabled": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "停用 02");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "1", "warehouse": "02" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "停用仓应 400");
+
+    // 删除守卫：默认仓 400；被引用仓 400；未引用仓 200
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/warehouses/01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "默认仓不可删");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/warehouses/02", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "被引用仓不可删");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/warehouses",
+            &sid,
+            serde_json::json!({ "code": "03", "name": "临时仓" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新增 03");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete("/api/warehouses/03", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "未引用仓可删");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

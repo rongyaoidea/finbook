@@ -217,14 +217,17 @@ fn stock_sale_in(
     period: Period,
     date: NaiveDate,
     memo: &str,
+    warehouse: &str,
 ) -> DbResult<()> {
+    // 仓库：空 = 默认仓；非空必须存在且未停用（仓库主数据 v30）
+    let wh = crate::warehouse::resolve_conn(tx, warehouse)?;
     let mut mv = crate::business::StockMove {
         id: 0,
         period,
         biz_date: date,
         kind: crate::business::StockKind::Sale,
         item: item.to_string(),
-        warehouse: String::new(),
+        warehouse: wh,
         batch_no: String::new(),
         qty,
         price: Money::ZERO,
@@ -255,6 +258,7 @@ pub fn so_shipment_with_stock(
     date: NaiveDate,
     qty: Money,
     memo: &str,
+    warehouse: &str,
 ) -> DbResult<i64> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("发货数量必须为正数").into());
@@ -283,6 +287,7 @@ pub fn so_shipment_with_stock(
         period,
         date,
         &format!("销售出库 {}", so.no),
+        warehouse,
     )?;
     tx.commit()?;
     Ok(rid)
@@ -297,6 +302,7 @@ pub fn so_return_with_stock(
     date: NaiveDate,
     qty: Money,
     memo: &str,
+    warehouse: &str,
 ) -> DbResult<i64> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("退货数量必须为正数").into());
@@ -334,6 +340,7 @@ pub fn so_return_with_stock(
         period,
         date,
         &format!("销售退货 {}", so.no),
+        warehouse,
     )?;
     tx.commit()?;
     Ok(rid)

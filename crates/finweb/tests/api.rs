@@ -3840,6 +3840,102 @@ async fn budget_control_flow() {
     assert_eq!(save_voucher("50").await, StatusCode::OK, "strong 未超放行");
 }
 
+/// P2：银行代发文件 + 工资条 + 个税申报表。
+#[tokio::test]
+async fn payroll_bank_slip_tax() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 员工档案：E001 带银行账号，E002 无
+    for (code, props) in [
+        ("E001", serde_json::json!({ "bank_account": "6222001", "bank_name": "张三" })),
+        ("E002", serde_json::json!({})),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/aux",
+                &sid,
+                serde_json::json!({
+                    "id": 0, "kind": "employee", "code": code, "name": code,
+                    "parent_code": null, "disabled": false, "props": props, "memo": ""
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "员工档案 {code}");
+    }
+    // 工资两条
+    for (emp, gross) in [("E001", "10000"), ("E002", "8000")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/payroll?period=202601",
+                &sid,
+                serde_json::json!({
+                    "employee": emp, "dept": "财务部", "gross": gross,
+                    "social": "500", "housing": "300", "deduction": "0",
+                    "additional": "1000", "social_co": "800", "housing_co": "300", "memo": ""
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "工资 {emp}");
+    }
+
+    // 银行代发：CSV 含账号与户名；无账号员工跳过
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/payroll/bank-file?period=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let csv = body_string(resp).await;
+    assert!(csv.contains("6222001"), "代发应含账号：{csv}");
+    assert!(csv.contains("张三"), "户名取档案 bank_name：{csv}");
+    assert!(!csv.contains("E002"), "无账号员工应跳过：{csv}");
+
+    // 工资条：先补 202602 一条，验证 YTD 口径 = 截至上月（2 月时累计 1 个月）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/payroll?period=202602",
+            &sid,
+            serde_json::json!({
+                "employee": "E001", "dept": "财务部", "gross": "10000",
+                "social": "500", "housing": "300", "deduction": "0",
+                "additional": "1000", "social_co": "800", "housing_co": "300", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "2 月工资");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/payroll/slip?period=202602&employee=E001",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["payroll"]["net"].as_str().is_some(), "工资条实发：{r}");
+    assert_eq!(r["ytd"]["months"], 1, "2 月时本年累计 1 个月：{r}");
+    assert!(
+        r["ytd"]["income"].as_str().unwrap().contains("10,000"),
+        "累计收入=1 月应发：{r}"
+    );
+    // 缺 employee → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/payroll/slip?period=202602", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "缺 employee 应 400");
+
+    // 个税申报表：2 人
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/payroll/tax-report?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 2, "申报表 2 人：{r}");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

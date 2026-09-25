@@ -7669,6 +7669,9 @@ async function viewPayroll(main) {
       <button class="btn ghost sm" id="py-next">下期 ▶</button>
       <button class="btn" id="py-refresh">刷新</button>
       ${can("export") ? `<button class="btn ghost sm" id="py-export">导出 CSV</button>` : ""}
+      ${can("export") ? `<button class="btn ghost sm" id="py-bank">银行代发</button>` : ""}
+      <button class="btn ghost sm" id="py-slip">工资条</button>
+      <button class="btn ghost sm" id="py-taxrep">个税申报表</button>
     </div>
     <div id="py-body" class="muted">加载中…</div>`;
   const body = $("#py-body");
@@ -7682,6 +7685,46 @@ async function viewPayroll(main) {
   $("#py-refresh").onclick = () => switchPeriod($("#py-period").value.trim() || period);
   $("#py-period").addEventListener("keydown", (e) => { if (e.key === "Enter") switchPeriod($("#py-period").value.trim() || period); });
   if ($("#py-export")) $("#py-export").onclick = () => window.open(`/api/export/payroll?period=${encodeURIComponent(period)}`, "_blank");
+  if ($("#py-bank")) $("#py-bank").onclick = () => window.open(`/api/payroll/bank-file?period=${encodeURIComponent(ymm(period))}`, "_blank");
+  // 工资条：单人本期 + 本年累计（打印预览）
+  $("#py-slip").onclick = () => {
+    const m = modal(`<h3>工资条</h3>
+      <div class="field"><label>员工编码 *</label><input id="ps-emp" placeholder="如 E001" /></div>
+      <div id="ps-out" class="muted">输入员工编码后查询</div>
+      <div class="foot"><button class="btn primary" id="ps-load">查询</button><button class="btn ghost" id="ps-print">打印预览</button><button class="btn ghost" id="ps-close">关闭</button></div>`);
+    $("#ps-close", m).onclick = closeModal;
+    $("#ps-load", m).onclick = async () => {
+      const emp = $("#ps-emp", m).value.trim();
+      if (!emp) { toast("请输入员工编码", "err"); return; }
+      try {
+        const r = await api(`/payroll/slip?period=${encodeURIComponent(ymm(period))}&employee=${encodeURIComponent(emp)}`);
+        const p = r.payroll, y = r.ytd;
+        $("#ps-out", m).innerHTML = `<table class="grid" id="ps-table"><tbody>
+          <tr><td>员工</td><td>${esc(p.employee)} ${esc(p.dept || "")}</td><td>期间</td><td>${esc(r.period)}</td></tr>
+          <tr><td>应发</td><td>${fmt(p.gross)}</td><td>社保(个人)</td><td>${fmt(p.social)}</td></tr>
+          <tr><td>公积金(个人)</td><td>${fmt(p.housing)}</td><td>其他扣除</td><td>${fmt(p.deduction)}</td></tr>
+          <tr><td>专项附加</td><td>${fmt(p.additional)}</td><td>计税基数</td><td>${fmt(p.tax_base)}</td></tr>
+          <tr><td>个税</td><td>${fmt(p.tax)}</td><td><b>实发</b></td><td><b>${fmt(p.net)}</b></td></tr>
+          <tr><td>单位社保</td><td>${fmt(p.social_co)}</td><td>单位公积金</td><td>${fmt(p.housing_co)}</td></tr>
+          <tr><td>本年累计收入</td><td>${fmt(y.income)}</td><td>累计已预扣个税</td><td>${fmt(y.withheld)}（${y.months} 个月）</td></tr>
+        </tbody></table>`;
+      } catch (e) { $("#ps-out", m).innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+    };
+    $("#ps-print", m).onclick = () => { const t = $("#ps-table", m); if (!t) { toast("先查询", "err"); return; } printPreview("工资条", t); };
+  };
+  // 个税申报表（全员工资薪金本期口径，打印预览）
+  $("#py-taxrep").onclick = async () => {
+    try {
+      const r = await api(`/payroll/tax-report?period=${encodeURIComponent(ymm(period))}`);
+      const trows = r.rows || [];
+      const m = modal(`<h3>个税申报表（${esc(r.period)}）</h3>
+        <table class="grid" id="tr-table"><thead><tr><th>员工</th><th>部门</th><th class="num">本期收入</th><th class="num">专项扣除</th><th class="num">专项附加</th><th class="num">计税基数</th><th class="num">个税</th><th class="num">实发</th></tr></thead>
+        <tbody>${trows.length ? trows.map((x) => `<tr><td>${esc(x.employee)}</td><td>${esc(x.dept || "")}</td><td class="num">${fmt(x.income)}</td><td class="num">${fmt(x.special)}</td><td class="num">${fmt(x.additional)}</td><td class="num">${fmt(x.tax_base)}</td><td class="num">${fmt(x.tax)}</td><td class="num">${fmt(x.net)}</td></tr>`).join("") : `<tr><td colspan="8" class="muted">本期无工资记录</td></tr>`}</tbody></table>
+        <div class="foot"><button class="btn ghost" id="tr-print">打印预览</button><button class="btn ghost" id="tr-close">关闭</button></div>`);
+      $("#tr-close", m).onclick = closeModal;
+      $("#tr-print", m).onclick = () => printPreview("个税申报表", $("#tr-table", m));
+    } catch (e) { toast(e.message, "err"); }
+  };
 
   const ymm6 = ymm(period);
   let rows = [], employees = [];

@@ -476,6 +476,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/payroll/social-pay", post(payroll_social_pay))
         .route("/api/payroll/pay", post(payroll_pay))
         .route("/api/payroll/:id", delete(delete_payroll))
+        .route("/api/payroll/bank-file", get(export_payroll_bank_file))
+        .route("/api/payroll/slip", get(get_payroll_slip))
+        .route("/api/payroll/tax-report", get(get_payroll_tax_report))
         .route("/api/claims", get(list_claims).post(create_claim))
         .route("/api/claims/next-no", get(next_claim_no))
         .route("/api/claims/:id", put(update_claim).delete(delete_claim))
@@ -11361,6 +11364,120 @@ async fn list_payroll(
         rows
     };
     Ok(Json(rows))
+}
+
+/// 员工银行信息（辅助档案 props.bank_account / bank_name）
+fn employee_bank(db: &findb::Db, code: &str) -> Result<(String, String), AppError> {
+    let e = auxs::get(db, AuxKind::Employee, code)?;
+    let props = e.map(|x| x.props).unwrap_or_default();
+    let acc = props.get("bank_account").cloned().unwrap_or_default();
+    let name = props.get("bank_name").cloned().unwrap_or_default();
+    Ok((acc.trim().to_string(), name.trim().to_string()))
+}
+
+/// 银行代发文件（CSV：账号,户名,金额；缺账号的员工跳过并计数）
+async fn export_payroll_bank_file(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let rows = business::payroll_list(&db, period)?;
+    let mut out = vec![vec!["账号".to_string(), "户名".to_string(), "金额".to_string()]];
+    let mut skipped = 0usize;
+    for p in &rows {
+        if !p.net.is_positive() {
+            continue;
+        }
+        let (acc, bank) = employee_bank(&db, &p.employee)?;
+        if acc.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        out.push(vec![
+            acc,
+            if bank.is_empty() { p.employee.clone() } else { bank },
+            p.net.fmt_plain(),
+        ]);
+    }
+    db.log(
+        user.username(),
+        "工资",
+        "银行代发文件",
+        &format!(
+            "{} 共 {} 人（缺账号跳过 {skipped}）",
+            period_to_str(period),
+            out.len().saturating_sub(1)
+        ),
+    )?;
+    Ok(csv_response(
+        &format!("bank_payroll_{}.csv", period.ymm()),
+        out,
+    ))
+}
+
+/// 工资条（单人）：本期工资 + 本年累计
+async fn get_payroll_slip(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let employee = q.get("employee").map(String::as_str).unwrap_or("").trim();
+    if employee.is_empty() {
+        return Err(AppError::bad_request("缺少 employee 参数"));
+    }
+    let p = business::payroll_get(&db, period, employee)?
+        .ok_or_else(|| AppError::not_found("该员工本期无工资记录"))?;
+    let ytd = business::payroll_ytd(&db, period, employee)?;
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "payroll": {
+            "employee": p.employee, "dept": p.dept,
+            "gross": p.gross.fmt_money(), "social": p.social.fmt_money(),
+            "housing": p.housing.fmt_money(), "deduction": p.deduction.fmt_money(),
+            "additional": p.additional.fmt_money(), "tax_base": p.tax_base.fmt_money(),
+            "tax": p.tax.fmt_money(), "net": p.net.fmt_money(),
+            "social_co": p.social_co.fmt_money(), "housing_co": p.housing_co.fmt_money(),
+            "memo": p.memo,
+        },
+        "ytd": {
+            "income": ytd.income.fmt_money(), "special": ytd.special.fmt_money(),
+            "additional": ytd.additional.fmt_money(), "withheld": ytd.withheld.fmt_money(),
+            "months": ytd.months,
+        },
+    })))
+}
+
+/// 个税申报表（全员工资薪金，本期口径）
+async fn get_payroll_tax_report(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let rows = business::payroll_list(&db, period)?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|p| {
+            json!({
+                "employee": p.employee, "dept": p.dept,
+                "income": p.gross.fmt_money(),
+                "special": (p.social + p.housing).fmt_money(),
+                "additional": p.additional.fmt_money(),
+                "tax_base": p.tax_base.fmt_money(),
+                "tax": p.tax.fmt_money(),
+                "net": p.net.fmt_money(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "period": period_to_str(period), "rows": items })))
 }
 
 /// 录入/修改一条工资：后端按累计预扣预缴法算个税与实发，前端无需自己算税

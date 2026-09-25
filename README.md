@@ -595,6 +595,14 @@
 - **Web 预算编制**：`GET /api/budget/rows?period=`（FinReport）+ `POST /api/budget/rows`（AccountEdit，按 期间+科目+部门+当前版本 upsert）+ `POST /api/budget/rows/:id/delete`；预算版本页新增「预算编制」面板（列表/新增/删除）。
 - **测试**：web `budget_control_flow`——编制 660201 预算 100 → warn：120 放行、50 放行 → strong：120 拒绝、50 放行。
 
+### 4.49 银行代发 + 工资条 + 个税申报表（P2）
+
+- **员工银行信息**：职员档案 `props.bank_account / bank_name`（辅助档案编辑器 props 已有机制）。
+- **银行代发文件**：`GET /api/payroll/bank-file?period=`（Export）——CSV（账号,户名,金额），户名优先档案 `bank_name`、缺账号员工跳过并计数审计；工资页「银行代发」按钮。
+- **工资条**：`GET /api/payroll/slip?period=&employee=`（VoucherNew）——本期应发/社保/公积金/其他扣除/专项附加/计税基数/个税/实发 + 单位承担 + 本年累计（收入/已预扣/月数）；工资页「工资条」弹窗（打印预览）。
+- **个税申报表**：`GET /api/payroll/tax-report?period=`（VoucherNew）——全员工资薪金本期口径（收入/专项扣除/专项附加/计税基数/个税/实发）；「个税申报表」弹窗（打印预览）。
+- **测试**：web `payroll_bank_slip_tax`——E001 带账号/E002 无：代发 CSV 含账号与户名、跳过 E002；工资条实发 + 累计 1 个月、缺 employee 400；申报表 2 人。
+
 ---
 
 ## 5. 关键设计约定

@@ -173,6 +173,8 @@ pub fn quo_to_order(db: &Db, id: i64, who: &str) -> DbResult<i64> {
             fincore::FinError::msg("报价单状态已变化，请刷新后重试").into(),
         );
     }
+    // 单据链：报价 → 销售订单（供单据链面板追溯上游）
+    crate::docflow::link_add(db, "quote", id, "so", so_id, "报价转订单")?;
     Ok(so_id)
 }
 

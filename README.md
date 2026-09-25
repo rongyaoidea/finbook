@@ -529,6 +529,12 @@
 - **UI**：往来核销页新增「催款单 / 对账函」面板——列表（状态标签 + 发出/结清/作废 + 查看）+ 新建（类型/客商）+ 明细弹窗（复用打印预览）。
 - **测试**：web `dunning_flow`——销售发货造应收 100 → 生成催款单（CK 号 / 100 / 明细非空）→ 无欠款 400 → sent→settled → 重复结清 / 已结清作废 400 → 列表含单 → 未知 404。
 
+### 4.40 供应链补链（报价→订单勾稽 + 采购到货推进订单状态）
+
+- **报价→订单 doc_link**：`quo_to_order` 生成订单时写 `doc_link(quote→so)`；单据链面板可见上游报价（`doc_chain::node_of` 新增 quote 节点：单号/日期/客户/数量/状态）。
+- **采购订单执行状态自动推进**（对标金蝶）：`po_receipt_with_stock` / `po_return_with_stock` 结束后按**累计净收货**刷新——≥ 订购量 → `Completed`、>0 → `PartialIn`、=0 → `Confirmed`；已取消不回退（`WHERE status <> 'Cancelled'`）。
+- **测试**：web `quote_link_and_po_status`——报价→审批→转订单→链上游见报价；PO 10 @9：到货 4 → PartialIn → 到货 6 → Completed → 退货 2 → PartialIn。
+
 ---
 
 ## 5. 关键设计约定

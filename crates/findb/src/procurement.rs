@@ -253,6 +253,28 @@ fn first_line(po: &crate::scm::PurchaseOrder) -> Result<&crate::scm::PoLine, fin
 /// 到货登记：执行流水 + 采购入库流水**同事务**。
 /// 防呆：订单无行拒、单价为 0 拒（0 价入库会污染移动平均——下推后请先补价）。
 /// 多行订单按首行（品/价）入库并 memo 注明；这也是「最近采购价」的真实数据源。
+/// 按累计净收货刷新采购订单执行状态（到货/退货共用）：
+/// 净收货 ≥ 订购量 → Completed；>0 → PartialIn；=0 → Confirmed；
+/// 已取消的单不回退（WHERE status <> 'Cancelled'）。
+fn refresh_po_status(db: &Db, po_id: i64) -> DbResult<()> {
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
+    let ordered: Money = po.lines.iter().map(|l| l.qty_ordered).sum();
+    let received = po_receipt_sum(db, po_id)?;
+    let target = if ordered.is_positive() && received >= ordered {
+        "Completed"
+    } else if received.is_positive() {
+        "PartialIn"
+    } else {
+        "Confirmed"
+    };
+    db.conn().execute(
+        "UPDATE purchase_order SET status=?2 WHERE id=?1 AND status <> 'Cancelled'",
+        rusqlite::params![po_id, target],
+    )?;
+    Ok(())
+}
+
 pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
     if r.qty.is_negative() || r.qty.is_zero() {
         return Err(fincore::FinError::msg("到货数量必须为正数").into());
@@ -285,6 +307,8 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
         tx.execute("UPDATE stock_move SET qc_status='pending' WHERE id=?1", [mid])?;
     }
     tx.commit()?;
+    // 到货推进订单执行状态（对标金蝶：部分入库 / 已完成）
+    refresh_po_status(db, r.po_id)?;
     Ok(rid)
 }
 
@@ -330,6 +354,8 @@ pub fn po_return_with_stock(
         &format!("采购退货 {}", po.no),
     )?;
     tx.commit()?;
+    // 退货后重算订单执行状态（可能从「已完成」回落到「部分入库」/「已确认」）
+    refresh_po_status(db, po_id)?;
     Ok(rid)
 }
 

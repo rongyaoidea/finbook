@@ -2650,6 +2650,159 @@ async fn dunning_flow() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知催款单应 404");
 }
 
+/// P1：供应链补链——报价→订单 doc_link + 到货推进采购订单状态（部分入库/已完成，退货回落）。
+#[tokio::test]
+async fn quote_link_and_po_status() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d13 = format!("{}-13", dash["current_period"].as_str().unwrap());
+
+    // 报价 → 审批 → 转订单 → 单据链上游含报价
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d13, "customer_code": "C01",
+                "customer_name": "客户甲", "item_code": "140301", "item_name": "原料",
+                "qty": "3", "unit_price": "20", "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建报价");
+    let qid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{qid}/approve"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "审批报价");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{qid}/to-order"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "报价转订单");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["so_id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/doc-links?kind=so&id={so_id}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "quote" && n["dir"] == "up"),
+        "订单链上游应见报价：{r}"
+    );
+
+    // 采购订单 10 @9：到货 4 → 部分入库；到货 6 → 已完成；退货 2 → 部分入库
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d13, "supplier_code": "S01", "supplier_name": "供应商甲",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    async fn po_status_of(
+        state: &Arc<WebState>,
+        sid: &str,
+        cur_ymm: i32,
+        po_id: i64,
+    ) -> String {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(&format!("/api/procure/po?period={cur_ymm}"), sid))
+            .await
+            .unwrap();
+        let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == po_id)
+            .map(|x| x["status"].as_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+    assert_eq!(
+        po_status_of(&state, &sid, cur_ymm, po_id).await,
+        "Draft"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货 4");
+    assert_eq!(
+        po_status_of(&state, &sid, cur_ymm, po_id).await,
+        "PartialIn",
+        "部分到货应为部分入库"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "6", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "到货 6");
+    assert_eq!(
+        po_status_of(&state, &sid, cur_ymm, po_id).await,
+        "Completed",
+        "全量到货应为已完成"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/return",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d13, "qty": "2", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "退货 2");
+    assert_eq!(
+        po_status_of(&state, &sid, cur_ymm, po_id).await,
+        "PartialIn",
+        "退货后应回落到部分入库"
+    );
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

@@ -172,6 +172,25 @@ fn node_of(tx: &rusqlite::Connection, kind: &str, id: i64, dir: &str) -> DbResul
                 },
             )
             .optional()?,
+        "quote" => tx
+            .query_row(
+                "SELECT no, date, customer_name, qty, status FROM quotation WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(DocNode {
+                        kind: "quote".into(),
+                        id,
+                        no: r.get(0)?,
+                        date: r.get(1)?,
+                        title: r.get::<_, String>(2)?,
+                        qty: r.get::<_, String>(3)?,
+                        amount: "0".into(),
+                        memo: r.get::<_, String>(4)?,
+                        dir: dir.to_string(),
+                    })
+                },
+            )
+            .optional()?,
         "invoice" => tx
             .query_row(
                 "SELECT number, date, buyer, seller, amount, status FROM invoice WHERE id=?1",

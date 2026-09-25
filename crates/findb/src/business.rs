@@ -493,6 +493,23 @@ pub fn item_cost_method(db: &Db, item: &str) -> DbResult<CostMethod> {
     Ok(CostMethod::parse(m.as_deref().unwrap_or("moving_average")))
 }
 
+/// 存货是否启用来料检验（aux props.qc_required = "1"/true）——到货入库标记待检
+pub fn item_qc_required(db: &Db, item: &str) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT props_json FROM aux_entity WHERE kind='item' AND code=?1",
+            [item],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|p| serde_json::from_str::<std::collections::BTreeMap<String, String>>(&p).ok())
+        .and_then(|m| m.get("qc_required").cloned())
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// 读取某存货的标准成本单价（未配置为 0）
 pub fn item_standard_cost(db: &Db, item: &str) -> DbResult<Money> {
     let v: Option<String> = db

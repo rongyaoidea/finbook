@@ -3591,8 +3591,8 @@ async function viewInvWarehouse(main) {
       const r = await api(`/inventory/warehouse-stock?item=${encodeURIComponent(item)}`);
       const rows = r.rows || [];
       $("#iw-result").innerHTML = rows.length
-        ? `<table><thead><tr><th>仓库</th><th>存货</th><th>结存数量</th></tr></thead>
-          <tbody>${rows.map((x) => `<tr><td>${esc(x.warehouse)}</td><td>${esc(x.item)}</td><td class="r">${fmt(x.qty)}</td></tr>`).join("")}</tbody></table>`
+        ? `<table><thead><tr><th>仓库</th><th>存货</th><th>结存数量</th><th>可用</th><th>待检</th><th>隔离</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.warehouse)}</td><td>${esc(x.item)}</td><td class="r">${fmt(x.qty)}</td><td class="r">${fmt(x.available || "0")}</td><td class="r">${x.pending && x.pending !== "0" ? fmt(x.pending) : "—"}</td><td class="r">${x.quarantine && x.quarantine !== "0" ? fmt(x.quarantine) : "—"}</td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">无库存</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
@@ -3888,7 +3888,7 @@ function openQcEditor(poId, reload) {
     <div class="field"><label>检验人</label><input id="qc-who" placeholder="留空 = 当前账号" /></div>
     <div class="field"><label>日期</label><input type="date" id="qc-date" value="${today()}" /></div>
     <div class="field"><label>备注</label><input id="qc-memo" /></div>
-    <p class="muted" style="font-size:12px;margin:6px 0 0">合格部分留库；不合格部分自动按采购订单单价退货（负到货 + 负入库流水）。订单单价为 0 时请先补价。</p>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">待检物料（档案勾了「来料检验」）：按待检量逐笔检验，合格转正可用、不合格转隔离（仍可退货）；事后质检（未勾检验）：不合格自动按订单单价退货（单价为 0 请先补价）。</p>
     <div class="foot"><button class="btn primary" id="qc-save">保存质检单</button><button class="btn ghost" id="qc-cancel">取消</button></div>`);
   $("#qc-cancel", mask).onclick = closeModal;
   $("#qc-save", mask).onclick = async () => {
@@ -4021,7 +4021,7 @@ async function viewPoDoc(main) {
   const poid = () => parseInt($("#pd-poid").value.trim(), 10) || 0;
   const amt = () => $("#pd-amt").value.trim();
   const memo = () => $("#pd-memo2").value.trim();
-  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const rr = await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast(rr && rr.qc_pending ? "已到货（待检入库，待质检转正后可用）" : "已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已付款，付款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   load();
@@ -5834,7 +5834,7 @@ function openAuxEditor(main, ent, kind) {
     <div class="field"><label>编码 *</label><input id="au-code" value="${esc(e.code)}" /></div>
     <div class="field"><label>名称 *</label><input id="au-name" value="${esc(e.name)}" /></div>
     ${kind === "customer" ? `<div class="field"><label>信用额度（0 = 不限；超出后订单「确认」被拒）</label><input id="au-credit" value="${esc((e.props && e.props.credit_limit) || "0")}" /></div>` : ""}
-    ${kind === "item" ? `<div class="field"><label>保质期天数（0 = 不启用批次效期）</label><input id="au-shelf" value="${esc((e.props && e.props.shelf_life_days) || "0")}" /></div>` : ""}
+    ${kind === "item" ? `<div class="field"><label>保质期天数（0 = 不启用批次效期）</label><input id="au-shelf" value="${esc((e.props && e.props.shelf_life_days) || "0")}" /></div><div class="field"><label style="display:flex;gap:6px;align-items:center;font-weight:400"><input type="checkbox" id="au-qc" ${e.props && (e.props.qc_required === "1" || e.props.qc_required === "true") ? "checked" : ""} /> 启用来料检验（到货先入待检，质检转正后才可用）</label></div>` : ""}
     <div class="field"><label>上级编码（分级档案用）</label><input id="au-parent" value="${esc(e.parent_code || "")}" /></div>
     <div class="field"><label>备注</label><input id="au-memo" value="${esc(e.memo)}" /></div>
     <div class="field"><label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="au-disabled" ${e.disabled ? "checked" : ""} />停用</label></div>
@@ -5854,7 +5854,7 @@ function openAuxEditor(main, ent, kind) {
       parent_code: parent || null,
       disabled: $("#au-disabled", mask).checked,
       memo: $("#au-memo", mask).value.trim(),
-      props: Object.assign({}, e.props || {}, kind === "customer" ? { credit_limit: $("#au-credit", mask).value.trim() || "0" } : {}, kind === "item" ? { shelf_life_days: $("#au-shelf", mask).value.trim() || "0" } : {}),
+      props: Object.assign({}, e.props || {}, kind === "customer" ? { credit_limit: $("#au-credit", mask).value.trim() || "0" } : {}, kind === "item" ? { shelf_life_days: $("#au-shelf", mask).value.trim() || "0", qc_required: $("#au-qc", mask).checked ? "1" : "0" } : {}),
     });
     try {
       if (isEdit) await api(`/aux/${e.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

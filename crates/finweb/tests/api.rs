@@ -2300,6 +2300,153 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 来料检验状态机（对标金蝶质检管理）：qc_required 存货到货入待检 →
+/// 合格转正/不合格隔离（部分不合格拆分）→ 可用/待检/隔离三口径；非检验存货直通。
+#[tokio::test]
+async fn qc_state_machine() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 建检验存货并启用来料检验
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/aux",
+            &sid,
+            serde_json::json!({ "id": 0, "kind": "item", "code": "RM50", "name": "待检料", "disabled": false, "memo": "", "props": { "qc_required": "1" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建存货档案");
+
+    let mk_po = |qty: String, price: String| {
+        let st = state.clone();
+        let sd = sid.clone();
+        let dd = d15.clone();
+        async move {
+            let resp = handlers::router(st)
+                .oneshot(authed_post(
+                    "/api/procure/po",
+                    &sd,
+                    serde_json::json!({
+                        "period": cur_ymm, "date": dd, "supplier_code": "S01",
+                        "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                        "lines": [{ "item_code": "RM50", "qty_ordered": qty, "unit_price": price, "tax_rate": "0" }]
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "建采购订单");
+            serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+                .as_i64()
+                .unwrap()
+        }
+    };
+    // PO1：到货10 → 待检（available=0, pending=10）
+    let po1 = mk_po("10".to_string(), "5".to_string()).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po1, "period": cur_ymm, "date": d15.clone(), "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["qc_pending"], serde_json::json!(true), "检验存货到货应标记待检：{r}");
+    let get = |state: Arc<WebState>, sid: String, item: String| async move {
+        let resp = handlers::router(state)
+            .oneshot(authed_get(&format!("/api/inventory/warehouse-stock?item={item}"), &sid))
+            .await
+            .unwrap();
+        body_string(resp).await
+    };
+    let b = get(state.clone(), sid.clone(), "RM50".to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(money_num(v["rows"][0]["qty"].as_str().unwrap()), 10.0, "结存10");
+    assert_eq!(money_num(v["rows"][0]["available"].as_str().unwrap()), 0.0, "待检期可用为0");
+    assert_eq!(money_num(v["rows"][0]["pending"].as_str().unwrap()), 10.0, "待检10");
+
+    // 质检部分不合格3 → 合格7转正 + 隔离3（拆分）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/qc",
+            &sid,
+            serde_json::json!({ "po_id": po1, "qty_insp": "10", "qty_fail": "3", "inspector": "质检员", "date": d15.clone(), "memo": "外观不良" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "质检保存");
+    let b = get(state.clone(), sid.clone(), "RM50".to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(money_num(v["rows"][0]["available"].as_str().unwrap()), 7.0, "合格7转正");
+    assert_eq!(money_num(v["rows"][0]["quarantine"].as_str().unwrap()), 3.0, "不合格3隔离");
+    assert_eq!(money_num(v["rows"][0]["pending"].as_str().unwrap()), 0.0, "待检清零");
+
+    // PO2：到货5 → 全不合格 → 隔离+5、待检清零
+    let po2 = mk_po("5".to_string(), "5".to_string()).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po2, "period": cur_ymm, "date": d15.clone(), "qty": "5", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/qc",
+            &sid,
+            serde_json::json!({ "po_id": po2, "qty_insp": "5", "qty_fail": "5", "date": d15.clone(), "memo": "整批不良" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "全不合格质检");
+    let b = get(state.clone(), sid.clone(), "RM50".to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(money_num(v["rows"][0]["quarantine"].as_str().unwrap()), 8.0, "隔离累计8");
+    assert_eq!(money_num(v["rows"][0]["pending"].as_str().unwrap()), 0.0, "无待检余量");
+
+    // 非检验存货（140301 未勾检验）→ 到货直通可用
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "6", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po3 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po3, "period": cur_ymm, "date": d15.clone(), "qty": "6", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["qc_pending"], serde_json::json!(false), "未勾检验直通");
+    let b = get(state.clone(), sid.clone(), "140301".to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(money_num(v["rows"][0]["available"].as_str().unwrap()), 6.0, "直通可用=结存");
+}
+
 /// 销售成本结转（Web 化，对标金蝶存货核算-凭证生成）：仅统计销售出库（kind=sale，
 /// 领料/形态转换不进 6401）；无出库不生成凭证；同期间防重复结转。
 #[tokio::test]

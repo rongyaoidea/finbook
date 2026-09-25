@@ -4480,7 +4480,15 @@ async fn add_po_receipt(
     let id = findb::procurement::po_receipt_with_stock(&db, &findb::procurement::PoReceipt {
         id: 0, po_id: req.po_id, period, date, qty: parse_money_checked(&req.qty)?, memo: req.memo,
     })?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    // 待检提示：首行存货勾选了来料检验 → 入库为待检状态（质检转正后方可领用）
+    let qc_pending = findb::scm::po_get(&db, req.po_id)?
+        .and_then(|p| {
+            p.lines
+                .first()
+                .map(|l| findb::business::item_qc_required(&db, &l.item_code))
+        })
+        .unwrap_or(false);
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "qc_pending": qc_pending })))
 }
 
 async fn add_po_return(

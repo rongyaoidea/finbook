@@ -351,7 +351,7 @@ pub fn below_safety(db: &Db) -> DbResult<Vec<(String, Money, Money)>> {
     let mut out = Vec::new();
     for (item, safety) in plans {
         let on: f64 = db.conn().query_row(
-            "SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM stock_move WHERE item=?1",
+            "SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM stock_move WHERE item=?1 AND qc_status=''",
             [&item],
             |r| r.get(0),
         )?;
@@ -366,28 +366,56 @@ pub fn below_safety(db: &Db) -> DbResult<Vec<(String, Money, Money)>> {
     Ok(out)
 }
 
-/// 库存状态：分仓库结存
+/// 库存状态：分仓库结存（含质检三口径：qty=结存、available=可用、pending=待检、quarantine=隔离）
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WhStock {
     pub warehouse: String,
     pub item: String,
     pub qty: Money,
+    pub available: Money,
+    pub pending: Money,
+    pub quarantine: Money,
 }
 
 pub fn warehouse_stock(db: &Db, item: &str) -> DbResult<Vec<WhStock>> {
     let mut st = db.conn().prepare(
-        "SELECT warehouse, qty FROM stock_move WHERE item=?1 ORDER BY warehouse",
+        "SELECT warehouse, qc_status, qty FROM stock_move WHERE item=?1 ORDER BY warehouse",
     )?;
     let rows = st
-        .query_map([item], |r| Ok((r.get::<_, String>(0)?, m(&r.get::<_, String>(1)?))))?
+        .query_map([item], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                m(&r.get::<_, String>(2)?),
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut map: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
-    for (w, q) in rows {
-        *map.entry(if w.is_empty() { "默认仓".to_string() } else { w }).or_insert(Money::ZERO) += q;
+    // 每仓四桶：结存 / 可用 / 待检 / 隔离（qc_status=''或未知→可用；pending/quarantine 各归其桶）
+    let mut map: std::collections::BTreeMap<String, (Money, Money, Money, Money)> =
+        std::collections::BTreeMap::new();
+    for (w, qc, q) in rows {
+        let e = map
+            .entry(if w.is_empty() { "默认仓".to_string() } else { w })
+            .or_insert((Money::ZERO, Money::ZERO, Money::ZERO, Money::ZERO));
+        e.0 += q;
+        match qc.as_str() {
+            "pending" => e.2 += q,
+            "quarantine" => e.3 += q,
+            _ => e.1 += q,
+        }
     }
     Ok(map
         .into_iter()
-        .map(|(warehouse, qty)| WhStock { warehouse, item: item.to_string(), qty })
+        .map(
+            |(warehouse, (qty, available, pending, quarantine))| WhStock {
+                warehouse,
+                item: item.to_string(),
+                qty,
+                available,
+                pending,
+                quarantine,
+            },
+        )
         .collect())
 }
 

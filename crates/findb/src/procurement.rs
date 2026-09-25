@@ -212,7 +212,7 @@ fn receipt_row_in(
     Ok(tx.last_insert_rowid())
 }
 
-/// 在调用方事务内写采购入库库存流水（kind=purchase，价=订单行单价）
+/// 在调用方事务内写采购入库库存流水（kind=purchase，价=订单行单价），返回流水 id
 fn stock_purchase_in(
     tx: &rusqlite::Transaction,
     po_no: &str,
@@ -222,7 +222,7 @@ fn stock_purchase_in(
     period: Period,
     date: NaiveDate,
     memo: &str,
-) -> DbResult<()> {
+) -> DbResult<i64> {
     let mut mv = crate::business::StockMove {
         id: 0,
         period,
@@ -242,7 +242,7 @@ fn stock_purchase_in(
         },
     };
     crate::business::stock_insert_of(tx, &mut mv)?;
-    Ok(())
+    Ok(tx.last_insert_rowid())
 }
 
 /// 订单首行（品名与单价）——到货/退货/质检统一取价口径
@@ -270,7 +270,7 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
     let price = line.unit_price;
     let tx = db.write_tx()?;
     let rid = receipt_row_in(&tx, r.po_id, r.period, r.date, r.qty, &r.memo)?;
-    stock_purchase_in(
+    let mid = stock_purchase_in(
         &tx,
         &po.no,
         &item,
@@ -280,6 +280,10 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt) -> DbResult<i64> {
         r.date,
         &format!("采购入库 {}", po.no),
     )?;
+    // 来料检验（存货档案 qc_required=1）→ 入库标记待检：可用量口径排除，质检转正后方可领用
+    if crate::business::item_qc_required(db, &item) {
+        tx.execute("UPDATE stock_move SET qc_status='pending' WHERE id=?1", [mid])?;
+    }
     tx.commit()?;
     Ok(rid)
 }
@@ -360,61 +364,163 @@ pub fn qc_save(
     let po = crate::scm::po_get(db, po_id)?
         .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
     let line = first_line(&po)?;
-    if qty_fail.is_positive() && line.unit_price.is_zero() {
-        return Err(fincore::FinError::msg("采购订单单价为 0：请先补价再处理不合格退货").into());
-    }
     let item = line.item_code.clone();
     let price = line.unit_price;
-    let result = if !qty_fail.is_positive() {
-        "pass"
-    } else if qty_fail == qty_insp {
-        "fail"
-    } else {
-        "partial"
-    };
     let tx = db.write_tx()?;
-    if qty_fail.is_positive() {
-        let received = {
-            let mut st = tx.prepare("SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM po_receipt WHERE po_id=?1")?;
-            let v: f64 = st.query_row([po_id], |r| r.get(0))?;
-            Money::parse_or_zero(&format!("{v:.4}"))
-        };
-        if qty_fail > received {
+
+    // 该订单的待检入库流水（qc_required 存货到货时标记 pending；memo=采购入库 单号）。
+    // 逐笔串行检验：取首笔 pending——前笔转正/隔离后自动轮到下一笔。
+    let pending: Option<(i64, Money, Money, String)> = {
+        let mut st = tx.prepare(
+            "SELECT id, CAST(qty AS REAL), CAST(amount AS REAL), warehouse FROM stock_move
+             WHERE kind='purchase' AND qc_status='pending' AND memo=?1 ORDER BY id",
+        )?;
+        let rows = st
+            .query_map([format!("采购入库 {}", po.no)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .find(|(_, q, _, _)| *q > 0.0)
+            .map(|(id, q, a, wh)| {
+                (
+                    id,
+                    Money::parse_or_zero(&format!("{q:.4}")),
+                    Money::parse_or_zero(&format!("{a:.4}")),
+                    wh,
+                )
+            })
+    };
+
+    // 受检量与结果：待检模式以待检量为准（忽略入参检验数，逐笔检验）；否则按入参（事后质检）
+    let (insp_qty, fail_qty, result) = if let Some((mid, m_qty, m_amt, m_wh)) = pending {
+        if qty_fail > m_qty {
             return Err(fincore::FinError::state(format!(
-                "不合格数 {} 超过累计净收货 {}",
+                "不合格数 {} 超过待检量 {}",
                 qty_fail.fmt_qty(),
-                received.fmt_qty()
+                m_qty.fmt_qty()
             ))
             .into());
         }
-        receipt_row_in(
-            &tx,
-            po_id,
-            Period::from_date(date),
-            date,
-            qty_fail.negated(),
-            &format!("质检退货 {}", memo),
-        )?;
-        stock_purchase_in(
-            &tx,
-            &po.no,
-            &item,
-            price,
-            qty_fail.negated(),
-            Period::from_date(date),
-            date,
-            &format!("质检退货 {}", po.no),
-        )?;
-    }
+        let r = if !qty_fail.is_positive() {
+            "pass"
+        } else if qty_fail >= m_qty {
+            "fail"
+        } else {
+            "partial"
+        };
+        let unit = if m_qty.is_zero() {
+            Money::ZERO
+        } else {
+            m_amt.checked_div(m_qty).unwrap_or(Money::ZERO).round2()
+        };
+        if !qty_fail.is_positive() {
+            // 全部合格 → 转正（可用）
+            tx.execute("UPDATE stock_move SET qc_status='' WHERE id=?1", [mid])?;
+        } else if qty_fail >= m_qty {
+            // 全部不合格 → 隔离（库存仍持有但不可用；可经退货冲销）
+            tx.execute(
+                "UPDATE stock_move SET qc_status='quarantine' WHERE id=?1",
+                [mid],
+            )?;
+        } else {
+            // 部分不合格：合格部分留在原行转正（数量/金额按不合格数扣减）+ 拆出隔离行
+            let pass_qty = m_qty - qty_fail;
+            tx.execute(
+                "UPDATE stock_move SET qty=?2, amount=?3, qc_status='' WHERE id=?1",
+                rusqlite::params![
+                    mid,
+                    crate::exact_param(pass_qty),
+                    crate::money_param(unit * pass_qty)
+                ],
+            )?;
+            let iso_id = crate::business::stock_insert_of(
+                &tx,
+                &crate::business::StockMove {
+                    id: 0,
+                    period: Period::from_date(date),
+                    biz_date: date,
+                    kind: crate::business::StockKind::Purchase,
+                    item: item.clone(),
+                    warehouse: m_wh,
+                    batch_no: String::new(),
+                    qty: qty_fail,
+                    price: unit,
+                    amount: unit * qty_fail,
+                    voucher_id: None,
+                    memo: format!("质检隔离 {}", po.no),
+                },
+            )?;
+            tx.execute(
+                "UPDATE stock_move SET qc_status='quarantine' WHERE id=?1",
+                [iso_id],
+            )?;
+        }
+        (m_qty, qty_fail, r)
+    } else {
+        // 事后质检（qc_required=0 的存货，无待检流水）：不合格直接退货（行为与存量一致）
+        let r = if !qty_fail.is_positive() {
+            "pass"
+        } else if qty_fail == qty_insp {
+            "fail"
+        } else {
+            "partial"
+        };
+        if qty_fail.is_positive() {
+            if price.is_zero() {
+                return Err(
+                    fincore::FinError::msg("采购订单单价为 0：请先补价再处理不合格退货").into(),
+                );
+            }
+            let received = {
+                let mut st = tx
+                    .prepare("SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM po_receipt WHERE po_id=?1")?;
+                let v: f64 = st.query_row([po_id], |r| r.get(0))?;
+                Money::parse_or_zero(&format!("{v:.4}"))
+            };
+            if qty_fail > received {
+                return Err(fincore::FinError::state(format!(
+                    "不合格数 {} 超过累计净收货 {}",
+                    qty_fail.fmt_qty(),
+                    received.fmt_qty()
+                ))
+                .into());
+            }
+            receipt_row_in(
+                &tx,
+                po_id,
+                Period::from_date(date),
+                date,
+                qty_fail.negated(),
+                &format!("质检退货 {}", memo),
+            )?;
+            stock_purchase_in(
+                &tx,
+                &po.no,
+                &item,
+                price,
+                qty_fail.negated(),
+                Period::from_date(date),
+                date,
+                &format!("质检退货 {}", po.no),
+            )?;
+        }
+        (qty_insp, qty_fail, r)
+    };
     tx.execute(
         "INSERT INTO qc_order(po_id,item,qty_insp,qty_pass,qty_fail,result,inspector,date,memo,created_by,created_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         rusqlite::params![
             po_id,
             item,
-            crate::exact_param(qty_insp),
-            crate::exact_param(qty_insp - qty_fail),
-            crate::exact_param(qty_fail),
+            crate::exact_param(insp_qty),
+            crate::exact_param(insp_qty - fail_qty),
+            crate::exact_param(fail_qty),
             result,
             inspector,
             date.format("%Y-%m-%d").to_string(),

@@ -617,6 +617,133 @@ pub fn transfer_do(
     Ok((out_id, in_id))
 }
 
+// ---------------- 存货档案一站式（独立存货档案页，C 选项） ----------------
+
+/// 存货档案聚合行：aux(item) + 计划参数 + 库存现量 + 主单位
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ItemMasterRow {
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    pub memo: String,
+    pub disabled: bool,
+    pub parent: Option<String>,
+    /// 保质期天（props.shelf_life_days 原文，空/0 = 未启用）
+    pub shelf_life: String,
+    /// 启用来料检验（props.qc_required）
+    pub qc: bool,
+    pub safety: Money,
+    pub lead_days: i32,
+    pub lot: Money,
+    /// 现存量（全部流水汇总，出负入正）
+    pub qty: Money,
+    /// 主单位（item_unit.base_unit，未设为空）
+    pub unit: String,
+}
+
+/// 存货档案一站式聚合（四查询拼装，档案量级本地毫秒）
+pub fn item_master(db: &Db) -> DbResult<Vec<ItemMasterRow>> {
+    use std::collections::HashMap;
+    // 1) 库存现量（逐行内存汇总，与 batch_balance 同模式）
+    let mut qty_map: HashMap<String, Money> = HashMap::new();
+    {
+        let mut st = db
+            .conn()
+            .prepare("SELECT item, qty FROM stock_move")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (item, q) in rows {
+            *qty_map.entry(item).or_insert(Money::ZERO) += Money::parse_or_zero(&q);
+        }
+    }
+    // 2) 计划参数
+    let mut plan_map: HashMap<String, (Money, i32, Money)> = HashMap::new();
+    {
+        let mut st = db.conn().prepare(
+            "SELECT item_code, safety_stock, lead_days, lot_size FROM item_plan",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i32>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (c, s, l, lot) in rows {
+            plan_map.insert(c, (Money::parse_or_zero(&s), l, Money::parse_or_zero(&lot)));
+        }
+    }
+    // 3) 主单位
+    let mut unit_map: HashMap<String, String> = HashMap::new();
+    {
+        let mut st = db
+            .conn()
+            .prepare("SELECT item, base_unit FROM item_unit")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (c, u) in rows {
+            unit_map.insert(c, u);
+        }
+    }
+    // 4) aux(item) 全量
+    let mut st = db.conn().prepare(
+        "SELECT id,code,name,memo,disabled,parent_code,props_json
+         FROM aux_entity WHERE kind='item' ORDER BY code",
+    )?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let out = rows
+        .into_iter()
+        .map(|(id, code, name, memo, disabled, parent, props_json)| {
+            let props: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&props_json).unwrap_or_default();
+            let (safety, lead, lot) = plan_map
+                .get(&code)
+                .cloned()
+                .unwrap_or((Money::ZERO, 0, Money::ZERO));
+            ItemMasterRow {
+                shelf_life: props
+                    .get("shelf_life_days")
+                    .cloned()
+                    .unwrap_or_else(|| "0".into()),
+                qc: matches!(props.get("qc_required").map(String::as_str), Some("1") | Some("true")),
+                id,
+                code: code.clone(),
+                qty: qty_map.get(&code).copied().unwrap_or(Money::ZERO),
+                unit: unit_map.get(&code).cloned().unwrap_or_default(),
+                name,
+                memo,
+                disabled: disabled != 0,
+                parent,
+                safety,
+                lead_days: lead,
+                lot,
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

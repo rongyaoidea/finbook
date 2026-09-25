@@ -183,6 +183,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 数据导入（其他软件 / CSV）
         .route("/api/import/analyze", post(import_analyze))
         .route("/api/import/template", get(import_template))
+        .route("/api/arap-opening", get(list_arap_opening))
+        .route("/api/arap-opening/:id", delete(delete_arap_opening))
+        .route("/api/items/master", get(items_master))
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
         .route("/api/ledger", get(get_ledger))
@@ -2880,11 +2883,64 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, AppError> {
 fn import_perm(kind: &str) -> Result<Perm, AppError> {
     Ok(match kind {
         "voucher" | "begin" => Perm::VoucherNew,
+        "begin" => Perm::VoucherNew,
+        "arap_opening" => Perm::VoucherNew,
         "account" => Perm::AccountEdit,
         "aux" => Perm::AuxEdit,
         "item" | "opening_stock" => Perm::Warehouse,
         _ => return Err(AppError::bad_request("未知导入类型 kind")),
     })
+}
+
+/// 往来期初明细列表（账龄页管理区块；合计 ar/ap 分列）
+async fn list_arap_opening(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q
+        .get("kind")
+        .map(String::as_str)
+        .filter(|k| !k.is_empty());
+    let rows = findb::settle::arap_opening_list(&db, kind)?;
+    let (mut ar, mut ap) = (Money::ZERO, Money::ZERO);
+    for r in &rows {
+        if r.kind == "ar" {
+            ar += r.amount;
+        } else {
+            ap += r.amount;
+        }
+    }
+    Ok(Json(json!({
+        "rows": rows,
+        "total_ar": ar.fmt_qty(),
+        "total_ap": ap.fmt_qty(),
+    })))
+}
+
+/// 删除往来期初明细（导错可删；会计权）
+async fn delete_arap_opening(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::settle::arap_opening_delete(&db, id)?;
+    db.log(user.username(), "档案", "删除往来期初", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 存货档案一站式列表（独立存货档案页：档案+计划参数+现量+主单位）
+async fn items_master(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Warehouse)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": findb::inventory2::item_master(&db)? })))
 }
 
 /// 下载导入模板（列头 + 示例行；主数据三平台列头一致，CSV 带 BOM 供 Excel 直接打开）
@@ -2916,6 +2972,11 @@ async fn import_template(
         "begin" => vec![
             vec!["科目编码", "科目名称", "方向", "期初余额", "累计借方", "累计贷方"],
             vec!["1001", "库存现金", "借", "1000", "0", "0"],
+        ],
+        "arap_opening" => vec![
+            vec!["类型", "客商编码", "单据号", "单据日期", "金额", "客商名称", "备注"],
+            vec!["应收", "C01", "XSQ-0001", "2025-12-31", "5000", "客户甲", "期初欠款"],
+            vec!["应付", "S01", "CGQ-0001", "2025-12-31", "3000", "供应商甲", ""],
         ],
         "voucher" => vec![
             vec!["日期", "凭证字", "摘要", "科目编码", "借方", "贷方"],
@@ -2977,7 +3038,10 @@ async fn import_analyze(
         };
         // 主数据类（aux/item/account/opening_stock）无科目引用——预检直接返回空
         // （行级错误由执行时 warnings 呈现；空 text 走同一条解析路径保证类型一致）
-        let missing = if matches!(req.kind.as_str(), "aux" | "item" | "account" | "opening_stock") {
+        let missing = if matches!(
+            req.kind.as_str(),
+            "aux" | "item" | "account" | "opening_stock" | "arap_opening"
+        ) {
             findb::imports::analyze_missing(&db, "", tmpl, is_begin)?
         } else {
             findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?
@@ -3053,6 +3117,13 @@ async fn import_run(
                     findb::imports::import_opening_stock_bytes(&db, bytes, &who)?
                 } else {
                     findb::imports::import_opening_stock(&db, &req.text, &who)?
+                }
+            }
+            "arap_opening" => {
+                if let Some(bytes) = &file_bytes {
+                    findb::imports::import_arap_opening_bytes(&db, bytes, &who)?
+                } else {
+                    findb::imports::import_arap_opening(&db, &req.text, &who)?
                 }
             }
             // "begin" 及未列出的既有类型（kind 已由 import_perm 校验，未知 kind 到不了这里）

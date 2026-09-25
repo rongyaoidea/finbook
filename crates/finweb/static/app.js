@@ -446,6 +446,7 @@ const NAV_ITEMS = [
   { id: "so-doc", label: "销售单据", perm: "order_ops", group: "销售" },
   { id: "so-reconcile", label: "销售对账", perm: "report", group: "销售" },
   { id: "order-change-log", label: "订单变更", perm: "report", group: "销售" },
+  { id: "items-master", label: "存货档案", perm: "warehouse", group: "库存" },
   { id: "inv-batch", label: "批次库位", perm: "warehouse", group: "库存" },
   { id: "inv-count", label: "存货盘点", perm: "warehouse", group: "库存" },
   { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
@@ -509,6 +510,7 @@ const VIEWS = {
   "inv-transfer": viewInvTransfer,
   "po-estimate": viewPoEstimate,
   "inv-count": viewInvCount,
+  "items-master": viewItemsMaster,
   "inv-batch": viewBatch,
   "workflow": viewWorkflow,
   "procure-quota": viewProcureQuota,
@@ -1760,6 +1762,7 @@ async function viewImports(main) {
           <optgroup label="期初（会计）">
             <option value="begin">期初余额表</option>
             <option value="opening_stock">期初库存（数量/批次）</option>
+            <option value="arap_opening">往来期初明细（应收/应付按单据）</option>
           </optgroup>
           <optgroup label="凭证（会计）">
             <option value="voucher">记账凭证</option>
@@ -1816,6 +1819,7 @@ async function viewImports(main) {
     item: "编码,名称,保质期天,安全库存",
     account: "编码,名称,类别,方向,备注（类别空按编码首位推）",
     opening_stock: "存货编码,仓库,数量,单价,批次号,生产日期,备注（只入数量，不生成凭证）",
+    arap_opening: "类型(应收/应付),客商编码,单据号,单据日期,金额,客商名称,备注（影子挂账进账龄，不生成凭证）",
     begin: "科目编码, 方向(借/贷), 金额（金蝶/用友用完整列）",
     voucher: "日期, 凭证字, 摘要, 科目编码, 借方, 贷方",
   };
@@ -3624,7 +3628,15 @@ async function viewSettle(main) {
     </div>
     <div class="muted" id="st-sum" style="margin-bottom:8px">加载中…</div>
     <div class="panel"><div id="st-table"></div></div>
-    <div id="st-extra" style="margin-top:10px"></div>`;
+    <div id="st-extra" style="margin-top:10px"></div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h4 style="margin:0">往来期初明细（按单据 · 迁移）</h4><span class="grow"></span>
+        <span class="muted" style="font-size:12px" id="arap-total"></span>
+        <button class="btn ghost sm" id="arap-reload">刷新</button>
+        ${can("voucher_new") ? `<button class="btn ghost sm" id="arap-goimport">去导入</button>` : ""}
+      </div>
+      <div id="arap-list" class="muted" style="margin-top:8px">加载中…</div>
+    </div>`;
   let selFrom = null, selTo = null, rows = [];
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
   const acct = () => $("#st-acct", main).value.trim();
@@ -3650,6 +3662,27 @@ async function viewSettle(main) {
       render();
     } catch (e) { $("#st-sum", main).textContent = e.message; }
   }
+
+  // 往来期初明细（迁移数据）：列表 + 合计 + 删除；「账龄分析」自动包含期初行（影子挂账）
+  const loadArap = async () => {
+    try {
+      const r = await api("/arap-opening");
+      const arows = r.rows || [];
+      $("#arap-total").textContent = arows.length ? `应收合计 ${r.total_ar} · 应付合计 ${r.total_ap}` : "";
+      $("#arap-list").innerHTML = arows.length
+        ? `<table class="grid"><thead><tr><th>类型</th><th>客商</th><th>名称</th><th>单据号</th><th>单据日期</th><th class="num">金额</th><th>备注</th><th>录入</th><th></th></tr></thead><tbody>${arows.map((o) => `<tr><td>${o.kind === "ar" ? '<span class="tag">应收</span>' : '<span class="tag warn">应付</span>'}</td><td>${esc(o.party_code)}</td><td>${esc(o.party_name || "—")}</td><td>${esc(o.doc_no)}</td><td>${esc(o.doc_date)}</td><td class="num">${fmt(o.amount)}</td><td>${esc(o.memo || "")}</td><td>${esc(o.created_by)}</td>
+            <td class="row-actions">${can("voucher_new") ? `<button class="btn ghost sm" data-arap-del="${o.id}">删</button>` : ""}</td></tr>`).join("")}</tbody></table>
+          <p class="muted" style="font-size:12px;margin-top:6px">期初明细为影子挂账：进入「账龄分析」（单据号标「期初」），暂不参与自动核销（核销 v2）；金额总额仍以科目期初为准。</p>`
+        : `<div class="muted">暂无往来期初（点「去导入」按单据批量迁移）</div>`;
+      $all("[data-arap-del]", main).forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("删除该期初明细行？", true))) return;
+        try { await api(`/arap-opening/${b.dataset.arapDel}`, { method: "DELETE" }); toast("已删除", "ok"); loadArap(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#arap-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  loadArap();
+  if ($("#arap-reload", main)) $("#arap-reload", main).onclick = loadArap;
+  if ($("#arap-goimport", main)) $("#arap-goimport", main).onclick = () => { state.view = "imports"; renderMain(); };
 
   $("#st-load", main).onclick = load;
   if ($("#st-auto", main)) $("#st-auto", main).onclick = async () => {
@@ -4146,6 +4179,69 @@ function openCountEditor(warehouse, reload) {
 
 // 批次库存与库位（对标金蝶批号/保质期/货位）：登记写库存流水带批号（与普通库存同一本账）、
 // 批次余额=流水按批汇总、FEFO 近效期先出推荐、临期预警、库位主数据
+// 存货档案（独立页，C 选项）：一站式 编码/名称/单位/现量/计划参数/保质期/质检/停用
+async function viewItemsMaster(main) {
+  main.innerHTML = `<h2>存货档案</h2>
+    <div class="toolbar">
+      <label>搜索 <input id="im-q" placeholder="编码/名称" style="width:150px" /></label>
+      <span class="grow"></span>
+      <label style="font-size:12px"><input type="checkbox" id="im-low" /> 只看低库存</label>
+      <button class="btn ghost sm" id="im-reload">刷新</button>
+      <button class="btn primary" id="im-new">新增存货</button>
+    </div>
+    <div class="panel"><div id="im-list" class="muted">加载中…</div></div>
+    <p class="muted" style="font-size:12px">档案字段（保质期/质检/安全库存等）在行内「编辑」统一维护；单位换算到「多单位换算」页；批量迁移用「数据导入 → 存货档案」。低库存 = 现量 &lt; 安全库存（红显）。</p>`;
+  let rows = [];
+  const render = () => {
+    const q = ($("#im-q").value || "").trim().toLowerCase();
+    const lowOnly = $("#im-low").checked;
+    const list = rows.filter((r) => {
+      if (q && !(r.code.toLowerCase().includes(q) || (r.name || "").toLowerCase().includes(q))) return false;
+      if (lowOnly && !(Number(r.safety) > 0 && Number(r.qty) < Number(r.safety))) return false;
+      return true;
+    });
+    $("#im-list").innerHTML = list.length
+      ? `<table class="grid"><thead><tr><th>编码</th><th>名称</th><th>单位</th><th class="num">现量</th><th class="num">安全库存</th><th class="num">前置期</th><th>保质期</th><th>质检</th><th>状态</th><th>备注</th><th></th></tr></thead><tbody>${list.map((r) => {
+          const low = Number(r.safety) > 0 && Number(r.qty) < Number(r.safety);
+          return `<tr${low ? ' style="background:var(--err-bg)"' : ""}>
+            <td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.unit || "—")}</td>
+            <td class="num"${low ? ' style="color:var(--err);font-weight:600"' : ""}>${fmt(r.qty)}</td>
+            <td class="num">${Number(r.safety) ? fmt(r.safety) : "—"}</td>
+            <td class="num">${r.lead_days ? r.lead_days + "天" : "—"}</td>
+            <td>${Number(r.shelf_life) ? r.shelf_life + "天" : "—"}</td>
+            <td>${r.qc ? '<span class="tag">质检</span>' : ""}</td>
+            <td>${r.disabled ? '<span class="tag warn">停用</span>' : low ? '<span class="tag err">低库存</span>' : '<span class="tag ok">在用</span>'}</td>
+            <td>${esc(r.memo || "")}</td>
+            <td class="row-actions"><button class="btn ghost sm" data-im-edit="${r.id}">编辑</button></td>
+          </tr>`;
+        }).join("")}</tbody></table>`
+      : `<div class="muted">暂无存货档案（右上「新增存货」，或到「数据导入」批量迁移）</div>`;
+    $all("[data-im-edit]").forEach((b) => b.onclick = () => {
+      const r = rows.find((x) => String(x.id) === b.dataset.imEdit);
+      if (!r) return;
+      // 构造 AuxEntity 形状复用通用档案编辑器（字段与辅助档案一致）
+      openAuxEditor(main, {
+        id: r.id, kind: "item", code: r.code, name: r.name,
+        parent_code: r.parent || null, disabled: !!r.disabled,
+        props: { shelf_life_days: String(r.shelf_life || "0"), qc_required: r.qc ? "1" : "0" },
+        memo: r.memo || "",
+      }, "item");
+    });
+  };
+  const load = async () => {
+    try {
+      const r = await api("/items/master");
+      rows = r.rows || [];
+      render();
+    } catch (e) { $("#im-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#im-q").addEventListener("input", render);
+  $("#im-low").addEventListener("change", render);
+  $("#im-reload").addEventListener("click", load);
+  $("#im-new").addEventListener("click", () => openAuxEditor(main, null, "item"));
+  await load();
+}
+
 async function viewBatch(main) {
   main.innerHTML = `<h2>批次库存与库位</h2>
     <div class="toolbar">
@@ -6493,7 +6589,7 @@ function openAuxEditor(main, ent, kind) {
           });
         } catch (e2) { toast(`档案已保存，计划参数保存失败：${e2.message}`, "err"); }
       }
-      toast("已保存", "ok"); closeModal(); rerenderView("aux", main);
+      toast("已保存", "ok"); closeModal(); rerenderView(state.view, main);
     } catch (err) { toast(err.message, "err"); }
   });
 }

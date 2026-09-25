@@ -619,6 +619,21 @@ CREATE TABLE IF NOT EXISTS mps_plan (
 );
 CREATE INDEX IF NOT EXISTS idx_mps_run ON mps_plan(run_at);
 
+-- 往来期初明细（按单据，平台迁移导入 v2）：影子挂账——进账龄展示、不参与 FIFO 核销
+CREATE TABLE IF NOT EXISTS arap_opening (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,                 -- ar 应收 / ap 应付
+    party_code TEXT NOT NULL,
+    party_name TEXT NOT NULL DEFAULT '',
+    doc_no     TEXT NOT NULL DEFAULT '',
+    doc_date   TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    memo       TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_arap_kind ON arap_opening(kind, party_code);
+
 -- 生产成本归集表
 CREATE TABLE IF NOT EXISTS prod_cost (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

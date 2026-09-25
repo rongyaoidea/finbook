@@ -468,6 +468,14 @@
 - **B 项·存货计划参数入口**（补断链）：`GET/POST /api/item-plan`（Warehouse）——存货档案编辑器新增 **安全库存/前置期/批量** 三字段（回显 GET、随档案同存 POST）——低库存预警报表 ↔ 设置入口闭环（此前 `item_plan` 只有表和 MRP 逻辑、**无 Web 入口**）。
 - **测试**：web `import_master_data`——模板 BOM/列头/未知 kind 400 → aux 导入 ok2+skip2（重码/坏类型）+幂等重导 ok0/skip4 → item 保质期入 props + 安全库存入 item_plan → account 类别推断建档 → **未知 kind 400** → opening_stock 批次建档（W09、失效日=生产+30、余额40）+ **凭证零生成断言**；既有导入回归 `import_*` 全量。
 
+### 4.32 独立存货档案页（C 选项）+ 往来期初按单据明细（导入 v2）
+
+- **存货档案页**（NAV 库存组，页=warehouse 查看、编辑服务端 AuxEdit 拦）：`GET /api/items/master` 一次聚合四源——`aux(kind=item)` 全量 + `item_plan`（安全库存/前置期/批量）+ **库存现量**（流水逐行汇总）+ **主单位**（item_unit）；列表含 编码/名称/单位/现量/安全库存/前置期/保质期/质检/状态/备注，**低库存红显**（现量<安全库存）、关键字搜索、只看低库存开关、行「编辑」复用通用档案编辑器（构造 AuxEntity 形状）、新建同款；`openAuxEditor` 保存后改 `rerenderView(state.view)`（原硬编码 aux 页——通用化后从存货档案页编辑不再跳页）。
+- **往来期初按单据**：新表 `arap_opening`（ar/ap、客商、单据号/日期、金额——纯新表）；导入 kind `arap_opening`（perm VoucherNew，类型/日期/金额行级校验、**同 kind+客商+单据号幂等跳过**）+ 模板 + 期初组下拉；账龄页（viewSettle）新增「往来期初明细」区块（列表 + **应收/应付分列合计** + 删除 + 去导入）。
+- **账龄覆盖**：`settle::aging` **单点注入**影子 AgingItem（按科目方向 1↔ar、2↔ap 过滤、单据期间≤upto、doc_no 标「期初」）——**不碰 `open_entries`/FIFO 零核销风险**。
+- **口径声明**：期初明细为**影子挂账**——进账龄展示与管理，**暂不参与自动核销**（收期初款的 FIFO 核销留 v2，需 settle 对伪 entry 的支持）；金额总额仍以科目期初为准，本表承载逐单欠款信息。
+- **测试**：web `items_master_and_arap_opening`——arap 导入 ok3/skip1 + 幂等 ok0/skip4 → 列表合计 8000/2000 → **1122 账龄含期初客商 Q01** → 删除后 2 行；存货建档（导入保质期45）+ item-plan（safety30/lead3/lot10）+ 期初数量 25 → master 聚合字段全断言（shelf/safety/lead/lot/qty/disabled）；回归 web settle 3/3 + findb aging 1/1。
+
 ---
 
 ## 5. 关键设计约定

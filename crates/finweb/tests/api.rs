@@ -1,4 +1,4 @@
-//! finweb 关键 API 集成测试（多租户模型）
+﻿//! finweb 关键 API 集成测试（多租户模型）
 //!
 //! 覆盖：平台身份库引导、平台登录、普通用户自建账套、归属隔离、
 //! 成员协作（邀请账套内成员）、管理员跨账套查看（不留痕迹）、
@@ -2491,6 +2491,147 @@ async fn import_master_data() {
         r["rows"].as_array().cloned().unwrap_or_default()
     });
     assert!(vlist.is_empty(), "期初库存不应生成凭证：{r}");
+}
+
+/// C 选项 + 导入 v2：存货档案一站式聚合（档案+计划参数+现量+单位）
+/// ＋ 往来期初按单据（导入→账龄覆盖→列表合计→删除）。
+#[tokio::test]
+async fn items_master_and_arap_opening() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // ---- 往来期初：导入 3 行（2 应收 + 1 应付）+ 1 坏类型；幂等重导 ----
+    let csv = "类型,客商编码,单据号,单据日期,金额,客商名称,备注\n\
+               应收,Q01,XSQ-9001,2025-12-01,5000,青云客户,期初一\n\
+               应收,Q01,XSQ-9002,2025-12-15,3000,青云客户,期初二\n\
+               应付,S91,CGQ-9001,2025-12-20,2000,远航供应商,\n\
+               坏类型,X01,BAD-1,2025-12-01,100,,\n";
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({ "kind": "arap_opening", "template": "generic", "text": csv }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "往来期初导入");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 3, "3 行有效：{r}");
+    assert_eq!(r["skipped"], 1, "坏类型跳过：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({ "kind": "arap_opening", "template": "generic", "text": csv }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], 0, "幂等重导：{r}");
+    assert_eq!(r["skipped"], 4, "全跳过：{r}");
+
+    // 列表：3 行 + 合计应收 8000 / 应付 2000
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/arap-opening", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 3, "{r}");
+    assert_eq!(
+        money_num(r["total_ar"].as_str().unwrap()),
+        8000.0,
+        "应收合计：{r}"
+    );
+    assert_eq!(
+        money_num(r["total_ap"].as_str().unwrap()),
+        2000.0,
+        "应付合计：{r}"
+    );
+    let first_id = r["rows"][0]["id"].as_i64().unwrap();
+
+    // 账龄覆盖：1122 账龄应含期初客商 Q01（影子行注入）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/settle/aging?account=1122&upto=202601",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "账龄可用");
+    let aging_body = body_string(resp).await;
+    assert!(aging_body.contains("Q01"), "期初客商应进账龄：{aging_body}");
+
+    // 删除一行 → 2 行
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_delete(&format!("/api/arap-opening/{first_id}"), &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "删除期初行");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/arap-opening", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 2, "删除后 2 行：{r}");
+
+    // ---- 存货档案一站式：导入建档 + 计划参数 + 期初数量 ----
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "item", "template": "generic",
+                "text": "编码,名称,保质期天,安全库存\nXM01,档案页存货,45,30\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "存货建档");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/item-plan",
+            &sid,
+            serde_json::json!({
+                "item_code": "XM01", "safety_stock": "30",
+                "lead_days": 3, "lot_size": "10"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "计划参数保存");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/import/run",
+            &sid,
+            serde_json::json!({
+                "kind": "opening_stock", "template": "generic",
+                "text": "存货编码,仓库,数量,单价\nXM01,W01,25,2\n"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "期初数量");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/items/master", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "存货档案端点");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let it = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["code"] == "XM01")
+        .unwrap()
+        .clone();
+    assert_eq!(it["name"], "档案页存货", "{it}");
+    assert_eq!(it["shelf_life"], "45", "保质期来自 props：{it}");
+    assert_eq!(money_num(it["safety"].as_str().unwrap()), 30.0, "{it}");
+    assert_eq!(it["lead_days"], 3, "{it}");
+    assert_eq!(money_num(it["lot"].as_str().unwrap()), 10.0, "{it}");
+    assert_eq!(money_num(it["qty"].as_str().unwrap()), 25.0, "现量来自流水：{it}");
+    assert_eq!(it["disabled"], false, "{it}");
 }
 
 /// 链7：数字钻取（科目明细账：期初 + 逐笔 + 运行余额 + 贷余负值）与缺参校验。

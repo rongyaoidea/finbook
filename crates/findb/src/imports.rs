@@ -728,6 +728,89 @@ fn import_opening_stock_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResu
     Ok(res)
 }
 
+/// 导入往来期初明细（列：类型(应收/应付/ar/ap),客商编码,单据号,单据日期,金额[,客商名,备注]）。
+/// 同 kind+客商+单据号已存在 → 静默跳过（幂等重导）；**影子挂账不生成凭证**
+/// （金额与客商总额由「科目期初」负责，本表只承载逐单欠款信息供账龄与管理）。
+pub fn import_arap_opening(db: &Db, text: &str, who: &str) -> DbResult<ImportResult> {
+    import_arap_opening_rows(db, &text_to_rows(text), who)
+}
+
+pub fn import_arap_opening_bytes(db: &Db, bytes: &[u8], who: &str) -> DbResult<ImportResult> {
+    import_arap_opening_rows(db, &read_xlsx_bytes(bytes)?, who)
+}
+
+fn arap_kind_of(s: &str) -> Option<&'static str> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "应收" | "ar" | "receivable" | "accounts_receivable" => Some("ar"),
+        "应付" | "ap" | "payable" | "accounts_payable" => Some("ap"),
+        _ => None,
+    }
+}
+
+fn import_arap_opening_rows(db: &Db, rows: &[Vec<String>], who: &str) -> DbResult<ImportResult> {
+    let mut res = ImportResult { ok: 0, skipped: 0, warnings: Vec::new() };
+    for (i, f) in rows.iter().enumerate() {
+        if f.len() < 5 {
+            continue;
+        }
+        let type_s = master_cell(f, 0);
+        if type_s == "类型" || type_s.eq_ignore_ascii_case("type") {
+            continue; // 表头
+        }
+        let Some(kind) = arap_kind_of(&type_s) else {
+            res.warnings.push(format!("第 {} 行：类型「{type_s}」应为 应收/应付，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        };
+        let party = master_cell(f, 1);
+        let doc_no = master_cell(f, 2);
+        let doc_date = master_cell(f, 3);
+        let amount = Money::parse_or_zero(&master_cell(f, 4));
+        if party.is_empty() || doc_no.is_empty() {
+            res.warnings.push(format!("第 {} 行：客商编码或单据号为空，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if chrono::NaiveDate::parse_from_str(&doc_date, "%Y-%m-%d").is_err() {
+            res.warnings.push(format!(
+                "第 {} 行：单据日期「{doc_date}」应为 YYYY-MM-DD，已跳过",
+                i + 1
+            ));
+            res.skipped += 1;
+            continue;
+        }
+        if !amount.is_positive() {
+            res.warnings.push(format!("第 {} 行：金额必须大于 0，已跳过", i + 1));
+            res.skipped += 1;
+            continue;
+        }
+        if crate::settle::arap_opening_exists(db, kind, &party, &doc_no)? {
+            res.skipped += 1;
+            continue; // 幂等
+        }
+        crate::settle::arap_opening_insert(
+            db,
+            &crate::settle::ArapOpening {
+                id: 0,
+                kind: kind.to_string(),
+                party_code: party,
+                party_name: master_cell(f, 5),
+                doc_no,
+                doc_date,
+                amount,
+                memo: master_cell(f, 6),
+                created_by: String::new(),
+            },
+            who,
+        )?;
+        res.ok += 1;
+    }
+    if res.ok > 0 {
+        db.log(who, "导入", "导入往来期初", &format!("成功 {} 条", res.ok))?;
+    }
+    Ok(res)
+}
+
 pub fn analyze_missing(
     db: &Db,
     text: &str,

@@ -532,7 +532,7 @@ pub fn aging(
     buckets: &[AgingBucket],
 ) -> DbResult<Vec<AgingLine>> {
     let entries = open_entries(db, account, upto, false)?;
-    let items: Vec<AgingItem> = entries
+    let mut items: Vec<AgingItem> = entries
         .iter()
         .map(|e| AgingItem {
             key: e.aux_key.clone(),
@@ -542,7 +542,127 @@ pub fn aging(
             doc_no: format!("{}-{}", e.word, e.no),
         })
         .collect();
+    // 往来期初明细（迁移数据，影子行）：按科目方向取对应类型（1开头=应收 / 2开头=应付），
+    // 单据日期期间不晚于 upto；**只进账龄展示、不参与 FIFO 核销**（核销 v2，避免伪 entry 外键）。
+    let want = if account.starts_with('1') {
+        Some("ar")
+    } else if account.starts_with('2') {
+        Some("ap")
+    } else {
+        None
+    };
+    if let Some(w) = want {
+        for o in arap_opening_list(db, Some(w))? {
+            let d = NaiveDate::parse_from_str(&o.doc_date, "%Y-%m-%d")
+                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            if Period::from_date(d).ymm() > upto.ymm() {
+                continue;
+            }
+            items.push(AgingItem {
+                key: o.party_code.clone(),
+                date: d,
+                amount: if o.kind == "ar" { o.amount } else { o.amount.negated() },
+                settled: Money::ZERO,
+                doc_no: format!(
+                    "期初 {}",
+                    if o.doc_no.is_empty() { format!("#{}", o.id) } else { o.doc_no.clone() }
+                ),
+            });
+        }
+    }
     Ok(fincore::engine::aging::analyze(&items, as_of, buckets)?)
+}
+
+// ---------------- 往来期初明细（按单据，平台迁移导入 v2） ----------------
+
+/// 往来期初明细（应收/应付逐单据）。**影子挂账**：进账龄展示、不参与 FIFO 核销（v2）——
+/// 金额与客商总额仍由「科目期初」负责，本表是迁移来的逐单欠款凭证信息。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ArapOpening {
+    pub id: i64,
+    /// ar 应收 / ap 应付
+    pub kind: String,
+    pub party_code: String,
+    pub party_name: String,
+    pub doc_no: String,
+    pub doc_date: String,
+    pub amount: Money,
+    pub memo: String,
+    pub created_by: String,
+}
+
+const ARO_COLS: &str = "id,kind,party_code,party_name,doc_no,doc_date,amount,memo,created_by";
+
+fn map_arap_opening(r: &rusqlite::Row) -> rusqlite::Result<ArapOpening> {
+    Ok(ArapOpening {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        party_code: r.get(2)?,
+        party_name: r.get(3)?,
+        doc_no: r.get(4)?,
+        doc_date: r.get(5)?,
+        amount: Money::parse_or_zero(&r.get::<_, String>(6)?),
+        memo: r.get(7)?,
+        created_by: r.get(8)?,
+    })
+}
+
+pub fn arap_opening_list(db: &Db, kind: Option<&str>) -> DbResult<Vec<ArapOpening>> {
+    let mut out = Vec::new();
+    match kind {
+        Some(k) => {
+            let mut st = db.conn().prepare(&format!(
+                "SELECT {ARO_COLS} FROM arap_opening WHERE kind=?1 ORDER BY doc_date, id"
+            ))?;
+            out = st
+                .query_map([k], map_arap_opening)?
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        None => {
+            let mut st = db.conn().prepare(&format!(
+                "SELECT {ARO_COLS} FROM arap_opening ORDER BY kind, doc_date, id"
+            ))?;
+            out = st
+                .query_map([], map_arap_opening)?
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
+    Ok(out)
+}
+
+/// 是否已有同 kind+客商+单据号（幂等重导跳过）
+pub fn arap_opening_exists(db: &Db, kind: &str, party: &str, doc_no: &str) -> DbResult<bool> {
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM arap_opening WHERE kind=?1 AND party_code=?2 AND doc_no=?3",
+        rusqlite::params![kind, party, doc_no],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn arap_opening_insert(db: &Db, o: &ArapOpening, who: &str) -> DbResult<i64> {
+    db.conn().execute(
+        "INSERT INTO arap_opening(kind,party_code,party_name,doc_no,doc_date,amount,memo,created_by,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            o.kind,
+            o.party_code,
+            o.party_name,
+            o.doc_no,
+            o.doc_date,
+            crate::exact_param(o.amount),
+            o.memo,
+            who,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        ],
+    )?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+pub fn arap_opening_delete(db: &Db, id: i64) -> DbResult<()> {
+    db.conn()
+        .execute("DELETE FROM arap_opening WHERE id=?1", [id])?;
+    Ok(())
 }
 
 /// 计提坏账准备：按应收（1122/1221）账龄与默认坏账比例计算**目标余额**，

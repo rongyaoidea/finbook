@@ -4317,7 +4317,7 @@ function openWfEditor(flow, reload) {
         ${n.type === "approve" ? `
         <div class="field"><label>参与人（角色，留空=需审核权限）</label><div id="pr-parts" style="display:flex;flex-direction:column;gap:4px"></div></div>
         <div class="field"><label>会签策略（v1 单人通过即过）</label><select id="pr-strat">
-          <option value="all" ${n.strategy === "all" ? "selected" : ""}>全部通过</option>
+          <option value="all" ${n.strategy === "all" ? "selected" : ""}>全部通过（会签：每个参与角色各需一票）</option>
           <option value="any" ${n.strategy === "any" ? "selected" : ""}>任一通过</option>
         </select></div>
         <div class="field"><label>驳回至（可选）</label><select id="pr-rej"><option value="">（用驳回连线）</option>${nodes.filter((x) => x.id !== n.id).map((x) => `<option value="${x.id}" ${n.reject_to === x.id ? "selected" : ""}>${esc(x.name || T[x.type] || x.id)}</option>`).join("")}</select></div>` : ""}
@@ -4347,7 +4347,7 @@ function openWfEditor(flow, reload) {
           <option value="normal" ${e2.kind !== "reject" ? "selected" : ""}>普通</option>
           <option value="reject" ${e2.kind === "reject" ? "selected" : ""}>驳回</option>
         </select></div>
-        <div class="field"><label>条件（展示用，v1 不求值）</label><input id="pr-cond" value="${esc(e2.condition || "")}" placeholder="如：金额&gt;5000" /></div>
+        <div class="field"><label>连线条件（审批时求值）</label><input id="pr-cond" value="${esc(e2.condition || "")}" placeholder="如：amount &gt; 5000" /><p class="muted" style="font-size:11px;margin:4px 0 0">字段：amount/qty/customer_code 等；运算符 &gt; &gt;= &lt; &lt;= == !=；多条出线按序匹配，空条件为兜底；字符串值加引号</p></div>
         <div style="margin-top:6px"><button class="btn danger sm" id="pr-del2">删除连线</button></div>`;
       $("#pr-kind", mask).onchange = (ev) => { snap(); e2.kind = ev.target.value; render(); };
       $("#pr-cond", mask).onchange = (ev) => { snap(); e2.condition = ev.target.value; render(); };

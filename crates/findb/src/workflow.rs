@@ -9,7 +9,7 @@
 //! （报价转已审批 / 请购批准 / 报销通过 / 收付款单出凭证）。驳回沿 reject 连线或节点
 //! reject_to 移动，无路径则实例终态 rejected（业务单据状态由调用方自行处理）。
 
-use fincore::{Perm, User};
+use fincore::{Money, Perm, User};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,7 @@ fn role_code(r: &Role) -> String {
         .unwrap_or_default()
 }
 
-use fincore::Role;
+use fincore::{Period, Role};
 
 /// 画布节点
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -468,11 +468,159 @@ fn first_approve(flow: &WfFlow) -> Option<&WfNode> {
     flow.nodes.iter().find(|n| n.node_type == "approve")
 }
 
-fn normal_next(flow: &WfFlow, from: &str) -> Option<String> {
-    flow.edges
+/// 条件分支上下文：按业务类型取单据属性（统一字符串；数值比较时解析）
+fn cond_context(
+    db: &Db,
+    biz_type: &str,
+    biz_id: i64,
+) -> DbResult<std::collections::BTreeMap<String, String>> {
+    let mut m: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let money = |v: Money| format!("{}", crate::workbench::money_f64(v));
+    match biz_type {
+        "quotation" => {
+            if let Some(q) = crate::sales::quo_get(db, biz_id)? {
+                m.insert("qty".into(), money(q.qty));
+                m.insert("amount".into(), money(q.qty * q.unit_price));
+                m.insert("customer_code".into(), q.customer_code);
+                m.insert("item_code".into(), q.item_code);
+            }
+        }
+        "claim" => {
+            if let Some(c) = crate::business::claim_get(db, biz_id)? {
+                m.insert("amount".into(), money(c.amount));
+                m.insert("applicant".into(), c.applicant);
+                m.insert("dept".into(), c.dept);
+            }
+        }
+        "receipt" => {
+            if let Some(r) = crate::receipt::receipt_list(db)?
+                .into_iter()
+                .find(|d| d.id == biz_id)
+            {
+                m.insert("amount".into(), money(r.amount));
+                m.insert("kind".into(), r.kind);
+                m.insert("party".into(), r.party);
+            }
+        }
+        "purchase_req" => {
+            if let Some(r) = crate::procurement::pr_get(db, biz_id)? {
+                m.insert("qty".into(), money(r.qty));
+                m.insert("item_code".into(), r.item_code);
+                m.insert("requester".into(), r.requester);
+            }
+        }
+        _ => {}
+    }
+    Ok(m)
+}
+
+/// 求值单条条件：`字段 操作 值`——运算符 >= <= != == > <；值带引号=字符串；
+/// 未带引号优先数值比较（双侧可解析），退化为字符串 ==/!=；字段缺失或类型不符 → Err
+/// （配置错误在审批时立即暴露，不让流程带病推进）。
+fn eval_condition(
+    cond: &str,
+    ctx: &std::collections::BTreeMap<String, String>,
+) -> Result<bool, String> {
+    let c = cond.trim();
+    let mut op = "";
+    let mut idx = 0;
+    for candidate in [">=", "<=", "!=", "==", ">", "<"] {
+        if let Some(p) = c.find(candidate) {
+            op = candidate;
+            idx = p;
+            break;
+        }
+    }
+    if op.is_empty() {
+        return Err("缺少比较运算符（>= <= != == > <）".to_string());
+    }
+    let field = c[..idx].trim();
+    let raw = c[idx + op.len()..].trim();
+    if field.is_empty() || raw.is_empty() {
+        return Err("条件应为「字段 运算符 值」".to_string());
+    }
+    let lv = ctx.get(field).ok_or_else(|| {
+        let keys: Vec<&str> = ctx.keys().map(|s| s.as_str()).collect();
+        format!(
+            "未知字段 {field}（当前业务类型支持：{}）",
+            if keys.is_empty() { "无可用字段".to_string() } else { keys.join("/") }
+        )
+    })?;
+    let quoted = (raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2)
+        || (raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2);
+    let as_num = |s: &str| s.trim().parse::<f64>().ok();
+    let result = if quoted {
+        let rv = &raw[1..raw.len() - 1];
+        match op {
+            "==" => lv.as_str() == rv,
+            "!=" => lv.as_str() != rv,
+            _ => return Err("字符串字段只支持 == 与 !=".to_string()),
+        }
+    } else {
+        match (as_num(lv), as_num(raw)) {
+            (Some(a), Some(b)) => match op {
+                ">" => a > b,
+                ">=" => a >= b,
+                "<" => a < b,
+                "<=" => a <= b,
+                "==" => a == b,
+                "!=" => a != b,
+                _ => return Err("不支持的运算符".to_string()),
+            },
+            _ => match op {
+                // 非数值字段退化为字符串比较
+                "==" => lv.as_str() == raw,
+                "!=" => lv.as_str() != raw,
+                _ => return Err(format!("字段 {field} 非数值，不能用 {op} 比较")),
+            },
+        }
+    };
+    Ok(result)
+}
+
+/// 条件分支出边：有条件边按插入序逐条求值，空条件边作兜底（最后匹配）；
+/// 单条无条件边=直通（兼容既有流程）；全不匹配 → Err。
+fn branch_next(
+    db: &Db,
+    flow: &WfFlow,
+    node: &WfNode,
+    biz_type: &str,
+    biz_id: i64,
+) -> DbResult<Option<String>> {
+    let edges: Vec<&WfEdge> = flow
+        .edges
         .iter()
-        .find(|e| e.from_node == from && e.kind == "normal")
-        .map(|e| e.to_node.clone())
+        .filter(|e| e.from_node == node.id && e.kind == "normal")
+        .collect();
+    if edges.is_empty() {
+        return Ok(None);
+    }
+    if edges.len() == 1 && edges[0].condition.trim().is_empty() {
+        return Ok(Some(edges[0].to_node.clone()));
+    }
+    let ctx = cond_context(db, biz_type, biz_id)?;
+    for e in edges.iter().filter(|e| !e.condition.trim().is_empty()) {
+        match eval_condition(&e.condition, &ctx) {
+            Ok(true) => return Ok(Some(e.to_node.clone())),
+            Ok(false) => continue,
+            Err(msg) => {
+                return Err(fincore::FinError::state(format!(
+                    "节点【{}】条件「{}」配置错误：{}",
+                    node_label(node),
+                    e.condition.trim(),
+                    msg
+                ))
+                .into())
+            }
+        }
+    }
+    if let Some(e) = edges.iter().find(|e| e.condition.trim().is_empty()) {
+        return Ok(Some(e.to_node.clone()));
+    }
+    Err(
+        fincore::FinError::state("该节点所有条件分支均不满足，且未配置兜底（空条件）出边")
+            .into(),
+    )
 }
 
 fn reject_next(flow: &WfFlow, from: &str) -> Option<String> {
@@ -582,13 +730,55 @@ pub fn intercept(
         ))
         .into());
     }
-    // 记轨迹（读-改-写 log_json）
+    // 记轨迹（读-改-写 log_json）—— 会签判定复用旧票集
     let log_s: String = tx.query_row(
         "SELECT log_json FROM workflow_instance WHERE id=?1",
         [inst_id],
         |r| r.get(0),
     )?;
     let mut log: Vec<WfLogEntry> = serde_json::from_str(&log_s).unwrap_or_default();
+
+    // 会签（strategy=all 且参与人非空）：每个参与角色各需一票；同一人不可重复批；
+    // 未满票时停留在当前节点（Pending 文案带 已通过/总角色数）。
+    let mut cosign_label: Option<String> = None;
+    if approve && node.strategy == "all" && !node.participants.is_empty() {
+        if log
+            .iter()
+            .any(|e| e.node == node.id && e.action == "approve" && e.who == user.username)
+        {
+            return Err(
+                fincore::FinError::state("您已在该节点会签通过，不可重复审批").into(),
+            );
+        }
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in log
+            .iter()
+            .filter(|e| e.node == node.id && e.action == "approve")
+        {
+            if let Some(u) = crate::users::get(db, &e.who)? {
+                for r in u.all_roles() {
+                    covered.insert(role_code(&r));
+                }
+            }
+        }
+        for r in user.all_roles() {
+            covered.insert(role_code(&r));
+        }
+        let done = node
+            .participants
+            .iter()
+            .filter(|p| covered.contains(*p))
+            .count();
+        if done < node.participants.len() {
+            cosign_label = Some(format!(
+                "{}（会签 {}/{}）",
+                node_label(&node),
+                done,
+                node.participants.len()
+            ));
+        }
+    }
+
     log.push(WfLogEntry {
         node: node.id.clone(),
         action: if approve { "approve" } else { "reject" }.to_string(),
@@ -599,10 +789,13 @@ pub fn intercept(
         "UPDATE workflow_instance SET log_json=?2 WHERE id=?1",
         rusqlite::params![inst_id, serde_json::to_string(&log)?],
     )?;
-    let next = if approve {
-        normal_next(&flow, &node.id)
-    } else {
+    let next = if !approve {
         reject_next(&flow, &node.id)
+    } else if cosign_label.is_some() {
+        // 会签未满票：留在当前节点
+        Some(node.id.clone())
+    } else {
+        branch_next(db, &flow, &node, biz_type, biz_id)?
     };
     match next {
         None => {
@@ -616,12 +809,15 @@ pub fn intercept(
             Ok(Gate::Final { approved: approve })
         }
         Some(nid) => {
-            let label = flow
-                .nodes
-                .iter()
-                .find(|n| n.id == nid)
-                .map(node_label)
-                .unwrap_or_else(|| nid.clone());
+            let label = if nid == node.id {
+                cosign_label.clone().unwrap_or_else(|| node_label(&node))
+            } else {
+                flow.nodes
+                    .iter()
+                    .find(|n| n.id == nid)
+                    .map(node_label)
+                    .unwrap_or_else(|| nid.clone())
+            };
             let n = tx.execute(
                 "UPDATE workflow_instance SET current_node=?2 WHERE id=?1 AND status='running'",
                 rusqlite::params![inst_id, nid],
@@ -778,6 +974,114 @@ mod tests {
         ));
     }
 
+    /// 会签（strategy=all + 多参与角色）：每个角色各需一票；同人不可重复批；满票推进。
+    #[test]
+    fn cosign_all_needs_each_role() {
+        let db = mem();
+        let nodes = vec![
+            n("s1", "start", "开始", vec![]),
+            n("a1", "approve", "会签节点", vec!["order_clerk", "keeper"]),
+        ];
+        let edges = vec![e("e1", "s1", "a1", "normal")];
+        let id = flow_save(&db, &input(0, "会签流", nodes, edges), "u").unwrap();
+        flow_set_status(&db, id, true, "u").unwrap();
+
+        let oc = User::new("s1", "订单员", Role::OrderClerk);
+        let kp = User::new("a2", "仓管员", Role::Keeper);
+        // 会签票按 who 查套内角色——审批人必是套内成员（现实场景），测试同步入库
+        crate::users::insert(&db, &oc).unwrap();
+        crate::users::insert(&db, &kp).unwrap();
+        // 订单员首票 → 停留当前节点，文案带 会签 1/2
+        match intercept(&db, BIZ_QUOTATION, 1, &oc, true, "").unwrap() {
+            Gate::Pending { next } => assert!(next.contains("会签 1/2"), "会签文案：{next}"),
+            other => panic!("应停留会签：{other:?}"),
+        }
+        // 同人重复批 → 拒
+        assert!(
+            intercept(&db, BIZ_QUOTATION, 1, &oc, true, "").is_err(),
+            "重复审批应拒"
+        );
+        // 仓管员第二票 → 满票 → 终态（无出边 Final）
+        match intercept(&db, BIZ_QUOTATION, 1, &kp, true, "").unwrap() {
+            Gate::Final { approved } => assert!(approved, "满票应到终态"),
+            other => panic!("满票应 Final：{other:?}"),
+        }
+    }
+
+    /// 条件分支：有条件出线按序求值、空条件兜底；语法/未知字段报配置错误。
+    #[test]
+    fn condition_branch_routing() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mk = |qty: &str, price: &str| -> i64 {
+            let mut q = crate::sales::Quotation {
+                id: 0,
+                no: String::new(),
+                period: p,
+                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+                customer_code: "C01".into(),
+                customer_name: "客户".into(),
+                item_code: "140301".into(),
+                item_name: "原料".into(),
+                qty: Money::parse(qty).unwrap(),
+                unit_price: Money::parse(price).unwrap(),
+                status: "draft".into(),
+                prepared_by: "u".into(),
+                memo: String::new(),
+            };
+            q.no = crate::sales::quo_next_no(&db, p).unwrap();
+            crate::sales::quo_save(&db, &mut q).unwrap()
+        };
+        let big = mk("10", "600"); // amount 6000
+        let small = mk("10", "10"); // amount 100
+        let bad_cond = mk("10", "900");
+        let unknown_f = mk("10", "800");
+
+        let cond_flow = |name: &str, second_cond: &str| -> i64 {
+            let nodes = vec![
+                n("s1", "start", "开始", vec![]),
+                n("a1", "approve", "审批", vec![]),
+                n("a2", "approve", "高额复核", vec![]),
+                n("a3", "approve", "快速通过", vec![]),
+            ];
+            let mut edges = vec![e("e1", "s1", "a1", "normal")];
+            if !second_cond.is_empty() {
+                let mut c = e("e2", "a1", "a2", "normal");
+                c.condition = second_cond.to_string();
+                edges.push(c);
+            }
+            edges.push(e("e3", "a1", "a3", "normal"));
+            let id = flow_save(&db, &input(0, name, nodes, edges), "u").unwrap();
+            flow_set_status(&db, id, true, "u").unwrap();
+            id
+        };
+
+        // 主流程：amount>5000 走高额复核，否则兜底快速通过
+        cond_flow("条件流", "amount > 5000");
+        let u = User::new("b1", "管理员", Role::Admin);
+        match intercept(&db, BIZ_QUOTATION, big, &u, true, "").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "高额复核"),
+            other => panic!("高额路由：{other:?}"),
+        }
+        match intercept(&db, BIZ_QUOTATION, small, &u, true, "").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "快速通过"),
+            other => panic!("兜底路由：{other:?}"),
+        }
+        // 语法错误 → 审批即报配置错误
+        cond_flow("坏条件流", "amount >>> 5");
+        assert!(
+            intercept(&db, BIZ_QUOTATION, bad_cond, &u, true, "").is_err(),
+            "语法错误应报配置错"
+        );
+        // 未知字段 → 审批即报配置错误
+        cond_flow("未知字段流", "foo > 5");
+        assert!(
+            intercept(&db, BIZ_QUOTATION, unknown_f, &u, true, "").is_err(),
+            "未知字段应报配置错"
+        );
+    }
+
+    /// 驳回后重新发起：实例重置回第一个审批节点，正常推进。
     #[test]
     fn intercept_reject_and_restart() {
         let db = mem();

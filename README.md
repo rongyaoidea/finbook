@@ -435,6 +435,15 @@
 - **批次调拨**（Web 此前只有报表无创建）：`POST /api/inventory/transfer`（Warehouse）——源仓分仓余额校验（不足 400）→ **调出（qty 负）/调入（qty 正）两条 Transfer 流水**（标准价、amount=0 计价引擎结算参与成本序列）→ **批次主仓标签改写**（`stock_batch UNIQUE(item,batch_no)` 全仓一行，分仓数量以流水分账）；批号留空 = **FEFO 近效期自动选批**（首条不足量 400 提示分批）。批次台账行「调拨」按钮 + modal（源仓默认主仓/目标仓/数量/日期）；调拨报表新增批号列。
 - **测试**：web `chain5_batch_stock` 一件串三——造批次 W01×10 → 批次盘点（快照=10 断言/应用后余额 8）→ 成本勾稽（detail 含批次、Σqty=8、book/diff 列）→ 调拨 W01→W02×3（双流水断言、主仓改写 W02、总量仍 8、超额 400、FEFO 自动选中 BT500）；回归 findb `count_apply_loss_gain_and_guards` 1/1 + web `stock_count_flow`/`stock_batch_flow`/`workbench_role_matrix` 3/3。
 
+### 4.29 MPS 主生产计划 + 粗细排产（对标金蝶 MPS/排产，清单⑥）
+
+- **MPS 主计划**（新表 `mps_plan`）：需求 = 已确认销售订单未发量 ∪ 手工行 → **净算计划量 = 需求 − 现有库存 − 在制未完工**（防重复下达）；「运行 MPS / 最近一次 / 计划量转 MRP」；行「**下达**」一键 = open→converted（条件更新防并发）+ **同事务语义生成已下达生产订单**（账期=当前计划期、单据日期=建议交期，允许跨期；数量可改、计划量为 0 拒、重复下达 400）；交期默认今天+7。
+- **粗排**（`POST /api/mps/rough`）：**件/日产能**口径（v1——工艺路线暂无标准工时字段，工时口径留待迭代，诚实声明）——本期间未完工自制订单按单据日期顺排，`need_days=ceil(open/日产能)`、逐日装载产生**按日负荷**（超载标红）；建议区间单行「应用」/「全部应用到订单」。
+- **细排**（`POST /api/prod/schedule`，schema **v26**：`production_order.plan_start/plan_end`）：批量写回计划开工/完工日（**仅未完工订单**，条件更新防误写终态单）；生产订单列表投影补 plan 字段；「③ 细排结果」面板显示已排订单。
+- **顺手修**：`run_at` 秒级精度同秒两次运行会在 `MAX(run_at)` 查询中混合（MPS 与 MRP 同款隐患）——均改微秒格式。
+- **UI**：新页「MPS 排产」（NAV 生产制造组），三块面板 ①MPS ②粗排+负荷 ③细排结果。
+- **测试**：web `mps_schedule_flow`——确认 SO 未发量6 → MPS demand=6/planned=6 → 在制4后再跑 wip=4/planned=2 → 下达生成 SC 单+重复 400 → 粗排 日产能2：MPS单1天/在制单2天/负荷非空 → 细排写回 plan_start=2026-02-01 + 空清单400 + 空需求400；回归 findb `mrp_basic`/`mrp_lot_size_and_safety_stock`/`prod_crud`/`count_apply_loss_gain_and_guards` 4/4 + web `production_issue_complete_flow`/`workbench_role_matrix` 2/2。
+
 ---
 
 ## 5. 关键设计约定

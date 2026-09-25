@@ -305,6 +305,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/bom", get(get_bom_ep).post(save_bom_ep))
         .route("/api/mrp/latest", get(get_mrp_latest))
         .route("/api/mrp/run", post(run_mrp))
+        .route("/api/mps/run", post(run_mps))
+        .route("/api/mps/latest", get(get_mps_latest))
+        .route("/api/mps/:id/convert", post(convert_mps))
+        .route("/api/mps/rough", post(rough_mps))
+        .route("/api/prod/schedule", post(schedule_prod))
         // 预算版本
         .route("/api/budget/versions", get(list_budget_versions).post(save_budget_version))
         .route("/api/budget/versions/:key/delete", post(delete_budget_version))
@@ -5796,6 +5801,8 @@ async fn list_prod_orders(
                 "status": format!("{:?}", o.status),
                 "order_kind": o.order_kind,
                 "supplier_name": o.supplier_name,
+                "plan_start": o.plan_start,
+                "plan_end": o.plan_end,
             })
         })
         .collect();
@@ -6149,6 +6156,177 @@ fn prod_act_date(s: &str) -> chrono::NaiveDate {
         .unwrap_or_else(|_| chrono::Local::now().date_naive())
 }
 
+// ---- MPS 主生产计划 / 粗排 / 细排（链6） ----
+
+#[derive(Deserialize)]
+struct MpsRunReq {
+    #[serde(default)]
+    pub demands: Vec<MrpDemandDto>,
+    /// true = 合并已确认销售订单未发量（与手工行并集）
+    #[serde(default)]
+    pub from_sales: bool,
+    /// 建议交期（默认今天 +7）
+    #[serde(default)]
+    pub due_date: String,
+}
+
+/// MPS 运行：需求聚合（销售未发量 + 手工行）→ 净算计划量（扣现有库存与在制）
+async fn run_mps(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<MpsRunReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let mut extra: Vec<(String, Money, String)> = Vec::with_capacity(req.demands.len());
+    for d in &req.demands {
+        extra.push((
+            d.item_code.clone(),
+            parse_money_checked(&d.qty)?,
+            d.source.clone(),
+        ));
+    }
+    if req.from_sales {
+        extra.extend(advanced::mrp_demands_from_sales(
+            &db,
+            current_period(&state, &user),
+        )?);
+    }
+    if extra.is_empty() {
+        return Err(AppError::bad_request("请提供手工需求，或勾选「从销售订单收集」"));
+    }
+    let due = if req.due_date.trim().is_empty() {
+        (chrono::Local::now().date_naive() + chrono::Duration::days(7))
+            .format("%Y-%m-%d")
+            .to_string()
+    } else {
+        req.due_date.trim().to_string()
+    };
+    // 销售需求已在 handler 合并，findb 侧不再取（sales_period=0）
+    let run_at = advanced::mps_run(&db, &extra, Period::from_ymm(0), &due)?;
+    let rows = advanced::mps_latest(&db)?;
+    db.log(
+        user.username(),
+        "生产",
+        "MPS 运算",
+        &format!("{} 行，建议交期 {due}", rows.len()),
+    )?;
+    Ok(Json(json!({ "run_at": run_at, "due_date": due, "rows": rows })))
+}
+
+/// MPS 最近一次结果
+async fn get_mps_latest(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!({ "rows": advanced::mps_latest(&db)? })))
+}
+
+#[derive(Deserialize)]
+struct MpsConvertReq {
+    /// 空 = 用行净算计划量
+    #[serde(default)]
+    qty: String,
+}
+
+/// MPS 下达：状态 open → converted 并一键生成已下达生产订单（数量可改）
+async fn convert_mps(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<MpsConvertReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let q = if req.qty.trim().is_empty() {
+        None
+    } else {
+        Some(parse_money_checked(&req.qty)?)
+    };
+    let (oid, no) = advanced::mps_convert_to_order(
+        &db,
+        id,
+        q,
+        current_period(&state, &user),
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "生产",
+        "MPS 下达",
+        &format!("行 #{id} → 生产订单 {no}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "order_id": oid, "order_no": no })))
+}
+
+#[derive(Deserialize)]
+struct RoughReq {
+    /// 日产能（件/日），空 = 10
+    #[serde(default)]
+    daily_qty: String,
+    #[serde(default)]
+    period: i32,
+}
+
+/// 粗排：件/日产能顺排（v1 口径——工艺路线暂无标准工时，工时口径留待迭代）
+async fn rough_mps(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<RoughReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let daily = parse_money_checked(if req.daily_qty.trim().is_empty() {
+        "10"
+    } else {
+        req.daily_qty.trim()
+    })?;
+    let (orders, load) = advanced::rough_schedule(&db, period, daily)?;
+    Ok(Json(json!({ "orders": orders, "load": load, "daily_qty": daily })))
+}
+
+#[derive(Deserialize)]
+struct SchedItem {
+    id: i64,
+    #[serde(default)]
+    start: String,
+    #[serde(default)]
+    end: String,
+}
+
+#[derive(Deserialize)]
+struct ScheduleReq {
+    items: Vec<SchedItem>,
+}
+
+/// 细排：批量写回计划开工/完工日（仅未完工订单可排）
+async fn schedule_prod(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ScheduleReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    if req.items.is_empty() {
+        return Err(AppError::bad_request("排产清单为空"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let items: Vec<(i64, String, String)> = req
+        .items
+        .into_iter()
+        .map(|i| (i.id, i.start.trim().to_string(), i.end.trim().to_string()))
+        .collect();
+    let n = findb::scm::prod_schedule(&db, &items)?;
+    db.log(user.username(), "生产", "生产排产", &format!("写回 {n} 单计划日期"))?;
+    Ok(Json(json!({ "ok": true, "updated": n })))
+}
+
 /// 下达生产订单（MRP 结果页「下达」/ 手工）：状态=已下达。
 /// 此前生产订单全系统无创建入口（仅 MRP 计划与测试直造），此端点补齐工厂链第一环。
 async fn create_prod_ep(
@@ -6187,6 +6365,8 @@ async fn create_prod_ep(
         },
         supplier_code: req.supplier_code.trim().to_string(),
         supplier_name: req.supplier_name.trim().to_string(),
+        plan_start: String::new(),
+        plan_end: String::new(),
     };
     order.no = findb::scm::prod_next_no(&db, period)?;
     let id = findb::scm::prod_save(&db, &mut order)?;

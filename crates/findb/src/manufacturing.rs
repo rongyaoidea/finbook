@@ -758,7 +758,7 @@ pub fn outsource_fee(db: &Db, po_id: i64, amount: Money, date: NaiveDate, who: &
 pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> {
     let row = db.conn()
         .query_row(
-            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
+            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name, plan_start, plan_end
              FROM production_order WHERE id=?",
             [po_id],
             |r| Ok(ProductionOrder {
@@ -777,6 +777,8 @@ pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> 
                 order_kind: r.get(12)?,
                 supplier_code: r.get(13)?,
                 supplier_name: r.get(14)?,
+                plan_start: r.get(15)?,
+                plan_end: r.get(16)?,
             }),
         );
     match row {
@@ -872,6 +874,8 @@ mod tests {
             order_kind: "inhouse".into(),
             supplier_code: String::new(),
             supplier_name: String::new(),
+            plan_start: String::new(),
+            plan_end: String::new(),
         };
 
         // 领料结转：借 500101=60 / 贷 140301=60

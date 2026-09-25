@@ -429,6 +429,7 @@ const NAV_ITEMS = [
   { id: "settle", label: "往来核销", perm: "voucher_new", group: "期末" },
   { id: "reconcile", label: "期末对账", perm: "fin_report", group: "期末" },
   { id: "mrp", label: "MRP 运算", perm: "production_ops", group: "生产制造" },
+  { id: "mps", label: "MPS 排产", perm: "production_ops", group: "生产制造" },
   { id: "routing", label: "工艺路线", perm: "production_ops", group: "生产制造" },
   { id: "work-report", label: "工序报工", perm: "production_ops", group: "生产制造" },
   { id: "funds", label: "资金管理", perm: "fin_report", group: "资金" },
@@ -487,6 +488,7 @@ const VIEWS = {
   "settle": viewSettle,
   "reconcile": viewReconcile,
   "mrp": viewMrp,
+  "mps": viewMps,
   "routing": viewRouting,
   "approval": viewApproval,
   "notes": viewNotes,
@@ -2514,6 +2516,123 @@ async function viewRatios(main) {
 }
 
 // ===========================================================================
+// MPS 主生产计划 + 粗排 + 细排（链6：清单⑥）
+async function viewMps(main) {
+  main.innerHTML = `<h2>MPS 主生产计划 · 粗细排产</h2>
+    <div class="panel">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h4 style="margin:0">① MPS 运行（需求 − 现有 − 在制 = 计划）</h4><span class="grow"></span>
+        <label style="font-size:12px"><input type="checkbox" id="mps-sales" checked /> 从销售订单收集未发量</label>
+        <label style="font-size:12px">手工 <input id="mps-item" placeholder="存货编码" style="width:110px" /> × <input id="mps-qty" placeholder="数量" style="width:70px" /></label>
+        <label style="font-size:12px">建议交期 <input type="date" id="mps-due" /></label>
+        <button class="btn primary" id="mps-run">运行 MPS</button>
+        <button class="btn ghost" id="mps-latest">最近一次</button>
+        <button class="btn ghost sm" id="mps-tomrp">计划量转 MRP</button>
+      </div>
+      <div id="mps-table" class="muted" style="margin-top:8px">运行后显示净算建议；「下达」一键生成已下达生产订单。</div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h4 style="margin:0">② 粗排（件/日产能顺排）</h4><span class="grow"></span>
+        <label style="font-size:12px">日产能 <input id="rq-daily" value="10" style="width:60px" /> 件/日</label>
+        <button class="btn" id="rq-run">计算粗排</button>
+        <button class="btn ghost sm" id="rq-apply-all">全部应用到订单</button>
+      </div>
+      <div id="rq-table" class="muted" style="margin-top:8px">计算后显示排期建议与按日负荷（超载标红）。</div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px"><h4 style="margin:0">③ 细排结果（已写回订单的计划日期）</h4><span class="grow"></span><button class="btn ghost sm" id="sch-reload">刷新</button></div>
+      <div id="sch-table" class="muted" style="margin-top:8px">「粗排-应用」写回后在此显示。</div>
+    </div>`;
+  // 建议交期默认今天 +7（内联计算——shift 是别处的局部函数）
+  $("#mps-due").value = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  let mpsRows = [];
+  let roughRows = [];
+
+  const renderMps = (rows) => {
+    mpsRows = rows || [];
+    $("#mps-table").innerHTML = mpsRows.length
+      ? `<table class="grid"><thead><tr><th>存货</th><th class="num">需求</th><th class="num">现有</th><th class="num">在制</th><th class="num">计划量</th><th>来源</th><th>建议交期</th><th>状态</th><th></th></tr></thead><tbody>${mpsRows.map((r) => `<tr><td>${esc(r.item_code)}</td><td class="num">${fmt(r.demand)}</td><td class="num">${fmt(r.on_hand)}</td><td class="num">${fmt(r.wip)}</td><td class="num"><b>${fmt(r.planned)}</b></td><td>${esc(r.source)}</td><td>${esc(r.due_date)}</td><td>${r.status === "open" ? '<span class="tag">待下达</span>' : '<span class="tag ok">已下达</span>'}</td>
+        <td class="row-actions">${r.status === "open" && Number(r.planned) > 0 ? `<button class="btn primary sm" data-mps-go="${r.id}">下达</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="muted">暂无结果（先运行 MPS）</div>`;
+    $all("[data-mps-go]").forEach((b) => b.onclick = async () => {
+      try {
+        const r = await postJson(`/mps/${b.dataset.mpsGo}/convert`, {});
+        toast(`已下达 → 生产订单 ${r.order_no}（到「工序报工」开工/领料）`, "ok");
+        loadMps();
+      } catch (e) { toast(e.message, "err"); }
+    });
+  };
+  const loadMps = async () => {
+    try { const r = await api("/mps/latest"); renderMps(r.rows || []); } catch (e) { $("#mps-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#mps-run").onclick = async () => {
+    try {
+      const demands = [];
+      const it = $("#mps-item").value.trim();
+      const q = $("#mps-qty").value.trim();
+      if (it && q) demands.push({ item_code: it, qty: q, source: "手工" });
+      const r = await postJson("/mps/run", { demands, from_sales: $("#mps-sales").checked, due_date: $("#mps-due").value });
+      renderMps(r.rows || []);
+      $("#mps-item").value = ""; $("#mps-qty").value = "";
+      toast(`MPS 运算完成（${(r.rows || []).length} 行）`, "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#mps-latest").onclick = loadMps;
+  $("#mps-tomrp").onclick = async () => {
+    const demands = mpsRows
+      .filter((r) => Number(r.planned) > 0)
+      .map((r) => ({ item_code: r.item_code, qty: String(r.planned), source: "MPS" }));
+    if (!demands.length) { toast("无正计划量行可转", "err"); return; }
+    try {
+      await postJson("/mrp/run", { demands });
+      toast("已按 MPS 计划量运行 MRP（到「MRP 运算」页点「最近一次结果」）", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const applySch = async (list) => {
+    const use = list.filter((o) => o && o.sug_start && o.sug_end);
+    if (!use.length) { toast("无可用排期", "err"); return; }
+    try {
+      const r = await postJson("/prod/schedule", { items: use.map((o) => ({ id: o.id, start: o.sug_start, end: o.sug_end })) });
+      toast(`已写回 ${r.updated} 单计划日期`, "ok");
+      loadSch();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  const renderRough = (orders, load) => {
+    roughRows = orders || [];
+    $("#rq-table").innerHTML = (roughRows.length
+      ? `<table class="grid"><thead><tr><th>订单</th><th>存货</th><th class="num">未完工</th><th class="num">需天数</th><th>建议开工</th><th>建议完工</th><th></th></tr></thead><tbody>${roughRows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.item_code)}</td><td class="num">${fmt(o.open_qty)}</td><td class="num">${o.need_days}</td><td>${esc(o.sug_start)}</td><td>${esc(o.sug_end)}</td>
+        <td class="row-actions"><button class="btn ghost sm" data-sch="${o.id}">应用</button></td></tr>`).join("")}</tbody></table>`
+      : `<div class="muted">无未完工自制订单</div>`)
+      + ((load || []).length
+        ? `<div style="margin-top:10px"><b style="font-size:12.5px">按日负荷</b><table class="grid" style="margin-top:4px"><thead><tr><th>日期</th><th class="num">负荷</th><th class="num">产能</th><th>状态</th></tr></thead><tbody>${load.map((l) => `<tr><td>${esc(l.date)}</td><td class="num">${fmt(l.qty)}</td><td class="num">${fmt(l.capacity)}</td><td>${l.over ? '<span class="tag err">超载</span>' : '<span class="tag ok">正常</span>'}</td></tr>`).join("")}</tbody></table></div>`
+        : "");
+    $all("[data-sch]").forEach((b) => b.onclick = () => applySch([roughRows.find((o) => String(o.id) === b.dataset.sch)]));
+  };
+  $("#rq-run").onclick = async () => {
+    try {
+      const r = await postJson("/mps/rough", { daily_qty: $("#rq-daily").value.trim() || "10" });
+      renderRough(r.orders || [], r.load || []);
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#rq-apply-all").onclick = () => applySch(roughRows);
+
+  const loadSch = async () => {
+    try {
+      const r = await api(`/prod?period=${ymm(state.current || "")}`);
+      const rows = (r.orders || []).filter((o) => o.plan_start);
+      $("#sch-table").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>订单</th><th>存货</th><th class="num">计划量</th><th>计划开工</th><th>计划完工</th><th>状态</th></tr></thead><tbody>${rows.map((o) => `<tr><td>${esc(o.no)}</td><td>${esc(o.item_code)}</td><td class="num">${fmt(o.planned_qty)}</td><td>${esc(o.plan_start)}</td><td>${esc(o.plan_end)}</td><td>${esc(o.status)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">暂无已排产订单（粗排后点「应用」）</div>`;
+    } catch (e) { $("#sch-table").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#sch-reload").onclick = loadSch;
+  await Promise.all([loadMps(), loadSch()]);
+}
+
 // MRP 运算
 // ===========================================================================
 async function viewMrp(main) {

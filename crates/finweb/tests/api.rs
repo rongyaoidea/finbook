@@ -2300,6 +2300,189 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 链6：MPS（销售需求+净算+在制扣减+一键下达）→ 粗排（件/日顺排+按日负荷）→ 细排写回。
+#[tokio::test]
+async fn mps_schedule_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 需求：确认销售订单 140301 ×6（未发量 = 6）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "MPS 造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "6", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // ① MPS（从销售收集）：demand=6、wip=0、planned=6（无库存）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mps/run",
+            &sid,
+            serde_json::json!({ "from_sales": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "MPS 运行");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_code"] == "140301")
+        .unwrap()
+        .clone();
+    assert_eq!(row["demand"].as_str().unwrap().parse::<f64>().unwrap(), 6.0, "需求=未发量：{row}");
+    assert_eq!(row["wip"].as_str().unwrap().parse::<f64>().unwrap(), 0.0, "初始无在制");
+    assert_eq!(row["planned"].as_str().unwrap().parse::<f64>().unwrap(), 6.0, "计划=6-0-0：{row}");
+
+    // ② 在制扣减：建生产订单 ×4 → 再跑 MPS → wip=4、planned=2
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140301", "qty": "4", "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建在制订单");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mps/run",
+            &sid,
+            serde_json::json!({ "from_sales": true }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row2 = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_code"] == "140301")
+        .unwrap()
+        .clone();
+    assert_eq!(row2["wip"].as_str().unwrap().parse::<f64>().unwrap(), 4.0, "在制=4：{row2}");
+    assert_eq!(row2["planned"].as_str().unwrap().parse::<f64>().unwrap(), 2.0, "计划扣在制=6-4：{row2}");
+    let mps_id = row2["id"].as_i64().unwrap();
+
+    // ③ 一键下达 → 生成生产订单；重复下达 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/mps/{mps_id}/convert"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "MPS 下达");
+    let conv: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let mps_order_id = conv["order_id"].as_i64().unwrap();
+    assert!(conv["order_no"].as_str().unwrap().starts_with("SC"), "生成生产订单单号");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/mps/{mps_id}/convert"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复下达拒");
+
+    // ④ 粗排：日产能 2 → 在制单（open 4 → 2 天）+ MPS 单（open 2 → 1 天）；负荷非空
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mps/rough",
+            &sid,
+            serde_json::json!({ "daily_qty": "2" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "粗排");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let orders = r["orders"].as_array().unwrap();
+    assert!(orders.len() >= 2, "两单参与粗排：{r}");
+    let mps_row = orders.iter().find(|o| o["id"].as_i64() == Some(mps_order_id)).unwrap();
+    assert_eq!(mps_row["need_days"].as_i64(), Some(1), "open2/日产能2 → 1 天：{mps_row}");
+    let wip_row = orders.iter().find(|o| o["id"].as_i64() != Some(mps_order_id)).unwrap();
+    assert_eq!(wip_row["need_days"].as_i64(), Some(2), "open4/日产能2 → 2 天：{wip_row}");
+    assert!(!r["load"].as_array().unwrap().is_empty(), "按日负荷非空");
+    assert!(!mps_row["sug_start"].as_str().unwrap().is_empty());
+
+    // ⑤ 细排写回：MPS 单排到 2026-02-01（跨期日期允许）；空清单 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/schedule",
+            &sid,
+            serde_json::json!({ "items": [{ "id": mps_order_id, "start": "2026-02-01", "end": "2026-02-01" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "细排写回");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["updated"], 1);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/prod?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let scheduled = r["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"].as_i64() == Some(mps_order_id))
+        .unwrap()
+        .clone();
+    assert_eq!(scheduled["plan_start"], "2026-02-01", "计划开工已写回：{scheduled}");
+    assert_eq!(scheduled["plan_end"], "2026-02-01");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/schedule",
+            &sid,
+            serde_json::json!({ "items": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "空清单拒");
+
+    // ⑥ 空需求 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mps/run",
+            &sid,
+            serde_json::json!({ "from_sales": false, "demands": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "空需求拒");
+}
+
 /// 链5：批次盘点（批次账面快照/差异流水带批次/盘盈建档）→ 批次成本勾稽 → 批次调拨（双流水+主仓改写+FEFO）。
 #[tokio::test]
 async fn chain5_batch_stock() {

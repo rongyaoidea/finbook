@@ -519,7 +519,8 @@ fn bom_children(db: &Db, parent: &str) -> DbResult<Vec<BomNode>> {
 ///
 /// 有 BOM 的物料 action=produce，否则 purchase。返回本次 run_at 时间戳。
 pub fn mrp_run(db: &Db, demands: &[(String, Money, String)]) -> DbResult<String> {
-    let run_at = now();
+    // run_at 微秒精度：秒级会令同秒两次运行在 mrp_latest（MAX(run_at)）中混合
+    let run_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
     // 净需求累加表：item -> (gross, level, source)
     struct Acc {
         gross: Money,
@@ -648,6 +649,325 @@ pub fn mrp_demands_from_sales(db: &Db, period: Period) -> DbResult<Vec<(String, 
         }
     }
     Ok(out)
+}
+
+// ===========================================================================
+// MPS 主生产计划 / 粗排（链6）
+// ===========================================================================
+
+/// MPS 计划行（成品维度：需求 − 现有 − 在制 = 计划）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MpsPlan {
+    pub id: i64,
+    pub run_at: String,
+    pub item_code: String,
+    pub item_name: String,
+    pub demand: Money,
+    pub on_hand: Money,
+    pub wip: Money,
+    pub planned: Money,
+    pub source: String,
+    pub due_date: String,
+    /// open / converted
+    pub status: String,
+}
+
+const MPS_COLS: &str =
+    "id,run_at,item_code,item_name,demand,on_hand,wip,planned,source,due_date,status";
+
+fn map_mps(r: &rusqlite::Row) -> rusqlite::Result<MpsPlan> {
+    Ok(MpsPlan {
+        id: r.get(0)?,
+        run_at: r.get(1)?,
+        item_code: r.get(2)?,
+        item_name: r.get(3)?,
+        demand: read_m(&r.get::<_, String>(4)?),
+        on_hand: read_m(&r.get::<_, String>(5)?),
+        wip: read_m(&r.get::<_, String>(6)?),
+        planned: read_m(&r.get::<_, String>(7)?),
+        source: r.get(8)?,
+        due_date: r.get(9)?,
+        status: r.get(10)?,
+    })
+}
+
+/// MPS 运行：需求聚合（已确认销售订单未发量 + 手工行）→ 净算计划量
+/// （扣现有库存与在制未完工，防止重复下达）。sales_period=0 不取销售需求。
+/// 返回本次 run_at。
+pub fn mps_run(
+    db: &Db,
+    extra: &[(String, Money, String)],
+    sales_period: Period,
+    due_date: &str,
+) -> DbResult<String> {
+    use std::collections::HashMap;
+    let mut demand: HashMap<String, Money> = HashMap::new();
+    let mut source: HashMap<String, Vec<String>> = HashMap::new();
+    if sales_period.ymm() > 0 {
+        for (item, qty, src) in mrp_demands_from_sales(db, sales_period)? {
+            *demand.entry(item.clone()).or_insert(Money::ZERO) += qty;
+            source.entry(item).or_default().push(src);
+        }
+    }
+    for (item, qty, src) in extra {
+        let it = item.trim();
+        if it.is_empty() || !qty.is_positive() {
+            continue;
+        }
+        *demand.entry(it.to_string()).or_insert(Money::ZERO) += *qty;
+        source.entry(it.to_string()).or_default().push(src.clone());
+    }
+    // 在制 = 全部未完工生产订单的 open qty（Draft/Released/InProgress）
+    let mut wip: HashMap<String, Money> = HashMap::new();
+    {
+        let mut st = db
+            .conn()
+            .prepare("SELECT item_code, planned_qty, completed_qty, status FROM production_order")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (item, pq, cq, stt) in rows {
+            if stt == "completed" || stt == "cancelled" {
+                continue;
+            }
+            let open = read_m(&pq) - read_m(&cq);
+            if open.is_positive() {
+                *wip.entry(item).or_insert(Money::ZERO) += open;
+            }
+        }
+    }
+    // run_at 精确到微秒：秒级精度下同秒两次运行会在 mps_latest（MAX(run_at)）中混合
+    let run_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let tx = db.write_tx()?;
+    let now_s = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut items: Vec<String> = demand.keys().cloned().collect();
+    items.sort();
+    for item in items {
+        let d = demand[&item];
+        let on_hand: Money = crate::inventory2::warehouse_stock(db, &item)?
+            .iter()
+            .map(|w| w.qty)
+            .sum();
+        let w = wip.get(&item).copied().unwrap_or(Money::ZERO);
+        let net = d - on_hand - w;
+        let planned = if net.is_positive() { net } else { Money::ZERO };
+        let src = source
+            .get(&item)
+            .map(|v| v.join(","))
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO mps_plan(run_at,item_code,item_name,demand,on_hand,wip,planned,source,due_date,status,created_at)
+             VALUES(?1,?2,'',?3,?4,?5,?6,?7,?8,'open',?9)",
+            rusqlite::params![run_at, item, crate::exact_param(d), crate::exact_param(on_hand), crate::exact_param(w), crate::exact_param(planned), src, due_date, now_s],
+        )?;
+    }
+    tx.commit()?;
+    Ok(run_at)
+}
+
+/// 最近一次 MPS 结果
+pub fn mps_latest(db: &Db) -> DbResult<Vec<MpsPlan>> {
+    let latest: Option<String> = db
+        .conn()
+        .query_row("SELECT MAX(run_at) FROM mps_plan", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })?;
+    let Some(ts) = latest else {
+        return Ok(Vec::new());
+    };
+    let mut st = db.conn().prepare(&format!(
+        "SELECT {MPS_COLS} FROM mps_plan WHERE run_at=?1 ORDER BY id"
+    ))?;
+    let rows = st
+        .query_map([ts], map_mps)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// MPS 行下达：open → converted（条件更新防并发）并生成已下达生产订单。
+/// qty=None 用行计划量；**订单账期=当前计划期**（对齐 create_prod 惯例——period 跟计划、
+/// date 跟交期，允许跨期），单据日期=行建议交期（无交期=今天）。
+/// 两步非原子（防重闸在先，prod_save 独立事务）——prod_save 失败时行已转，
+/// 可由审计日志定位补单；v1 声明。返回 (生产订单 id, 单号)。
+pub fn mps_convert_to_order(
+    db: &Db,
+    id: i64,
+    qty: Option<Money>,
+    period: Period,
+    who: &str,
+) -> DbResult<(i64, String)> {
+    let row = match db
+        .conn()
+        .query_row(
+            &format!("SELECT {MPS_COLS} FROM mps_plan WHERE id=?1"),
+            [id],
+            map_mps,
+        ) {
+        Ok(r) => r,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(fincore::FinError::not_found("MPS 行不存在").into())
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if row.status != "open" {
+        return Err(fincore::FinError::state("该 MPS 行已下达").into());
+    }
+    let q = qty.unwrap_or(row.planned);
+    if !q.is_positive() {
+        return Err(fincore::FinError::msg("计划量为 0，无需下达").into());
+    }
+    // 防并发：条件更新（open → converted）
+    let n = db.conn().execute(
+        "UPDATE mps_plan SET status='converted' WHERE id=?1 AND status='open'",
+        [id],
+    )?;
+    if n == 0 {
+        return Err(fincore::FinError::state("MPS 行状态已变化").into());
+    }
+    let date = chrono::NaiveDate::parse_from_str(row.due_date.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Local::now().date_naive());
+    let mut order = crate::scm::ProductionOrder {
+        id: 0,
+        no: String::new(),
+        period,
+        date,
+        item_code: row.item_code.clone(),
+        item_name: row.item_name.clone(),
+        planned_qty: q,
+        completed_qty: Money::ZERO,
+        status: crate::scm::ProdStatus::Released,
+        work_center: String::new(),
+        prepared_by: who.to_string(),
+        memo: "MPS 下达".to_string(),
+        order_kind: "inhouse".to_string(),
+        supplier_code: String::new(),
+        supplier_name: String::new(),
+        plan_start: String::new(),
+        plan_end: String::new(),
+    };
+    if order.item_name.is_empty() {
+        order.item_name = order.item_code.clone();
+    }
+    order.no = crate::scm::prod_next_no(db, order.period)?;
+    let oid = crate::scm::prod_save(db, &mut order)?;
+    Ok((oid, order.no))
+}
+
+/// 粗排建议行
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RoughRow {
+    pub id: i64,
+    pub no: String,
+    pub item_code: String,
+    pub item_name: String,
+    pub open_qty: Money,
+    pub work_center: String,
+    pub need_days: i64,
+    pub sug_start: String,
+    pub sug_end: String,
+}
+
+/// 按日负荷
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LoadRow {
+    pub date: String,
+    pub qty: Money,
+    pub capacity: Money,
+    pub over: bool,
+}
+
+/// 粗排（v1 **件/日产能**口径——工艺路线暂无标准工时字段，工时口径留待迭代）：
+/// 本期间未完工自制订单按单据日期顺排，need_days 以 ceil(open/日产能) 计；
+/// 起点=今天，逐单装载产生按日负荷（超载标红）。返回 (排期建议, 按日负荷)。
+pub fn rough_schedule(
+    db: &Db,
+    period: Period,
+    daily_qty: Money,
+) -> DbResult<(Vec<RoughRow>, Vec<LoadRow>)> {
+    if !daily_qty.is_positive() {
+        return Err(fincore::FinError::msg("日产能必须大于 0").into());
+    }
+    let orders = crate::scm::prod_list(db, period, None)?;
+    let mut rows: Vec<RoughRow> = orders
+        .into_iter()
+        .filter(|o| {
+            !matches!(o.status, crate::scm::ProdStatus::Completed | crate::scm::ProdStatus::Cancelled)
+                && o.order_kind == "inhouse"
+                && (o.planned_qty - o.completed_qty).is_positive()
+        })
+        .map(|o| RoughRow {
+            open_qty: o.planned_qty - o.completed_qty,
+            need_days: 0,
+            sug_start: String::new(),
+            sug_end: String::new(),
+            id: o.id,
+            no: o.no,
+            item_code: o.item_code,
+            item_name: o.item_name,
+            work_center: o.work_center,
+        })
+        .collect();
+    // 排序：单据日期 → id
+    let date_of = orders_date_map(db, period)?;
+    rows.sort_by(|a, b| {
+        let da = date_of.get(&a.id).cloned().unwrap_or_default();
+        let dbb = date_of.get(&b.id).cloned().unwrap_or_default();
+        da.cmp(&dbb).then_with(|| a.id.cmp(&b.id))
+    });
+    let mut cursor = chrono::Local::now().date_naive();
+    let mut load: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
+    for r in &mut rows {
+        // need_days = ceil(open / daily)（Money 加法累加，避免浮点）
+        let mut days: i64 = 1;
+        let mut acc = daily_qty;
+        while acc < r.open_qty {
+            acc += daily_qty;
+            days += 1;
+        }
+        r.need_days = days;
+        r.sug_start = cursor.format("%Y-%m-%d").to_string();
+        let end = cursor + chrono::Duration::days(days - 1);
+        r.sug_end = end.format("%Y-%m-%d").to_string();
+        // 逐日装载
+        let mut rest = r.open_qty;
+        for i in 0..days {
+            let day = cursor + chrono::Duration::days(i);
+            let put = rest.min(daily_qty);
+            *load.entry(day.format("%Y-%m-%d").to_string()).or_insert(Money::ZERO) += put;
+            rest -= put;
+        }
+        cursor = end + chrono::Duration::days(1);
+    }
+    let load_rows: Vec<LoadRow> = load
+        .into_iter()
+        .map(|(date, qty)| LoadRow {
+            over: qty > daily_qty,
+            date,
+            qty,
+            capacity: daily_qty,
+        })
+        .collect();
+    Ok((rows, load_rows))
+}
+
+/// 粗排排序辅助：订单 id → 单据日期（"YYYY-MM-DD" 字典序即日期序）
+fn orders_date_map(db: &Db, period: Period) -> DbResult<std::collections::HashMap<i64, String>> {
+    let mut st = db
+        .conn()
+        .prepare("SELECT id, date FROM production_order WHERE period=?1")?;
+    let rows = st
+        .query_map([period.ymm()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().collect())
 }
 
 // ===========================================================================
@@ -1946,6 +2266,8 @@ mod tests {
             order_kind: "inhouse".into(),
             supplier_code: String::new(),
             supplier_name: String::new(),
+            plan_start: String::new(),
+            plan_end: String::new(),
         };
         order.no = crate::scm::prod_next_no(&db, p).unwrap();
         let po_id = crate::scm::prod_save(&db, &mut order).unwrap();

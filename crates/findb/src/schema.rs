@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -595,10 +595,29 @@ CREATE TABLE IF NOT EXISTS production_order (
     order_kind      TEXT NOT NULL DEFAULT 'inhouse', -- inhouse 自制 / outsourcing 委外
     supplier_code   TEXT NOT NULL DEFAULT '',
     supplier_name   TEXT NOT NULL DEFAULT '',
+    plan_start      TEXT NOT NULL DEFAULT '',   -- 细排计划开工日（链6）
+    plan_end        TEXT NOT NULL DEFAULT '',   -- 细排计划完工日（链6）
     created_at      TEXT NOT NULL DEFAULT '',
     updated_at      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_prod_period ON production_order(period, status);
+
+-- MPS 主生产计划（链6：成品维度净算建议 —— 需求-现有-在制=计划）
+CREATE TABLE IF NOT EXISTS mps_plan (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at     TEXT NOT NULL,
+    item_code  TEXT NOT NULL,
+    item_name  TEXT NOT NULL DEFAULT '',
+    demand     TEXT NOT NULL DEFAULT '0',
+    on_hand    TEXT NOT NULL DEFAULT '0',
+    wip        TEXT NOT NULL DEFAULT '0',
+    planned    TEXT NOT NULL DEFAULT '0',
+    source     TEXT NOT NULL DEFAULT '',
+    due_date   TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'open', -- open / converted
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mps_run ON mps_plan(run_at);
 
 -- 生产成本归集表
 CREATE TABLE IF NOT EXISTS prod_cost (
@@ -1403,6 +1422,12 @@ const MIGRATE_V24: &[(&str, &str, &str)] =
 const MIGRATE_V25: &[(&str, &str, &str)] =
     &[("inv_count_line", "batch_no", "TEXT NOT NULL DEFAULT ''")];
 
+/// v25 → v26：细排计划日期（production_order.plan_start/plan_end）
+const MIGRATE_V26: &[(&str, &str, &str)] = &[
+    ("production_order", "plan_start", "TEXT NOT NULL DEFAULT ''"),
+    ("production_order", "plan_end", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// v8 → v9：BOM 表 UNIQUE 从 (parent,child) 扩展为 (parent,child,version)，
 fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "bom", "version")? {
@@ -1623,6 +1648,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V23)?;
             migrate_generic(conn, MIGRATE_V24)?;
             migrate_generic(conn, MIGRATE_V25)?;
+            migrate_generic(conn, MIGRATE_V26)?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?1)",
                 rusqlite::params![SCHEMA_VERSION.to_string()],

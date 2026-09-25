@@ -245,6 +245,10 @@ pub struct ProductionOrder {
     pub order_kind: String,
     pub supplier_code: String,
     pub supplier_name: String,
+    /// 细排计划开工日（空 = 未排，链6）
+    pub plan_start: String,
+    /// 细排计划完工日
+    pub plan_end: String,
 }
 
 // ===========================================================================
@@ -1016,7 +1020,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
         tx.execute(
             "UPDATE production_order SET period=?, date=?, item_code=?, item_name=?,
              planned_qty=?, completed_qty=?, status=?, work_center=?, prepared_by=?, memo=?,
-             order_kind=?, supplier_code=?, supplier_name=?, updated_at=?
+             order_kind=?, supplier_code=?, supplier_name=?, plan_start=?, plan_end=?, updated_at=?
              WHERE id=?",
             rusqlite::params![
                 order.period.ymm(), order.date, order.item_code, order.item_name,
@@ -1024,6 +1028,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
                 order.status.code(),
                 order.work_center, order.prepared_by, order.memo,
                 order.order_kind, order.supplier_code, order.supplier_name,
+                order.plan_start, order.plan_end,
                 now, order.id
             ],
         )?;
@@ -1032,14 +1037,15 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name,
              planned_qty, completed_qty, status, work_center, prepared_by, memo,
-             order_kind, supplier_code, supplier_name, created_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+             order_kind, supplier_code, supplier_name, plan_start, plan_end, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
             rusqlite::params![
                 order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 order.status.code(),
                 order.work_center, order.prepared_by, order.memo,
                 order.order_kind, order.supplier_code, order.supplier_name,
+                order.plan_start, order.plan_end,
                 now
             ],
         )?;
@@ -1054,13 +1060,15 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
     let sql = if let Some(_s) = status {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
+             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+             plan_start, plan_end
              FROM production_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
         )
     } else {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name
+             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+             plan_start, plan_end
              FROM production_order WHERE period=? ORDER BY date DESC, id DESC"
         )
     };
@@ -1076,6 +1084,7 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
                 order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
+                plan_start: r.get(15)?, plan_end: r.get(16)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     } else {
@@ -1088,10 +1097,27 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 status: prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
                 order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
+                plan_start: r.get(15)?, plan_end: r.get(16)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     };
     Ok(rows)
+}
+
+/// 细排：批量写回计划开工/完工日（仅未完工订单可排；条件更新防误写终态单）
+pub fn prod_schedule(db: &Db, items: &[(i64, String, String)]) -> DbResult<usize> {
+    let tx = db.write_tx()?;
+    let now_s = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut n = 0usize;
+    for (id, start, end) in items {
+        n += tx.execute(
+            "UPDATE production_order SET plan_start=?, plan_end=?, updated_at=?
+             WHERE id=? AND status NOT IN ('completed','cancelled')",
+            rusqlite::params![start, end, now_s, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1113,6 +1139,8 @@ mod prod_tests {
             order_kind: "inhouse".to_string(),
             supplier_code: String::new(),
             supplier_name: String::new(),
+            plan_start: String::new(),
+            plan_end: String::new(),
         };
         order.no = prod_next_no(&db, p).unwrap();
         let id = prod_save(&db, &mut order).unwrap();

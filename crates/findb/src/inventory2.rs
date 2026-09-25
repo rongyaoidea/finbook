@@ -226,44 +226,171 @@ pub fn abc_analysis(db: &Db, upto: Period) -> DbResult<Vec<AbcRow>> {
 // 组装 / 拆卸 / 库存状态 / 调拨报表
 // ===========================================================================
 
-/// 组装：把多个子件组合成 1 个成品（子件出库、成品入库）
-pub fn assemble(db: &Db, period: Period, date: NaiveDate, parent: &str, children: &[(String, Money)], memo: &str) -> DbResult<()> {
+/// 组装：多个子件 → 1 个成品。
+/// **成本口径（对标金蝶组装单按成本构成入账）**：子件按各自移动加权成本出库，
+/// 成品按**子件成本合计**入库（等值转入）；任一子件无成本价 → 拒绝
+/// （0 价首入会污染计价引擎与销售成本结转，与形态转换同口径）。
+pub fn assemble(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    parent: &str,
+    children: &[(String, Money)],
+    memo: &str,
+) -> DbResult<()> {
     use crate::business::{stock_insert, StockKind, StockMove};
-    // 子件出库
-    for (item, qty) in children {
-        stock_insert(db, &StockMove {
-            id: 0, period, biz_date: date, kind: StockKind::OtherOut,
-            item: item.clone(), warehouse: String::new(), batch_no: String::new(),
-            qty: qty.negated(), price: Money::ZERO, amount: Money::ZERO, voucher_id: None,
-            memo: format!("组装 {}", memo),
-        })?;
+    if children.is_empty() {
+        return Err(fincore::FinError::msg("组装至少需要一个子件").into());
     }
-    // 成品入库（数量 1）
-    stock_insert(db, &StockMove {
-        id: 0, period, biz_date: date, kind: StockKind::OtherIn,
-        item: parent.to_string(), warehouse: String::new(), batch_no: String::new(),
-        qty: Money::ONE, price: Money::ZERO, amount: Money::ZERO, voucher_id: None,
-        memo: format!("组装 {}", memo),
-    })?;
+    // 先全量校验并算价，任一失败不落任何流水（避免半成品状态）
+    let mut plan: Vec<(String, Money, Money, Money)> = Vec::new();
+    let mut total = Money::ZERO;
+    for (item, qty) in children {
+        if !qty.is_positive() {
+            return Err(fincore::FinError::msg(format!("子件 {item} 数量必须大于 0")).into());
+        }
+        let unit = crate::business::stock_state(
+            db,
+            item,
+            period,
+            fincore::engine::costing::CostMethod::MovingAverage,
+        )?
+        .unit_cost();
+        if !unit.is_positive() {
+            return Err(fincore::FinError::msg(format!(
+                "子件 {item} 无成本价，无法组装（请先入库带价或执行期末结价）"
+            ))
+            .into());
+        }
+        let amount = *qty * unit;
+        total = total + amount;
+        plan.push((item.clone(), *qty, unit, amount));
+    }
+    for (item, qty, unit, amount) in &plan {
+        stock_insert(
+            db,
+            &StockMove {
+                id: 0,
+                period,
+                biz_date: date,
+                kind: StockKind::OtherOut,
+                item: item.clone(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: qty.negated(),
+                price: *unit,
+                amount: *amount,
+                voucher_id: None,
+                memo: format!("组装 {}", memo),
+            },
+        )?;
+    }
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::OtherIn,
+            item: parent.to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty: Money::ONE,
+            price: total,
+            amount: total,
+            voucher_id: None,
+            memo: format!("组装 {}", memo),
+        },
+    )?;
     Ok(())
 }
 
-/// 拆卸：1 个成品拆回多个子件（成品出库、子件入库）
-pub fn disassemble(db: &Db, period: Period, date: NaiveDate, parent: &str, children: &[(String, Money)], memo: &str) -> DbResult<()> {
+/// 拆卸：1 个成品 → 多个子件。
+/// **成本口径**：成品按移动加权成本出库，子件按**数量比例**分摊成品成本入库
+/// （尾差归最后一行）；成品无成本价 → 拒绝。等值转换，不产生总账凭证。
+pub fn disassemble(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    parent: &str,
+    children: &[(String, Money)],
+    memo: &str,
+) -> DbResult<()> {
     use crate::business::{stock_insert, StockKind, StockMove};
-    stock_insert(db, &StockMove {
-        id: 0, period, biz_date: date, kind: StockKind::OtherOut,
-        item: parent.to_string(), warehouse: String::new(), batch_no: String::new(),
-        qty: Money::ONE.negated(), price: Money::ZERO, amount: Money::ZERO, voucher_id: None,
-        memo: format!("拆卸 {}", memo),
-    })?;
-    for (item, qty) in children {
-        stock_insert(db, &StockMove {
-            id: 0, period, biz_date: date, kind: StockKind::OtherIn,
-            item: item.clone(), warehouse: String::new(), batch_no: String::new(),
-            qty: *qty, price: Money::ZERO, amount: Money::ZERO, voucher_id: None,
+    if children.is_empty() {
+        return Err(fincore::FinError::msg("拆卸至少需要一个子件").into());
+    }
+    if children.iter().any(|(item, _)| item == parent) {
+        return Err(fincore::FinError::msg("子件不能与成品相同").into());
+    }
+    let qty_sum: Money = children.iter().map(|(_, q)| *q).sum();
+    if !qty_sum.is_positive() {
+        return Err(fincore::FinError::msg("子件数量合计必须大于 0").into());
+    }
+    let unit = crate::business::stock_state(
+        db,
+        parent,
+        period,
+        fincore::engine::costing::CostMethod::MovingAverage,
+    )?
+    .unit_cost();
+    if !unit.is_positive() {
+        return Err(fincore::FinError::msg(
+            "成品无成本价，无法拆卸（请先入库带价或执行期末结价）",
+        )
+        .into());
+    }
+    let total = unit; // 成品出库 1 件
+    // 成品出库
+    stock_insert(
+        db,
+        &StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::OtherOut,
+            item: parent.to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty: Money::ONE.negated(),
+            price: unit,
+            amount: total,
+            voucher_id: None,
             memo: format!("拆卸 {}", memo),
-        })?;
+        },
+    )?;
+    // 子件入库：按数量比例分摊成本，尾差归最后一行
+    let mut allocated = Money::ZERO;
+    let last = children.len() - 1;
+    for (i, (item, qty)) in children.iter().enumerate() {
+        let amount = if i == last {
+            total - allocated
+        } else {
+            (total * *qty)
+                .checked_div(qty_sum.0)
+                .expect("qty_sum 已判正")
+        };
+        allocated = allocated + amount;
+        let price = amount
+            .checked_div(qty.0)
+            .expect("子件数量已判正");
+        stock_insert(
+            db,
+            &StockMove {
+                id: 0,
+                period,
+                biz_date: date,
+                kind: StockKind::OtherIn,
+                item: item.clone(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: *qty,
+                price,
+                amount,
+                voucher_id: None,
+                memo: format!("拆卸 {}", memo),
+            },
+        )?;
     }
     Ok(())
 }
@@ -797,16 +924,73 @@ mod tests {
 
     #[test]
     fn assemble_disassemble() {
+        use crate::business::{stock_insert, StockKind, StockMove};
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
         let d = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
-        assemble(&db, p, d, "FG", &[("RM1".into(), m("2")), ("RM2".into(), m("1"))], "测试").unwrap();
+        // 子件先带价入库：RM1 2×5、RM2 1×10（合计 20）
+        for (item, qty, price) in [("RM1", "2", "5"), ("RM2", "1", "10")] {
+            stock_insert(
+                &db,
+                &StockMove {
+                    id: 0,
+                    period: p,
+                    biz_date: d,
+                    kind: StockKind::OtherIn,
+                    item: item.into(),
+                    warehouse: String::new(),
+                    batch_no: String::new(),
+                    qty: m(qty),
+                    price: m(price),
+                    amount: m(qty) * m(price),
+                    voucher_id: None,
+                    memo: "建账".into(),
+                },
+            )
+            .unwrap();
+        }
+        // 无成本子件 → 拒绝（0 价首入污染计价引擎）
+        assert!(assemble(&db, p, d, "FG", &[("RM9".into(), m("1"))], "测试").is_err());
+        // 组装：成品 1 件按子件成本合计 20 入库
+        assemble(
+            &db,
+            p,
+            d,
+            "FG",
+            &[("RM1".into(), m("2")), ("RM2".into(), m("1"))],
+            "测试",
+        )
+        .unwrap();
         let fg = warehouse_stock(&db, "FG").unwrap();
         assert_eq!(fg.iter().map(|w| w.qty).sum::<Money>(), m("1"));
+        let fg_unit = crate::business::stock_state(
+            &db,
+            "FG",
+            p,
+            fincore::engine::costing::CostMethod::MovingAverage,
+        )
+        .unwrap()
+        .unit_cost();
+        assert_eq!(fg_unit, m("20"), "成品按子件成本合计入库");
         let rm1 = warehouse_stock(&db, "RM1").unwrap();
-        assert_eq!(rm1.iter().map(|w| w.qty).sum::<Money>(), m("-2"));
+        // 先入 2、组装出 2 → 净 0
+        assert_eq!(rm1.iter().map(|w| w.qty).sum::<Money>(), m("0"));
+        // 拆卸：成品按成本 20 出库，子件按数量比例分摊 → RM1 回补 2 件（成本 20）
         disassemble(&db, p, d, "FG", &[("RM1".into(), m("2"))], "拆").unwrap();
         let fg = warehouse_stock(&db, "FG").unwrap();
         assert_eq!(fg.iter().map(|w| w.qty).sum::<Money>(), m("0"));
+        let rm1 = warehouse_stock(&db, "RM1").unwrap();
+        assert_eq!(rm1.iter().map(|w| w.qty).sum::<Money>(), m("2"));
+        let rm1_unit = crate::business::stock_state(
+            &db,
+            "RM1",
+            p,
+            fincore::engine::costing::CostMethod::MovingAverage,
+        )
+        .unwrap()
+        .unit_cost();
+        assert_eq!(rm1_unit, m("10"), "成品成本 20 全部摊给唯一子件（2 件 → 单价 10）");
+        // 成品已无库存 → 再拆拒绝
+        assert!(disassemble(&db, p, d, "FG", &[("RM1".into(), m("1"))], "拆").is_err());
     }
 }

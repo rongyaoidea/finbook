@@ -2905,11 +2905,18 @@ async function viewMrp(main) {
     <div id="mrp-result" class="muted">输入需求产品与数量后运行</div>`;
   const load = (rows) => {
     $("#mrp-result").innerHTML = `<table><thead><tr><th>层级</th><th>物料</th><th>毛需求</th><th>现有库存</th><th>净需求</th><th>计划量</th><th>行动</th><th>来源</th><th></th></tr></thead>
-      <tbody>${rows.map((x) => `<tr><td>${x.level}</td><td>${esc(x.item_code)}</td><td class="r">${fmt(x.gross_req)}</td><td class="r">${fmt(x.on_hand)}</td><td class="r">${fmt(x.net_req)}</td><td class="r">${fmt(x.planned_qty)}</td><td>${x.action === "produce" ? "生产" : x.action === "purchase" ? "采购" : "无"}</td><td>${esc(x.source)}</td><td>${x.action === "produce" ? `<button class="btn ghost sm" data-mrp-go-item="${esc(x.item_code)}" data-mrp-go-qty="${esc(String(x.planned_qty))}">下达</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
+      <tbody>${rows.map((x) => `<tr><td>${x.level}</td><td>${esc(x.item_code)}</td><td class="r">${fmt(x.gross_req)}</td><td class="r">${fmt(x.on_hand)}</td><td class="r">${fmt(x.net_req)}</td><td class="r">${fmt(x.planned_qty)}</td><td>${x.action === "produce" ? "生产" : x.action === "purchase" ? "采购" : "无"}</td><td>${esc(x.source)}</td><td>${x.action === "produce" ? `<button class="btn ghost sm" data-mrp-go-item="${esc(x.item_code)}" data-mrp-go-qty="${esc(String(x.planned_qty))}">下达</button>` : x.action === "purchase" ? `<button class="btn ghost sm" data-mrp-req="${x.id}">下推请购</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
     $all("[data-mrp-go-item]").forEach((b) => b.onclick = async () => {
       try {
         const r = await postJson("/prod", { item_code: b.dataset.mrpGoItem, qty: b.dataset.mrpGoQty });
         toast(`已下达生产订单 ${r.no}（到「工序报工」开工/领料）`, "ok");
+      } catch (e) { toast(e.message, "err"); }
+    });
+    $all("[data-mrp-req]").forEach((b) => b.onclick = async () => {
+      try {
+        const r = await postJson(`/mrp/${b.dataset.mrpReq}/to-req`, {});
+        toast(`已下推请购单 ${r.no}（到「采购单据」审批后下推采购订单）`, "ok");
+        b.disabled = true; b.textContent = "已下推";
       } catch (e) { toast(e.message, "err"); }
     });
   };
@@ -4159,6 +4166,7 @@ async function viewInvAssemble(main) {
       <textarea id="ia-children" style="width:420px;height:70px" placeholder="RM1:2&#10;RM2:1"></textarea>
       <button class="btn" id="ia-do">组装</button>
       <button class="btn" id="ia-undo">拆卸</button>
+      <span class="muted" style="font-size:12px">组装=子件按移动加权成本等值转入成品；拆卸=成品成本按子件数量比例分摊；无成本价将被拒绝</span>
     </div>
     <div class="toolbar">
       <label style="font-weight:600">形态转换</label>
@@ -4167,7 +4175,7 @@ async function viewInvAssemble(main) {
       <label>数量 <input id="fc-qty" style="width:80px" /></label>
       <label>备注 <input id="fc-memo" style="width:140px" /></label>
       <button class="btn" id="fc-do">转换</button>
-      <span class="muted" style="font-size:12px">同数量一减一增，金额交期末结价</span>
+      <span class="muted" style="font-size:12px">同数量一减一增，金额按源移动加权成本平移</span>
     </div>`;
   $("#ia-date").value = new Date().toISOString().slice(0, 10);
   const doOp = async (disassemble) => {

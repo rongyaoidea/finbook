@@ -2402,6 +2402,109 @@ async fn data_scope_ledgers() {
     );
 }
 
+/// P1：MRP 采购建议下推请购——仅采购行可推、幂等、生产行拒绝。
+#[tokio::test]
+async fn mrp_purchase_push() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 无 BOM 物料 → 采购建议
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mrp/run",
+            &sid,
+            serde_json::json!({ "demands": [{ "item_code": "140301", "qty": "6", "source": "手工" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "MRP 运行");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let row = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_code"] == "140301")
+        .expect("140301 行");
+    assert_eq!(row["action"], "purchase", "无 BOM 应为采购建议：{r}");
+    let rid = row["id"].as_i64().unwrap();
+
+    // 下推请购 → 200 + 单号
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/mrp/{rid}/to-req"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "下推请购：{b}");
+    let pr: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(pr["req_id"].as_i64().unwrap() > 0, "应返回请购单 id：{pr}");
+    let no = pr["no"].as_str().unwrap().to_string();
+    assert!(!no.is_empty(), "应返回请购单号");
+
+    // 重复下推 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/mrp/{rid}/to-req"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复下推应 400");
+
+    // 未知 id → 404
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mrp/999999/to-req",
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未知 MRP 行应 404");
+
+    // 建 BOM 后：140501=生产建议，生产行下推请购 → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bom",
+            &sid,
+            serde_json::json!({ "parent": "140501", "children": [{ "child": "140301", "qty": "2", "loss": "0" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建 BOM");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/mrp/run",
+            &sid,
+            serde_json::json!({ "demands": [{ "item_code": "140501", "qty": "2", "source": "手工" }] }),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let prod = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_code"] == "140501")
+        .expect("140501 行");
+    assert_eq!(prod["action"], "produce", "有 BOM 应为生产建议：{r}");
+    let pid = prod["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/mrp/{pid}/to-req"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "生产建议不可下推请购");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，
@@ -10148,6 +10251,32 @@ async fn web_read_endpoints_no_5xx() {
 async fn web_write_endpoints_smoke() {
     let (state, _bd, _dir) = test_state();
     let sid = boss_in_b1(&state).await;
+    // 前置：140301 带价入库（组装成本平移要求子件有成本价，0 价将被拒绝）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "5", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "前置采购单");
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": 202601, "date": "2026-01-05", "qty": "5", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "前置到货");
     let post = |uri: &'static str, body: serde_json::Value| {
         let state = state.clone();
         let sid = sid.clone();

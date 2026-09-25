@@ -480,6 +480,59 @@ pub fn mrp_by_run(db: &Db, run_at: &str) -> DbResult<Vec<MrpRow>> {
     Ok(rows)
 }
 
+/// 按 id 取一条 MRP 结果行
+pub fn mrp_get(db: &Db, id: i64) -> DbResult<Option<MrpRow>> {
+    db.conn()
+        .query_row(
+            &format!("SELECT {MRP_COLS} FROM mrp_result WHERE id=?1"),
+            rusqlite::params![id],
+            map_mrp,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// MRP **采购建议**下推请购单（草稿，对标金蝶 MRP 投放 → 请购）：
+/// - 仅 `action=purchase` 且计划量 > 0 可下推；
+/// - 单号按期间自动取号；同一 MRP 行只能下推一次（doc_link 幂等，重复 400）；
+/// - 返回 (请购单 id, 单号)。
+pub fn mrp_to_req(db: &Db, id: i64, requester: &str) -> DbResult<(i64, String)> {
+    let row = mrp_get(db, id)?.ok_or_else(|| FinError::not_found("MRP 结果行"))?;
+    if row.action != "purchase" {
+        return Err(FinError::msg("仅采购类建议可下推请购（生产类请走「下达」生成生产订单）").into());
+    }
+    if !row.planned_qty.is_positive() {
+        return Err(FinError::msg("计划量为 0，无可下推数量").into());
+    }
+    if crate::docflow::has_link(db, "mrp", id, "req")? {
+        return Err(FinError::msg("该 MRP 行已下推过请购单，请勿重复下推").into());
+    }
+    let date = chrono::Local::now().date_naive();
+    let period = Period::from_date(date);
+    let mut r = crate::procurement::PurchaseReq {
+        id: 0,
+        no: String::new(),
+        period,
+        date,
+        item_code: row.item_code.clone(),
+        item_name: if row.item_name.trim().is_empty() {
+            row.item_code.clone()
+        } else {
+            row.item_name.clone()
+        },
+        qty: row.planned_qty,
+        status: "draft".into(),
+        requester: requester.to_string(),
+        memo: format!("MRP 下推（{}）", row.run_at),
+    };
+    if r.no.trim().is_empty() {
+        r.no = crate::procurement::pr_next_no(db, period)?;
+    }
+    let req_id = crate::procurement::pr_save(db, &mut r)?;
+    crate::docflow::link_add(db, "mrp", id, "req", req_id, "MRP 采购建议下推")?;
+    Ok((req_id, r.no))
+}
+
 /// 存货现有库存（stock_move 数量代数和）
 fn on_hand_qty(db: &Db, item_code: &str) -> DbResult<Money> {
     let mut st = db

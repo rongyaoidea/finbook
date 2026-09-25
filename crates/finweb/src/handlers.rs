@@ -318,6 +318,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/bom", get(get_bom_ep).post(save_bom_ep))
         .route("/api/mrp/latest", get(get_mrp_latest))
         .route("/api/mrp/run", post(run_mrp))
+        .route("/api/mrp/:id/to-req", post(mrp_to_req_ep))
         .route("/api/mps/run", post(run_mps))
         .route("/api/mps/latest", get(get_mps_latest))
         .route("/api/mps/:id/convert", post(convert_mps))
@@ -6280,6 +6281,27 @@ async fn run_mrp(
     let run_at = advanced::mrp_run(&db, &demands)?;
     let rows = advanced::mrp_by_run(&db, &run_at)?;
     Ok(Json(serde_json::json!({ "run_at": run_at, "rows": rows })))
+}
+
+/// MRP 采购建议下推请购单（草稿，幂等）
+async fn mrp_to_req_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    if findb::advanced::mrp_get(&db, id)?.is_none() {
+        return Err(AppError::not_found("MRP 结果行不存在"));
+    }
+    let (req_id, no) = findb::advanced::mrp_to_req(&db, id, user.username())?;
+    db.log(
+        user.username(),
+        "采购",
+        "MRP 下推请购",
+        &format!("MRP#{id} → 请购单 {no}"),
+    )?;
+    Ok(Json(json!({ "ok": true, "req_id": req_id, "no": no })))
 }
 
 // ---- 库存作业：形态转换 / 质检 / 低库存预警（对标金蝶） ----

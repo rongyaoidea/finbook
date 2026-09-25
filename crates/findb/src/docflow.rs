@@ -57,6 +57,16 @@ pub fn link_add(
     Ok(())
 }
 
+/// 是否已存在某类下游边（下推幂等检查：同源单同目标类型只允许一条）
+pub fn has_link(db: &Db, src_type: &str, src_id: i64, dst_type: &str) -> DbResult<bool> {
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM doc_link WHERE src_type=?1 AND src_id=?2 AND dst_type=?3",
+        rusqlite::params![src_type, src_id, dst_type],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// 请购单下推采购订单：
 /// - 仅 已审批(approved) / 已下推(ordered) 可推（草稿/已取消拒绝）；
 /// - 生成采购订单草稿：单行 = 请购品名与数量，**单价留空待补**（请购无价），供应商留空；

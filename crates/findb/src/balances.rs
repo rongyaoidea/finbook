@@ -1,4 +1,4 @@
-//! 余额与账簿的实时聚合
+﻿//! 余额与账簿的实时聚合
 //!
 //! 设计要点：**不物化余额表**。
 //! 余额 = 期初 + 已记账凭证发生额，每次查询实时算。单机 SQLite 下十万级分录仍是毫秒级，
@@ -693,6 +693,95 @@ pub struct QtyBalanceRow {
 }
 
 /// 数量金额账：数量核算科目的数量与金额对照（按科目汇总，含下级）
+/// 科目明细账行（链7 数字钻取）：分录逐笔 + 运行余额
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AcctDetailRow {
+    pub date: String,
+    pub voucher_id: i64,
+    /// 凭证号（word + no，如 记1）
+    pub no: String,
+    /// 凭证摘要
+    pub summary: String,
+    /// 分录摘要
+    pub line_memo: String,
+    pub debit: Money,
+    pub credit: Money,
+    /// 运行余额（期初起累计，借正贷负）
+    pub balance: Money,
+    pub status: String,
+}
+
+/// 科目明细账：期初（from 之前累计）+ from..to 分录逐笔运行余额。
+/// 口径：**status = 'posted' 已记账**（与试算平衡 H-3 完全一致——草稿/已审未记账不进）；
+/// 余额 = 借 − 贷 累计（贷余为负）。返回 (期初余额, 明细行)。
+pub fn account_detail(
+    db: &Db,
+    account: &str,
+    from: Period,
+    to: Period,
+) -> DbResult<(Money, Vec<AcctDetailRow>)> {
+    // 期初（逐行文本汇总，与 batch_balance 同模式）
+    let mut st = db.conn().prepare(
+        "SELECT e.debit, e.credit FROM voucher_entry e
+         JOIN voucher v ON v.id = e.voucher_id
+         WHERE e.account_code = ?1 AND v.period < ?2 AND v.status = 'posted'",
+    )?;
+    let begin_rows = st
+        .query_map(rusqlite::params![account, from.ymm()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let begin: Money = begin_rows
+        .iter()
+        .map(|(d, c)| Money::parse_or_zero(d) - Money::parse_or_zero(c))
+        .sum();
+    // 明细
+    let mut st = db.conn().prepare(
+        "SELECT v.date, v.id, v.no, v.word, v.memo, v.status, e.summary, e.debit, e.credit
+         FROM voucher_entry e
+         JOIN voucher v ON v.id = e.voucher_id
+         WHERE e.account_code = ?1 AND v.period BETWEEN ?2 AND ?3 AND v.status = 'posted'
+         ORDER BY v.period, v.date, v.id, e.line",
+    )?;
+    let raw = st
+        .query_map(
+            rusqlite::params![account, from.ymm(), to.ymm()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut bal = begin;
+    let mut out = Vec::with_capacity(raw.len());
+    for (date, vid, no, word, vsum, status, lsum, debit, credit) in raw {
+        let d = Money::parse_or_zero(&debit);
+        let c = Money::parse_or_zero(&credit);
+        bal += d - c;
+        out.push(AcctDetailRow {
+            date,
+            voucher_id: vid,
+            no: format!("{word}{no}"),
+            summary: vsum,
+            line_memo: lsum,
+            debit: d,
+            credit: c,
+            balance: bal,
+            status,
+        });
+    }
+    Ok((begin, out))
+}
+
 pub fn qty_balance_sheet(
     db: &Db,
     from: Period,
@@ -1683,5 +1772,41 @@ mod tests {
         let rows = BalanceSnapshot::load(&db, &q2).unwrap().account_table(&chart, &q2);
         assert!(rows.iter().any(|r| r.account_code == "1001"));
         assert!(!rows.iter().any(|r| r.account_code == "600101"));
+    }
+}
+
+#[cfg(test)]
+mod drill_tests {
+    use super::*;
+    use crate::tests::mem;
+
+    #[test]
+    fn account_detail_smoke() {
+        let db = mem();
+        db.conn()
+            .execute(
+                "INSERT INTO voucher(period,date,word,no,status,prepared_by,created_at,updated_at)
+                 VALUES(202601,'2026-01-15','记',1,'posted','u','x','x')",
+                [],
+            )
+            .unwrap();
+        let vid = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO voucher_entry(voucher_id,period,line,summary,account_code,debit,credit)
+                 VALUES(?1,202601,1,'t','1001','100','0')",
+                [vid],
+            )
+            .unwrap();
+        let (begin, rows) = account_detail(
+            &db,
+            "1001",
+            Period::from_ymm(202601),
+            Period::from_ymm(202601),
+        )
+        .unwrap();
+        assert_eq!(begin, Money::ZERO);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].balance, Money::parse("100").unwrap());
     }
 }

@@ -190,6 +190,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/ledger/print-form", get(print_ledger_form))
         .route("/api/vouchers/print-form", get(print_voucher_form))
         .route("/api/reports/trial-balance", get(get_trial_balance))
+        .route("/api/reports/account-detail", get(account_detail_ep))
         .route(
             "/api/reports/trial-balance/print",
             get(print_trial_balance),
@@ -3291,6 +3292,39 @@ async fn get_trial_balance(
             "debit": totals.period_debit.fmt_money(), "credit": totals.period_credit.fmt_money(),
             "end_debit": totals.end_debit.fmt_money(), "end_credit": totals.end_credit.fmt_money(),
         },
+    })))
+}
+
+/// 科目明细账（链7 数字钻取）：期初 + 分录逐笔 + 合计；行点击可开凭证
+async fn account_detail_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::FinReport)?;
+    let db = state.db_for(&user.book_key)?;
+    let (from, to) = report_range(&state, &user, &q);
+    let account = q
+        .get("account")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少 account 科目编码"));
+    }
+    let (begin, rows) = findb::balances::account_detail(&db, &account, from, to)?;
+    let (td, tc): (Money, Money) = rows.iter().fold((Money::ZERO, Money::ZERO), |(ad, ac), r| {
+        (ad + r.debit, ac + r.credit)
+    });
+    Ok(Json(json!({
+        "account": account,
+        "from": period_to_str(from),
+        "to": period_to_str(to),
+        "begin": begin,
+        "rows": rows,
+        "total_debit": td,
+        "total_credit": tc,
     })))
 }
 

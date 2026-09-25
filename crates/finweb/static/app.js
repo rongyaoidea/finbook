@@ -27,6 +27,8 @@ async function api(path, opts = {}) {
     if (r.status === 403) msg += "（权限不足，请联系管理员开通该权限或调整岗位）";
     throw new Error(msg);
   }
+  // 列偏好：每次数据到达后重挂（异步填充的表格也能获得列菜单与隐藏样式）
+  try { autoColPrefs(); } catch (e) {}
   return data;
 }
 
@@ -670,6 +672,87 @@ async function ntMarkRead() {
 }
 // ---------------- 通知中心 END ----------------
 
+// ---------------- 列偏好（链7）：表格列显隐，localStorage 持久化 ----------------
+// 隐藏走 CSS 类（table.pc-KEY.ch-N 的 nth-child 规则）——**数据异步后填的行自动继承**；
+// key = 视图#表序号，重渲染后同 key 自动恢复；列少（<4）的表不挂菜单。
+const COL_PREFS = {};
+function colCls(key) { return "k" + key.replace(/[^a-zA-Z0-9]/g, "_"); }
+function applyColPrefs(key, hidden) {
+  COL_PREFS[key] = hidden;
+  let st = document.getElementById("colpref-css");
+  if (!st) {
+    st = document.createElement("style");
+    st.id = "colpref-css";
+    document.head.appendChild(st);
+  }
+  st.textContent = Object.entries(COL_PREFS)
+    .map(([k, idxs]) => {
+      const c = colCls(k);
+      return idxs
+        .map(
+          (i) =>
+            `table.grid.pc-${c}.ch-${i} th:nth-child(${i + 1}),table.grid.pc-${c}.ch-${i} td:nth-child(${i + 1}){display:none}`
+        )
+        .join("");
+    })
+    .join("");
+  const tbl = document.querySelector(`table.grid[data-colkey="${CSS.escape(key)}"]`);
+  if (!tbl) return;
+  const c = colCls(key);
+  [...tbl.classList]
+    .filter((cl) => cl.startsWith("pc-") || cl.startsWith("ch-"))
+    .forEach((cl) => tbl.classList.remove(cl));
+  if (hidden.length) {
+    tbl.classList.add(`pc-${c}`);
+    hidden.forEach((i) => tbl.classList.add(`ch-${i}`));
+  }
+}
+function autoColPrefs() {
+  $all("#main table.grid").forEach((tbl, i) => {
+    const key = `${state.view}#${i}`;
+    if (tbl.dataset.colkey) return;
+    const ths = $all("thead th", tbl);
+    if (ths.length < 4) return; // 列少不挂（菜单无价值）
+    tbl.dataset.colkey = key;
+    let hidden = [];
+    try { hidden = JSON.parse(localStorage.getItem("colpref:" + key) || "[]"); } catch (e) {}
+    applyColPrefs(key, hidden); // 注册规则并挂类（恢复历史偏好）
+    const bar = document.createElement("div");
+    bar.className = "col-bar";
+    bar.innerHTML = `<button class="btn ghost sm" data-colbtn title="列显隐（持久记忆）">列▾</button><div class="col-menu" hidden></div>`;
+    tbl.parentNode.insertBefore(bar, tbl);
+    const menu = bar.querySelector(".col-menu");
+    menu.innerHTML = ths
+      .map(
+        (th, ci) =>
+          `<label><input type="checkbox" data-col="${ci}" ${hidden.includes(ci) ? "" : "checked"} />${esc(th.textContent.trim().replace(/[▲▼]/g, ""))}</label>`
+      )
+      .join("");
+    menu.addEventListener("change", (e) => {
+      const cb = e.target.closest("input[data-col]");
+      if (!cb) return;
+      const idx = parseInt(cb.dataset.col, 10);
+      let cur = [];
+      try { cur = JSON.parse(localStorage.getItem("colpref:" + key) || "[]"); } catch (e2) { cur = []; }
+      if (cb.checked) cur = cur.filter((x) => x !== idx);
+      else if (!cur.includes(idx)) cur.push(idx);
+      cur.sort((a, b) => a - b);
+      try { localStorage.setItem("colpref:" + key, JSON.stringify(cur)); } catch (e3) {}
+      applyColPrefs(key, cur);
+    });
+    bar.querySelector("[data-colbtn]").addEventListener("click", (e) => {
+      e.stopPropagation();
+      menu.hidden = !menu.hidden;
+    });
+  });
+}
+// 点击列菜单外关闭所有菜单（全局注册一次；菜单内点击不受影响）
+document.addEventListener("click", (e) => {
+  if (e.target && e.target.closest && e.target.closest(".col-bar")) return;
+  $all(".col-menu").forEach((m) => { m.hidden = true; });
+});
+// ---------------- 列偏好 END ----------------
+
 // 单据行内流程徽标：按业务类型拉取流程实例状态，填充 [data-wftag="类型:id"] 占位
 async function fillWfTags(root) {
   const els = $all("[data-wftag]", root || document);
@@ -785,7 +868,10 @@ function render() {
 function renderMain() {
   const main = document.getElementById("main");
   const fn = VIEWS[state.view] || viewDashboard;
-  return fn(main);
+  const r = fn(main);
+  // 列偏好：同步表结构先挂一次（async 表由 api() 回调补挂）
+  try { autoColPrefs(); } catch (e) {}
+  return r;
 }
 
 async function logout() {
@@ -1912,7 +1998,7 @@ async function loadTrial() {
   if (!rows.length) { tb.innerHTML = `<tr><td colspan="9" class="muted">无数据</td></tr>`; return; }
   tb.innerHTML = rows.map((r) => {
     // 后端 TrialRow：begin_dir/end_dir/begin/end/debit/credit/ytd_* 均为已格式化字符串
-    return `<tr>
+    return `<tr data-drill="${esc(r.account_code)}" title="点击查看明细账" style="cursor:pointer">
       <td>${esc(r.account_code)}</td><td>${esc(r.account_name)}</td>
       <td>${esc(r.end_dir)}</td>
       <td class="num">${esc(r.begin_dir)} ${esc(r.begin)}</td>
@@ -1932,6 +2018,38 @@ async function loadTrial() {
       <td class="num">${esc(t.ytd_debit || "—")}</td><td class="num">${esc(t.ytd_credit || "—")}</td>
     </tr>`;
   }
+  // 数字钻取：数据行点击 → 该科目明细账（合计行无 data-drill 不受影响）
+  $all("[data-drill]", tb).forEach((tr) => {
+    tr.onclick = () => openAccountDetail(tr.dataset.drill, f, t);
+  });
+}
+
+// 科目明细账弹窗（数字钻取）：期初 + 逐笔 + 合计；行点击打开凭证（二级钻取）
+async function openAccountDetail(account, from, to) {
+  const mask = modal(`<h3>明细账 · ${esc(account)}</h3><div id="ad-body" class="muted">加载中…</div>
+    <div class="foot"><button class="btn ghost" id="ad-print">打印预览</button><button class="btn primary" id="ad-close">关闭</button></div>`, true);
+  $("#ad-close", mask).onclick = closeModal;
+  let tableEl = null;
+  const dir = (v) => Number(v) < 0 ? `贷 ${fmt(-Number(v))}` : Number(v) > 0 ? `借 ${fmt(v)}` : "平";
+  try {
+    const r = await api(`/reports/account-detail?account=${encodeURIComponent(account)}&from=${encodeURIComponent(from || "")}&to=${encodeURIComponent(to || "")}`);
+    const rows = r.rows || [];
+    $("#ad-body", mask).innerHTML = `
+      <div class="muted" style="font-size:12.5px;margin-bottom:6px">期间 ${esc(r.from)} ~ ${esc(r.to)} · 期初：<b>${dir(r.begin)}</b> · 点击行打开凭证</div>
+      ${rows.length ? `<table class="grid" id="ad-tbl"><thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th>分录摘要</th><th class="num">借方</th><th class="num">贷方</th><th class="num">余额</th></tr></thead><tbody>
+        <tr style="background:var(--z-50)"><td>—</td><td>—</td><td colspan="4"><b>期初余额</b></td><td class="num"><b>${dir(r.begin)}</b></td></tr>
+        ${rows.map((x) => `<tr data-ad-v="${x.voucher_id}" style="cursor:pointer" title="打开凭证 #${x.voucher_id}"><td>${esc(x.date)}</td><td>${esc(x.no)}</td><td>${esc(x.summary)}</td><td>${esc(x.line_memo || "—")}</td><td class="num">${Number(x.debit) ? fmt(x.debit) : ""}</td><td class="num">${Number(x.credit) ? fmt(x.credit) : ""}</td><td class="num">${dir(x.balance)}</td></tr>`).join("")}
+        <tr style="font-weight:600;background:#fafafa"><td colspan="4">合计</td><td class="num">${fmt(r.total_debit)}</td><td class="num">${fmt(r.total_credit)}</td><td class="num"></td></tr>
+      </tbody></table>` : `<div class="muted">该科目此期间无发生额</div>`}`;
+    tableEl = $("#ad-tbl", mask);
+    $all("[data-ad-v]", mask).forEach((tr) => tr.onclick = () => {
+      closeModal();
+      openVoucherEditor(parseInt(tr.dataset.adV, 10));
+    });
+  } catch (e) {
+    $("#ad-body", mask).innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`;
+  }
+  $("#ad-print", mask).onclick = () => { if (tableEl) printPreview(`明细账 ${account}`, tableEl); };
 }
 
 // ===========================================================================

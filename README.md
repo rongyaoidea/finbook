@@ -444,6 +444,14 @@
 - **UI**：新页「MPS 排产」（NAV 生产制造组），三块面板 ①MPS ②粗排+负荷 ③细排结果。
 - **测试**：web `mps_schedule_flow`——确认 SO 未发量6 → MPS demand=6/planned=6 → 在制4后再跑 wip=4/planned=2 → 下达生成 SC 单+重复 400 → 粗排 日产能2：MPS单1天/在制单2天/负荷非空 → 细排写回 plan_start=2026-02-01 + 空清单400 + 空需求400；回归 findb `mrp_basic`/`mrp_lot_size_and_safety_stock`/`prod_crud`/`count_apply_loss_gain_and_guards` 4/4 + web `production_issue_complete_flow`/`workbench_role_matrix` 2/2。
 
+### 4.30 报表数字钻取 + 列偏好持久化（清单⑦，**六项清单全部收官**）
+
+- **数字钻取**：`GET /api/reports/account-detail?account=&from=&to=`（FinReport，`report_range` 同款参数）——findb `balances::account_detail`：**期初累计 + 分录逐笔 + 运行余额**（借正贷负）；**口径与试算平衡 H-3 完全一致 = 仅已记账 `status='posted'`**（首版 `<>void` 含草稿被 H-3 揭示口径不一致，已对齐——草稿/已审未记账不进）。
+- **UI**：`openAccountDetail()` 通用明细弹窗（期初行 → 逐笔 日期/凭证号/摘要/借贷/运行余额 → 合计，打印预览复用）；**二级钻取**：明细行点击直接打开凭证编辑器；试算平衡表**数据行点击即钻取**（`data-drill`，行 hover 提示）；参数透传与试算同源（同 `parse_period`）。
+- **列偏好**：`autoColPrefs()` **全局自动挂载**——扫 `#main table.grid`（列数≥4）表前插「列▾」checkbox 菜单（列名取自 th 文本），隐藏走 **CSS 类 + 动态 `<style>` 规则**（`table.pc-KEY.ch-N nth-child`）——**数据异步后填的行自动继承**；localStorage `colpref:{view}#{序号}` 持久化；`renderMain` 同步挂 + `api()` 回调补挂（async 表全覆盖）；点击表外关菜单。声明：列**显隐** v1，列宽拖拽留待迭代。
+- **顺手修**：明细 SQL 首版 `v.summary` 列不存在（voucher 表是 `memo`）——mem 单测复现定位。
+- **测试**：findb `account_detail_smoke`（手插凭证直调）1/1；web `report_drill`——三笔记账凭证（借100/借200/贷30，每笔保存即记账走 H-3 流程）→ 本期 begin=0/3行/借300/贷30/末行余额270/凭证号记82/分录摘要 → 下期 begin=270 期初累计、无行 → 缺 account 400；回归 `trial_balance_default_posted_only_h3`（口径锚）+ `web_aux_qty_and_custom_reports` + `fin_report_vs_business_report` 3/3。
+
 ---
 
 ## 5. 关键设计约定

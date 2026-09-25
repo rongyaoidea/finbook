@@ -2300,6 +2300,115 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 链7：数字钻取（科目明细账：期初 + 逐笔 + 运行余额 + 贷余负值）与缺参校验。
+#[tokio::test]
+async fn report_drill() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 造两笔（借 1001 100 / 借 1001 200）+ 一笔贷方（1001 贷 30 → 余额转负验证方向）。
+    // 口径：明细账与试算平衡同为「仅已记账」——每笔保存后立即记账（H-3 同款流程）。
+    for (no, entries) in [
+        (80, serde_json::json!([
+            { "line": 1, "account_code": "1001", "summary": "drill-a", "debit": "100", "credit": "0" },
+            { "line": 2, "account_code": "2001", "summary": "drill-a", "debit": "0", "credit": "100" }
+        ])),
+        (81, serde_json::json!([
+            { "line": 1, "account_code": "1001", "summary": "drill-b", "debit": "200", "credit": "0" },
+            { "line": 2, "account_code": "2001", "summary": "drill-b", "debit": "0", "credit": "200" }
+        ])),
+        (82, serde_json::json!([
+            { "line": 1, "account_code": "1001", "summary": "drill-c", "debit": "0", "credit": "30" },
+            { "line": 2, "account_code": "2001", "summary": "drill-c", "debit": "30", "credit": "0" }
+        ])),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/vouchers",
+                &sid,
+                serde_json::json!({
+                    "id": 0, "period": cur_ymm, "date": d15.clone(), "word": "记",
+                    "no": no, "attachments": 0, "memo": "", "entries": entries
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "造凭证 #{no}");
+        let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                &format!("/api/vouchers/{vid}/post"),
+                &sid,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "记账凭证 #{no}");
+    }
+
+    // 明细：本期 from=to → begin=0、3 行、借合计 300、贷合计 30、末行余额 270
+    let next_ymm: i32 = {
+        let y = cur_ymm / 100;
+        let m = cur_ymm % 100;
+        if m == 12 { (y + 1) * 100 + 1 } else { y * 100 + m + 1 }
+    };
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/reports/account-detail?account=1001&from={cur_ymm}&to={cur_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "明细账可用：{body}");
+    let r: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 3, "3 行分录：{r}");
+    assert_eq!(r["begin"].as_str().unwrap().parse::<f64>().unwrap(), 0.0, "本期起无期初");
+    assert_eq!(r["total_debit"].as_str().unwrap().parse::<f64>().unwrap(), 300.0, "借合计");
+    assert_eq!(r["total_credit"].as_str().unwrap().parse::<f64>().unwrap(), 30.0, "贷合计");
+    let last = r["rows"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(
+        last["balance"].as_str().unwrap().parse::<f64>().unwrap(),
+        270.0,
+        "运行余额 100+200-30：{last}"
+    );
+    assert_eq!(last["no"], "记82", "凭证号 word+no 拼接");
+    assert_eq!(last["line_memo"], "drill-c", "分录摘要");
+
+    // 期初：from=下期 → 无行、begin=本期累计 270
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/reports/account-detail?account=1001&from={next_ymm}&to={next_ymm}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["rows"].as_array().unwrap().is_empty(), "下期无发生：{r}");
+    assert_eq!(
+        r["begin"].as_str().unwrap().parse::<f64>().unwrap(),
+        270.0,
+        "期初 = 本期累计：{r}"
+    );
+
+    // 缺 account → 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/account-detail", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "缺 account 拒");
+}
+
 /// 链6：MPS（销售需求+净算+在制扣减+一键下达）→ 粗排（件/日顺排+按日负荷）→ 细排写回。
 #[tokio::test]
 async fn mps_schedule_flow() {

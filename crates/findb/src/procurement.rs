@@ -53,7 +53,7 @@ fn map_req(r: &rusqlite::Row) -> rusqlite::Result<PurchaseReq> {
 const R_COLS: &str = "id,no,period,date,item_code,item_name,qty,status,requester,memo";
 
 pub fn pr_next_no(db: &Db, period: Period) -> DbResult<String> {
-    let prefix = format!("QG{:04}{:02}", period.year(), period.month());
+    let prefix = format!("{}{:04}{:02}", crate::doc_prefix(db, "req", "QG"), period.year(), period.month());
     let n: i64 = db.conn().query_row(
         "SELECT COUNT(*) FROM purchase_req WHERE no LIKE ?1",
         rusqlite::params![format!("{prefix}%")],

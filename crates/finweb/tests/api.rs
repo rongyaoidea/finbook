@@ -3936,6 +3936,166 @@ async fn payroll_bank_slip_tax() {
     assert_eq!(r["rows"].as_array().unwrap().len(), 2, "申报表 2 人：{r}");
 }
 
+/// P2：单据编码规则自定义 + 工作流消息节点（到达即通知并自动继续）。
+#[tokio::test]
+async fn doc_prefix_and_wf_message() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 1) 单据前缀：采购改 CGP，销售留默认
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &sid))
+        .await
+        .unwrap();
+    let mut opts: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    opts["doc_prefixes"] = serde_json::json!({ "po": "CGP" });
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &sid, opts))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存前缀");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "supplier_code": "S01", "supplier_name": "供应商甲",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "1", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/procure/po?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let po_no = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_i64() == Some(po_id))
+        .unwrap()["no"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(po_no.starts_with("CGP202601"), "采购单号应带自定义前缀：{po_no}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-05", "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140501", "qty_ordered": "1", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let so_no = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_i64() == Some(so_id))
+        .unwrap()["no"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(so_no.starts_with("XS202601"), "销售单号保持默认前缀：{so_no}");
+
+    // 2) 工作流消息节点：start → 初审 → 消息 → 复核；消息节点自动跳过并留痕
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows",
+            &sid,
+            serde_json::json!({
+                "id": 0, "name": "报价带消息节点", "biz_type": "quotation",
+                "nodes": [
+                    { "id": "n1", "type": "start", "name": "开始" },
+                    { "id": "n2", "type": "approve", "name": "初审" },
+                    { "id": "n3", "type": "message", "name": "通知业务员" },
+                    { "id": "n4", "type": "approve", "name": "复核" }
+                ],
+                "edges": [
+                    { "id": "e1", "from": "n1", "to": "n2", "kind": "normal" },
+                    { "id": "e2", "from": "n2", "to": "n3", "kind": "normal" },
+                    { "id": "e3", "from": "n3", "to": "n4", "kind": "normal" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存流程");
+    let flow_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/workflows/{flow_id}/publish"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发布流程");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/quote",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-06", "customer_code": "C03", "customer_name": "客户丙",
+                "item_code": "140501", "item_name": "成品", "qty": "1", "unit_price": "5",
+                "status": "draft", "prepared_by": "", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let q = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{q}/approve"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["pending"], "复核", "消息节点应自动跳过、停在复核：{r}");
+    // 消息留痕（审计 → 通知中心动态）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/logs?limit=20", &sid))
+        .await
+        .unwrap();
+    let logs = body_string(resp).await;
+    assert!(logs.contains("工作流") && logs.contains("消息"), "消息节点应留痕：{logs}");
+    // 复核通过 → 终态批准
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/quote/{q}/approve"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(r["ok"] == true, "终态批准：{r}");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

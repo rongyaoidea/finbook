@@ -258,7 +258,7 @@ pub struct ProductionOrder {
 pub fn po_next_no(db: &Db, period: Period) -> DbResult<String> {
     let year = period.year();
     let month = period.month();
-    let prefix = format!("CG{:04}{:02}", year, month);
+    let prefix = format!("{}{:04}{:02}", crate::doc_prefix(db, "po", "CG"), year, month);
     let sql = format!(
         "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM purchase_order WHERE no LIKE ?",
         prefix.len() + 1
@@ -272,7 +272,7 @@ pub fn po_next_no(db: &Db, period: Period) -> DbResult<String> {
 pub fn so_next_no(db: &Db, period: Period) -> DbResult<String> {
     let year = period.year();
     let month = period.month();
-    let prefix = format!("XS{:04}{:02}", year, month);
+    let prefix = format!("{}{:04}{:02}", crate::doc_prefix(db, "so", "XS"), year, month);
     let sql = format!(
         "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM sales_order WHERE no LIKE ?",
         prefix.len() + 1
@@ -1001,7 +1001,7 @@ mod tests {
 pub fn prod_next_no(db: &Db, period: Period) -> DbResult<String> {
     let year = period.year();
     let month = period.month();
-    let prefix = format!("SC{:04}{:02}", year, month);
+    let prefix = format!("{}{:04}{:02}", crate::doc_prefix(db, "prod", "SC"), year, month);
     let sql = format!(
         "SELECT COALESCE(MAX(CAST(SUBSTR(no, {}) AS INTEGER)), 0) + 1 FROM production_order WHERE no LIKE ?",
         prefix.len() + 1

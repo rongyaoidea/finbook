@@ -682,6 +682,9 @@ pub struct BookOptions {
     /// 预算控制：off/空=关闭（默认）、warn=超预算仅提醒放行、strong=超预算拒绝保存
     #[serde(default)]
     pub budget_control: String,
+    /// 单据号前缀自定义（键：po/so/req/quo/prod；空/缺省用内置默认 CG/XS/QG/BJ/SC）
+    #[serde(default)]
+    pub doc_prefixes: std::collections::BTreeMap<String, String>,
     /// 凭证字号方案
     pub voucher_words: Vec<String>,
 }
@@ -732,6 +735,7 @@ impl Default for BookOptions {
             require_audit: true,
             biz_accounts: BizAccounts::default(),
             budget_control: String::new(),
+            doc_prefixes: std::collections::BTreeMap::new(),
             voucher_words: vec!["记".to_string()],
         }
     }

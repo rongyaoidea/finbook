@@ -59,7 +59,7 @@ fn map_quo(r: &rusqlite::Row) -> rusqlite::Result<Quotation> {
 const Q_COLS: &str = "id,no,period,date,customer_code,customer_name,item_code,item_name,qty,unit_price,status,prepared_by,memo";
 
 pub fn quo_next_no(db: &Db, period: Period) -> DbResult<String> {
-    let prefix = format!("BJ{:04}{:02}", period.year(), period.month());
+    let prefix = format!("{}{:04}{:02}", crate::doc_prefix(db, "quo", "BJ"), period.year(), period.month());
     let n: i64 = db.conn().query_row(
         "SELECT COUNT(*) FROM quotation WHERE no LIKE ?1",
         rusqlite::params![format!("{prefix}%")],

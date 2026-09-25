@@ -808,7 +808,51 @@ pub fn intercept(
             tx.commit()?;
             Ok(Gate::Final { approved: approve })
         }
-        Some(nid) => {
+        Some(mut nid) => {
+            // 消息节点（对标金蝶：到达即发通知，不阻塞流程）——写审计（进通知中心动态）并自动继续
+            let mut hops = 0;
+            loop {
+                let Some(nnode) = flow.nodes.iter().find(|n| n.id == nid) else {
+                    break;
+                };
+                if nnode.node_type != "message" {
+                    break;
+                }
+                crate::log_on(
+                    &tx,
+                    &user.username,
+                    "工作流",
+                    "消息",
+                    &format!(
+                        "流程【{}】{}#{} 到达消息节点【{}】{}",
+                        flow.name,
+                        biz_type,
+                        biz_id,
+                        node_label(nnode),
+                        if comment.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("（{}）", comment.trim())
+                        }
+                    ),
+                )?;
+                hops += 1;
+                if hops > 10 {
+                    break;
+                }
+                match branch_next(db, &flow, nnode, biz_type, biz_id)? {
+                    Some(x) => nid = x,
+                    None => {
+                        // 消息节点即终点：流程完成
+                        tx.execute(
+                            "UPDATE workflow_instance SET status='approved' WHERE id=?1",
+                            [inst_id],
+                        )?;
+                        tx.commit()?;
+                        return Ok(Gate::Final { approved: true });
+                    }
+                }
+            }
             let label = if nid == node.id {
                 cosign_label.clone().unwrap_or_else(|| node_label(&node))
             } else {

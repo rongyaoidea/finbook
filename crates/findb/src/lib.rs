@@ -523,6 +523,17 @@ pub fn money_param(m: fincore::Money) -> String {
     m.fmt_plain()
 }
 
+/// 单据号前缀（账套参数 `doc_prefixes` 可自定义；空/未配置用内置默认）。
+/// 键：po / so / req / quo / prod（采购订单/销售订单/请购/报价/生产订单）。
+pub fn doc_prefix(db: &Db, kind: &str, default: &str) -> String {
+    db.options()
+        .doc_prefixes
+        .get(kind)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// 给报表 SQL 追加数据范围条件（科目区间 + 仅本人填制的凭证）。
 ///
 /// 调用方需保证 SQL 中分录表别名是 `e`、凭证表别名是 `v`，且 `params`

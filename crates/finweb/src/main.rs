@@ -1,7 +1,7 @@
 //! FinBook Web 服务端入口
 //!
-//! 多租户模式：全局平台身份库（realm.db）+ 多账套目录。
-//! - 平台管理员：管理普通用户账号、查看全部账套（本身不需要建账套）。
+//! 多租户模式：全局账号库（realm.db）+ 多账套目录。
+//! - 管理员：管理普通用户账号、查看全部账套（本身不需要建账套）。
 //! - 普通用户：登录后自建账套（每个账套独立 `.fbk` 文件，彼此隔离）。
 //!
 //! 业务代码在 lib 目标（finweb::handlers / finweb::state），本文件只做启动装配。
@@ -32,7 +32,7 @@ fn init_tracing() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let listen = std::env::var("FINBOOK_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    // 平台身份库（全局账号 + 账套目录）
+    // 账号库（全局账号 + 账套目录）
     let realm_path =
         std::env::var("FINBOOK_REALM").unwrap_or_else(|_| "./data/realm.db".to_string());
     // 用户自建账套的存放目录
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 兼容旧版单账套环境变量：若设置且目录里有账套文件，则注册为可选账套
     let legacy_dir = std::env::var("FINBOOK_DIR").ok().map(PathBuf::from);
 
-    // 平台身份库：打开（首次自动建表）并引导管理员
+    // 账号库：打开（首次自动建表）并引导管理员
     let realm = RealmDb::open(&realm_path)?;
     let bootstrap = realm.ensure_bootstrap(
         &std::env::var("FINBOOK_ADMIN_USER").unwrap_or_else(|_| "admin".to_string()),
@@ -85,18 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         asset_version(),
     );
 
+    // 账套归属迁移（账号模型二元化，幂等）：普通账号名下的存量账套 → 管理员名下
+    let _ = state.migrate_book_owners_to_admin();
+
     let app = build_app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     let book_count = state.books.list().len();
     println!(
-        "\n  FinBook Web 已启动（多租户模式）\n  访问地址   : http://{listen}\n  平台身份库 : {}\n  账套目录   : {}\n  已注册账套 : {book_count} 个\n",
+        "\n  FinBook Web 已启动（多租户模式）\n  访问地址   : http://{listen}\n  账号库     : {}\n  账套目录   : {}\n  已注册账套 : {book_count} 个\n",
         state.realm.path().display(),
         books_dir.display(),
     );
     if let Some((user, pass)) = bootstrap {
         println!("  ┌─────────────────────────────────────────────┐");
-        println!("  │ 已初始化平台管理员（请立即保存，仅显示一次）│");
+        println!("  │ 已初始化管理员（请立即保存，仅显示一次）│");
         println!("  │   账号：{user:<40}│");
         println!("  │   口令：{pass:<40}│");
         println!("  └─────────────────────────────────────────────┘\n");

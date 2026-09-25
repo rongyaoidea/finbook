@@ -127,16 +127,51 @@ async fn select_book(state: &Arc<WebState>, sid: &str, key: &str) -> StatusCode 
 
 /// 普通用户自助建账套（返回 (status, body)）
 async fn create_book(state: &Arc<WebState>, sid: &str, company: &str) -> (StatusCode, String) {
+    // 治理收归（账号模型二元化）：建套仅管理员——helper 内部改用管理员建套，并把原
+    // 调用者（会话反查 username）邀请进套为会计，既有测试的「进入/协作」语义不变；
+    // 调用者本身是管理员（boss）时直接用其会话建套、不重复邀请。
+    let token = sid.split('=').nth(1).unwrap_or(sid); // Cookie 形如 "sid=xxx"，会话表用裸 token
+    let caller = state.sessions.get(token, 0).map(|s| s.username);
+    let admin_sid = match &caller {
+        Some(u) if u == "boss" => sid.to_string(),
+        _ => login(state, "boss", "Admin!2026").await.1,
+    };
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/books",
-            sid,
+            &admin_sid,
             serde_json::json!({ "key": "", "company": company, "start_period": 202601 }),
         ))
         .await
         .unwrap();
     let status = resp.status();
     let s = body_string(resp).await;
+    if status == StatusCode::OK {
+        if let Some(u) = caller.filter(|u| u != "boss") {
+            let key = serde_json::from_str::<serde_json::Value>(&s)
+                .ok()
+                .and_then(|v| v["key"].as_str().map(String::from));
+            if let Some(key) = key {
+                assert_eq!(
+                    select_book(state, &admin_sid, &key).await,
+                    StatusCode::OK,
+                    "helper: 管理员应能进入新建账套"
+                );
+                let inv = handlers::router(state.clone())
+                    .oneshot(authed_post(
+                        "/api/users",
+                        &admin_sid,
+                        serde_json::json!({
+                            "username": u, "display_name": u, "password": "",
+                            "role": "accountant", "must_change_pwd": false
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(inv.status(), StatusCode::OK, "helper: 应把调用者邀请进套");
+            }
+        }
+    }
     (status, s)
 }
 
@@ -365,20 +400,32 @@ async fn normal_user_creates_and_enters_own_book() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "强制改密应成功");
 
-    // 自建账套并进入
+    // 账号模型二元化：普通账号不能自建账套
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/books",
+            &sid,
+            serde_json::json!({ "key": "", "company": "张记贸易直建", "start_period": 202601 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不能新建账套");
+
+    // 管理员代建 + 邀请进入：进入者是套内会计成员（不再是"创建者即管理员"）
     let (status, body) = create_book(&state, &sid, "张记贸易").await;
-    assert_eq!(status, StatusCode::OK, "自建账套应成功：{body}");
+    assert_eq!(status, StatusCode::OK, "管理员代建账套应成功：{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let key = v["key"].as_str().unwrap().to_string();
 
     let status = select_book(&state, &sid, &key).await;
-    assert_eq!(status, StatusCode::OK, "进入自建账套应成功");
+    assert_eq!(status, StatusCode::OK, "受邀进入账套应成功");
     let resp = handlers::router(state.clone())
         .oneshot(authed_get("/api/me", &sid))
         .await
         .unwrap();
     let s = body_string(resp).await;
-    assert!(s.contains("\"is_admin\":true"), "创建者应为账套内管理员：{s}");
+    assert!(s.contains("\"is_admin\":false"), "受邀成员应为套内非管理员：{s}");
+    assert!(s.contains("\"role\":\"accountant\""), "受邀成员应为会计岗位：{s}");
 }
 
 #[tokio::test]
@@ -478,20 +525,43 @@ async fn admin_can_enter_any_book() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let key = v["key"].as_str().unwrap().to_string();
 
-    // 平台管理员进入 li 的账套：临时管理员身份，不写入账套 user 表
-    let status = select_book(&state, &admin_sid, &key).await;
-    assert_eq!(status, StatusCode::OK, "平台管理员应能进入任意账套");
+    // 第二个管理员进入该套：临时管理员身份，不写入账套 user 表
     let resp = handlers::router(state.clone())
-        .oneshot(authed_get("/api/me", &admin_sid))
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &admin_sid,
+            serde_json::json!({ "username": "m2", "display_name": "管理员二", "password": "M2aa123456", "is_admin": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通第二管理员应成功");
+    let (_, m2_sid) = login(&state, "m2", "M2aa123456").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &m2_sid,
+            serde_json::json!({ "old": "M2aa123456", "new": "M2aa654321" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "m2 改密应成功");
+    let status = select_book(&state, &m2_sid, &key).await;
+    assert_eq!(status, StatusCode::OK, "管理员应能进入任意账套");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/me", &m2_sid))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "管理员进入后 /me 应可用");
 
-    // 无痕迹验证：管理员进入他人账套后，账套内不应出现管理员的账号行
+    // 无痕迹验证：归属者行（owner seed，建套时写入）保留；以临时身份进入的访问者 m2 不留行
     let db = findb::Db::open(books_dir.join(format!("{key}.fbk"))).expect("打开账套文件失败");
     assert!(
-        findb::users::get(&db, "boss").unwrap().is_none(),
-        "平台管理员不应在他人账套留下账号记录"
+        findb::users::get(&db, "boss").unwrap().is_some(),
+        "归属者（管理员）的套内行应保留"
+    );
+    assert!(
+        findb::users::get(&db, "m2").unwrap().is_none(),
+        "访问他人账套的管理员不应留下账号记录"
     );
 }
 
@@ -560,25 +630,25 @@ async fn deleting_book_unblocks_user_deletion() {
         ))
         .await
         .unwrap();
-    // 自建账套
+    // 自建账套（治理收归：helper 由管理员代建并邀请 zhang 入套）
     let (_, body) = create_book(&state, &sid, "张记贸易").await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let key = v["key"].as_str().unwrap().to_string();
-    // 有账套时不能删账号
+    // 名下有账套的账号不能被删（新模型下账套只归管理员——删管理员本人被自身保护拦下）
     let resp = handlers::router(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/api/platform/users/zhang")
+                .uri("/api/platform/users/boss")
                 .header(header::COOKIE, &admin_sid)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "有账套时应拒绝删除账号");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不能删除当前登录的管理员");
 
-    // 归属者删除自己的账套
+    // 新模型：账套归管理员——普通成员无权删套，管理员可删自己的套
     let resp = handlers::router(state.clone())
         .oneshot(
             Request::builder()
@@ -590,14 +660,26 @@ async fn deleting_book_unblocks_user_deletion() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "归属者应能删除自己的账套");
-    // 账套应已从列表消失
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通成员不能删除账套");
     let resp = handlers::router(state.clone())
-        .oneshot(authed_get("/api/books", &sid))
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&format!("/api/books/{}", key))
+                .header(header::COOKIE, &admin_sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员应能删除账套");
+    // 该套应已从列表消失（管理员名下仍有 b1 等既有账套）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/books", &admin_sid))
         .await
         .unwrap();
     let s = body_string(resp).await;
-    assert!(s.contains("\"books\":[]"), "删除后列表应为空：{s}");
+    assert!(!s.contains(&key), "删除后列表不应再含该套：{s}");
     // 此时账号可删
     let resp = handlers::router(state.clone())
         .oneshot(
@@ -775,12 +857,14 @@ async fn member_revoke_takes_effect_immediately() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let key = v["key"].as_str().unwrap().to_string();
     assert_eq!(select_book(&state, &zhang_sid, &key).await, StatusCode::OK);
+    // 管理员进入该套（后续以管理员身份执行邀请/停用等治理操作）
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
 
-    // 邀请 acc1（会计，不强制改密）
+    // 管理员邀请 acc1（会计，不强制改密）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users",
-            &zhang_sid,
+            &admin_sid,
             serde_json::json!({
                 "username": "acc1", "display_name": "小会", "password": "Acc1123456",
                 "role": "accountant", "must_change_pwd": false,
@@ -804,27 +888,28 @@ async fn member_revoke_takes_effect_immediately() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(select_book(&state, &acc_sid, &key).await, StatusCode::OK);
 
-    // 归属者不可被停用/修改账套内身份（否则账套失去主人）
+    // 任何账号都不能停用自己/改自己的授权（自改保护——由管理员自身触发验证：
+    // 新模型下管理员还是账套归属者，命中归属者/自改保护同样是 400）
     let resp = handlers::router(state.clone())
         .oneshot(authed_put(
-            "/api/users/zhang",
-            &zhang_sid,
+            "/api/users/boss",
+            &admin_sid,
             serde_json::json!({ "disabled": true }),
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "归属者不可被停用");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不能停用自己");
 
-    // owner 停用成员 → 成员现有会话立即下线
+    // 管理员停用成员 → 成员现有会话立即下线
     let resp = handlers::router(state.clone())
         .oneshot(authed_put(
             "/api/users/acc1",
-            &zhang_sid,
+            &admin_sid,
             serde_json::json!({ "disabled": true }),
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "停用成员应成功");
+    assert_eq!(resp.status(), StatusCode::OK, "管理员停用成员应成功");
     let resp = handlers::router(state.clone())
         .oneshot(authed_get("/api/me", &acc_sid))
         .await
@@ -833,13 +918,13 @@ async fn member_revoke_takes_effect_immediately() {
     // 即使会话残留，身份对账后的 disabled 复核也会 403 兜底
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "被停用成员的会话应立即下线");
 
-    // owner 移除成员 → 成员重新登录也进不了账套（平台账号本身不受影响）
+    // 管理员移除成员 → 成员重新登录也进不了账套（账号本身不受影响）
     let resp = handlers::router(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri("/api/users/acc1")
-                .header(header::COOKIE, &zhang_sid)
+                .header(header::COOKIE, &admin_sid)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -889,12 +974,14 @@ async fn book_member_collaboration() {
     let key = v["key"].as_str().unwrap().to_string();
     let status = select_book(&state, &zhang_sid, &key).await;
     assert_eq!(status, StatusCode::OK, "归属者应能进入自己的账套");
+    // 管理员进入该套（后续以管理员身份执行邀请等治理操作）
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
 
-    // 3) 归属者邀请 acc1 进入账套（账套内建「会计」角色，不强制改密）
+    // 3) 管理员邀请 acc1 进入账套（账套内建「会计」角色，不强制改密）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users",
-            &zhang_sid,
+            &admin_sid,
             serde_json::json!({
                 "username": "acc1",
                 "display_name": "小会",
@@ -906,11 +993,11 @@ async fn book_member_collaboration() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "邀请成员应成功");
-    // 未开通平台账号的子账号应被拒绝（避免产生无法登录的死账号）
+    // 未开通账号的子账号应被拒绝（避免产生无法登录的死账号）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users",
-            &zhang_sid,
+            &admin_sid,
             serde_json::json!({
                 "username": "ghost",
                 "display_name": "幽灵",
@@ -2037,33 +2124,41 @@ async fn provision_plain_user(
     sid
 }
 
-/// 账套管理员不能把平台管理员拉进自己的账套（否则可用账套内重置口令
-/// 重置他人的平台口令，形成提权链）
+/// 管理员不能把另一个管理员拉进账套（口令为全局口令，管理员入套会形成提权链）
 #[tokio::test]
 async fn cannot_invite_platform_admin_into_book() {
     let (state, _bd, _dir) = test_state();
     let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
-    let zhang = provision_plain_user(&state, &admin_sid, "zhangx", "Zx12345678").await;
-    let (status, body) = create_book(&state, &zhang, "张记").await;
+    // 开通第二个管理员
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &admin_sid,
+            serde_json::json!({ "username": "boss2", "display_name": "管理员二", "password": "Bb12345678", "is_admin": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通第二个管理员应成功");
+    let (status, body) = create_book(&state, &admin_sid, "张记").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(select_book(&state, &zhang, &key).await, StatusCode::OK);
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
 
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users",
-            &zhang,
+            &admin_sid,
             serde_json::json!({
-                "username": "boss", "display_name": "平台管理员", "password": "Boss123456",
+                "username": "boss2", "display_name": "管理员二", "password": "Bb12345678",
                 "role": "accountant", "must_change_pwd": false,
             }),
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "不应允许邀请平台管理员进账套");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "不应允许邀请管理员进账套");
 }
 
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
@@ -2090,9 +2185,10 @@ async fn backups_isolated_per_book() {
         .to_string();
     assert_eq!(select_book(&state, &li, &lk).await, StatusCode::OK);
 
-    // 张备份后拿到文件名
+    // 管理员进入张记套后备份（备份/恢复为管理员能力；按套隔离语义不变）
+    assert_eq!(select_book(&state, &admin_sid, &zk).await, StatusCode::OK);
     let resp = handlers::router(state.clone())
-        .oneshot(authed_post("/api/backups", &zhang, serde_json::json!({})))
+        .oneshot(authed_post("/api/backups", &admin_sid, serde_json::json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "备份应成功");
@@ -2100,29 +2196,31 @@ async fn backups_isolated_per_book() {
         serde_json::from_str(&body_string(resp).await).expect("备份响应应是 JSON");
     let zname = v["name"].as_str().expect("应返回备份文件名").to_string();
 
-    // 李的备份列表里不能出现张的备份
+    // 李记套的备份列表里不能出现张记的备份（管理员切到李记套上下文查询）
+    assert_eq!(select_book(&state, &admin_sid, &lk).await, StatusCode::OK);
     let resp = handlers::router(state.clone())
-        .oneshot(authed_get("/api/backups", &li))
+        .oneshot(authed_get("/api/backups", &admin_sid))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let list = body_string(resp).await;
     assert!(!list.contains(&zname), "不应看到其他账套的备份：{list}");
 
-    // 李恢复张的备份必须被拒（不是 404，而是明确属于别的账套）
+    // 从李记套恢复张记备份必须被拒（不是 404，而是明确属于别的账套）
     let resp = handlers::router(state.clone())
-        .oneshot(authed_post("/api/restore", &li, serde_json::json!({ "file": zname })))
+        .oneshot(authed_post("/api/restore", &admin_sid, serde_json::json!({ "file": zname })))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "不应允许恢复其他账套的备份");
 
-    // 自己的备份仍可见（确认过滤没有把范围清空）
+    // 回到张记套：本套的备份仍可见（确认过滤没有把范围清空）
+    assert_eq!(select_book(&state, &admin_sid, &zk).await, StatusCode::OK);
     let resp = handlers::router(state.clone())
-        .oneshot(authed_get("/api/backups", &zhang))
+        .oneshot(authed_get("/api/backups", &admin_sid))
         .await
         .unwrap();
     let own = body_string(resp).await;
-    assert!(own.contains(&zname), "自己的备份应可见：{own}");
+    assert!(own.contains(&zname), "本套的备份应可见：{own}");
 }
 
 /// 身份操作收归套内管理员：持有 UserManage 的**非管理员**不能重置口令 / 重置设备 /
@@ -2202,11 +2300,76 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
-/// 跨租户口令接管回归：账套管理员不能重置「其他账套归属者」的平台口令。
-///
-/// 历史漏洞：任意自建账套的用户（天然拥有 UserManage）可把受害者平台账号
-/// 拉进自己的账套，再调 `/api/users/:username/reset-password` 改写其全局口令，
-/// 而该口令会被同步覆盖到受害者名下所有账套 → 跨租户锁定/接管。
+/// 建套收归管理员 + 存量账套归属迁移（版本更新时执行、幂等）：
+/// 普通账号名下的套 → 最早管理员名下，并把管理员补进该套的套内管理员成员行。
+#[tokio::test]
+async fn only_admin_creates_books_and_owners_migrate() {
+    let (state, books_dir, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // 1) 普通账号不能建套；2) 管理员能建套（owner=boss）
+    let u = provision_plain_user(&state, &admin_sid, "fr1", "Fr12345678").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/books",
+            &u,
+            serde_json::json!({ "key": "", "company": "普通账号自建", "start_period": 202601 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "仅管理员可新建账套");
+    let (st, body) = create_book(&state, &admin_sid, "存量改造套").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let k1 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(state.realm.book_owner(&k1).unwrap().unwrap(), "boss");
+
+    // 3) 造迁移前存量：普通账号 owner 的账套（realm 直插 + 真实文件 + 注册）
+    let path = books_dir.join("legacy1.fbk");
+    let _ = findb::Db::create_no_admin(&path, &BookOptions::default()).expect("建存量账套文件");
+    state
+        .realm
+        .register_book("legacy1", path.to_str().unwrap(), "fr1", "旧账套")
+        .expect("直插存量账套记录");
+    state.books.register(&path, 16);
+
+    // 4) 执行迁移：归属接管 + 套内补管理员成员行
+    let n = state.migrate_book_owners_to_admin();
+    assert!(n >= 1, "应接管至少 1 个存量账套（实际 {n}）");
+    assert_eq!(
+        state.realm.book_owner("legacy1").unwrap().unwrap(),
+        "boss",
+        "普通账号名下的套应归管理员"
+    );
+    assert_eq!(
+        state.realm.book_owner(&k1).unwrap().unwrap(),
+        "boss",
+        "管理员名下的套不动"
+    );
+    let db = findb::Db::open(&path).expect("打开存量账套");
+    let bu = findb::users::get(&db, "boss").expect("读套内成员");
+    assert!(
+        bu.map(|x| x.is_admin()).unwrap_or(false),
+        "管理员应补进套内管理员成员行"
+    );
+
+    // 5) 幂等：二次执行无事可做
+    let n2 = state.migrate_book_owners_to_admin();
+    assert_eq!(n2, 0, "二次迁移应为 0");
+
+    // 6) 管理员可进入迁移后的套
+    assert_eq!(
+        select_book(&state, &admin_sid, "legacy1").await,
+        StatusCode::OK,
+        "管理员应能进入迁移后的套"
+    );
+}
+
+/// 跨租户口令接管回归（账号模型二元化）：普通账号不能自建账套、不能邀请成员、
+/// 不能重置他人口令——历史漏洞（自建套→拉人→改全局口令→跨租户接管）的三个
+/// 前置步骤在新模型下全部不存在。
 #[tokio::test]
 async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
     let (state, _bd, _dir) = test_state();
@@ -2214,24 +2377,43 @@ async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
     let attacker = provision_plain_user(&state, &admin_sid, "att1", "At12345678").await;
     let victim = provision_plain_user(&state, &admin_sid, "vic1", "Vc12345678").await;
 
-    // 双方各自建账套（此时双方都是自己账套的 Admin）
-    let (st, body) = create_book(&state, &attacker, "攻击者账套").await;
+    // 前置一：普通账号不能自建账套（治理收编，攻击链第一步即断）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/books",
+            &attacker,
+            serde_json::json!({ "key": "", "company": "攻击者账套", "start_period": 202601 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不能自建账套");
+
+    // 管理员建套并邀请双方入套（均为会计成员）
+    let (st, body) = create_book(&state, &admin_sid, "工作账套").await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let akey = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+    let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(select_book(&state, &attacker, &akey).await, StatusCode::OK);
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
+    for (u, name) in [("att1", "攻击者"), ("vic1", "受害者")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &admin_sid,
+                serde_json::json!({
+                    "username": u, "display_name": name, "password": "",
+                    "role": "accountant", "must_change_pwd": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "管理员邀请 {u} 应成功");
+    }
+    assert_eq!(select_book(&state, &attacker, &key).await, StatusCode::OK);
+    assert_eq!(select_book(&state, &victim, &key).await, StatusCode::OK);
 
-    let (st, body) = create_book(&state, &victim, "受害者账套").await;
-    assert_eq!(st, StatusCode::OK, "{body}");
-    let vkey = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(select_book(&state, &victim, &vkey).await, StatusCode::OK);
-
-    // 攻击者把受害者账号拉进自己的账套（合法成员邀请，但不应借此重置全局口令）
+    // 前置二：普通成员没有 UserManage，不能邀请他人进套
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users",
@@ -2243,9 +2425,9 @@ async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "邀请成员本身应成功");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通成员不能邀请成员");
 
-    // 重置全局口令必须被拒（受害者拥有自己的账套）
+    // 前置三：普通成员无权重置他人的全局口令
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/users/vic1/reset-password",
@@ -2257,12 +2439,12 @@ async fn book_admin_cannot_reset_global_password_of_other_book_owner() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "账套管理员不得重置其他账套归属者的平台口令"
+        "普通成员不得重置他人平台口令"
     );
 
     // 受害者原口令仍可登录（未被改写）
     let (st, _) = login(&state, "vic1", "Vc12345678x").await;
-    assert_eq!(st, StatusCode::OK, "受害者口令不应被跨租户重置");
+    assert_eq!(st, StatusCode::OK, "受害者口令不应被改写");
 }
 
 // ---------------------------------------------------------------------------

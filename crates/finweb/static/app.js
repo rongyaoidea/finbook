@@ -167,7 +167,7 @@ async function showLogin() {
       <div class="login-card">
         <h1>FinBook 财务管理系统</h1>
         <div class="sub">多用户 · 多账套</div>
-        <div class="banner set">请输入平台账号登录。登录后可选择或新建自己的账套。</div>
+        <div class="banner set">请输入账号登录。登录后选择账套进入（仅管理员可新建账套）。</div>
         <form id="login-form">
           <div class="field"><label>账号</label><input id="u" autocomplete="username" required /></div>
           <div class="field"><label>口令</label><input id="p" type="password" autocomplete="current-password" required /></div>
@@ -225,8 +225,8 @@ async function showBookPicker(pre, force) {
     <div class="login-wrap">
       <div class="login-card wide">
         <h1>选择账套</h1>
-        <div class="sub">${esc(u.display_name || "")}${isPlatformAdmin ? "（平台管理员）" : ""}</div>
-        <div class="muted" style="margin:6px 0 14px">普通用户可在自己创建的账套中记账；平台管理员可进入全部账套查看。选择账套进入，或新建一套。</div>
+        <div class="sub">${esc(u.display_name || "")}${isPlatformAdmin ? "（管理员）" : ""}</div>
+        <div class="muted" style="margin:6px 0 14px">管理员可创建账套并进入全部账套；普通账号由管理员开通并邀请进入账套工作。</div>
         <div id="book-list" class="book-list">${books.length ? books.map((b) => `
           <div class="book-item">
             <button class="book-enter" data-key="${esc(b.key)}" data-company="${esc(b.company || b.key)}">
@@ -234,9 +234,9 @@ async function showBookPicker(pre, force) {
               <span class="book-meta">${isPlatformAdmin ? `归属：${esc(b.owner)} · ` : ""}${esc(b.key)}</span>
             </button>
             ${(isPlatformAdmin || b.owner === u.username) ? `<button class="btn sm ghost book-del" data-del="${esc(b.key)}" title="删除该账套（数据不可恢复）">删除</button>` : ""}
-          </div>`).join("") : `<div class="muted" style="padding:18px 0">还没有账套，点击下方「新建账套」开始记账。</div>`}</div>
+          </div>`).join("") : `<div class="muted" style="padding:18px 0">${isPlatformAdmin ? "还没有账套，点击下方「新建账套」开始记账。" : "暂无可用账套，请让管理员创建并邀请你加入。"}</div>`}</div>
         <div style="display:flex;gap:10px;margin-top:16px">
-          <button class="btn primary" id="new-book">＋ 新建账套</button>
+          ${isPlatformAdmin ? `<button class="btn primary" id="new-book">＋ 新建账套</button>` : ""}
           <span class="grow"></span>
           <button class="btn ghost" id="picker-logout">退出登录</button>
         </div>
@@ -248,7 +248,7 @@ async function showBookPicker(pre, force) {
   $all(".book-del").forEach((el) => {
     el.addEventListener("click", () => deleteBook(el.dataset.del, el.dataset.del));
   });
-  $("#new-book").addEventListener("click", openCreateBook);
+  if ($("#new-book")) $("#new-book").addEventListener("click", openCreateBook);
   $("#picker-logout").addEventListener("click", async () => {
     try { await api("/logout", { method: "POST" }); } catch (e) {}
     session.user = null;
@@ -273,7 +273,7 @@ async function enterBook(key, name) {
   }
 }
 
-/// 删除账套（平台管理员 或 账套归属者）；删除后回到账套选择页
+/// 删除账套（管理员 或 账套归属者）；删除后回到账套选择页
 async function deleteBook(key, name) {
   if (!(await confirmDialog(`确定删除账套「${name || key}」？该账套内的全部凭证、科目与设置将被永久删除，不可恢复。`, true))) return;
   try {
@@ -295,7 +295,7 @@ function openCreateBook() {
   const mask = modal(`
     <h3>新建账套</h3>
     <p class="muted" style="margin:0 0 14px;line-height:1.6">
-      每个账套都是独立隔离的一套账。创建者自动成为该账套的管理员，可再为同事开通账套内子账号。
+      每个账套都是独立隔离的一套账。仅管理员可创建；创建后可在「账号管理」开通成员并邀请入套、分配岗位。
     </p>
     <div class="field"><label>公司名称</label><input id="cb-company" placeholder="例如：某某贸易有限公司" /></div>
     <div class="field"><label>启用期间（YYYY-MM）</label><input id="cb-start" value="${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}" /></div>
@@ -398,8 +398,8 @@ async function showSetupWizard() {
 // group: 侧边栏分组（与桌面端 NavItem::group 保持一致）
 const NAV_ITEMS = [
   { id: "overview", label: "账目总览", admin: true, group: "管理员" },
-  { id: "platform-users", label: "平台账号", platform: true, group: "平台管理" },
-  { id: "platform-books", label: "全部账套", platform: true, group: "平台管理" },
+  { id: "platform-users", label: "账号管理", platform: true, group: "系统管理" },
+  { id: "platform-books", label: "全部账套", platform: true, group: "系统管理" },
   { id: "dashboard", label: "工作台", perm: null, group: "开始" },
   { id: "accounts", label: "会计科目", perm: "account_edit", group: "基础资料" },
   { id: "begin", label: "期初建账", perm: "opening", group: "基础资料" },
@@ -1994,8 +1994,8 @@ async function openNewUser() {
   const roles = await loadRoles();
   const mask = modal(`
     <h3>新建用户（账套内成员）</h3>
-    <div class="banner set" style="margin-bottom:12px">此账号用于本账套内的角色分工。对方需已拥有<b>平台账号</b>（同名）才能登录本账套；没有的请先让平台管理员在「平台账号」中开通。</div>
-    <div class="field"><label>账号（须与平台账号同名）</label><input id="nu-u" /></div>
+    <div class="banner set" style="margin-bottom:12px">此账号用于本账套内的角色分工。对方需已存在同名<b>账号</b>才能登录本账套；没有的请先让管理员在「账号管理」中开通。</div>
+    <div class="field"><label>账号（须与已开通账号同名）</label><input id="nu-u" /></div>
     <div class="field"><label>姓名</label><input id="nu-n" /></div>
     <div class="field"><label>角色（主岗位）</label><select id="nu-r">${roles.map((r) => `<option value="${r.role}">${esc(r.label)}</option>`).join("")}</select></div>
     <div class="field"><label>兼任岗位（可多选 = 身兼多职；权限取并集，出纳签字与会计核心仍互斥）</label>
@@ -2123,13 +2123,13 @@ function openAdminResetPwd(username) {
   };
 }
 // ===========================================================================
-// 平台管理（仅平台管理员，作用于全局身份库，与账套内子账号无关）
+// 账号管理（仅管理员，作用于全局账号库，与账套内子账号无关）
 // ===========================================================================
 async function viewPlatformUsers(main) {
-  main.innerHTML = `<h2>平台账号</h2>
+  main.innerHTML = `<h2>账号管理</h2>
     <div class="toolbar">
       <button class="btn primary" id="pu-add">＋ 开通账号</button>
-      <span class="muted">平台账号用于登录 Web 系统；普通用户登录后自行创建与维护账套。</span>
+      <span class="muted">管理员创建与管理账套；普通账号由管理员开通并邀请进入账套工作。</span>
     </div>
     <div id="pu-list" class="muted">加载中…</div>`;
   async function load() {
@@ -2139,7 +2139,7 @@ async function viewPlatformUsers(main) {
         <th>账号</th><th>展示名</th><th>类型</th><th>状态</th><th>设备</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody>${rows.map((x) => `<tr>
           <td>${esc(x.username)}</td><td>${esc(x.display_name)}</td>
-          <td>${x.is_admin ? "平台管理员" : "普通用户"}</td>
+          <td>${x.is_admin ? "管理员" : "普通账号"}</td>
           <td>${x.disabled ? `<span style="color:var(--err)">已停用</span>` : "正常"}</td>
           <td>${x.device_bound ? "已绑定" : "未绑定"}</td>
           <td class="muted">${esc(x.created_at)}</td>
@@ -2153,11 +2153,11 @@ async function viewPlatformUsers(main) {
   }
   $("#pu-add").addEventListener("click", () => {
     const mask = modal(`
-      <h3>开通平台账号</h3>
+      <h3>开通账号</h3>
       <div class="field"><label>账号（登录名）</label><input id="nc-u" autocomplete="off" /></div>
       <div class="field"><label>展示名</label><input id="nc-d" /></div>
       <div class="field"><label>初始口令（至少 6 位，首次登录会要求改密）</label><input id="nc-p" type="text" /></div>
-      <div class="field"><label><input type="checkbox" id="nc-a" /> 设为平台管理员</label></div>
+      <div class="field"><label><input type="checkbox" id="nc-a" /> 设为管理员</label></div>
       <div class="foot"><button class="btn" id="nc-cancel">取消</button><button class="btn primary" id="nc-save">创建</button></div>`);
     $("#nc-cancel", mask).onclick = closeModal;
     $("#nc-save", mask).onclick = async () => {
@@ -2196,7 +2196,7 @@ async function viewPlatformUsers(main) {
       const mask = modal(`
         <h3>编辑账号：${esc(u)}</h3>
         <div class="field"><label>展示名</label><input id="eu-d" value="${esc(info ? info.display_name : "")}" /></div>
-        <div class="field"><label><input type="checkbox" id="eu-a" ${info && info.is_admin ? "checked" : ""} /> 平台管理员</label></div>
+        <div class="field"><label><input type="checkbox" id="eu-a" ${info && info.is_admin ? "checked" : ""} /> 管理员</label></div>
         <div class="field"><label><input type="checkbox" id="eu-x" ${info && info.disabled ? "checked" : ""} /> 停用该账号</label></div>
         <div class="foot"><button class="btn" id="eu-cancel">取消</button><button class="btn primary" id="eu-save">保存</button></div>`);
       $("#eu-cancel", mask).onclick = closeModal;
@@ -2219,7 +2219,7 @@ async function viewPlatformUsers(main) {
 
 async function viewPlatformBooks(main) {
   main.innerHTML = `<h2>全部账套</h2>
-    <div class="muted" style="margin-bottom:10px">平台管理员可进入任意账套查看：以临时管理员身份进入，不在该账套留下账号记录，操作会记入账套审计日志。</div>
+    <div class="muted" style="margin-bottom:10px">管理员可进入任意账套查看：以临时管理员身份进入，不在该账套留下账号记录，操作会记入账套审计日志。</div>
     <div id="pb-list" class="muted">加载中…</div>`;
   async function load() {
     try {

@@ -58,7 +58,7 @@ pub struct LoginResp {
     pub books: Vec<serde_json::Value>,
 }
 
-/// 平台账号（开通/列表用，不含敏感字段）
+/// 账号（开通/列表用，不含敏感字段）
 #[derive(Clone, Serialize)]
 pub struct PlatformUserItem {
     pub username: String,
@@ -85,14 +85,14 @@ impl PlatformUserItem {
     }
 }
 
-/// 开通/修改平台账号请求
+/// 开通/修改账号请求
 #[derive(Deserialize)]
 pub struct PlatformUserReq {
     pub username: String,
     pub display_name: String,
     #[serde(default)]
     pub password: String,
-    /// 是否平台管理员（默认 false，即普通用户）
+    /// 是否管理员（默认 false，即普通用户）
     #[serde(default)]
     pub is_admin: bool,
 }
@@ -185,7 +185,7 @@ pub struct LoginReq {
     pub book_key: String,
 }
 
-/// 平台账号修改请求（管理员用，仅改展示名/停用/管理员标志，口令走 reset-password）
+/// 账号修改请求（管理员用，仅改展示名/停用/管理员标志，口令走 reset-password）
 #[derive(Deserialize)]
 pub struct UpdatePlatformUserReq {
     pub display_name: Option<String>,

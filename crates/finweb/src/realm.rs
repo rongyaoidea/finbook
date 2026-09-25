@@ -1,7 +1,7 @@
 //! 平台身份层（realm）
 //!
 //! 独立于账套（`.fbk`）的一层全局存储，负责两件事：
-//! 1. **全局账号** `realm_user`：能登录 Web 的"平台账号"。管理员与普通用户都是这里面的账号。
+//! 1. **全局账号** `realm_user`：能登录 Web 的"账号"。管理员与普通用户都是这里面的账号。
 //! 2. **账套目录** `realm_book`：每个账套一条记录，记录 `key`（文件名）、`path`、`owner_username`（创建者）。
 //!
 //! 账套内部仍用 `.fbk` 自带的 `user` 表做授权；进入账套时由 `state::CurrentUser` 按本文件的
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS realm_book (
 );
 "#;
 
-/// 平台身份库（单进程内以 Mutex<Connection> 持有，WAL 模式下并发安全）
+/// 账号库（单进程内以 Mutex<Connection> 持有，WAL 模式下并发安全）
 pub struct RealmDb {
     inner: Mutex<Connection>,
     path: PathBuf,
@@ -73,7 +73,7 @@ fn now() -> String {
 }
 
 impl RealmDb {
-    /// 打开（必要时创建）平台身份库并初始化表结构
+    /// 打开（必要时创建）账号库并初始化表结构
     pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(dir) = path.parent() {
@@ -128,7 +128,7 @@ impl RealmDb {
         Ok(conn.query_row("SELECT COUNT(*) FROM realm_user", [], |r| r.get(0))?)
     }
 
-    /// 首次启动引导：若没有任何账号，则创建平台管理员。
+    /// 首次启动引导：若没有任何账号，则创建管理员。
     /// - `admin_pass` 非空：用给定口令创建（运维通过环境变量注入，推荐）。
     /// - 否则：自动生成强口令，调用方负责打印一次性凭据。
     /// 返回 `(username, password)`：若管理员已存在则返回 `None`。
@@ -148,7 +148,7 @@ impl RealmDb {
         } else {
             (admin_user.to_string(), admin_pass.to_string())
         };
-        self.create_user(&user, "平台管理员", &pass, true, must_change, policy)?;
+        self.create_user(&user, "管理员", &pass, true, must_change, policy)?;
         Ok(Some((user, pass)))
     }
 
@@ -255,7 +255,7 @@ impl RealmDb {
     ) -> DbResult<()> {
         let mut u = self
             .get_user(username)?
-            .ok_or_else(|| fincore::FinError::not_found("平台账号不存在"))?;
+            .ok_or_else(|| fincore::FinError::not_found("账号不存在"))?;
         if let Some(d) = display_name {
             u.display_name = d.to_string();
         }
@@ -272,7 +272,7 @@ impl RealmDb {
                     .count();
                 if admins <= 1 {
                     return Err(DbError::Fin(fincore::FinError::msg(
-                        "至少保留一个平台管理员账号",
+                        "至少保留一个管理员账号",
                     )));
                 }
             }
@@ -286,16 +286,16 @@ impl RealmDb {
         Ok(())
     }
 
-    /// 删除平台账号。拒绝删除最后一个管理员，避免出现无人能管理系统的状态。
+    /// 删除账号。拒绝删除最后一个管理员，避免出现无人能管理系统的状态。
     pub fn delete_user(&self, username: &str) -> DbResult<()> {
         let target = self
             .get_user(username)?
-            .ok_or_else(|| fincore::FinError::not_found("平台账号不存在"))?;
+            .ok_or_else(|| fincore::FinError::not_found("账号不存在"))?;
         if target.is_admin {
             let admins = self.list_users()?.into_iter().filter(|u| u.is_admin).count();
             if admins <= 1 {
                 return Err(DbError::Fin(fincore::FinError::msg(
-                    "至少保留一个平台管理员账号",
+                    "至少保留一个管理员账号",
                 )));
             }
         }
@@ -338,7 +338,7 @@ impl RealmDb {
         let cur = match cur {
             Some(c) => c,
             None => {
-                return Err(DbError::Fin(fincore::FinError::msg("平台账号不存在")));
+                return Err(DbError::Fin(fincore::FinError::msg("账号不存在")));
             }
         };
         if !cur.is_empty() {
@@ -390,7 +390,7 @@ impl RealmDb {
     ) -> DbResult<Result<(), String>> {
         let u = self
             .get_user(username)?
-            .ok_or_else(|| fincore::FinError::not_found("平台账号不存在"))?;
+            .ok_or_else(|| fincore::FinError::not_found("账号不存在"))?;
         if !verify_password(old, &u.password_hash) {
             return Ok(Err("原口令不正确".to_string()));
         }
@@ -422,6 +422,47 @@ impl RealmDb {
             rusqlite::params![key, path, owner_username, company, now()],
         )?;
         Ok(())
+    }
+
+    /// 最早创建的（未停用）管理员：账号模型二元化后的唯一治理者候选
+    pub fn first_admin(&self) -> DbResult<Option<(String, String)>> {
+        let conn = self.inner.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT username, display_name FROM realm_user
+                 WHERE is_admin=1 AND disabled=0 ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 存量账套归属接管（账号模型二元化，幂等，每次启动可执行）：
+    /// owner 非管理员的账套 → 归最早创建的管理员；owner 已是任意管理员的不动
+    /// （多管理员各自归属保留）。返回被接管的 (key, path) 列表供调用方补套内成员。
+    pub fn reassign_books_to_admin(&self) -> DbResult<Vec<(String, String)>> {
+        let Some((admin, _)) = self.first_admin()? else {
+            return Ok(Vec::new()); // 尚未引导管理员时跳过
+        };
+        let conn = self.inner.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT key, path FROM realm_book
+             WHERE owner_username NOT IN (SELECT username FROM realm_user WHERE is_admin=1)",
+        )?;
+        let rows: Vec<(String, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        conn.execute(
+            "UPDATE realm_book SET owner_username=?1
+             WHERE owner_username NOT IN (SELECT username FROM realm_user WHERE is_admin=1)",
+            [&admin],
+        )?;
+        Ok(rows)
     }
 
     pub fn get_book(&self, key: &str) -> DbResult<Option<RealmBook>> {
@@ -521,7 +562,7 @@ impl RealmDb {
     ///
     /// 单密码统一后账套内不再设独立口令：账套内同名用户行只是平台口令的镜像
     /// （供桌面端直连 .fbk 登录用）。同步时一并同步改密标志并解除锁定，
-    /// 与旧"账套内重置"语义对齐。缺行则跳过（平台管理员看他人账套是临时身份，
+    /// 与旧"账套内重置"语义对齐。缺行则跳过（管理员看他人账套是临时身份，
     /// 不留行）；单个账套失败只记日志，不影响其他账套。
     pub fn sync_password_to_books(
         &self,
@@ -611,7 +652,7 @@ fn generate_password() -> String {
 /// 身份对账：确保账套内存在该平台用户对应的 `user` 行（角色 Admin）。
 ///
 /// - 普通用户自建账套时已被 [`crate::handlers::create_book`] 种子为 Admin；
-/// - 平台管理员查看他人账套时，首次进入自动以其全局口令哈希种子一行 Admin。
+/// - 管理员查看他人账套时，首次进入自动以其全局口令哈希种子一行 Admin。
 /// 之后账套引擎的权限/数据范围/设备绑定逻辑对这行用户照常生效。
 pub fn ensure_book_admin(db: &Db, ru: &RealmUser) -> DbResult<()> {
     if users::get(db, &ru.username)?.is_none() {

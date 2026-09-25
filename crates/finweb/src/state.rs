@@ -1,4 +1,4 @@
-//! Web 服务共享状态：平台身份库、账套注册表、会话管理、鉴权提取器与错误类型。
+//! Web 服务共享状态：账号库、账套注册表、会话管理、鉴权提取器与错误类型。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub struct WebState {
     pub login_limiter: LoginLimiter,
     /// 登录限流（来源 IP 维度，防同一出口跨账号扫号）
     pub login_ip_limiter: LoginLimiter,
-    /// 平台身份库（全局账号 + 账套目录）
+    /// 账号库（全局账号 + 账套目录）
     pub realm: RealmDb,
     /// 用户自建账套的存放目录
     pub books_dir: PathBuf,
@@ -90,6 +90,67 @@ impl WebState {
     pub fn default_db(&self) -> Result<Db, DbError> {
         let key = self.books.first_key();
         self.books.open(&key)
+    }
+
+    /// 账套归属迁移（版本升级时执行，幂等）：普通账号名下的存量账套接管到
+    /// 最早创建的管理员名下，并尽力把该管理员补进各套的套内管理员成员行
+    /// （管理员进入他人套也可走临时身份，此步保证套内身份与工具链始终可用）。
+    /// realm 归属接管必做；套内补行对缺失/损坏的账套文件跳过并打日志。
+    pub fn migrate_book_owners_to_admin(&self) -> usize {
+        let moved = match self.realm.reassign_books_to_admin() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[finweb] 账套归属迁移失败: {e}");
+                return 0;
+            }
+        };
+        if moved.is_empty() {
+            return 0;
+        }
+        let admin = match self.realm.first_admin() {
+            Ok(Some(a)) => a,
+            _ => return moved.len(), // 归属已接管；管理员信息缺失时跳过补行
+        };
+        for (key, path) in &moved {
+            if !std::path::PathBuf::from(path).exists() {
+                continue;
+            }
+            let db = match self.books.open(key) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("[finweb] 迁移补套内管理员失败（{key} 打不开）: {e}");
+                    continue;
+                }
+            };
+            let ensured = (|| -> findb::DbResult<()> {
+                match findb::users::get(&db, &admin.0)? {
+                    None => {
+                        let mut u = fincore::User::new(&admin.0, &admin.1, fincore::Role::Admin);
+                        if let Ok(Some(ru)) = self.realm.get_user(&admin.0) {
+                            u.password_hash = ru.password_hash;
+                            u.must_change_pwd = ru.must_change_pwd;
+                        }
+                        findb::users::insert(&db, &u)?;
+                    }
+                    Some(mut u) if !u.is_admin() => {
+                        u.role = fincore::Role::Admin;
+                        u.roles.retain(|r| *r != fincore::Role::Admin);
+                        findb::users::update(&db, &u)?;
+                    }
+                    Some(_) => {}
+                }
+                Ok(())
+            })();
+            if let Err(e) = ensured {
+                eprintln!("[finweb] 迁移补套内管理员失败（{key}）: {e}");
+            }
+        }
+        println!(
+            "  账套归属迁移：接管 {} 个存量账套 → {}",
+            moved.len(),
+            admin.0
+        );
+        moved.len()
     }
 }
 
@@ -256,7 +317,7 @@ pub struct SessionStore {
 #[derive(Clone)]
 pub struct SessionInfo {
     pub username: String,
-    /// 平台管理员标志（决定能否看全部账套）
+    /// 管理员标志（决定能否看全部账套）
     pub is_admin: bool,
     /// 登录时的设备指纹（用于逐请求复核"一人一机"策略）
     pub device_id: String,
@@ -514,7 +575,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
     ) -> Result<Self, Self::Rejection> {
         let (token, info) = session_of(&parts.headers, state)?;
 
-        // 1) 平台账号存在且未停用
+        // 1) 账号存在且未停用
         let ru: RealmAccount = state
             .realm
             .get_user(&info.username)?
@@ -524,7 +585,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
         }
 
-        // 2) 账套归属授权：平台管理员可看全部；归属者可进；账套内已有该用户行 = 被邀请的成员
+        // 2) 账套归属授权：管理员可看全部；归属者可进；账套内已有该用户行 = 被邀请的成员
         let book_key = info.book_key.clone();
         if book_key.is_empty() {
             return Err(AppError::unauthorized("请先选择账套"));
@@ -535,7 +596,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             .ok_or_else(|| AppError::not_found("账套不存在或已被删除"))?;
         let db = state.db_for(&book_key)?;
         let in_book = users::get(&db, &ru.username)?;
-        // 账套归属授权必须以平台身份库的最新 is_admin 为准，而非登录时快照进会话的
+        // 账套归属授权必须以账号库的最新 is_admin 为准，而非登录时快照进会话的
         // info.is_admin：否则管理员被降权后，旧会话在自然过期前仍能越权查看全部账套。
         let allowed = ru.is_admin || book.owner_username == ru.username || in_book.is_some();
         if !allowed {
@@ -548,7 +609,7 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             Some(u) => u,
             None => {
                 if ru.is_admin && book.owner_username != ru.username {
-                    // 平台管理员查看他人账套：构造临时账套管理员身份，不写入该账套 user 表，
+                    // 管理员查看他人账套：构造临时账套管理员身份，不写入该账套 user 表，
                     // 避免在他人账套留下账号记录；操作仍按管理员用户名记入审计与凭证。
                     let mut u = User::new(&ru.username, &ru.display_name, Role::Admin);
                     u.password_hash = ru.password_hash.clone();

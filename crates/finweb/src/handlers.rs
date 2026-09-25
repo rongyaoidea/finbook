@@ -93,7 +93,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/logout", post(post_logout))
         .route("/api/me", get(get_me))
         .route("/api/change-password", post(post_change_password))
-        // 平台账号管理（仅平台管理员，作用于全局身份库）
+        // 账号管理（仅管理员，作用于全局身份库）
         .route(
             "/api/platform/users",
             get(list_platform_users).post(create_platform_user),
@@ -521,7 +521,7 @@ async fn serve_index(State(state): State<Arc<WebState>>) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<SetupStatus>, AppError> {
-    // 平台管理员是否已初始化（首次启动已引导）
+    // 管理员是否已初始化（首次启动已引导）
     let admin_set = state.realm.count_users()? > 0;
     Ok(Json(SetupStatus {
         admin_set,
@@ -578,7 +578,7 @@ async fn post_login(
     headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, AppError> {
-    // 全局登录（认平台身份库，而非某一套账）
+    // 全局登录（认账号库，而非某一套账）
     let username = req.username.trim().to_string();
     // 设备指纹必须非空：空串会让"一人一机"首次绑定写成空值从而永久绕过校验
     let device_id = req.device_id.trim().to_string();
@@ -699,6 +699,10 @@ async fn create_book(
     user: RealmUser,
     Json(req): Json<CreateBookReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // 账号模型二元化：仅管理员可新建账套（普通账号由管理员开通并邀请进入账套工作）
+    if !user.is_admin {
+        return Err(AppError::forbidden("仅管理员可新建账套"));
+    }
     let owner = user.username.clone();
     // 限制每账号账套数量，防止无限建账占满磁盘
     let owned = state.realm.count_books_of(&owner)?;
@@ -746,7 +750,7 @@ async fn select_book(
         .realm
         .get_book(&key)?
         .ok_or_else(|| AppError::not_found("账套不存在"))?;
-    // 授权三层：平台管理员 / 归属者 / 账套内已有该用户的行（被邀请成员）。
+    // 授权三层：管理员 / 归属者 / 账套内已有该用户的行（被邀请成员）。
     // 注意：账套打不开（文件损坏等）必须透出 500，不能吞成"无权访问"误导用户。
     let is_member = match state.db_for(&key) {
         Ok(db) => users::get(&db, &user.username).ok().flatten().is_some(),
@@ -767,7 +771,7 @@ async fn select_book(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 删除账套（平台管理员 或 账套归属者）：解除「有账套的用户无法删除」的死锁
+/// 删除账套（管理员 或 账套归属者）：解除「有账套的用户无法删除」的死锁
 async fn delete_book(
     State(state): State<Arc<WebState>>,
     user: RealmUser,
@@ -808,7 +812,7 @@ async fn post_logout(State(state): State<Arc<WebState>>, jar: axum_extra::extrac
 async fn get_me(
     user: CurrentUser,
 ) -> Result<Json<PublicUser>, AppError> {
-    // 直接使用身份对账后的用户：平台管理员查看他人账套时是临时身份
+    // 直接使用身份对账后的用户：管理员查看他人账套时是临时身份
     // （不写入账套 user 表），回查数据库会 404
     Ok(Json(PublicUser::from_user(&user.user)))
 }
@@ -849,7 +853,7 @@ async fn post_change_password(
 }
 
 // ---------------------------------------------------------------------------
-// 平台账号管理（仅平台管理员）
+// 账号管理（仅管理员）
 // ---------------------------------------------------------------------------
 
 async fn list_platform_users(
@@ -857,7 +861,7 @@ async fn list_platform_users(
     user: RealmUser,
 ) -> Result<Json<Vec<PlatformUserItem>>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     let list = state
         .realm
@@ -874,7 +878,7 @@ async fn create_platform_user(
     Json(req): Json<PlatformUserReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     if req.username.trim().is_empty() {
         return Err(AppError::bad_request("用户名不能为空"));
@@ -894,7 +898,7 @@ async fn update_platform_user(
     Json(req): Json<UpdatePlatformUserReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     if username == user.username {
         return Err(AppError::bad_request("不能修改当前登录的账号，请使用改密功能"));
@@ -911,7 +915,7 @@ async fn delete_platform_user(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     if username == user.username {
         return Err(AppError::bad_request("不能删除当前登录的账号"));
@@ -931,7 +935,7 @@ async fn reset_platform_password(
     Json(req): Json<ResetPwdReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     check_password(&state, &req.new)?;
     state.realm.reset_password(&username, &req.new, &state.policy)?;
@@ -953,7 +957,7 @@ async fn reset_platform_device(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if !user.is_admin {
-        return Err(AppError::forbidden("该操作仅限平台管理员"));
+        return Err(AppError::forbidden("该操作仅限管理员"));
     }
     if username == user.username {
         return Err(AppError::bad_request("不能重置当前登录账号的设备"));
@@ -995,18 +999,18 @@ async fn create_user(
     if username.is_empty() {
         return Err(AppError::bad_request("用户名不能为空"));
     }
-    // Web 端登录只认平台身份库：账套内子账号必须对应一个已存在的平台账号，
+    // Web 端登录只认账号库：账套内子账号必须对应一个已存在的账号，
     // 否则开出来的账号无法登录（死账号）。单密码统一后账套内不再独立设口令，
     // 直接沿用平台口令哈希，前端若传了 password 则忽略（兼容旧前端）。
     let ru = state.realm.get_user(&username)?.ok_or_else(|| {
         AppError::bad_request(
-            "该账号尚未开通平台账号，请先让平台管理员在「平台账号」中开通同名账号",
+            "该账号尚未开通，请先让管理员在「账号管理」中开通同名账号",
         )
     })?;
-    // 账套管理员不能把平台管理员拉进自己的账套：账套内重置口令会重置平台口令，
-    // 否则任何能建账的用户都能借此接管平台管理员账号。
+    // 账套管理员不能把管理员拉进自己的账套：账套内重置口令会重置平台口令，
+    // 否则任何能建账的用户都能借此接管管理员账号。
     if ru.is_admin {
-        return Err(AppError::forbidden("不能将平台管理员加入账套"));
+        return Err(AppError::forbidden("不能将管理员加入账套"));
     }
     let db = state.db_for(&user.book_key)?;
     if users::get(&db, &username)?.is_some() {
@@ -1138,17 +1142,17 @@ async fn reset_user_password(
         return Err(AppError::not_found("该用户不在当前账套"));
     }
     let ru = state.realm.get_user(&username)?.ok_or_else(|| {
-        AppError::bad_request("该账号尚未开通平台账号")
+        AppError::bad_request("该账号不存在")
     })?;
-    // 平台管理员的口令只能由平台管理员在「平台账号」中重置。账套管理员若能把
-    // 平台管理员邀请进本套再调本接口，就能重置其平台口令并同步到全部账套。
+    // 管理员的口令只能由管理员在「账号」中重置。账套管理员若能把
+    // 管理员邀请进本套再调本接口，就能重置其平台口令并同步到全部账套。
     if ru.is_admin {
         return Err(AppError::forbidden(
-            "平台管理员的口令请由平台管理员在「平台账号」中重置",
+            "管理员的口令请由管理员在「账号管理」中重置",
         ));
     }
     // 平台口令是全局的：账套管理员只允许重置「仅属于本账套、且不拥有任何账套」的
-    // 成员。否则"把任意平台账号邀请进自己的账套，再重置其全局口令"即可跨租户
+    // 成员。否则"把任意账号邀请进自己的账套，再重置其全局口令"即可跨租户
     // 接管/锁死他人账号（受害者口令被改，且会同步覆盖其名下所有账套）。
     let caller_is_platform_admin = state
         .realm
@@ -1158,12 +1162,12 @@ async fn reset_user_password(
     if !caller_is_platform_admin {
         if state.realm.count_books_of(&username)? > 0 {
             return Err(AppError::forbidden(
-                "该账号拥有自己的账套，账套管理员不能重置其平台口令，请由平台管理员处理",
+                "该账号拥有自己的账套，账套管理员不能重置其口令，请由管理员处理",
             ));
         }
         if state.realm.count_books_containing(&state.books_dir, &username)? > 1 {
             return Err(AppError::forbidden(
-                "该账号还属于其他账套，账套管理员不能重置其平台口令，请由平台管理员处理",
+                "该账号还属于其他账套，账套管理员不能重置其口令，请由管理员处理",
             ));
         }
     }

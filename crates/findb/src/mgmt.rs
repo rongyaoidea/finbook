@@ -262,6 +262,89 @@ pub fn budget_vs_actual(
     Ok(out)
 }
 
+/// 预算超支明细（凭证保存前的硬控制检查结果）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BudgetOver {
+    pub account_code: String,
+    pub account_name: String,
+    pub dept: String,
+    pub budget: Money,
+    pub actual: Money,
+    pub add: Money,
+    pub over: Money,
+}
+
+/// 预算控制检查（凭证保存前）：对费用/成本类借方分录（本次发生额 `add`）比对**当前激活版本**的预算。
+/// 口径：执行额 = 会计年度 1 月至该期间的**已记账**发生额（与预算执行报表一致）+ 本次；
+/// 无预算行 / 预算为 0 / 非费用类分录不拦；返回全部超支行（空 = 未超）。
+pub fn budget_check(
+    db: &Db,
+    period: Period,
+    adds: &[(String, String, Money)],
+) -> DbResult<Vec<BudgetOver>> {
+    if adds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ver = crate::advanced::bversion_current(db)?;
+    let budgets: Vec<Budget> = budget_list(db, period)?
+        .into_iter()
+        .filter(|b| b.version == ver)
+        .collect();
+    if budgets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chart = crate::accounts::chart(db)?;
+    let from = Period::new(period.year(), 1).unwrap_or(period);
+    let snap = BalanceSnapshot::load(db, &BalanceQuery::range(from, period))?;
+    let mut out = Vec::new();
+    for (code, dept, add) in adds {
+        if !add.is_positive() {
+            continue;
+        }
+        let is_expense = chart
+            .get(code)
+            .map(|a| {
+                !matches!(a.category, fincore::account::AcctCategory::Income)
+                    && (code.starts_with('6') || code.starts_with('5'))
+            })
+            .unwrap_or(false);
+        if !is_expense {
+            continue;
+        }
+        for b in budgets
+            .iter()
+            .filter(|b| b.account_code == *code && (b.dept.is_empty() || b.dept == *dept))
+        {
+            if b.amount.is_zero() {
+                continue;
+            }
+            let aux = if b.dept.is_empty() {
+                None
+            } else {
+                Some(AuxRef {
+                    dept: Some(b.dept.clone()),
+                    ..Default::default()
+                })
+            };
+            let row = snap.for_account(code, aux.as_ref());
+            let actual = row.debit - row.credit;
+            let after = actual + *add;
+            if after > b.amount {
+                out.push(BudgetOver {
+                    account_code: code.clone(),
+                    account_name: chart.get(code).map(|a| a.name.clone()).unwrap_or_default(),
+                    dept: b.dept.clone(),
+                    budget: b.amount,
+                    actual,
+                    add: *add,
+                    over: after - b.amount,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// 预算预警：执行率超过阈值（默认 100% = 超支）的科目
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct BudgetAlert {

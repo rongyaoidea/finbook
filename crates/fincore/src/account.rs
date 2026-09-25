@@ -679,6 +679,9 @@ pub struct BookOptions {
     /// 业务凭证默认科目（收付款单 / 发货收入 / 暂估等自动生成用）
     #[serde(default)]
     pub biz_accounts: BizAccounts,
+    /// 预算控制：off/空=关闭（默认）、warn=超预算仅提醒放行、strong=超预算拒绝保存
+    #[serde(default)]
+    pub budget_control: String,
     /// 凭证字号方案
     pub voucher_words: Vec<String>,
 }
@@ -728,6 +731,7 @@ impl Default for BookOptions {
             require_cashier: false,
             require_audit: true,
             biz_accounts: BizAccounts::default(),
+            budget_control: String::new(),
             voucher_words: vec!["记".to_string()],
         }
     }

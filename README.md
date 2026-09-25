@@ -588,6 +588,13 @@
 - **列宽拖拽**：拖 th 右缘调宽（最小 48px），按 `视图#表序号` 存 localStorage，重渲染自动恢复。
 - 挂载点与列偏好同源（`renderMain` 同步挂 + `api()` 回调补挂，异步表全覆盖）。
 
+### 4.48 预算硬控制 + Web 预算编制入口（P2）
+
+- **账套参数**：新增 `budget_control`（off/空=关闭、warn=超预算提醒放行、strong=超预算拒绝保存），账套参数页可选。
+- **校验点**：凭证保存时对**费用/成本类借方分录**（科目 5/6 开头且非收入类）逐条比对**当前激活版本**的预算；执行额口径 = 会计年度 1 月至该期间的**已记账**发生额（与预算执行报表一致）+ 本次；strong → 400 拒绝、warn → 放行并写审计「超预算提醒」。
+- **Web 预算编制**：`GET /api/budget/rows?period=`（FinReport）+ `POST /api/budget/rows`（AccountEdit，按 期间+科目+部门+当前版本 upsert）+ `POST /api/budget/rows/:id/delete`；预算版本页新增「预算编制」面板（列表/新增/删除）。
+- **测试**：web `budget_control_flow`——编制 660201 预算 100 → warn：120 放行、50 放行 → strong：120 拒绝、50 放行。
+
 ---
 
 ## 5. 关键设计约定

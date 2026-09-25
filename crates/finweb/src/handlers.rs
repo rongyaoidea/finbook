@@ -341,6 +341,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/budget/versions/:key/delete", post(delete_budget_version))
         .route("/api/budget/versions/:key/activate", post(activate_budget_version))
         .route("/api/budget/versions/copy", post(copy_budget_version))
+        .route("/api/budget/rows", get(list_budget_rows).post(save_budget_row))
+        .route("/api/budget/rows/:id/delete", post(delete_budget_row))
         // 审批流
         .route("/api/approvals", get(list_approvals).post(start_approval))
         .route("/api/approvals/todo", get(list_approval_todo))
@@ -1065,6 +1067,107 @@ async fn cost_overhead_ep(
         "base": base.label(),
         "rows": items,
     })))
+}
+
+// ---- 预算编制（当前激活版本的预算行，Web 入口） ----
+
+#[derive(Deserialize)]
+struct BudgetRowReq {
+    #[serde(default)]
+    id: i64,
+    period: i32,
+    account_code: String,
+    #[serde(default)]
+    dept: String,
+    amount: String,
+    #[serde(default)]
+    memo: String,
+}
+
+/// 预算行列表（当前激活版本）
+async fn list_budget_rows(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::FinReport)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = q
+        .get("period")
+        .and_then(|s| parse_period(s))
+        .unwrap_or_else(|| current_period(&state, &user));
+    let ver = findb::advanced::bversion_current(&db)?;
+    let rows: Vec<serde_json::Value> = findb::mgmt::budget_list(&db, period)?
+        .into_iter()
+        .filter(|b| b.version == ver)
+        .map(|b| {
+            json!({
+                "id": b.id, "period": period_to_str(b.period),
+                "account_code": b.account_code, "dept": b.dept,
+                "amount": b.amount.fmt_money(), "memo": b.memo, "version": b.version,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "version": ver,
+        "rows": rows,
+    })))
+}
+
+/// 新增/修改预算行（按 期间+科目+部门+版本 upsert；版本 = 当前激活版本）
+async fn save_budget_row(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BudgetRowReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = period_checked(req.period)?;
+    if req.account_code.trim().is_empty() {
+        return Err(AppError::bad_request("科目编码不能为空"));
+    }
+    let amount = parse_money_checked(&req.amount)?;
+    if amount.is_negative() {
+        return Err(AppError::bad_request("预算金额不能为负"));
+    }
+    let ver = findb::advanced::bversion_current(&db)?;
+    let b = findb::mgmt::Budget {
+        id: 0,
+        period,
+        account_code: req.account_code.trim().to_string(),
+        dept: req.dept.trim().to_string(),
+        amount,
+        memo: req.memo,
+        version: ver,
+    };
+    let id = findb::mgmt::budget_upsert_version(&db, &b)?;
+    db.log(
+        user.username(),
+        "预算",
+        "预算编制",
+        &format!(
+            "{} {} {} {}",
+            period_to_str(period),
+            b.account_code,
+            if b.dept.is_empty() { "" } else { b.dept.as_str() },
+            b.amount.fmt_money()
+        ),
+    )?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// 删除预算行
+async fn delete_budget_row(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::AccountEdit)?;
+    let db = state.db_for(&user.book_key)?;
+    findb::mgmt::budget_delete(&db, id)?;
+    db.log(user.username(), "预算", "删除预算行", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// 生成唯一账套 key（文件名，不含扩展名）
@@ -2600,6 +2703,44 @@ async fn save_voucher(
     }
     if !v.balanced() {
         return Err(AppError::bad_request("借贷不平衡，请检查分录金额"));
+    }
+    // 预算控制（账套参数 budget_control：off/warn/strong）：费用/成本类借方分录比对预算执行
+    let budget_ctl = db.options().budget_control.trim().to_string();
+    if budget_ctl == "warn" || budget_ctl == "strong" {
+        let adds: Vec<(String, String, Money)> = v
+            .entries
+            .iter()
+            .filter(|e| e.debit.is_positive())
+            .map(|e| {
+                (
+                    e.account_code.clone(),
+                    e.aux.dept.clone().unwrap_or_default(),
+                    e.debit,
+                )
+            })
+            .collect();
+        let overs = findb::mgmt::budget_check(&db, v.period, &adds)?;
+        if !overs.is_empty() {
+            let msg = overs
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{} {} 预算 {} 已执行 {} 本次 {} 超 {}",
+                        o.account_code,
+                        if o.dept.is_empty() { "" } else { o.dept.as_str() },
+                        o.budget.fmt_money(),
+                        o.actual.fmt_money(),
+                        o.add.fmt_money(),
+                        o.over.fmt_money()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            if budget_ctl == "strong" {
+                return Err(AppError::bad_request(format!("预算强控：{msg}")));
+            }
+            db.log(user.username(), "预算", "超预算提醒", &msg)?;
+        }
     }
     // 保存为「未记账」，核对无误后在界面点「记账」确认入账（无审核环节）
     v.status = VoucherStatus::Draft;

@@ -3217,6 +3217,16 @@ async function viewBudgetVersions(main) {
       <div class="field"><label>备注</label><input id="bv-memo" /></div>
       <label class="muted"><input type="checkbox" id="bv-copy" checked /> 从当前版本复制数据</label>
       <div style="margin-top:8px"><button class="btn primary" id="bv-save">创建版本</button></div>
+    </div>
+    <div class="card" style="margin-top:12px"><h3>预算编制（当前版本）</h3>
+      <div class="toolbar">
+        <label>期间 <input id="be-per" value="${(state.current || "").replace("-", "")}" style="width:90px" placeholder="YYYYMM" /></label>
+        <button class="btn sm" id="be-load">加载</button>
+        <span class="grow"></span>
+        <button class="btn primary sm" id="be-new">新增预算行</button>
+      </div>
+      <div id="be-list" class="muted">选择期间后加载</div>
+      <p class="muted" style="font-size:12px;margin-top:6px">口径：执行额 = 会计年度 1 月至该期间已记账发生额；账套参数可设「超预算提醒 / 强控」（凭证保存时生效）。</p>
     </div>`;
   const load = async () => {
     try {
@@ -3249,6 +3259,38 @@ async function viewBudgetVersions(main) {
       load();
     } catch (e) { toast(e.message, "err"); }
   });
+  // 预算编制：当前版本的预算行 CRUD
+  const loadRows = async () => {
+    try {
+      const r = await api(`/budget/rows?period=${encodeURIComponent($("#be-per").value.trim())}`);
+      const rows = r.rows || [];
+      $("#be-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr><th>科目</th><th>部门</th><th class="num">预算金额</th><th>备注</th><th></th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.account_code)}</td><td>${esc(x.dept || "—")}</td><td class="num">${fmt(x.amount)}</td><td>${esc(x.memo || "")}</td><td class="row-actions"><button class="btn ghost sm" data-be-del="${x.id}">删</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">该期间（版本：${esc(r.version || "默认")}）暂无预算行</div>`;
+      $all("[data-be-del]").forEach((b) => b.onclick = async () => {
+        if (!(await confirmDialog("删除该预算行？", true))) return;
+        try { await api(`/budget/rows/${b.dataset.beDel}/delete`, { method: "POST" }); toast("已删除", "ok"); loadRows(); } catch (e) { toast(e.message, "err"); }
+      });
+    } catch (e) { $("#be-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  $("#be-load").onclick = loadRows;
+  $("#be-new").onclick = () => {
+    const m = modal(`<h3>新增预算行（当前版本）</h3>
+      <div class="field"><label>期间 *</label><input id="be2-per" value="${esc($("#be-per").value.trim())}" style="width:100px" /></div>
+      <div class="field"><label>科目编码 *</label><input id="be2-acct" placeholder="如 660201" /></div>
+      <div class="field"><label>部门（可空 = 全公司口径）</label><input id="be2-dept" /></div>
+      <div class="field"><label>预算金额 *</label><input id="be2-amt" /></div>
+      <div class="field"><label>备注</label><input id="be2-memo" /></div>
+      <div class="foot"><button class="btn primary" id="be2-save">保存</button><button class="btn ghost" id="be2-cancel">取消</button></div>`);
+    $("#be2-cancel", m).onclick = closeModal;
+    $("#be2-save", m).onclick = async () => {
+      try {
+        await postJson("/budget/rows", { period: parseInt($("#be2-per", m).value.trim(), 10) || 0, account_code: $("#be2-acct", m).value.trim(), dept: $("#be2-dept", m).value.trim(), amount: $("#be2-amt", m).value.trim(), memo: $("#be2-memo", m).value.trim() });
+        toast("已保存预算行", "ok"); closeModal(); loadRows();
+      } catch (e) { toast(e.message, "err"); }
+    };
+  };
+  loadRows();
   load();
 }
 
@@ -7305,6 +7347,7 @@ async function viewOptions(main) {
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-qty" ${o.enable_qty ? "checked" : ""} />启用数量核算</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-foreign" ${o.enable_foreign ? "checked" : ""} />启用外币核算</label>
         <label style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" id="op-cashier" ${o.require_cashier ? "checked" : ""} />出纳签字（涉及现金/银行的凭证记账前须签字）</label>
+        <label>预算控制 <select id="op-budget"><option value="" ${!o.budget_control ? "selected" : ""}>关闭</option><option value="warn" ${o.budget_control === "warn" ? "selected" : ""}>超预算提醒（放行）</option><option value="strong" ${o.budget_control === "strong" ? "selected" : ""}>超预算强控（拒绝保存）</option></select></label>
       </div>
       <p class="muted" style="font-size:12px">启用期间与科目级长影响科目编码校验与凭证编号，修改请谨慎；已开账后不建议改动。</p>
       ${can("sys_option") ? `<div class="foot" style="margin-top:10px"><button class="btn primary" id="op-save">保存参数</button></div>` : `<p class="muted">无修改权限（需要 sys_option）</p>`}
@@ -7325,6 +7368,7 @@ async function viewOptions(main) {
       enable_qty: $("#op-qty").checked,
       enable_foreign: $("#op-foreign").checked,
       require_cashier: $("#op-cashier").checked,
+      budget_control: $("#op-budget").value,
       biz_accounts: {
         ar: $("#op-biz-ar").value.trim() || "112201",
         ap: $("#op-biz-ap").value.trim() || "220201",

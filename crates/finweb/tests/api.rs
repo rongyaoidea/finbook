@@ -3766,6 +3766,80 @@ async fn cost_web_flow() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "分摊金额 0 应 400");
 }
 
+/// P2：预算硬控制——预算行编制 + 凭证保存按 warn/strong 校验（执行口径=已记账）。
+#[tokio::test]
+async fn budget_control_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 编制预算行：660201 202601 预算 100
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/budget/rows",
+            &sid,
+            serde_json::json!({ "period": 202601, "account_code": "660201", "dept": "", "amount": "100", "memo": "测试" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "编制预算行");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/budget/rows?period=202601", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1, "预算行列表：{r}");
+
+    // 账套参数：预算控制 = warn
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &sid))
+        .await
+        .unwrap();
+    let mut opts: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    opts["budget_control"] = serde_json::json!("warn");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &sid, opts.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存参数（warn）");
+
+    let save_voucher = |amount: &'static str| {
+        let state = state.clone();
+        let sid = sid.clone();
+        async move {
+            let resp = handlers::router(state)
+                .oneshot(authed_post(
+                    "/api/vouchers",
+                    &sid,
+                    serde_json::json!({
+                        "id": 0, "period": 202601, "date": "2026-01-15", "word": "记", "no": 0,
+                        "attachments": 0, "memo": "", "entries": [
+                            { "line": 1, "account_code": "660201", "summary": "预算测试", "debit": amount, "credit": "0" },
+                            { "line": 2, "account_code": "1001", "summary": "预算测试", "debit": "0", "credit": amount }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap();
+            resp.status()
+        }
+    };
+
+    // warn：超预算放行（120 > 100）
+    assert_eq!(save_voucher("120").await, StatusCode::OK, "warn 超预算放行");
+    // warn 下未超（50）也放行
+    assert_eq!(save_voucher("50").await, StatusCode::OK, "warn 未超放行");
+
+    // 切 strong：超预算拒绝（120），未超放行（50）
+    opts["budget_control"] = serde_json::json!("strong");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &sid, opts))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "保存参数（strong）");
+    assert_eq!(save_voucher("120").await, StatusCode::BAD_REQUEST, "strong 超预算拒绝");
+    assert_eq!(save_voucher("50").await, StatusCode::OK, "strong 未超放行");
+}
+
 /// 越权回归：只读（Viewer）与出纳不得写入这些端点。
 ///
 /// 历史上预算版本 / 审批 / 报表附注 / 档案的写路由只用只读权限 Perm::Report 把关，

@@ -2300,6 +2300,156 @@ async fn non_admin_usermanage_cannot_touch_identities() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置套内成员应成功");
 }
 
+/// 销售成本结转（Web 化，对标金蝶存货核算-凭证生成）：仅统计销售出库（kind=sale，
+/// 领料/形态转换不进 6401）；无出库不生成凭证；同期间防重复结转。
+#[tokio::test]
+async fn sales_cost_cutover() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let d15 = format!("{cur_label}-15");
+    let d12 = format!("{cur_label}-12");
+    let d20 = format!("{cur_label}-20");
+
+    // a) 采购入库 10×9（库存基础；此时无销售出库）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d12.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d12.clone(), "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购入库");
+
+    // b) 尚无销售出库 → 结转返回 none（不生成凭证）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/sales-cost",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "method": "moving_average", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["none"], serde_json::json!(true), "无销售出库不生成凭证：{r}");
+
+    // c) 销售订单确认 → 发货 4（kind=sale 出库）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "结转造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "4", "unit_price": "5", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货");
+
+    // d) 形态转换出 2 件（kind=other_out，验证不被结转进 6401）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/inventory/form-convert",
+            &sid,
+            serde_json::json!({ "from_item": "140301", "to_item": "140501", "qty": "2", "date": d15.clone(), "memo": "转产" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "形态转换");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/inventory/warehouse-stock?item=140301", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let on_hand: f64 = r["rows"].as_array().unwrap().iter()
+        .map(|x| money_num(x["qty"].as_str().unwrap())).sum();
+    assert_eq!(on_hand, 4.0, "10-4-2=4（sale4 + other_out2 均已扣数量）");
+
+    // e) 结转 → 6401 借 = 仅销售发出 4×9=36（不含形态转换的 2 件）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/sales-cost",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "method": "moving_average", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    let st2 = resp.status();
+    let cbody = body_string(resp).await;
+    assert_eq!(st2, StatusCode::OK, "CUTOVER_ERR={cbody}");
+    let r: serde_json::Value = serde_json::from_str(&cbody).unwrap();
+    let vid = r["voucher_id"].as_i64().unwrap_or(0);
+    assert!(vid > 0, "应生成结转凭证：{r}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    let dr = entries.iter().find(|e| e["account_code"] == "6401").expect("借主营业务成本");
+    assert_eq!(money_num(dr["debit"].as_str().unwrap()), 36.0, "结转额=销售发出 4×9=36（口径排除领料/转换）");
+    let cr = entries.iter().find(|e| e["account_code"] == "140501").expect("贷库存商品");
+    assert_eq!(money_num(cr["credit"].as_str().unwrap()), 36.0);
+
+    // f) 同期间重复结转 → 拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/sales-cost",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "method": "moving_average", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复结转应拒绝");
+}
+
 /// 建套收归管理员 + 存量账套归属迁移（版本更新时执行、幂等）：
 /// 普通账号名下的套 → 最早管理员名下，并把管理员补进该套的套内管理员成员行。
 #[tokio::test]

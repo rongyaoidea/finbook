@@ -265,6 +265,9 @@ pub struct StockSummary {
 }
 
 /// 计算本期各存货的收发存，并把出库成本回写到流水
+/// 存货收发存汇总——**结转口径：仅统计销售出库（kind=sale，含退货正行抵减）**。
+/// 领料/形态转换/组装/调拨等非销售出库不属主营业务成本，已在行级过滤排除
+///（否则制造业账下领料会被虚增结转进 6401）。
 pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Vec<StockSummary>> {
     let mut items = stock_items(db)?;
     items.sort();
@@ -302,7 +305,11 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 .filter(|r| r.qty.is_positive())
                 .map(|r| if r.amount.is_zero() { (r.qty * r.price).round2() } else { r.amount })
                 .sum();
-            let out_qty: Money = this_period.iter().filter(|r| r.qty.is_negative()).map(|r| r.qty.abs()).sum();
+            let out_qty: Money = this_period
+                .iter()
+                .filter(|r| r.qty.is_negative() && r.kind == StockKind::Sale)
+                .map(|r| r.qty.abs())
+                .sum();
             // 期初结存金额（含历史调整）
             let opening_adj: Money = rows
                 .iter()
@@ -347,6 +354,7 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 qty: r.qty,
                 price: if r.price.is_zero() { None } else { Some(r.price) },
             };
+            // 引擎跑全部行（含领料/转换/调拨），保证成本序列与单价正确
             let cost = st.apply(&mv, method)?;
             if r.qty.is_positive() {
                 s.in_qty += r.qty;
@@ -355,7 +363,8 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 } else {
                     r.amount
                 };
-            } else {
+            } else if r.kind == StockKind::Sale {
+                // 结转口径：仅销售出库计入发出量/成本并回写（非销售出库不进 6401）
                 s.out_qty += r.qty.abs();
                 let c = cost.unwrap_or(Money::ZERO);
                 s.out_amount += c;
@@ -412,6 +421,18 @@ pub fn stock_cost_voucher(
         .map(|m| m.id)
         .collect();
     let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    // 防重：同期间已有未作废的「结转销售成本」凭证 → 拒绝重复结转
+    let dup: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM voucher WHERE period=?1 AND memo='结转销售成本' AND status<>'void'",
+        [period.ymm()],
+        |r| r.get(0),
+    )?;
+    if dup > 0 {
+        return Err(
+            fincore::FinError::state("本期已生成销售成本结转凭证，请勿重复结转（如需重做请先作废原凭证）")
+                .into(),
+        );
+    }
     let mut v = Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = VoucherSource::Business;
@@ -421,6 +442,16 @@ pub fn stock_cost_voucher(
         ..Entry::new(1, cost_account, "结转销售成本")
     });
     for (idx, s) in sum.iter().filter(|s| !s.out_amount.is_zero()).enumerate() {
+        // 显式带发出单价（amount/qty）：存货若曾有 0 价入账，缺 price 会触发
+        // 「首次入库必须指定单价」校验；单价与数量金额三者恒自洽。
+        let unit = if s.out_qty.is_zero() {
+            Money::ZERO
+        } else {
+            s.out_amount
+                .checked_div(s.out_qty)
+                .unwrap_or(Money::ZERO)
+                .round2()
+        };
         v.push_entry(Entry {
             credit: s.out_amount,
             aux: AuxRef {
@@ -428,6 +459,7 @@ pub fn stock_cost_voucher(
                 ..Default::default()
             },
             qty: Some(s.out_qty),
+            price: Some(unit),
             ..Entry::new(idx as i32 + 2, asset_account, "结转销售成本")
         });
     }

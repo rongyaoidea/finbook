@@ -5466,7 +5466,12 @@ async function viewCost(main) {
         <label>期间 <input id="ce-period" value="${esc(state.current)}" style="width:90px" /></label>
         <button class="btn" id="ce-preview">试算（不落账）</button>
         <button class="btn primary" id="ce-apply">期末结价（写入调整）</button>
-      </div><div id="ce-list" class="muted">选择期间后试算</div>`;
+      </div><div id="ce-list" class="muted">选择期间后试算</div>
+      <div class="toolbar" style="margin-top:8px">
+        <label>结转口径 <select id="sc-method"><option value="moving_average">移动加权平均</option><option value="fifo">先进先出</option><option value="month_average">全月一次加权</option></select></label>
+        <button class="btn" id="sc-run">结转销售成本（借6401 / 贷140501）</button>
+        <span class="muted" style="font-size:12px">仅统计销售出库（领料/形态转换不进6401）；本期无出库不生成凭证；同期间防重复</span>
+      </div><div id="sc-out" class="muted"></div>`;
     const run = async (apply) => {
       const p = $("#ce-period").value.trim();
       try {
@@ -5485,6 +5490,17 @@ async function viewCost(main) {
     };
     $("#ce-preview").addEventListener("click", () => run(false));
     $("#ce-apply").addEventListener("click", async () => { if (!(await confirmDialog("期末结价会写入成本调整流水（不影响数量），确认执行？", true))) return; run(true); });
+  $("#sc-run").addEventListener("click", async () => {
+    const p = $("#ce-period").value.trim();
+    const label = $("#sc-method").selectedOptions[0].text;
+    if (!(await confirmDialog(`按【${label}】结转 ${p} 的销售成本（借 6401 / 贷 140501）？`, true))) return;
+    try {
+      const ym = Number(p.replace(/-/g, ""));
+      const r = await postJson("/cost/sales-cost", { period: ym, method: $("#sc-method").value });
+      if (r.none) { toast(r.message, "ok"); $("#sc-out").textContent = r.message; }
+      else { toast(`已生成销售成本结转凭证 #${r.voucher_id}`, "ok"); $("#sc-out").textContent = `凭证 #${r.voucher_id}（借 6401 / 贷 140501）`; }
+    } catch (e) { toast(e.message, "err"); }
+  });
   }
 }
 

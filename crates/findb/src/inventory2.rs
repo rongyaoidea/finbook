@@ -269,7 +269,8 @@ pub fn disassemble(db: &Db, period: Period, date: NaiveDate, parent: &str, child
 }
 
 /// 形态转换（对标金蝶形态转换单）：源物料出库 → 目标物料入库，同数量一减一增。
-/// 数量口径（金额交期末结价），与组装/拆卸一致；无总账凭证（存货内部结构调整）。
+/// **金额按源存货当前移动加权成本平移**（等值转换；目标 0 价首入会污染计价引擎与
+/// 销售成本结转，故源无成本价时拒绝转换）；无总账凭证（存货内部结构调整）。
 pub fn form_convert(
     db: &Db,
     period: Period,
@@ -285,6 +286,20 @@ pub fn form_convert(
     if !from_item.trim().is_empty() && !to_item.trim().is_empty() && !qty.is_positive() {
         return Err(fincore::FinError::msg("转换数量必须大于 0").into());
     }
+    let unit = crate::business::stock_state(
+        db,
+        from_item,
+        period,
+        fincore::engine::costing::CostMethod::MovingAverage,
+    )?
+    .unit_cost();
+    if !unit.is_positive() {
+        return Err(fincore::FinError::msg(
+            "源物料无成本价，无法形态转换（请先入库带价或执行期末结价）",
+        )
+        .into());
+    }
+    let amount = qty * unit;
     use crate::business::{stock_insert, StockKind, StockMove};
     stock_insert(
         db,
@@ -297,8 +312,8 @@ pub fn form_convert(
             warehouse: String::new(),
             batch_no: String::new(),
             qty: qty.negated(),
-            price: Money::ZERO,
-            amount: Money::ZERO,
+            price: unit,
+            amount,
             voucher_id: None,
             memo: format!("形态转换 {}", memo),
         },
@@ -314,8 +329,8 @@ pub fn form_convert(
             warehouse: String::new(),
             batch_no: String::new(),
             qty,
-            price: Money::ZERO,
-            amount: Money::ZERO,
+            price: unit,
+            amount,
             voucher_id: None,
             memo: format!("形态转换 {}", memo),
         },

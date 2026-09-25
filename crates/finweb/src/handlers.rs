@@ -365,6 +365,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
         .route("/api/cost/gl-reconcile", get(gl_reconcile_ep))
+        .route("/api/cost/sales-cost", post(sales_cost_ep))
         .route("/api/cost/period-end", get(run_period_end_cost).post(run_period_end_cost))
         // 固定资产（与桌面端对齐）：卡片 / 折旧计划 / 计提 / 清理
         .route("/api/assets", get(list_assets).post(create_asset))
@@ -7886,6 +7887,68 @@ async fn gl_reconcile_ep(
         "diff_total": rep.diff_total,
         "rows": rep.rows,
     })))
+}
+
+#[derive(Deserialize)]
+struct SalesCostReq {
+    /// yyyymm，0/缺省 = 当前期间
+    #[serde(default)]
+    period: i32,
+    /// 计价方法 code（moving_average/fifo/…，缺省移动加权）
+    #[serde(default)]
+    method: String,
+    /// 结转日期，缺省 = 期间末日
+    #[serde(default)]
+    date: String,
+}
+
+/// 销售成本结转：借 主营业务成本(6401) / 贷 库存商品(140501，数量+存货辅助)，
+/// 按计价方法计算销售发出成本。口径已在 stock_summary 收敛为 kind=sale
+///（领料/形态转换/调拨不属销售成本）；本期无销售出库 → 不生成凭证；同期间防重复结转。
+async fn sales_cost_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<SalesCostReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::CostOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.trim().is_empty() {
+        period.last_day()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let method = fincore::engine::costing::CostMethod::parse(&req.method);
+    let vid = findb::business::stock_cost_voucher(
+        &db,
+        period,
+        date,
+        method,
+        "6401",
+        "140501",
+        user.username(),
+    )?;
+    match vid {
+        Some(id) => {
+            db.log(
+                user.username(),
+                "存货",
+                "结转销售成本",
+                &format!("{} 凭证#{id}", period_to_str(period)),
+            )?;
+            Ok(Json(json!({ "ok": true, "voucher_id": id })))
+        }
+        None => Ok(Json(json!({
+            "ok": true,
+            "none": true,
+            "message": "本期无销售出库，未生成结转凭证"
+        }))),
+    }
 }
 
 async fn run_period_end_cost(

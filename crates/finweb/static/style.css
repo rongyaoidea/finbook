@@ -496,6 +496,17 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 .toast.ok   { background: #15803d; }
 .toast.warn { background: #92400e; }
 
+/* ── 科目选择器：🔍 过滤 + 原生下拉（最近使用置顶在 JS 排序）──── */
+.acct-pick { display: inline-flex; align-items: center; gap: 4px; width: 100%; min-width: 0; }
+.acct-pick .acct-q {
+  flex: 0 0 5.5ch; width: 5.5ch; min-width: 0;
+  padding: 4px 5px; border: 1px solid var(--z-200); border-radius: 8px;
+  background: var(--z-50); font-size: 12px; text-align: center;
+  transition: flex-basis .15s;
+}
+.acct-pick .acct-q:focus { flex-basis: 12ch; width: 12ch; text-align: left; }
+.acct-pick .acct-sel { flex: 1 1 auto; min-width: 80px; }
+
 /* ── 微调：滚动条、选择高亮 ───────────────────────────────── */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }

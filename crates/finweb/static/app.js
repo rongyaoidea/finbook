@@ -175,6 +175,72 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && modalStack.length) closeModal();
 });
 
+// 快捷键帮助面板（顶栏「?」或按 ?）
+function openShortcuts() {
+  const rows = [
+    ["Ctrl+K", "全局快速搜索（凭证 / 采购 / 销售 / 请购 / 报销）"],
+    ["Ctrl+Enter", "提交当前弹窗主按钮（保存 / 确定）"],
+    ["Ctrl+S", "保存当前录单弹窗"],
+    ["Enter", "录单：最后一行金额/摘要回车 → 新增一行（自动带出上一行摘要）"],
+    ["F7", "录单：聚焦科目搜索框（输入编码/名称过滤）"],
+    ["J / K", "审批实例：上下选择行"],
+    ["A / R", "审批实例：通过 / 驳回"],
+    ["Esc", "关闭最上层弹窗（下层编辑器保留）"],
+    ["?", "打开本帮助"],
+  ];
+  const mask = modal(`<h3>快捷键与帮助</h3>
+    <table class="grid"><tbody>${rows.map(([k, v]) => `<tr><td style="white-space:nowrap"><span class="tag">${k}</span></td><td>${v}</td></tr>`).join("")}</tbody></table>
+    <div class="muted" style="font-size:12px;margin-top:8px">所有列表：点列头排序、拖列边调宽、右上「列▾」显隐列（偏好自动记忆）；顶栏「Aa」调字号。</div>
+    <div class="foot"><button class="btn ghost" id="kb-close">关闭</button></div>`);
+  $("#kb-close", mask).onclick = closeModal;
+}
+
+// 录单键盘流 + 全局快捷键：Enter 加行（带出摘要）/ Ctrl+S 保存 / F7 科目搜索 / ? 帮助
+document.addEventListener("keydown", (e) => {
+  const t = e.target;
+  const tag = t && t.tagName;
+  // ? 帮助（输入态不触发）
+  if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey && !["INPUT", "SELECT", "TEXTAREA"].includes(tag)) {
+    e.preventDefault();
+    openShortcuts();
+    return;
+  }
+  // F7：聚焦当前弹窗的科目搜索框
+  if (e.key === "F7" && modalStack.length) {
+    const q = modalStack[modalStack.length - 1].querySelector(".acct-q");
+    if (q) { e.preventDefault(); q.focus(); }
+    return;
+  }
+  // Ctrl+S：保存当前录单弹窗（优先 #v-save，其次栈顶主按钮）
+  if ((e.ctrlKey || e.metaKey) && e.key && e.key.toLowerCase() === "s" && modalStack.length) {
+    const btn = document.querySelector("#v-save") || modalStack[modalStack.length - 1].querySelector(".foot .btn.primary");
+    if (btn) { e.preventDefault(); btn.click(); }
+    return;
+  }
+  // Enter：录单最后一行 → 新增行 + 带出上一行摘要
+  if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && t && t.matches && t.matches(".e-sum, .e-d, .e-c")) {
+    const tbody = t.closest("tbody");
+    const rows = [...tbody.querySelectorAll("tr:has(select.acct-sel)")];
+    const cur = t.closest("tr");
+    if (rows.length && cur === rows[rows.length - 1]) {
+      e.preventDefault();
+      const prevSum = (cur.querySelector(".e-sum") || {}).value || "";
+      const add = document.querySelector("#v-add");
+      if (!add) return;
+      add.click();
+      const rows2 = [...tbody.querySelectorAll("tr:has(select.acct-sel)")];
+      const last = rows2[rows2.length - 1];
+      const sum = last && last.querySelector(".e-sum");
+      if (sum && !sum.value && prevSum) {
+        sum.value = prevSum;
+        sum.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      const q = last && last.querySelector(".acct-q");
+      if (q) q.focus();
+    }
+  }
+});
+
 // ---------- 设备指纹 ----------
 function deviceId() {
   let id = localStorage.getItem("finbook_device_id");
@@ -899,6 +965,7 @@ function renderShell() {
         <span class="grow"></span>
         <button class="btn ghost sm" id="ui-scale-btn" title="界面字号（点击切换）">Aa 标准</button>
         <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
+        <button class="btn ghost sm" id="help-btn" title="快捷键与帮助（按 ? 唤起）">?</button>
         <button class="btn ghost sm" id="switch-book">切换账套</button>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
         <button class="btn ghost sm" id="logout">退出登录</button>
@@ -936,6 +1003,7 @@ function renderShell() {
   // 点击 logo 回到仪表盘（不再是无行为的死元素）
   $("#logo-home").addEventListener("click", () => { state.view = "dashboard"; closeMenu(); renderMain(); });
   $("#menu-btn").addEventListener("click", toggleMenu);
+  $("#help-btn").addEventListener("click", openShortcuts);
   $("#side-mask").addEventListener("click", closeMenu);
   // 事件委托：nav-item 只在 sidebar 容器上绑一次
   $(".sidebar").addEventListener("click", (e) => {
@@ -1343,9 +1411,63 @@ async function ensureAccounts() {
   return state.accounts;
 }
 function accountOptions(sel) {
-  const list = state.accounts || [];
-  return `<select class="acct-sel">${list.map((a) => `<option value="${esc(a.code)}">${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select>`;
+  const list = accountListSorted();
+  return `<span class="acct-pick"><input class="acct-q" placeholder="🔍" title="输入编码/名称快速过滤（Enter 选中首条，↓ 进下拉）" /><select class="acct-sel">${list.map((a) => `<option value="${esc(a.code)}">${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select></span>`;
 }
+// 科目列表按「最近使用」置顶（localStorage 记最近 12 个编码）
+function acctMru() {
+  try { return JSON.parse(localStorage.getItem("acct-mru") || "[]"); } catch (e) { return []; }
+}
+function accountListSorted() {
+  const list = state.accounts || [];
+  const mru = acctMru();
+  if (!mru.length) return list;
+  const rank = new Map(mru.map((c, i) => [c, i]));
+  return [...list].sort((a, b) => {
+    const ra = rank.has(a.code) ? rank.get(a.code) : 999;
+    const rb = rank.has(b.code) ? rank.get(b.code) : 999;
+    return ra - rb;
+  });
+}
+// 科目选择器：🔍 过滤（编码/名称包含）+ 最近使用记录（原生 select 保留 → 兼容 selectOption 与既有 onchange）
+document.addEventListener("input", (e) => {
+  const q = e.target.closest && e.target.closest(".acct-q");
+  if (!q) return;
+  const pick = q.closest(".acct-pick");
+  const sel = pick && pick.querySelector("select.acct-sel");
+  if (!sel) return;
+  const kw = q.value.trim().toLowerCase();
+  const list = (state.accounts || []).filter((a) => !kw || a.code.toLowerCase().includes(kw) || (a.name || "").toLowerCase().includes(kw));
+  const cur = sel.value;
+  sel.innerHTML = list.length
+    ? list.map((a) => `<option value="${esc(a.code)}">${esc(a.code)} ${esc(a.name)}</option>`).join("")
+    : `<option value="">无匹配</option>`;
+  if (list.some((a) => a.code === cur)) sel.value = cur;
+  else if (list.length) { sel.value = list[0].code; sel.dispatchEvent(new Event("change", { bubbles: true })); }
+});
+document.addEventListener("keydown", (e) => {
+  const q = e.target.closest && e.target.closest(".acct-q");
+  if (!q) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const sel = q.closest(".acct-pick").querySelector("select.acct-sel");
+    if (sel && sel.value) sel.dispatchEvent(new Event("change", { bubbles: true }));
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    const sel = q.closest(".acct-pick").querySelector("select.acct-sel");
+    if (sel) sel.focus();
+  }
+});
+// 最近使用：任何 acct-sel 变更都记一笔
+document.addEventListener("change", (e) => {
+  const sel = e.target.closest && e.target.closest("select.acct-sel");
+  if (!sel || !sel.value) return;
+  try {
+    const mru = acctMru().filter((x) => x !== sel.value);
+    mru.unshift(sel.value);
+    localStorage.setItem("acct-mru", JSON.stringify(mru.slice(0, 12)));
+  } catch (err) {}
+});
 
 async function viewVouchers(main) {
   main.innerHTML = `

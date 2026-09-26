@@ -624,6 +624,16 @@
 - **UI**：数据导入页新增「导出计划任务」面板（列表/新增/立即执行/删除）。
 - **测试**：web `export_schedule_flow`——新增 → 列表 → 立即执行（路径位于 exports 且文件存在）→ 未知类型/非法时刻 400 → 删除。
 
+### 4.53 Web 前端体验优化（UX 五批 + 异步竞态修复）
+
+- **表格系统**：`#main` 列表表格表头/单元格不折行 + 长文本 `max-width:32ch` 省略号（`autoCellTitles` 悬停补 title 全文）+ `min-width:max-content` 让 `.panel` 真正横向滚动 + 首列 `sticky`；**含交互控件（按钮/输入/链接）的单元格豁免裁切**（`:has` 守卫——修复"操作列按钮被 overflow 裁掉、点击命中 td"）；表头去中文 letter-spacing；行 hover 改 `var(--bg)`（暗色不再泛白）。
+- **模态栈**：`closeModal()` 只关栈顶（`confirmDialog` 入栈）——修复"Esc 连底层编辑器一起关掉"的数据丢失风险；`closeAllModals()` 用于切视图/登出；弹窗补 `role=dialog`/`aria-modal`/`aria-label` + Tab 焦点陷阱（不跑到背后页面）。
+- **录单效率**：科目选择器 = 🔍 过滤框 + 原生 select（编码/名称包含过滤、Enter 确认、↓ 进下拉；保留原生 select 兼容既有 onchange 与 E2E `selectOption`）+ **最近使用置顶**（localStorage 记 12 个）；键盘流：最后一行金额/摘要回车自动加行并带出上一行摘要、F7 聚焦科目搜索、Ctrl+S 保存当前录单弹窗、`?` 唤起快捷键面板。
+- **异步渲染竞态修复**：`renderMain()` 每次替换为**全新 `#main` 节点**——旧视图（async，先 await 后写 `innerHTML`）的迟到回调只写入已卸载节点，不再覆盖用户刚切到的新视图（CI run 36223455217 四个失败用例的主因：建账后立刻切视图，仪表盘慢响应把凭证页/资金页/平台账号页顶掉）。
+- **无障碍与空态**：全局 `:focus-visible` 焦点环、`prefers-reduced-motion` 动效降级、导航 `aria-current="page"`、图标按钮 `aria-label`；凭证列表空态改为「新增凭证 / 去导入」CTA；工作台凭证数为 0 时显示「三步开始记账」首启引导；toast 可手动关闭 + 380px 长文折行。
+- **视觉收口**：补 `--brand` token（修复排序表头 hover 无色变）、`--panel/--surface` 改 tinted 近白、登录卡顶部渐变条改单色钢蓝、移动端 `-webkit-overflow-scrolling:touch` + ≤600px 单元格 24ch。
+- **测试**：`e2e/tests/ux.spec.js`——①人为延迟 `/api/workbench` 1.5s 放大竞态窗口，断言建账后立即切视图（凭证/会计科目）不被迟到响应覆盖；②断言列表操作列按钮可点击（不被 overflow 裁切）。
+
 ---
 
 ## 5. 关键设计约定

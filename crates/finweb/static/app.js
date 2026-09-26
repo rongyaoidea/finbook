@@ -1065,7 +1065,16 @@ function render() {
 }
 
 function renderMain() {
-  const main = document.getElementById("main");
+  // 换一个新 #main 节点：旧视图（多为 async，先 await 后写 innerHTML）的迟到回调
+  // 只会写入已卸载的旧节点，不会把用户刚切到的新视图覆盖掉（修复异步渲染竞态）。
+  const old = document.getElementById("main");
+  let main = old;
+  if (old && old.parentNode) {
+    main = document.createElement("div");
+    main.id = "main";
+    main.className = old.className;
+    old.parentNode.replaceChild(main, old);
+  }
   closeAllModals(); // 切视图时关闭遗留弹窗（栈式关闭下不再整体清空）
   const fn = VIEWS[state.view] || viewDashboard;
   const r = fn(main);

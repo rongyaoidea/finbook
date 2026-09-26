@@ -358,6 +358,13 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 #main table.grid th { white-space: nowrap; letter-spacing: normal; }
 #main table.grid td { white-space: nowrap; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; }
 #main table.grid td.wrap { white-space: normal; overflow: visible; max-width: 48ch; }
+/* 含交互控件的单元格不裁切（否则按钮被 overflow:hidden 裁掉，点击命中 td 而非按钮） */
+#main table.grid td.row-actions,
+#main table.grid td:has(button),
+#main table.grid td:has(input),
+#main table.grid td:has(select),
+#main table.grid td:has(textarea),
+#main table.grid td:has(a) { max-width: none; overflow: visible; text-overflow: clip; }
 .panel table.grid th:first-child { position: sticky; left: 0; z-index: 3; background: var(--z-100); }
 .panel table.grid td:first-child { position: sticky; left: 0; z-index: 2; background: var(--panel); }
 .panel table.grid tbody tr:hover td:first-child { background: var(--bg); }

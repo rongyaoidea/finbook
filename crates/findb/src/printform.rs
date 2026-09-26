@@ -115,6 +115,23 @@ impl VoucherPrint {
     }
 }
 
+/// 套打页顶部工具条（先看后打）。
+///
+/// 早先各套打页在 `onload` 里直接 `window.print()` 自动弹打印框，问题有三：
+/// ① 用户还没来得及预览/校对就被弹窗打断，取消后新标签里空无一物、回不去应用；
+/// ② 打印对话框是模态的，会把该标签整个卡住（自动化环境甚至直接失去响应）；
+/// ③ 纸张、份数、打印机都没得选。
+/// 改成顶部常驻工具条 + 显式「打印本页」按钮，打印时用 `@media print` 隐藏。
+pub const PRINT_BAR: &str = r#"<div class="pbar"><button onclick="window.print()">🖨 打印本页</button><span>纸张 / 份数在打印对话框中选择；关闭本页即取消</span></div>"#;
+
+/// 工具条样式：各套打页 CSS 各自 @media print 隐藏 .pbar
+pub const PBAR_CSS: &str = r#"
+.pbar{position:sticky;top:0;z-index:9;display:flex;gap:14px;align-items:center;background:#1a1a1a;
+  color:#fff;padding:8px 14px;font-family:system-ui,sans-serif;font-size:12px;}
+.pbar button{background:#fff;color:#111;border:0;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;}
+@media print{.pbar{display:none;}}
+"#;
+
 /// 生成一页「记账凭证」套打 HTML（可含多张凭证，逐张分页）。
 /// 标准版式：摘要 / 总账科目 / 明细科目 / 借方金额 / 贷方金额 + 合计 + 签章栏。
 pub fn voucher_form_html(
@@ -131,9 +148,8 @@ pub fn voucher_form_html(
     format!(
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>记账凭证</title>
-<style>{VOUCHER_CSS}</style>
-<script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>
-</head><body>{forms}</body></html>"#
+<style>{VOUCHER_CSS}{PBAR_CSS}</style>
+</head><body>{PRINT_BAR}{forms}</body></html>"#
     )
 }
 
@@ -310,10 +326,9 @@ pub fn ledger_form_html(company: &str, ledger: &LedgerPrint) -> String {
     format!(
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>{title}</title>
-<style>{LEDGER_CSS}</style>
-<script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>
+<style>{LEDGER_CSS}{PBAR_CSS}</style>
 </head><body>
-<div class="lhead">
+{PB}<div class="lhead">
   <span class="ltitle">{title}</span>
   <span class="lacct">{acct}</span>
 </div>
@@ -341,6 +356,7 @@ pub fn ledger_form_html(company: &str, ledger: &LedgerPrint) -> String {
         page = esc(&page),
         head = head_row,
         rows = body,
+        PB = PRINT_BAR,
     )
 }
 

@@ -174,12 +174,15 @@ fn shell(title: &str, company: &str, subtitle: &str, unit: &str, table: &str) ->
          table{{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px;}}\
          th,td{{border:1px solid #bbb;padding:4px 8px;}}\
          th{{background:#f0f3f7;}}td.r{{text-align:right;}}td.c{{text-align:center;color:#888;}}\
-         @media print{{body{{font-size:12px;margin:0;}}}}</style></head>\
+         @media print{{body{{font-size:12px;margin:0;}}}}\
+         .pbar{{position:sticky;top:0;z-index:9;display:flex;gap:14px;align-items:center;background:#1a1a1a;color:#fff;padding:8px 14px;font-family:system-ui,sans-serif;font-size:12px;}}\
+         .pbar button{{background:#fff;color:#111;border:0;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;}}\
+         @media print{{.pbar{{display:none;}}}}</style></head>\
          <body><h2>{}</h2>\
          <div class='meta'><span>编制单位：{}</span><span>单位：{}</span></div>\
          <div class='meta'><span></span><span>{}　打印时间：{}</span></div>\
          {}\
-         <script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>\
+         <div class='pbar'><button onclick='window.print()'>🖨 打印本页</button><span>纸张 / 份数在打印对话框中选择；关闭本页即取消</span></div>\
          </body></html>",
         esc(title),
         esc(title),

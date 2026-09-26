@@ -223,6 +223,10 @@ a:hover { color: var(--primary-d); }
 .bell .bell-n { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
   background: var(--err); color: #fff; font-size: 10.5px; line-height: 16px; text-align: center; font-weight: 600; }
 .bell .bell-n[data-zero="1"] { display: none; }
+/* 待办提示点：未读数字清零后仍提示「还有活儿」，但不再占用未读计数 */
+.bell[data-todo="1"]::before { content: ""; position: absolute; top: -1px; left: -1px;
+  width: 7px; height: 7px; border-radius: 50%; background: var(--warn, #d97706);
+  box-shadow: 0 0 0 2px var(--bg); pointer-events: none; }
 .bell.pulse::after { content: ""; position: absolute; inset: -3px; border-radius: 8px;
   border: 2px solid var(--primary); animation: bellpulse .55s ease-out 2; pointer-events: none; }
 @keyframes bellpulse { from { opacity: 1; transform: scale(.92); } to { opacity: 0; transform: scale(1.3); } }

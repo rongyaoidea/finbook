@@ -5172,6 +5172,122 @@ async fn cannot_invite_platform_admin_into_book() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "不应允许邀请管理员进账套");
 }
 
+/// 平台经营总览：跨账套 × 各业务域可视化（对标金蝶星空云「多组织集团管控视图」）。
+///
+/// 锁三件事：① 权限闸门（仅平台管理员）② 多账套聚合与 `books=` 过滤
+/// ③ **单套打不开不影响整体** —— 整体 500 会让管理员看不到其他账套的真实状况。
+#[tokio::test]
+async fn platform_overview_aggregates_and_survives_broken_book() {
+    let (state, books_dir, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // 第二个账套
+    let (status, body) = create_book(&state, &admin_sid, "张记").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let zk = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // --- ① 权限闸门：非平台管理员一律 403 ---
+    let plain_sid = provision_plain_user(&state, &admin_sid, "zhangy", "Zy12345678").await;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/platform/overview", &plain_sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "非管理员不得看平台总览");
+
+    // --- ② 多账套聚合 ---
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/platform/overview", &admin_sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let ov: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(ov["book_count"], 2, "应看到两个账套：{ov}");
+    assert_eq!(ov["failed"], 0, "两个账套都应打得开");
+    let books = ov["books"].as_array().unwrap();
+    assert_eq!(books.len(), 2);
+    for b in books {
+        assert_eq!(b["ok"], true, "账套 {} 应正常：{b}", b["key"]);
+        // 每个账套都要出业务域卡片，且带可聚合的数值
+        let cards = b["cards"].as_array().unwrap();
+        assert!(!cards.is_empty(), "账套 {} 没有任何业务卡片", b["key"]);
+        for c in cards {
+            assert!(c["domain"].is_string() && c["label"].is_string());
+            assert!(c["num"].is_f64() || c["num"].is_i64(), "卡片缺少数值：{c}");
+        }
+        // 业务域覆盖：凭证/资金/销售/采购/仓管/生产/成本/报销/审批
+        let doms: std::collections::HashSet<&str> = cards
+            .iter()
+            .filter_map(|c| c["domain"].as_str())
+            .collect();
+        for want in ["凭证", "资金", "销售", "采购", "仓管", "生产", "成本"] {
+            assert!(doms.contains(want), "账套 {} 缺业务域「{want}」：{doms:?}", b["key"]);
+        }
+    }
+    // 汇总与逐套同源：每个 (域,指标) 的合计 == 各套之和
+    let totals = ov["totals"].as_array().unwrap();
+    assert!(!totals.is_empty(), "跨账套汇总不应为空");
+    for t in totals {
+        let (d, k) = (t["domain"].as_str().unwrap(), t["key"].as_str().unwrap());
+        let sum: f64 = books
+            .iter()
+            .flat_map(|b| b["cards"].as_array().unwrap())
+            .filter(|c| c["domain"] == d && c["key"] == k)
+            .map(|c| c["num"].as_f64().unwrap_or(0.0))
+            .sum();
+        let got = t["value"].as_f64().unwrap_or(0.0);
+        assert!(
+            (sum - got).abs() < 0.02,
+            "汇总「{d}/{k}」= {got}，但各套相加 = {sum}"
+        );
+    }
+
+    // books= 过滤：只统计指定账套
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/platform/overview?books={zk}"),
+            &admin_sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let one: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(one["book_count"], 1, "过滤后应只剩 1 个账套：{one}");
+    assert_eq!(one["books"][0]["key"], zk.as_str());
+
+    // --- ③ 单套文件损坏：整体仍 200，坏套标记原因，好套数据照常 ---
+    std::fs::write(books_dir.join(format!("{zk}.fbk")), b"this is not a sqlite database")
+        .expect("写坏账套文件");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/platform/overview", &admin_sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "一个账套坏掉不应让整体 500");
+    let mixed: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(mixed["failed"], 1, "应记 1 个取数失败：{mixed}");
+    let bad = mixed["books"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["key"] == zk.as_str())
+        .unwrap();
+    assert_eq!(bad["ok"], false);
+    assert!(
+        !bad["error"].as_str().unwrap_or("").is_empty(),
+        "坏套必须带原因，不能静默"
+    );
+    let good = mixed["books"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["key"] == "b1")
+        .unwrap();
+    assert_eq!(good["ok"], true, "好套应照常出数：{good}");
+    assert!(!good["cards"].as_array().unwrap().is_empty());
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {

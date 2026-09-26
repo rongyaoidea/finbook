@@ -88,6 +88,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 平台账套目录：列表（按归属过滤）+ 自建账套 + 选择当前账套
         .route("/api/books", get(list_books).post(create_book))
         .route("/api/consolidate/preview", get(consolidate_preview))
+        // 平台经营总览：跨账套 × 各业务域可视化（对标金蝶星空云「多组织集团管控视图」）
+        .route("/api/platform/overview", get(platform_overview))
         .route("/api/books/:key/select", post(select_book))
         .route("/api/books/:key", delete(delete_book))
         .route("/api/login", post(post_login))
@@ -925,6 +927,160 @@ async fn unlock_security_user(
 
 /// 合并汇总：对选中账套按期间汇总各科目期末余额（各套独立取数，仅已记账 H-3）。
 /// `books=b1,b2`；返回科目 × 账套矩阵 + 合计。
+/// 平台经营总览（跨账套 × 各业务域可视化；仅平台管理员）
+///
+/// 复用 `workbench::collect`——它已经按 9 个业务域（凭证/资金/销售/采购/仓管/生产/
+/// 成本/报销/审批）出卡片，不必为每个域重写一套查询。多账套时逐套打开取数再按
+/// (域, 指标, 单位) 聚合。
+///
+/// 两个刻意的设计：
+/// - **单套失败不影响整体**：某个账套文件损坏/被占用时记 `ok:false` + 原因，
+///   继续取下一套。整体 500 会让管理员看不到其他账套的真实状况。
+/// - **上限 50 套**：逐套 open 是 IO 密集操作，账套数量失控时宁可截断并明确告知，
+///   也不让一个请求把连接数/文件句柄打满。
+async fn platform_overview(
+    State(state): State<Arc<WebState>>,
+    user: RealmUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !user.is_admin {
+        return Err(AppError::forbidden("该入口仅限系统管理员使用"));
+    }
+    const MAX_BOOKS: usize = 50;
+    let want_period: Option<i32> = q.get("period").and_then(|s| parse_period(s)).map(|p| p.ymm());
+
+    let mut books = visible_books(&state, &user.username, true)?;
+    // 可选：只统计指定账套
+    if let Some(list) = q.get("books") {
+        let want: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        if !want.is_empty() {
+            books.retain(|b| want.contains(&b.key.as_str()));
+        }
+    }
+    books.sort_by(|a, b| a.company.cmp(&b.company));
+    let total = books.len();
+    let truncated = total > MAX_BOOKS;
+    books.truncate(MAX_BOOKS);
+
+    let mut per_book: Vec<serde_json::Value> = Vec::with_capacity(books.len());
+    // 聚合键：(域, 指标, 单位) —— 单位进键，避免把「元」和「张」加到一起
+    let mut agg: std::collections::BTreeMap<(String, String, String), f64> = Default::default();
+    let mut labels: std::collections::BTreeMap<(String, String, String), String> = Default::default();
+    let mut domains: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut failed = 0usize;
+
+    for b in &books {
+        let db = match state.db_for(&b.key) {
+            Ok(d) => d,
+            Err(e) => {
+                failed += 1;
+                per_book.push(json!({
+                    "key": b.key, "company": b.company, "owner": b.owner_username,
+                    "ok": false, "error": e.to_string(),
+                    "period": "", "cards": [], "todos": [],
+                }));
+                continue;
+            }
+        };
+        // 期间：请求指定的优先；早于该账套启用期间时回落到启用期间（否则全是空）
+        let opts = db.options();
+        let start = opts.start_period;
+        let cur = match want_period {
+            Some(p) if p >= start.ymm() => Period::from_ymm_checked(p).unwrap_or(start),
+            _ => start,
+        };
+        // 账套注册表里公司名可能没填，回落到账套自身参数
+        let company = if b.company.trim().is_empty() {
+            opts.company.clone()
+        } else {
+            b.company.clone()
+        };
+        // 以临时管理员身份看全部业务域（与 UI「全部账套」的进入语义一致）
+        let admin = fincore::User::new("__platform_admin__", "平台管理员", fincore::Role::Admin);
+        let wbo = match findb::workbench::collect(&db, &admin, cur, 6) {
+            Ok(w) => w,
+            Err(e) => {
+                failed += 1;
+                per_book.push(json!({
+                    "key": b.key, "company": company, "owner": b.owner_username,
+                    "ok": false, "error": e.to_string(),
+                    "period": period_to_str(cur), "cards": [], "todos": [],
+                }));
+                continue;
+            }
+        };
+        for c in &wbo.cards {
+            // 卡片值是已格式化的纯数字（fmt2 无千分位 / 整数 to_string），可安全解析
+            let n: f64 = c.value.replace(',', "").parse().unwrap_or(0.0);
+            let k = (c.domain.clone(), c.key.clone(), c.unit.clone());
+            *agg.entry(k.clone()).or_insert(0.0) += n;
+            labels.entry(k).or_insert_with(|| c.label.clone());
+            *domains.entry(c.domain.clone()).or_insert(0) += 1;
+        }
+        per_book.push(json!({
+            "key": b.key, "company": company, "owner": b.owner_username,
+            "ok": true, "error": "",
+            "period": wbo.period,
+            "cards": wbo.cards.iter().map(|c| json!({
+                "domain": c.domain, "key": c.key, "label": c.label,
+                "value": c.value, "unit": c.unit,
+                "num": c.value.replace(',', "").parse::<f64>().unwrap_or(0.0),
+            })).collect::<Vec<_>>(),
+            "todos": wbo.todos.iter().map(|t| json!({
+                "domain": t.domain, "key": t.key, "label": t.label,
+                "count": t.count, "view": t.view,
+            })).collect::<Vec<_>>(),
+            // 趋势：近 6 期各业务域走势，供前端画迷你折线（跨账套对比用）
+            "trends": wbo.trends.iter().map(|t| json!({
+                "domain": t.domain, "key": t.key, "title": t.title, "unit": t.unit,
+                "periods": t.periods,
+                "series": t.series.iter().map(|s| json!({
+                    "name": s.name, "color": s.color, "points": s.points,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
+    // 跨账套汇总（保持领域顺序稳定，便于前端分组渲染）
+    let mut totals: Vec<serde_json::Value> = agg
+        .into_iter()
+        .map(|((domain, key, unit), v)| {
+            json!({
+                "domain": domain, "key": key, "unit": unit,
+                "label": labels.get(&(domain.clone(), key.clone(), unit.clone())).cloned().unwrap_or_default(),
+                "value": (v * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+    totals.sort_by(|a, b| {
+        let da = a["domain"].as_str().unwrap_or("");
+        let db2 = b["domain"].as_str().unwrap_or("");
+        da.cmp(db2)
+            .then(a["key"].as_str().unwrap_or("").cmp(b["key"].as_str().unwrap_or("")))
+    });
+
+    // 汇总待办（跨账套累计待处理条数）
+    let mut todo_total: std::collections::BTreeMap<String, i64> = Default::default();
+    for b in &per_book {
+        for t in b["todos"].as_array().cloned().unwrap_or_default() {
+            let d = t["domain"].as_str().unwrap_or("").to_string();
+            *todo_total.entry(d).or_insert(0) += t["count"].as_i64().unwrap_or(0);
+        }
+    }
+
+    Ok(Json(json!({
+        "book_count": total,
+        "scanned": books.len(),
+        "truncated": truncated,
+        "max_books": MAX_BOOKS,
+        "failed": failed,
+        "domains": domains.into_iter().map(|(k, n)| json!({ "domain": k, "cards": n })).collect::<Vec<_>>(),
+        "totals": totals,
+        "todos": todo_total.into_iter().map(|(k, v)| json!({ "domain": k, "count": v })).collect::<Vec<_>>(),
+        "books": per_book,
+    })))
+}
+
 async fn consolidate_preview(
     State(state): State<Arc<WebState>>,
     user: RealmUser,
@@ -4605,7 +4761,10 @@ fn trial_balance_html(
          th,td{{border:1px solid #bbb;padding:4px 8px;}}\
          th{{background:#f0f3f7;}}td.r{{text-align:right;}}\
          tfoot td{{font-weight:bold;background:#fafafa;}}\
-         @media print{{body{{font-size:12px;}}}}</style></head>\
+         @media print{{body{{font-size:12px;}}}}\
+         .pbar{{position:sticky;top:0;z-index:9;display:flex;gap:14px;align-items:center;background:#1a1a1a;color:#fff;padding:8px 14px;font-family:system-ui,sans-serif;font-size:12px;}}\
+         .pbar button{{background:#fff;color:#111;border:0;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;}}\
+         @media print{{.pbar{{display:none;}}}}</style></head>\
          <body><h2>{} 科目余额表</h2>\
          <div class='meta'>期间：{} 至 {}　打印时间：{}</div>\
          <table><thead><tr>\
@@ -4617,7 +4776,7 @@ fn trial_balance_html(
          <td class='r'>{}</td><td class='r'>{}</td>\
          <td class='r'>借 {} / 贷 {}</td>\
          <td class='r'>—</td></tr></tfoot></table>\
-         <script>window.onload=function(){{setTimeout(function(){{window.print();}},300);}};</script>\
+         <div class='pbar'><button onclick='window.print()'>🖨 打印本页</button><span>纸张 / 份数在打印对话框中选择；关闭本页即取消</span></div>\
          </body></html>",
         html_escape(company),
         html_escape(&from),
@@ -9665,13 +9824,16 @@ async fn get_notices(
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let since = q.get("since").cloned().filter(|s| !s.is_empty());
     let today = now.get(..10).unwrap_or("").to_string();
-    let unread_events = events
-        .iter()
-        .filter(|l| match &since {
-            Some(s) => l.ts.as_str() > s.as_str(),
-            None => l.ts.starts_with(&today),
-        })
-        .count();
+    // 未读判定只有一处定义：水位之后（缺省=今天内）。
+    // 以前前端给每条事件都画未读点、再用 inline style 遮——重渲染就露回来了，
+    // 所以「全部已读」看着像没生效。未读必须由服务端按水位判定并逐条下发。
+    let is_unread = |ts: &str| -> bool {
+        match &since {
+            Some(s) => ts > s.as_str(),
+            None => ts.starts_with(&today),
+        }
+    };
+    let unread_events = events.iter().filter(|l| is_unread(&l.ts)).count();
     let ev: Vec<serde_json::Value> = events
         .iter()
         .map(|l| {
@@ -9682,6 +9844,7 @@ async fn get_notices(
                 "module": l.module,
                 "action": l.action,
                 "detail": l.detail,
+                "unread": is_unread(&l.ts),
             })
         })
         .collect();
@@ -9689,6 +9852,7 @@ async fn get_notices(
         "todos": todos,
         "events": ev,
         "unread_events": unread_events,
+        "todo_count": todos.iter().filter(|t| t.count > 0).count(),
         "now": now,
     })))
 }

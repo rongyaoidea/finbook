@@ -699,6 +699,11 @@ function ntBadge(n) {
   el.textContent = n > 99 ? "99+" : String(n);
   el.dataset.zero = n > 0 ? "0" : "1";
 }
+// 待办提示点：与未读数字分开，避免「全部已读」清不掉数字
+function ntTodoDot(n) {
+  const b = document.getElementById("bell");
+  if (b) b.dataset.todo = n > 0 ? "1" : "0";
+}
 function ntPulse() {
   const b = document.getElementById("bell");
   if (!b) return;
@@ -708,16 +713,20 @@ function ntPulse() {
 async function ntPoll(first) {
   try {
     const r = await api(`/notices?since=${encodeURIComponent(ntMark())}`);
-    const todoN = (r.todos || []).filter((t) => t.count > 0).length;
-    const unread = (r.unread_events || 0) + todoN;
+    // 铃铛数字只算「未读消息」。待办是「该干的活」不是「没看过的消息」——
+    // 两者混在一个数字里，「全部已读」就永远清不到 0，看着像按钮坏了。
+    // 待办改用铃铛上的小红点单独提示，不占未读计数。
+    const unread = r.unread_events || 0;
+    const todoN = r.todo_count != null ? r.todo_count : (r.todos || []).filter((t) => t.count > 0).length;
     const was = parseInt(document.getElementById("bell-n")?.textContent || "0", 10) || 0;
     ntBadge(unread);
+    ntTodoDot(todoN);
     if (!first && unread > was) {
       ntPulse();
       const now = Date.now();
       if (now - _ntToastAt > 5 * 60 * 1000) {
         _ntToastAt = now;
-        toast(`通知：新动态 ${r.unread_events} 条 · 待办 ${todoN} 项`, "ok");
+        toast(`通知：新动态 ${r.unread_events} 条${todoN ? ` · 待办 ${todoN} 项` : ""}`, "ok");
       }
     }
     return r;
@@ -746,9 +755,10 @@ function ntRender(r) {
   const body = document.getElementById("nt-body");
   if (!body) return;
   const todos = (r.todos || []).filter((t) => t.count > 0);
+  // 待办不画未读点：它不是「没读过的消息」，是自己的活儿。数量在右侧标签上。
   let html = todos.length
     ? `<div class="nt-sec">我的待办（点击处理）</div>` + todos.map((t) => `
-        <button class="nt-item" data-nt-view="${esc(t.view)}"><div class="nt-t"><span class="nt-dot"></span><b>${esc(t.label)}</b><span class="tag" style="margin-left:auto">${t.count}</span></div><div class="nt-m">${esc(t.domain)} · 直达处理页</div></div>`).join("")
+        <button class="nt-item" data-nt-view="${esc(t.view)}"><div class="nt-t"><b>${esc(t.label)}</b><span class="tag" style="margin-left:auto">${t.count}</span></div><div class="nt-m">${esc(t.domain)} · 直达处理页</div></button>`).join("")
     : "";
   // 动态按服务端时钟分组：今天 / 昨天 / 更早
   const dayOf = (ts) => (ts || "").slice(0, 10);
@@ -763,7 +773,7 @@ function ntRender(r) {
   });
   const G = (list, label) => list.length
     ? `<div class="nt-sec">${label}</div>` + list.map((ev) => `
-        <div class="nt-item"><div class="nt-t"><span class="nt-dot"></span><b>${esc(ev.user || "系统")}</b> ${esc(ev.action)}<span class="muted" style="margin-left:auto;font-size:11px">${esc((ev.ts || "").slice(11, 16))}</span></div><div class="nt-m">${esc(ev.module)} · ${esc(ev.detail)}</div></div>`).join("")
+        <div class="nt-item"><div class="nt-t">${ev.unread ? '<span class="nt-dot"></span>' : ""}<b>${esc(ev.user || "系统")}</b> ${esc(ev.action)}<span class="muted" style="margin-left:auto;font-size:11px">${esc((ev.ts || "").slice(11, 16))}</span></div><div class="nt-m">${esc(ev.module)} · ${esc(ev.detail)}</div></div>`).join("")
     : "";
   html += G(groups.today, "今天") + G(groups.yday, "昨天") + G(groups.older, "更早");
   if (!html) html = `<div class="nt-empty">没有待办，也暂无动态</div>`;
@@ -775,18 +785,21 @@ function ntRender(r) {
   });
 }
 async function ntMarkRead() {
-  // 已读 = 水位推到服务端当前时间（notices 返回的 now 与日志同钟同格式）
+  // 已读 = 水位推到服务端当前时间（notices 返回的 now 与日志同钟同格式）。
+  // 推完水位必须**重新取数重渲染**：未读点由服务端按水位逐条下发，
+  // 早先版本用 inline style 遮 .nt-dot，下次重渲染就全露回来，看着像按钮没生效。
   try {
     const r = await api(`/notices?since=${encodeURIComponent(ntMark())}`);
-    if (r && r.now) {
-      ntSetMark(r.now);
-      ntBadge((r.todos || []).filter((t) => t.count > 0).length);
-      toast("已全部标为已读", "ok");
-      const body = document.getElementById("nt-body");
-      if (body) $all(".nt-dot", body).forEach((d) => d.style.visibility = "hidden");
-    }
+    if (!r || !r.now) return;
+    ntSetMark(r.now);
+    const after = await api(`/notices?since=${encodeURIComponent(ntSet(r.now))}`);
+    ntBadge(after.unread_events || 0);
+    ntTodoDot(after.todo_count != null ? after.todo_count : 0);
+    ntRender(after);
+    toast("已全部标为已读", "ok");
   } catch (e) { toast(e.message, "err"); }
 }
+function ntSet(ts) { ntSetMark(ts); return ts; }
 // ---------------- 通知中心 END ----------------
 
 // ---------------- 列偏好（链7）：表格列显隐，localStorage 持久化 ----------------
@@ -1179,6 +1192,22 @@ async function viewDashboard(main) {
 // 管理员 · 账目总览（只读视角，仅系统管理员可见）
 // ===========================================================================
 
+// 文件下载：不要用 window.open(url, "_blank")
+//
+// 导出端点都带 `Content-Disposition: attachment`，用 window.open 打开时
+// ① 浏览器按「弹窗」处理，容易被拦掉——用户点了完全没反应，也不知道去哪找文件；
+// ② 没被拦时新标签立刻下载完关掉，同样没有任何反馈。
+// 同源 <a download> 走正常下载通道，触发下载且不新开标签，也不吃弹窗拦截。
+function downloadUrl(url) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 0);
+}
+
 // 金额字符串（"1,234.56" / "-1,234.56"）转数字
 function moneyNum(s) {
   const n = parseFloat(String(s == null ? "0" : s).replace(/[^0-9.-]/g, ""));
@@ -1419,6 +1448,14 @@ async function viewOverview(main) {
       ${card("进项发票价税合计", `${(d.invoice_in && d.invoice_in.amount_tax) || "0.00"}（${(d.invoice_in && d.invoice_in.count) || 0} 张）`)}
       ${card("销项发票价税合计", `${(d.invoice_out && d.invoice_out.amount_tax) || "0.00"}（${(d.invoice_out && d.invoice_out.count) || 0} 张）`)}
     </div>
+
+    <h2 style="margin:24px 0 4px">业务运营总览</h2>
+    <p class="muted" style="margin:0 0 10px">
+      上半部分是会计口径（收入 / 成本 / 利润），这里是业务口径（订单 / 库存 / 生产 / 资金 / 往来）。
+      数据取自已记账业务单据，含近 6 期走势；点「进入」跳到对应模块看明细。
+    </p>
+    <div id="ov-biz" class="muted">业务数据加载中…</div>
+
     <div class="toolbar" style="margin-top:14px">
       <span class="muted">科目表维护：</span>
       <button class="btn ghost sm" id="ov-fill">补齐新版科目表</button>
@@ -1442,6 +1479,109 @@ async function viewOverview(main) {
       viewOverview(main);
     } catch (e) { toast(e.message, "err"); }
   });
+  loadBizOverview(main);
+}
+
+// 业务域 → 对应模块入口（点「进入」跳转）。找不到模块就不显示按钮，不给死链。
+const BIZ_ENTRY = {
+  "销售": "so-doc", "采购": "po-doc", "仓管": "inv-warehouse", "库存": "inv-warehouse",
+  "生产": "mps", "资金": "funds", "成本": "cost", "凭证": "vouchers",
+  "报销": "claims", "审批": "approval",
+};
+const BIZ_ORDER = ["凭证", "资金", "销售", "采购", "仓管", "生产", "成本", "报销", "审批"];
+
+// 账目总览 · 业务运营总览（管理员只读）
+//
+// 数据全部来自既有端点，不新增查询口径：
+// - /workbench         已按 9 个业务域出卡片 + 近 N 期走势，口径与工作台一致
+// - /settle/aging      往来账龄（应收 1122 / 应付 2202），workbench 没有往来域，
+//                       但对财务管理员来说往来余额与账龄是最该先看的一屏，所以单独接上
+//
+// 独立失败不牵连：workbench 挂了还能看账龄，账龄挂了还能看业务卡片。
+async function loadBizOverview(main) {
+  const box = $("#ov-biz", main);
+  if (!box) return;
+  const [wb, ar, ap] = await Promise.all([
+    api("/workbench?periods=6").catch((e) => ({ __err: e.message })),
+    api("/settle/aging?account=1122").catch(() => null),
+    api("/settle/aging?account=2202").catch(() => null),
+  ]);
+
+  if (wb && wb.__err) {
+    box.innerHTML = `<div class="panel"><div style="color:var(--err)">业务数据加载失败：${esc(wb.__err)}</div></div>`;
+    return;
+  }
+  const cardsByDom = {};
+  ((wb && wb.cards) || []).forEach((c) => { (cardsByDom[c.domain] = cardsByDom[c.domain] || []).push(c); });
+  const trendsByDom = {};
+  ((wb && wb.trends) || []).forEach((t) => { (trendsByDom[t.domain] = trendsByDom[t.domain] || []).push(t); });
+
+  const wcard = (c) => `<div class="card"><div class="k">${esc(c.label)}</div>
+    <div class="v">${esc(c.value)}${c.unit === "元" || c.unit === "件" ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(c.unit)}</span>` : ""}</div></div>`;
+
+  // 每个业务域一块：指标卡 + 该域的走势图 + 跳转入口
+  const panels = BIZ_ORDER.filter((d) => cardsByDom[d] || trendsByDom[d]).map((dom) => {
+    const entry = BIZ_ENTRY[dom];
+    const goto = entry && VIEWS[entry] ? `<button class="btn ghost sm" data-biz-go="${entry}">进入</button>` : "";
+    const ts = (trendsByDom[dom] || []).map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
+        ${lineChartSvg(t.periods, (t.series || []).map((s) => ({ name: s.name, color: s.color, values: s.points })), 180)}
+      </div>`).join("");
+    return `<div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <b>${esc(dom)}</b><span class="grow"></span>${goto}
+      </div>
+      <div class="cards" style="margin-top:8px">${(cardsByDom[dom] || []).map(wcard).join("")}</div>
+      ${ts ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px;margin-top:10px">${ts}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  // ---- 往来：应收 / 应付余额 + 账龄分布（workbench 未覆盖的业务域）----
+  const aging = (data) => {
+    if (!data || !data.rows) return null;
+    const buckets = data.buckets || [];
+    const sums = buckets.map((_, i) => data.rows.reduce((a, r) => a + moneyNum((r.amounts || [])[i]), 0));
+    const net = data.rows.reduce((a, r) => a + moneyNum(r.net), 0);
+    const overdue = data.rows.filter((r) => Number(r.max_days) > 0);
+    return { buckets, sums, net, parties: data.rows.length, overdueCount: overdue.length,
+      overdueAmt: overdue.reduce((a, r) => a + moneyNum(r.net), 0) };
+  };
+  const arA = aging(ar), apA = aging(ap);
+  const settlePanel = (arA || apA) ? (() => {
+    const side = (label, a, color) => {
+      if (!a) return `<div class="card"><div class="k">${label}余额</div><div class="v">—</div></div>`;
+      const worst = a.overdueCount > 0
+        ? `<div class="card" style="border-color:var(--warn)"><div class="k">${label}逾期</div>
+             <div class="v" style="color:var(--warn)">${moneyFmt(a.overdueAmt)}<span style="font-size:12px;font-weight:400;opacity:.65"> / ${a.overdueCount} 户</span></div></div>`
+        : `<div class="card"><div class="k">${label}逾期</div><div class="v">0.00</div></div>`;
+      return `<div class="card"><div class="k">${label}余额</div><div class="v" style="font-size:18px">${moneyFmt(a.net)}</div></div>
+        <div class="card"><div class="k">${label}往来户数</div><div class="v">${a.parties}</div></div>${worst}`;
+    };
+    const chart = (arA && apA && arA.buckets.length)
+      ? `<div class="panel" style="margin:0;padding:10px 12px;margin-top:10px">
+          <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">往来账龄分布</b>
+            <span class="muted" style="font-size:12px">单位：元</span>
+            <span class="grow"></span>
+            <button class="btn ghost sm" data-biz-go="settle">进入往来核销</button></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px;margin-top:8px">
+            <div><div class="muted" style="font-size:12px;margin-bottom:2px">应收</div>
+              ${barChartSvg(arA.buckets, [{ name: "应收", color: "#2563eb", values: arA.sums }], 200)}</div>
+            <div><div class="muted" style="font-size:12px;margin-bottom:2px">应付</div>
+              ${barChartSvg(apA.buckets, [{ name: "应付", color: "#f59e0b", values: apA.sums }], 200)}</div>
+          </div>
+        </div>`
+      : `<div class="toolbar" style="margin-top:8px"><button class="btn ghost sm" data-biz-go="settle">进入往来核销</button></div>`;
+    return `<div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px"><b>往来</b>
+        <span class="muted" style="font-size:12px">应收 1122 / 应付 2202，只认已记账分录</span></div>
+      <div class="cards" style="margin-top:8px">${side("应收", arA)}${side("应付", apA)}</div>
+      ${chart}
+    </div>`;
+  })() : "";
+
+  box.innerHTML = panels + settlePanel
+    || `<div class="panel"><div class="muted">本期暂无业务数据。业务模块录单后这里会出现订单、库存、生产与往来概览。</div></div>`;
+  $all("[data-biz-go]", main).forEach((b) => b.onclick = () => { state.view = b.dataset.bizGo; renderMain(); });
 }
 
 // ===========================================================================
@@ -1546,7 +1686,7 @@ async function viewVouchers(main) {
   });
   if ($("#v-export")) $("#v-export").addEventListener("click", () => {
     const qs = new URLSearchParams({ period: (state.current || "").replace("-", ""), q: $("#v-q").value, status: $("#v-status").value });
-    window.open(`/api/export/vouchers?${qs.toString()}`, "_blank");
+    downloadUrl(`/api/export/vouchers?${qs.toString()}`);
   });
   if ($("#v-renumber")) $("#v-renumber").addEventListener("click", async () => {
     if (!(await confirmDialog(`将当前期间「记」字凭证的凭证号重排为连续？`, true))) return;
@@ -2294,7 +2434,7 @@ async function viewLedger(main) {
     const code = $("#l-code").value.trim();
     if (!code) { toast("请先输入科目编码", "err"); return; }
     const q = `code=${encodeURIComponent(code)}&from=${encodeURIComponent($("#l-from").value)}&to=${encodeURIComponent($("#l-to").value)}&include_children=${$("#l-children").checked ? 1 : 0}&posted_only=${$("#l-posted").checked ? 1 : 0}`;
-    window.open(`/api/export/ledger?${q}`, "_blank");
+    downloadUrl(`/api/export/ledger?${q}`);
   };
 }
 async function loadLedger() {
@@ -2461,11 +2601,15 @@ function printPreview(title, tableEl) {
     table{border-collapse:collapse;width:100%;font-size:13px;}
     th,td{border:1px solid #bbb;padding:4px 8px;}
     th{background:#f0f3f7;}td.r,td.num{text-align:right;}
-    @media print{body{font-size:12px;margin:0;}}</style></head>
-    <body><h2>${esc(title)}</h2>
+    @media print{body{font-size:12px;margin:0;}}
+    .pbar{position:sticky;top:0;z-index:9;display:flex;gap:14px;align-items:center;background:#1a1a1a;color:#fff;padding:8px 14px;font-family:system-ui,sans-serif;font-size:12px;}
+    .pbar button{background:#fff;color:#111;border:0;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer;}
+    @media print{.pbar{display:none;}}</style></head>
+    <body>
+    <div class="pbar"><button onclick="window.print()">🖨 打印本页</button><span>纸张 / 份数在打印对话框中选择；关闭本页即取消</span></div>
+    <h2>${esc(title)}</h2>
     <div class="meta"><span>${esc(session.user ? session.user.display_name : "")}</span><span>打印时间：${esc(today())}</span></div>
     ${tableEl.outerHTML}
-    <script>window.onload=function(){setTimeout(function(){window.print();},300);};</scr${"ipt"}>
     </body></html>`;
   const w = window.open("", "_blank");
   if (!w) { toast("浏览器拦截了打印窗口，请允许弹出窗口", "err"); return; }
@@ -3050,10 +3194,140 @@ async function viewConsolidate(main) {
 }
 
 async function viewPlatformBooks(main) {
-  main.innerHTML = `<h2>全部账套</h2>
-    <div class="muted" style="margin-bottom:10px">管理员可进入任意账套查看：以临时管理员身份进入，不在该账套留下账号记录，操作会记入账套审计日志。</div>
+  main.innerHTML = `<h2>平台经营总览 · 全部账套</h2>
+    <div class="muted" style="margin-bottom:10px">跨账套汇总各业务域（凭证/资金/销售/采购/仓管/生产/成本/报销/审批）。管理员可进入任意账套查看：以临时管理员身份进入，不在该账套留下账号记录，操作会记入账套审计日志。</div>
+    <div id="po-meta" class="cards"></div>
+    <div id="po-domains"></div>
+    <div id="po-books"></div>
+    <h3 style="margin:18px 0 8px">账套管理</h3>
     <div id="pb-list" class="muted">加载中…</div>`;
+
+  // ---------------------------------------------------------------- 平台总览
+  // 按单位分流：金额（元）走对比图与汇总卡，计数类（张/单/件）只进汇总卡与表格。
+  // 把「元」和「张」画在同一根坐标轴上是错的——量纲不同，谁也压不过谁。
+  const MONEY = "元";
+  const poFmt = (n, unit) => unit === MONEY ? fmt(Number(n).toFixed(2)) : fmt(n);
+
+  async function loadOverview() {
+    $("#po-meta").innerHTML = `<div class="card"><div class="k">账套取数中</div><div class="v">…</div></div>`;
+    let ov;
+    try { ov = await api("/platform/overview"); }
+    catch (e) {
+      $("#po-meta").innerHTML = "";
+      $("#po-domains").innerHTML = `<div class="panel"><div style="color:var(--err)">总览加载失败：${esc(e.message)}</div></div>`;
+      $("#po-books").innerHTML = "";
+      return;
+    }
+    const books = ov.books || [];
+    const okBooks = books.filter((b) => b.ok);
+    const todoSum = (ov.todos || []).reduce((a, t) => a + (Number(t.count) || 0), 0);
+
+    // 顶部概览条
+    $("#po-meta").innerHTML = `
+      <div class="card"><div class="k">账套总数</div><div class="v">${ov.book_count}<span style="font-size:12px;font-weight:400;opacity:.65"> 个</span></div></div>
+      <div class="card"><div class="k">取数成功</div><div class="v">${okBooks.length}<span style="font-size:12px;font-weight:400;opacity:.65"> / ${ov.book_count}</span></div></div>
+      <div class="card"><div class="k">覆盖业务域</div><div class="v">${(ov.domains || []).length}<span style="font-size:12px;font-weight:400;opacity:.65"> 个</span></div></div>
+      <div class="card"><div class="k">待办合计</div><div class="v">${todoSum}<span style="font-size:12px;font-weight:400;opacity:.65"> 条</span></div></div>
+      ${Number(ov.failed) > 0 ? `<div class="card" style="border-color:var(--err)"><div class="k">取数失败</div><div class="v" style="color:var(--err)">${ov.failed}<span style="font-size:12px;font-weight:400;opacity:.65"> 个</span></div></div>` : ""}
+      ${ov.truncated ? `<div class="card"><div class="k">已截断</div><div class="v">${ov.scanned}<span style="font-size:12px;font-weight:400;opacity:.65"> / ${ov.book_count}（上限 ${ov.max_books}）</span></div></div>` : ""}`;
+
+    if (!books.length) {
+      $("#po-domains").innerHTML = `<div class="panel"><div class="muted">系统中还没有账套，无法汇总。</div></div>`;
+      $("#po-books").innerHTML = "";
+      return;
+    }
+
+    // 每个指标 → 各账套取值（用于占比条）。只统计打得开的账套。
+    const split = (domain, key) => okBooks.map((b) => ({
+      name: b.company || b.key,
+      key: b.key,
+      value: (b.cards.find((c) => c.domain === domain && c.key === key) || {}).num || 0,
+    }));
+    // 金额指标：各账套都非零才值得横向比（全 0 或只有一个账套有数时无意义）
+    const moneyMetrics = (ov.totals || []).filter((t) => t.unit === MONEY);
+    const cntMetrics = (ov.totals || []).filter((t) => t.unit !== MONEY);
+
+    const metricCard = (t) => {
+      const parts = split(t.domain, t.key);
+      const total = parts.reduce((a, p) => a + p.value, 0);
+      const pos = parts.filter((p) => p.value > 0);
+      const bar = pos.length > 1 && total > 0
+        ? `<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin-top:6px;background:var(--z-200)">${pos.map((p, i) => {
+            const pct = (p.value / total) * 100;
+            const hue = 210 - (i * 137) % 150;
+            return `<span title="${esc(p.name)}：${poFmt(p.value, t.unit)}" style="width:${pct.toFixed(2)}%;background:hsl(${hue} 62% 52%)"></span>`;
+          }).join("")}</div>
+           <div class="muted" style="font-size:11px;margin-top:3px">${pos.map((p) => `${esc(p.name)} ${((p.value / total) * 100).toFixed(0)}%`).join(" · ")}</div>`
+        : "";
+      return `<div class="card"><div class="k">${esc(t.label || t.key)}</div>
+        <div class="v">${poFmt(t.value, t.unit)}${t.unit ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(t.unit)}</span>` : ""}</div>${bar}</div>`;
+    };
+
+    // 金额域：跨账套对比柱状图（X=账套，组=指标）
+    const moneyByDom = {};
+    moneyMetrics.forEach((t) => { (moneyByDom[t.domain] = moneyByDom[t.domain] || []).push(t); });
+    const charts = Object.keys(moneyByDom).map((dom) => {
+      const ms = moneyByDom[dom];
+      const groups = ms.slice(0, 6).map((t, i) => ({
+        name: t.label || t.key,
+        color: `hsl(${(i * 67) % 360} 62% 52%)`,
+        values: okBooks.map((b) => (b.cards.find((c) => c.domain === dom && c.key === t.key) || {}).num || 0),
+      }));
+      if (!groups.length || !groups.some((g) => g.values.some((v) => v !== 0))) return "";
+      return `<div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)} · 跨账套对比<span class="muted" style="font-weight:400;font-size:12px"> （单位：元）</span></h4>
+        <div class="panel" style="margin:0;padding:10px 12px">${barChartSvg(okBooks.map((b) => b.company || b.key), groups, 240)}</div></div>`;
+    }).join("");
+
+    const domSections = Object.keys(Object.assign({}, ...Object.values(moneyByDom), ...Object.values(
+      cntMetrics.reduce((a, t) => { a[t.domain] = 1; return a; }, {})))).map((dom) => {
+      const mm = moneyByDom[dom] || [];
+      const cm = cntMetrics.filter((t) => t.domain === dom);
+      if (!mm.length && !cm.length) return "";
+      return `<div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)}</h4>
+        <div class="cards">${mm.concat(cm).map(metricCard).join("")}</div></div>`;
+    }).join("");
+
+    $("#po-domains").innerHTML = (domSections || `<div class="panel"><div class="muted">各账套本期暂无业务数据。</div></div>`) + charts;
+
+    // 各账套明细：域卡片 + 近 6 期趋势
+    const bookPanels = books.map((b) => {
+      if (!b.ok) {
+        return `<div class="panel" style="margin-top:12px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <b>${esc(b.company || b.key)}</b><span class="muted">${esc(b.key)}</span>
+            <span class="tag" style="color:var(--err)">取数失败</span><span class="grow"></span>
+            <button class="btn ghost sm" data-po-enter="${esc(b.key)}" data-po-company="${esc(b.company || b.key)}">进入</button>
+          </div>
+          <div style="color:var(--err);font-size:12px;margin-top:6px">${esc(b.error || "未知原因")}</div>
+        </div>`;
+      }
+      const cg = {};
+      (b.cards || []).forEach((c) => { (cg[c.domain] = cg[c.domain] || []).push(c); });
+      const cards = Object.keys(cg).map((d) => `<div class="wb-sec"><h4 style="margin:8px 0 4px">${esc(d)}</h4>
+        <div class="cards">${cg[d].map((c) => `<div class="card"><div class="k">${esc(c.label)}</div>
+          <div class="v">${esc(c.value)}${c.unit === MONEY || c.unit === "件" ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(c.unit)}</span>` : ""}</div></div>`).join("")}</div></div>`).join("");
+      const trends = (b.trends || []).slice(0, 3).map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
+        ${lineChartSvg(t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 170)}
+      </div>`).join("");
+      const todo = (b.todos || []).filter((t) => Number(t.count) > 0);
+      return `<div class="panel" style="margin-top:12px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <b>${esc(b.company || b.key)}</b><span class="muted">${esc(b.key)} · ${esc(b.period)}</span>
+          <span class="grow"></span>
+          ${todo.length ? `<span class="tag warn">待办 ${todo.reduce((a, t) => a + (Number(t.count) || 0), 0)}</span>` : ""}
+          <button class="btn ghost sm" data-po-enter="${esc(b.key)}" data-po-company="${esc(b.company || b.key)}">进入</button>
+        </div>
+        ${cards}
+        ${trends ? `<h4 style="margin:10px 0 4px">近 6 期走势</h4><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px">${trends}</div>` : ""}
+      </div>`;
+    }).join("");
+    $("#po-books").innerHTML = `<h3 style="margin:18px 0 8px">各账套业务明细</h3>` + bookPanels;
+    $all("[data-po-enter]", main).forEach((b) => b.onclick = () => enterBook(b.dataset.poEnter, b.dataset.poCompany));
+  }
+
   async function load() {
+    await loadOverview();
     try {
       const data = await loadMyBooks();
       const books = data.books || [];
@@ -8069,8 +8343,8 @@ async function viewPayroll(main) {
   $("#py-next").onclick = () => switchPeriod(nextPeriod(period));
   $("#py-refresh").onclick = () => switchPeriod($("#py-period").value.trim() || period);
   $("#py-period").addEventListener("keydown", (e) => { if (e.key === "Enter") switchPeriod($("#py-period").value.trim() || period); });
-  if ($("#py-export")) $("#py-export").onclick = () => window.open(`/api/export/payroll?period=${encodeURIComponent(period)}`, "_blank");
-  if ($("#py-bank")) $("#py-bank").onclick = () => window.open(`/api/payroll/bank-file?period=${encodeURIComponent(ymm(period))}`, "_blank");
+  if ($("#py-export")) $("#py-export").onclick = () => downloadUrl(`/api/export/payroll?period=${encodeURIComponent(period)}`);
+  if ($("#py-bank")) $("#py-bank").onclick = () => downloadUrl(`/api/payroll/bank-file?period=${encodeURIComponent(ymm(period))}`);
   // 工资条：单人本期 + 本年累计（打印预览）
   $("#py-slip").onclick = () => {
     const m = modal(`<h3>工资条</h3>
@@ -8329,7 +8603,7 @@ async function viewClaims(main) {
   $("#cl-refresh").onclick = () => switchTo($("#cl-period").value.trim() || period, $("#cl-status").value);
   if ($("#cl-export")) $("#cl-export").onclick = () => {
     const qs = new URLSearchParams({ period, status: $("#cl-status").value });
-    window.open(`/api/export/claims?${qs.toString()}`, "_blank");
+    downloadUrl(`/api/export/claims?${qs.toString()}`);
   };
   if ($("#cl-new")) $("#cl-new").addEventListener("click", () => openClaimEditor(main, null, period));
 

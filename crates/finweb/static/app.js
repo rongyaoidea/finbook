@@ -6040,7 +6040,7 @@ async function viewWorkflow(main) {
       <button class="btn sm ${mode === "design" ? "primary" : "ghost"}" id="wf-d">流程设计</button>
       <button class="btn sm ${mode === "instances" ? "primary" : "ghost"}" id="wf-i">运行实例</button>
       <span class="grow"></span>
-      ${can("sys_option") ? `<button class="btn primary sm" id="wf-new">新建流程</button>` : `<span class="muted" style="font-size:12px">仅账套管理员可新建/发布流程；审批人按节点参与人在实例页操作</span>`}
+      ${can("sys_option") ? `<button class="btn ghost sm" id="wf-tpl">从模板创建</button><button class="btn primary sm" id="wf-new">新建流程</button>` : `<span class="muted" style="font-size:12px">仅账套管理员可新建/发布流程；审批人按节点参与人在实例页操作</span>`}
     </div>
     <div id="wf-body">${mode === "design" ? "加载中…" : ""}</div>`;
   $("#wf-d").onclick = () => { state.wfMode = "design"; viewWorkflow(main); };
@@ -6048,6 +6048,62 @@ async function viewWorkflow(main) {
   if (mode === "instances") return renderWfInstances($("#wf-body"));
   await renderWfDesign($("#wf-body"));
   if ($("#wf-new")) $("#wf-new").onclick = () => openWfEditor(null, () => renderWfDesign($("#wf-body")));
+  if ($("#wf-tpl")) $("#wf-tpl").onclick = () => openWfTemplatePicker(() => renderWfDesign($("#wf-body")));
+}
+
+// 从预置模板创建流程
+//
+// 模板固化的是财务惯例里的常见审批链，**不是**这家企业的授权制度，所以落的是草稿：
+// 管理员在画布上按自家授权制度改完、确认无误再发布。直接替企业发布等于替它做了
+// 内控决策；且已有单据在流转时改流程，会让在途实例的 current_node 指向不存在的
+// 节点（引擎报「流程可能被改」）。
+function openWfTemplatePicker(onDone) {
+  const m = modal(`<h3>从预置模板创建流程</h3>
+    <div class="muted" style="font-size:12px;margin-bottom:10px">
+      创建后为<b>草稿态</b>，请在画布上按本企业授权制度调整后再发布。
+    </div>
+    <div id="wt-list" class="muted">加载中…</div>
+    <div class="foot"><button class="btn ghost" id="wt-close">关闭</button></div>`);
+  $("#wt-close", m).onclick = closeModal;
+  api("/workflows/templates").then((r) => {
+    const rows = r.rows || [];
+    if (!rows.length) { $("#wt-list", m).innerHTML = `<div class="muted">暂无预置模板</div>`; return; }
+    $("#wt-list", m).innerHTML = rows.map((t) => {
+      const apps = (t.applicable || []).map((a) => {
+        const has = a.flow_id > 0;
+        return `<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:3px 0;cursor:pointer">
+          <input type="radio" name="wt-biz-${esc(t.key)}" value="${esc(a.biz_type)}" />
+          <span>${esc(a.biz_label)}</span>
+          ${has ? `<span class="muted" style="font-size:11px">（该单据已有${a.flow_status === "published" ? "已发布" : "草稿"}流程，将新增一条）</span>` : ""}
+        </label>`;
+      }).join("");
+      return `<div class="panel" style="margin:0 0 10px;padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <b>${esc(t.name)}</b>
+          <span class="tag">${t.node_count} 节点</span>
+          ${(t.requires_fields || []).length ? `<span class="tag warn">依赖字段：${esc((t.requires_fields || []).join("、"))}</span>` : ""}
+        </div>
+        <div class="muted" style="font-size:12px;margin:4px 0 6px">${esc(t.desc)}</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:2px">应用到：</div>
+        ${apps}
+        <div style="margin-top:8px"><button class="btn primary sm" data-wt-apply="${esc(t.key)}">用此模板创建</button></div>
+      </div>`;
+    }).join("");
+    $all("[data-wt-apply]", m).forEach((b) => b.onclick = async () => {
+      const key = b.dataset.wtApply;
+      const sel = $(`input[name="wt-biz-${CSS.escape(key)}"]:checked`, m);
+      if (!sel) { toast("请先选择要应用到哪种单据", "err"); return; }
+      try {
+        const r2 = await api("/workflows/templates/apply", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, biz_type: sel.value }),
+        });
+        toast(`已创建草稿「${r2.flow.name}」，请检查后发布`, "ok");
+        closeModal();
+        onDone && onDone();
+      } catch (e) { toast(e.message, "err"); }
+    });
+  }).catch((e) => { $("#wt-list", m).innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; });
 }
 
 async function renderWfInstances(body) {

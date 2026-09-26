@@ -500,6 +500,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/claims/:id/transition", post(claim_transition))
         .route("/api/claims/:id/voucher", post(claim_voucher))
         .route("/api/workflows", get(list_workflows).post(save_workflow))
+        .route("/api/workflows/templates", get(list_wf_templates))
+        .route("/api/workflows/templates/apply", post(apply_wf_template))
         .route("/api/workflows/instances", get(list_wf_instances))
         .route("/api/workflows/:id/publish", post(publish_workflow))
         .route("/api/workflows/:id/unpublish", post(unpublish_workflow))
@@ -6095,6 +6097,71 @@ async fn list_workflows(
     user.require(Perm::Report)?;
     let db = state.db_for(&user.book_key)?;
     Ok(Json(json!({ "rows": findb::workflow::flow_list(&db)? })))
+}
+
+#[derive(Deserialize)]
+struct WfTemplateApplyReq {
+    key: String,
+    biz_type: String,
+}
+
+/// 预置流程模板清单（不返回 nodes/edges 全文，前端只要元信息做选择卡片；
+/// 真正的图在 apply 之后随流程一起返回）
+async fn list_wf_templates(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    // 带上「该单据是否已有流程」，前端好提示是新建还是会被替换
+    let existing = findb::workflow::flow_list(&db)?;
+    let rows: Vec<serde_json::Value> = findb::workflow::templates()
+        .into_iter()
+        .map(|t| {
+            let used: Vec<serde_json::Value> = t
+                .biz_types
+                .iter()
+                .map(|b| {
+                    let hit = existing.iter().find(|f| &f.biz_type == b);
+                    json!({
+                        "biz_type": b,
+                        "biz_label": findb::workflow::biz_label(b),
+                        "flow_id": hit.map(|f| f.id).unwrap_or(0),
+                        "flow_status": hit.map(|f| f.status.clone()).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            json!({
+                "key": t.key, "name": t.name, "desc": t.desc,
+                "biz_types": t.biz_types,
+                "requires_fields": t.requires_fields,
+                "node_count": t.nodes.len(),
+                "applicable": used,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "rows": rows })))
+}
+
+/// 按预置模板落一条流程（草稿态）
+///
+/// 落的是草稿而非直接发布：模板是行业惯例，不是这家企业的授权制度；而且
+/// 已有单据在流转时改流程会让在途实例指向不存在的节点。
+async fn apply_wf_template(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<WfTemplateApplyReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    let f = findb::workflow::apply_template(&db, &req.key, &req.biz_type, user.username())?;
+    db.log(
+        user.username(),
+        "工作流",
+        "应用模板",
+        &format!("{}（{}）→ #{} 草稿", f.biz_type, f.name, f.id),
+    )?;
+    Ok(Json(json!({ "flow": f })))
 }
 
 async fn save_workflow(

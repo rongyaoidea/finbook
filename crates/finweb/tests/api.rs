@@ -5288,6 +5288,109 @@ async fn platform_overview_aggregates_and_survives_broken_book() {
     assert!(!good["cards"].as_array().unwrap().is_empty());
 }
 
+/// 工作流预置模板：一键落流程（草稿态）+ 拒绝不适用单据。
+///
+/// 关键契约：模板描述的是行业惯例而非本企业授权制度，所以**落的是草稿不是已发布**——
+/// 擅自发布等于替企业做了内控决策，且有单据在流转时改流程会让在途实例的
+/// current_node 指向不存在的节点（引擎报「流程可能被改」）。
+#[tokio::test]
+async fn workflow_template_apply_and_reject_mismatch() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 模板清单
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workflows/templates", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let tpls: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let rows = tpls["rows"].as_array().unwrap();
+    assert!(rows.len() >= 4, "预置模板不应少于 4 套：{tpls}");
+    let keys: Vec<&str> = rows.iter().filter_map(|t| t["key"].as_str()).collect();
+    for want in ["simple", "standard", "claim_full", "funds", "amount_tiered"] {
+        assert!(keys.contains(&want), "缺少模板 {want}：{keys:?}");
+    }
+    // 每个模板都要说明适用单据与依赖字段，前端据此筛选
+    for t in rows {
+        assert!(!t["name"].as_str().unwrap_or("").is_empty());
+        assert!(!t["desc"].as_str().unwrap_or("").is_empty());
+        assert!(t["node_count"].as_i64().unwrap_or(0) >= 2, "模板节点过少：{t}");
+        assert!(!t["applicable"].as_array().unwrap().is_empty(), "{t}");
+    }
+
+    // 金额分级模板不适用报价单（报价单无 amount 字段，套上去审批时会直接报错卡死）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows/templates/apply",
+            &sid,
+            serde_json::json!({ "key": "amount_tiered", "biz_type": "quotation" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "不适用单据应被拒");
+
+    // 正常应用：落草稿
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows/templates/apply",
+            &sid,
+            serde_json::json!({ "key": "claim_full", "biz_type": "claim" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let whole: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let f = &whole["flow"];
+    assert_eq!(f["status"], "draft", "模板应用后必须是草稿，不得自动发布");
+    assert_eq!(f["biz_type"], "claim");
+    let nodes = f["nodes"].as_array().unwrap();
+    // 部门 → 财务 → 出纳 三级
+    let names: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["type"] == "approve")
+        .map(|n| n["name"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(names.len(), 3, "应有三个审批节点：{names:?}");
+    assert!(names.iter().any(|n| n.contains("出纳")), "缺出纳节点：{names:?}");
+    // 出纳节点的参与人必须是 cashier 角色
+    let cash = nodes
+        .iter()
+        .find(|n| n["name"].as_str().unwrap_or("").contains("出纳"))
+        .unwrap();
+    assert_eq!(
+        cash["participants"][0], "cashier",
+        "出纳节点参与人应为 cashier：{cash}"
+    );
+
+    // 不存在的模板 → 404/400
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows/templates/apply",
+            &sid,
+            serde_json::json!({ "key": "nope", "biz_type": "claim" }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        r.status() == StatusCode::BAD_REQUEST || r.status() == StatusCode::NOT_FOUND,
+        "不存在的模板应被拒，实际 {}",
+        r.status()
+    );
+
+    // 应用后能在流程列表里看到
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workflows", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let list: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(
+        list["rows"].as_array().unwrap().iter().any(|x| x["biz_type"] == "claim"),
+        "模板落地的流程应出现在列表里"
+    );
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {

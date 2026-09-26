@@ -245,6 +245,217 @@ pub fn flow_list(db: &Db) -> DbResult<Vec<WfFlow>> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// 预置流程模板
+// ---------------------------------------------------------------------------
+
+/// 预置审批流程模板（对标金蝶云·星空的默认审批链）
+///
+/// 存在理由：空白画布要求用户自己拉节点、连線、配角色，等于让每个账套都从零
+/// 设计一遍审批链——实际��况是绝大多数企业直接用行业惯例。模板把这些惯例固化
+/// 下来一键落地，之后仍可在画布上改。
+///
+/// 三条设计约束（都是从引擎实际行为里读出来的，不是想当然；其中两条最初
+/// 我都写错了，是被 `amount_tiered` 的测试打出来的）：
+/// ① **「有条件边的节点」必须有兜底出边**。`branch_next` 在条件全不匹配且没有
+///    空条件出边时直接 `Err("所有条件分支均不满足…")`，单据直接卡死。终止要靠
+///    指向一个**无出边的 `message` 节点**——消息节点被自动跳过且 `branch_next`
+///    返回 `None`，实例随即置 approved（见 `intercept` 的消息节点循环）。
+///    单纯「让审批节点没有出边」是不行的：实例会停在那儿等人批一个终点节点。
+/// ② **实例起点是 nodes 数组里第一个 `approve` 节点**（`first_approve`），
+///    不是从 start 沿边走。所以条件分支的第一个审批节点必须排在数组前面。
+/// ③ **条件字段由 `cond_context` 提供**，只有四类单据有：quotation/claim/receipt/
+///    purchase_req，其中只有 claim 与 receipt 有 `amount`。给没有 `amount` 的单据
+///    套金额分级模板会在审批时直接报「条件配置错误」——所以模板显式声明适用
+///    单据，`apply_template` 强制校验。
+///
+/// 另外两条**引擎现状边界**，模板无法弥补、也不该假装能弥补：
+/// - 持 VoucherAudit 的主管/审核人/管理员可批**任意**节点（`audit_ok` 短路绕过
+///   参与人判定），所以模板里的「出纳复核」只是流程留痕；真正拦住「会计自签
+///   现金凭证」的是账套参数 `require_cashier`（凭证级硬门）。两者不能互替。
+/// - 条件分支是**按边顺序取第一条命中**，没有「多路并行」语义。
+#[derive(Clone, Debug, Serialize)]
+pub struct WfTemplate {
+    pub key: String,
+    pub name: String,
+    pub desc: String,
+    /// 适用业务类型（`ALL_BIZ` 的 key）
+    pub biz_types: Vec<String>,
+    /// 依赖的条件字段（如 ["amount"]），无则空
+    pub requires_fields: Vec<String>,
+    pub nodes: Vec<WfNode>,
+    pub edges: Vec<WfEdge>,
+}
+
+fn tnode(id: &str, ty: &str, name: &str, roles: &[&str], x: f64, y: f64) -> WfNode {
+    WfNode {
+        id: id.to_string(),
+        node_type: ty.to_string(),
+        name: name.to_string(),
+        participants: roles.iter().map(|s| s.to_string()).collect(),
+        strategy: default_strategy(),
+        reject_to: String::new(),
+        x,
+        y,
+    }
+}
+
+fn tedge(from: &str, to: &str) -> WfEdge {
+    WfEdge {
+        id: format!("{from}->{to}"),
+        from_node: from.to_string(),
+        to_node: to.to_string(),
+        kind: default_kind(),
+        condition: String::new(),
+    }
+}
+
+fn tedge_if(from: &str, to: &str, cond: &str) -> WfEdge {
+    WfEdge {
+        condition: cond.to_string(),
+        ..tedge(from, to)
+    }
+}
+
+/// 预置模板清单。
+///
+/// 金额阈值取 5000 / 50000 是财务惯例里的常见档位（小额主管批、中额加财务主管、
+/// 大额再上总经理），不是某一行业的强制标准——企业应按自身授权制度改。
+pub fn templates() -> Vec<WfTemplate> {
+    vec![
+        WfTemplate {
+            key: "simple".into(),
+            name: "单级审批".into(),
+            desc: "制单 → 主管审批。小额、高频单据用（如报价单、请购单）。".into(),
+            biz_types: vec![BIZ_QUOTATION.into(), BIZ_PURCHASE_REQ.into()],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("lead", "approve", "主管审批", &["supervisor"], 240.0, 140.0),
+            ],
+            edges: vec![tedge("start", "lead")],
+        },
+        WfTemplate {
+            key: "standard".into(),
+            name: "标准两级（业务 → 财务）".into(),
+            desc: "制单 → 业务主管 → 财务主管。业务与财务两道分离，通用性最好的一档。".into(),
+            biz_types: vec![
+                BIZ_QUOTATION.into(),
+                BIZ_PURCHASE_REQ.into(),
+                BIZ_CLAIM.into(),
+            ],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("biz", "approve", "业务主管审批", &["supervisor"], 240.0, 140.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 420.0, 140.0),
+            ],
+            edges: vec![tedge("start", "biz"), tedge("biz", "fin")],
+        },
+        WfTemplate {
+            key: "claim_full".into(),
+            name: "报销三级（部门 → 财务 → 出纳）".into(),
+            desc: "制单 → 部门负责人 → 财务主管 → 出纳付款。报销单专用，出纳节点对应实际付款动作。".into(),
+            biz_types: vec![BIZ_CLAIM.into()],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("dept", "approve", "部门负责人审批", &["supervisor"], 230.0, 140.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 400.0, 140.0),
+                tnode("cash", "approve", "出纳付款", &["cashier"], 570.0, 140.0),
+            ],
+            edges: vec![
+                tedge("start", "dept"),
+                tedge("dept", "fin"),
+                tedge("fin", "cash"),
+            ],
+        },
+        WfTemplate {
+            key: "funds".into(),
+            name: "资金单据（财务 → 出纳）".into(),
+            desc: "制单 → 财务主管 → 出纳复核。收付款单专用；出纳节点为流程留痕，硬门仍需账套参数「出纳签字」配合。".into(),
+            biz_types: vec![BIZ_RECEIPT.into()],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 240.0, 140.0),
+                tnode("cash", "approve", "出纳复核", &["cashier"], 420.0, 140.0),
+                tnode("msg", "message", "通知付款", &[], 600.0, 140.0),
+            ],
+            edges: vec![
+                tedge("start", "fin"),
+                tedge("fin", "cash"),
+                tedge("cash", "msg"),
+            ],
+        },
+        WfTemplate {
+            key: "amount_tiered".into(),
+            name: "金额分级审批".into(),
+            desc: "≤5000 主管批完归档；>5000 加财务主管；>50000 直接上总经理。阈值与节点均可在画布上改。".into(),
+            biz_types: vec![BIZ_CLAIM.into(), BIZ_RECEIPT.into()],
+            requires_fields: vec!["amount".into()],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 200.0),
+                // 注意顺序：lead 必须是数组里第一个 approve 节点（= 实例起点，见约束②）
+                tnode("lead", "approve", "主管审批", &["supervisor"], 230.0, 200.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 420.0, 120.0),
+                tnode("gm", "approve", "总经理审批", &["supervisor"], 610.0, 60.0),
+                // 无出边的消息节点 = 流程终点（见约束①）
+                tnode("done", "message", "主管批完归档", &[], 230.0, 300.0),
+            ],
+            // lead 三条出边：先判「>50000」再判「>5000」，最后一条空条件兜底。
+            // 兜底不可省——省了小额单据会在审批时直接报错卡死。
+            edges: vec![
+                tedge("start", "lead"),
+                tedge_if("lead", "gm", "amount > 50000"),
+                tedge_if("lead", "fin", "amount > 5000"),
+                tedge("lead", "done"),
+                tedge("fin", "gm"),
+            ],
+        },
+    ]
+}
+
+pub fn template_by_key(key: &str) -> Option<WfTemplate> {
+    templates().into_iter().find(|t| t.key == key)
+}
+
+/// 按模板落一条流程（草稿态，需显式发布才生效）
+///
+/// 刻意**不自动发布**：预置模板描述的是行业惯例，不是这家企业的授权制度。
+/// 直接发布等于替企业做了内控决策，而且一旦有单据已在流转，事后改流程会让
+/// 在途实例的 `current_node` 指向不存在的节点（`intercept` 报「流程可能被改」）。
+pub fn apply_template(db: &Db, key: &str, biz_type: &str, who: &str) -> DbResult<WfFlow> {
+    let tpl = template_by_key(key.trim())
+        .ok_or_else(|| fincore::FinError::not_found("流程模板不存在"))?;
+    if ALL_BIZ.iter().all(|(k, _)| *k != biz_type) {
+        return Err(fincore::FinError::validate("非法业务类型").into());
+    }
+    if tpl.biz_types.iter().all(|b| b != biz_type) {
+        return Err(fincore::FinError::validate(format!(
+            "模板【{}】不适用于「{}」，可选：{}",
+            tpl.name,
+            biz_label(biz_type),
+            tpl.biz_types
+                .iter()
+                .map(|b| biz_label(b))
+                .collect::<Vec<_>>()
+                .join("、")
+        ))
+        .into());
+    }
+    let input = WfFlowInput {
+        id: 0,
+        name: format!("{}·{}", biz_label(biz_type), tpl.name),
+        biz_type: biz_type.to_string(),
+        nodes: tpl.nodes,
+        edges: tpl.edges,
+    };
+    let id = flow_save(db, &input, who)?;
+    flow_of(db.conn(), id)?
+        .ok_or_else(|| fincore::FinError::msg("流程模板应用失败").into())
+}
+
 /// 保存流程（新建或更新）：整体替换节点与连线；校验 start 恰好一个、连线端点存在。
 pub fn flow_save(db: &Db, f: &WfFlowInput, who: &str) -> DbResult<i64> {
     if f.name.trim().is_empty() {
@@ -1064,6 +1275,165 @@ mod tests {
             intercept(&db, BIZ_CLAIM, 9, &sup, true, "").unwrap(),
             Gate::NoFlow
         ));
+    }
+
+    // ---- 预置模板 ----
+
+    /// 每个预置模板都必须能被 flow_save 的校验通过（start 唯一、id 不重复、
+    /// 连线端点存在、驳回目标存在）——否则用户点「从模板创建」当场失败。
+    #[test]
+    fn every_template_passes_flow_save_validation() {
+        let db = mem();
+        for tpl in templates() {
+            for biz in &tpl.biz_types {
+                let f = apply_template(&db, &tpl.key, biz, "u")
+                    .unwrap_or_else(|e| panic!("模板【{}】@{} 应用失败：{e}", tpl.name, biz));
+                assert_eq!(f.status, "draft", "模板应用后必须是草稿，不能自动发布");
+                assert_eq!(f.biz_type, *biz);
+                assert_eq!(
+                    f.nodes.iter().filter(|n| n.node_type == "start").count(),
+                    1,
+                    "模板【{}】必须恰好一个开始节点",
+                    tpl.name
+                );
+                assert!(
+                    f.nodes.iter().any(|n| n.node_type == "approve"),
+                    "模板【{}】没有审批节点，发布会被拒",
+                    tpl.name
+                );
+                // 节点 id 唯一（flow_save 已校验，这里再确认模板本身没自相矛盾）
+                let mut ids: Vec<&str> = f.nodes.iter().map(|n| n.id.as_str()).collect();
+                ids.sort_unstable();
+                let uniq = ids.len();
+                ids.dedup();
+                assert_eq!(ids.len(), uniq, "模板【{}】节点 id 重复", tpl.name);
+                // 连线 id 唯一（否则同一条边会被写两遍）
+                let mut eids: Vec<&str> = f.edges.iter().map(|e| e.id.as_str()).collect();
+                eids.sort_unstable();
+                let eu = eids.len();
+                eids.dedup();
+                assert_eq!(eids.len(), eu, "模板【{}】连线 id 重复", tpl.name);
+            }
+        }
+    }
+
+    /// 模板不能套到不适用���单据上——否则金额分级模板跑到报价单上，
+    /// 审批时会因缺 `amount` 字段直接报「条件配置错误」，把单据卡死。
+    #[test]
+    fn template_rejects_inapplicable_biz_type() {
+        let db = mem();
+        // simple 只适用报价/请购，套到报销单应被拒且说清可选范围
+        let e = apply_template(&db, "simple", BIZ_CLAIM, "u").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("不适用"), "错误信息应说明不适用：{msg}");
+        assert!(msg.contains("报销单"), "错误信息应列出可用的单据类型：{msg}");
+        // 非法 biz_type 也拒
+        assert!(apply_template(&db, "simple", "not_a_biz", "u").is_err());
+        // 不存在的模板 key 也拒
+        assert!(apply_template(&db, "no_such_tpl", BIZ_CLAIM, "u").is_err());
+    }
+
+    /// 金额分级模板必须真的按金额分流：小额主管批完即终态，大额要走到财务主管。
+    ///
+    /// 这是模板里最需要实证的一段——「条件边 + 该节点无后续出边 = 终点」这个
+    /// 约定如果不成立，小额单据会永远卡在主管节点。
+    #[test]
+    fn amount_tiered_template_branches_by_amount() {
+        use crate::business::{Claim, ClaimItem, ClaimStatus};
+        let db = mem();
+        let f = apply_template(&db, "amount_tiered", BIZ_CLAIM, "u").unwrap();
+        flow_set_status(&db, f.id, true, "u").unwrap();
+        let sup = User::new("s", "主管", Role::Supervisor);
+        let p = fincore::Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        // 造两张金额跨档的报销单，驱动真实条件求值（不是构造假条件）
+        let mk = |no: &str, amt: &str| -> i64 {
+            let money = fincore::Money::parse(amt).unwrap();
+            crate::business::claim_insert(
+                &db,
+                &Claim {
+                    id: 0,
+                    period: p,
+                    no: no.into(),
+                    biz_date: d,
+                    applicant: "E01".into(),
+                    dept: "D01".into(),
+                    reason: "差旅费".into(),
+                    amount: money,
+                    status: ClaimStatus::Submitted,
+                    items: vec![ClaimItem {
+                        expense_account: "660203".into(),
+                        amount: money,
+                        memo: "机票".into(),
+                    }],
+                    approver: String::new(),
+                    approved_at: None,
+                    payer: String::new(),
+                    paid_at: None,
+                    voucher_id: None,
+                    created_at: "2026-01-15 09:00:00".into(),
+                },
+            )
+            .unwrap()
+        };
+        let small = mk("BX202601-001", "3000");
+        let mid = mk("BX202601-002", "8000");
+        let big = mk("BX202601-003", "60000");
+
+        // 3000 ≤ 5000：主管一批即终态（兜底走到无出边消息节点 = 归档完成）
+        match intercept(&db, BIZ_CLAIM, small, &sup, true, "同意").unwrap() {
+            Gate::Final { approved } => assert!(approved, "3000 元应主管批完即终态"),
+            other => panic!("3000 元不应还有下一节点：{other:?}"),
+        }
+        // 8000 落在 (5000, 50000]：主管 → 财务主管
+        match intercept(&db, BIZ_CLAIM, mid, &sup, true, "同意").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "财务主管审批", "8000 元应加财务主管"),
+            other => panic!("8000 元应推进到财务主管：{other:?}"),
+        }
+        // 再批一次到总经理（fin 的出边无条件）
+        match intercept(&db, BIZ_CLAIM, mid, &sup, true, "同意").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "总经理审批"),
+            other => panic!("8000 元第二次应到总经理：{other:?}"),
+        }
+        // 60000 > 50000：主管一批直接跳总经理（先判 >50000 的边）
+        match intercept(&db, BIZ_CLAIM, big, &sup, true, "同意").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "总经理审批", "60000 元应跳到总经理"),
+            other => panic!("60000 元应跳到总经理：{other:?}"),
+        }
+    }
+
+    /// 出纳节点不能被主管顶替：Cashier 角色没 VoucherAudit，必须命中参与人才行。
+    ///
+    /// 顺带锁住一条**已知边界**（不是缺陷，是引擎现状）：持 VoucherAudit 的
+    /// 主管/审核人/管理员可批任意节点，所以工作流的「出纳复核」只是留痕，
+    /// 真正拦住「会计自签现金凭证」的是账套参数 `require_cashier`。
+    #[test]
+    fn funds_template_cashier_node_gates_non_audit_roles() {
+        let db = mem();
+        let f = apply_template(&db, "funds", BIZ_RECEIPT, "u").unwrap();
+        flow_set_status(&db, f.id, true, "u").unwrap();
+        let sup = User::new("s", "主管", Role::Supervisor);
+        let cashier = User::new("c", "出纳", Role::Cashier);
+
+        // 主管批掉财务主管节点 → 推进到出纳复核（Pending，未终态）
+        match intercept(&db, BIZ_RECEIPT, 1, &sup, true, "同意").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "出纳复核"),
+            other => panic!("应推进到出纳复核：{other:?}"),
+        }
+        // 无 CashierSign 的角色（如会计）到出纳节点应被拒
+        let acc = User::new("a", "会计", Role::Accountant);
+        assert!(
+            intercept(&db, BIZ_RECEIPT, 1, &acc, true, "同意").is_err(),
+            "会计不该能过出纳复核节点"
+        );
+        // 出纳本人可以（先入库，会签票按 who 查套内角色）
+        crate::users::insert(&db, &cashier).unwrap();
+        // 消息节点不阻塞：出纳批完直接到终态
+        match intercept(&db, BIZ_RECEIPT, 1, &cashier, true, "已付").unwrap() {
+            Gate::Final { approved } => assert!(approved, "出纳批完应到终态"),
+            other => panic!("出纳批完应到终态：{other:?}"),
+        }
     }
 
     /// 会签（strategy=all + 多参与角色）：每个角色各需一票；同人不可重复批；满票推进。

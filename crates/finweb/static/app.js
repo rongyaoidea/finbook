@@ -32,6 +32,8 @@ async function api(path, opts = {}) {
   // 通用列头排序 + 列宽拖拽（同点补挂，异步表也能获得）
   try { autoColSort(); } catch (e) {}
   try { autoColResize(); } catch (e) {}
+  // 单元格省略号补 title（悬停可见全文）
+  try { autoCellTitles(); } catch (e) {}
   return data;
 }
 
@@ -42,10 +44,20 @@ function toast(msg, kind) {
   while (wrap.children.length >= MAX_TOASTS) wrap.removeChild(wrap.firstChild);
   const t = document.createElement("div");
   t.className = "toast " + (kind || "");
-  t.textContent = msg;
+  const text = document.createElement("span");
+  text.textContent = msg;
+  const close = document.createElement("button");
+  close.className = "toast-x";
+  close.type = "button";
+  close.textContent = "✕";
+  close.setAttribute("aria-label", "关闭提示");
+  const dismiss = () => { t.classList.remove("show"); setTimeout(() => t.remove(), 200); };
+  close.onclick = dismiss;
+  t.appendChild(text);
+  t.appendChild(close);
   wrap.appendChild(t);
   requestAnimationFrame(() => t.classList.add("show"));
-  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 250); }, 2600);
+  setTimeout(dismiss, 2600);
 }
 
 let modalStack = [];
@@ -109,8 +121,17 @@ function modal(html, wide) {
   return mask;
 }
 function closeModal() {
-  const root = document.getElementById("modal-root");
-  root.innerHTML = "";
+  // 栈式关闭：只关最上层弹窗，下层（如凭证编辑器）保持不动
+  const top = modalStack.pop();
+  if (top) {
+    top.remove();
+    return;
+  }
+  document.getElementById("modal-root").innerHTML = "";
+}
+// 全量关闭（登出/切视图等场景显式调用）
+function closeAllModals() {
+  document.getElementById("modal-root").innerHTML = "";
   modalStack = [];
 }
 // 确认对话框（Promise 化，替代浏览器原生 confirm）
@@ -129,8 +150,11 @@ function confirmDialog(message, danger) {
       </div>
     </div>`;
     root.appendChild(mask);
+    modalStack.push(mask); // 入栈：Ctrl+Enter 提交与 Esc 关闭都作用于最上层
     const done = (val) => {
       document.removeEventListener("keydown", onKey, true);
+      const i = modalStack.indexOf(mask);
+      if (i >= 0) modalStack.splice(i, 1);
       mask.remove();
       resolve(val);
     };
@@ -833,6 +857,13 @@ function autoColResize() {
     });
   });
 }
+// 单元格省略号补 title：被 max-width 截断的单元格，悬停显示全文（只补一次）
+function autoCellTitles() {
+  $all("#main table.grid td").forEach((td) => {
+    if (td.title) return;
+    if (td.scrollWidth > td.clientWidth + 1) td.title = td.textContent.trim();
+  });
+}
 // ---------------- 列偏好 END ----------------
 
 // 单据行内流程徽标：按业务类型拉取流程实例状态，填充 [data-wftag="类型:id"] 占位
@@ -949,17 +980,20 @@ function render() {
 
 function renderMain() {
   const main = document.getElementById("main");
+  closeAllModals(); // 切视图时关闭遗留弹窗（栈式关闭下不再整体清空）
   const fn = VIEWS[state.view] || viewDashboard;
   const r = fn(main);
   // 列偏好：同步表结构先挂一次（async 表由 api() 回调补挂）
   try { autoColPrefs(); } catch (e) {}
   try { autoColSort(); } catch (e) {}
   try { autoColResize(); } catch (e) {}
+  try { autoCellTitles(); } catch (e) {}
   return r;
 }
 
 async function logout() {
   try { await api("/logout", { method: "POST" }); } catch (e) {}
+  closeAllModals();
   session.user = null;
   session.platformAdmin = false;
   render();

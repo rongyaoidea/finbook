@@ -17,10 +17,10 @@
   --z-800: #1e293b;
   --z-900: #0f172a;
 
-  /* 背景与面板 */
+  /* 背景与面板（tinted：避免纯 #fff 的塑料感）*/
   --bg:     var(--z-50);
-  --surface:#ffffffee;           /* 半透明白 */
-  --panel:  #ffffff;
+  --surface:#fcfdfeee;           /* 半透明微暖白 */
+  --panel:  #fcfdfe;
   --panel-border: rgba(15, 23, 42, .08);   /* hairline 边框 */
   --panel-border-strong: rgba(15, 23, 42, .15);
   --shadow: 0 1px 3px rgba(15, 23, 42, .06), 0 1px 2px rgba(15, 23, 42, .04);
@@ -37,6 +37,8 @@
   --primary-t:  rgba(37, 99, 235, .12);
   --primary-d:  #1d4ed8;
   --primary-fg: #fff;
+  /* 品牌别名（表格排序 hover 等引用；此前未定义导致 hover 无色变）*/
+  --brand:      var(--primary);
 
   /* 语义色：OK / WARN / ERR + 对应 tinted 背景 */
   --ok:     #15803d;
@@ -96,7 +98,7 @@ a:hover { color: var(--primary-d); }
 .login-card::before {
   content: "";
   position: absolute; top: 0; left: 0; right: 0; height: 3px;
-  background: linear-gradient(90deg, var(--primary), #7c3aed);
+  background: var(--primary);
 }
 .login-card h1 {
   font-size: 21px; font-weight: 700; margin: 0 0 4px;
@@ -350,6 +352,30 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .muted { color: var(--muted); }
 
+/* ── 表格排版（P0）：表头/单元格不折行、长文本省略号、宽表横滚、首列吸顶 ──
+   仅作用于 #main 的列表表格；弹窗内表单表（#v-entries 等）不受影响。 */
+#main table.grid { min-width: max-content; }
+#main table.grid th { white-space: nowrap; letter-spacing: normal; }
+#main table.grid td { white-space: nowrap; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; }
+#main table.grid td.wrap { white-space: normal; overflow: visible; max-width: 48ch; }
+.panel table.grid th:first-child { position: sticky; left: 0; z-index: 3; background: var(--z-100); }
+.panel table.grid td:first-child { position: sticky; left: 0; z-index: 2; background: var(--panel); }
+.panel table.grid tbody tr:hover td:first-child { background: var(--bg); }
+
+/* ── 键盘焦点可见（此前仅输入框有 focus ring）────────────── */
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 6px; }
+.btn:focus-visible, .nav-item:focus-visible, .hamburger:focus-visible { outline-offset: 1px; }
+
+/* ── 动效降级：系统开启"减少动态"时关闭非必要动画 ─────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Tag：语义色胶囊 */
 .tag {
   display: inline-block; padding: 2px 9px; border-radius: 20px;
@@ -457,8 +483,15 @@ table.grid tbody tr:last-child td { border-bottom: none; }
   opacity: 0; transform: translateY(-6px) scale(.97);
   transition: opacity .18s, transform .18s;
   pointer-events: auto;
+  max-width: 380px; word-break: break-word;
+  display: flex; align-items: flex-start; gap: 8px;
 }
 .toast.show { opacity: 1; transform: none; }
+.toast-x {
+  flex: none; background: none; border: 0; color: inherit; opacity: .65;
+  cursor: pointer; padding: 0 2px; line-height: 1.2; font-size: 12px;
+}
+.toast-x:hover { opacity: 1; }
 .toast.err  { background: #b91c1c; }
 .toast.ok   { background: #15803d; }
 .toast.warn { background: #92400e; }

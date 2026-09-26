@@ -2663,6 +2663,151 @@ async fn sales_shipment_and_return_are_atomic() {
     );
 }
 
+/// 往来核销列表的「含未记账」只读开关（对标金蝶单据驱动模型）。
+///
+/// 核销/账龄/催款只认已记账分录（全仓 H-3 口径）；勾上「含未记账」能把待记账的
+/// 往来一并列出来**查看**，但它们不可被核销——服务端 `settle` 会拒绝未记账的
+/// 被核销方。回归：早先 `open_entries` 写 `status != 'void'`，草稿直接进了核销列表。
+#[tokio::test]
+async fn settle_open_include_draft_is_readonly() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 录一张应收凭证（112201 核算客户，必须带辅助核算），可选是否记账
+    async fn mk(
+        state: &Arc<WebState>,
+        sid: &str,
+        no: i32,
+        post_it: bool,
+    ) -> i64 {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/vouchers",
+                sid,
+                serde_json::json!({
+                    "id": 0, "period": 202601, "date": "2026-01-10", "word": "记",
+                    "no": no, "attachments": 0, "memo": "含未记账开关造数",
+                    "entries": [
+                        { "line": 1, "account_code": "112201", "summary": "应收", "debit": "100", "credit": "0",
+                          "aux": { "customer": "C01" } },
+                        { "line": 2, "account_code": "600101", "summary": "应收", "debit": "0", "credit": "100" }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "录应收凭证");
+        let id: i64 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        if post_it {
+            let r = handlers::router(state.clone())
+                .oneshot(authed_post(
+                    &format!("/api/vouchers/{id}/post"),
+                    sid,
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "记账");
+        }
+        id
+    }
+    let posted_vid = mk(&state, &sid, 1, true).await;
+    let draft_vid = mk(&state, &sid, 2, false).await;
+
+    // 抓草稿凭证在 112201 上的分录 id
+    let draft_eid: i64 = {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_get(&format!("/api/vouchers/{draft_vid}"), &sid))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["account_code"] == "112201")
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    // 已记账那张的分录 id
+    let posted_eid: i64 = {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_get(&format!("/api/vouchers/{posted_vid}"), &sid))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["account_code"] == "112201")
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+
+    // 默认：只有已记账那笔
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/open?account=112201&upto=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(d["rows"].as_array().unwrap().len(), 1, "默认不应列出未记账行");
+    assert_eq!(d["draft_count"], 0);
+    assert_eq!(d["rows"][0]["posted"], true);
+
+    // 开关打开：两笔都在，草稿那笔 posted=false
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/settle/open?account=112201&upto=202601&draft=1",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(d["include_draft"], true);
+    assert_eq!(d["rows"].as_array().unwrap().len(), 2, "开关打开应列出未记账行");
+    assert_eq!(d["draft_count"], 1);
+    let draft_row = d["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["posted"] == false)
+        .expect("应有 posted=false 的行");
+    assert_eq!(draft_row["entry_id"].as_i64(), Some(draft_eid));
+
+    // 关键：草稿那笔不能当「原单」被核销（手工核销 entry id 由前端传入，
+    // 绕过了列表过滤，只能靠 settle 自己兜）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/run",
+            &sid,
+            serde_json::json!({ "from_entry": draft_eid, "to_entry": posted_eid, "amount": "10" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "未记账债权不得被核销");
+    let b: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(
+        b["error"].as_str().unwrap_or("").contains("已记账"),
+        "应说明需先记账：{b}"
+    );
+
+    // 核销记录不得留下
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/records?account=112201", &sid))
+        .await
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let recs = d["rows"].as_array().cloned().unwrap_or_default();
+    assert!(recs.is_empty(), "被拒的核销不得留下记录：{d}");
+}
+
 /// P1：催款单/对账函——按客商快照未核销、状态流转、无欠款拒绝。
 #[tokio::test]
 async fn dunning_flow() {

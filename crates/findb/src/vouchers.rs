@@ -1207,8 +1207,13 @@ mod tests {
             });
         }
         let vid = save(&db, &mut v).unwrap();
-        // 收款凭证：贷应收 600 / 700（草稿即可——核销不要求已记账，而已记账的凭证
-        // 本来就删不掉，不适合验证删凭证时的清核销原子性）
+        // 应收凭证必须**已记账**：核销的「被核销方」(from 侧) 要求已记账
+        // （settle::settle 守卫，全仓 H-3 口径）
+        post(&db, vid, "u").unwrap();
+        // 收款凭证：贷应收 600 / 700。保持**草稿**——已记账的凭证删不掉，
+        // 而本用例要验证的正是「删掉带核销记录的凭证时清核销的原子性」，
+        // 所以删的对象取这张收款凭证（核销的 to 侧，允许是草稿：对标金蝶
+        // 「单据审核 → 核销 → 生成凭证」三个并列步骤）
         let mut pay = Voucher::new(p, d, "记", 2);
         pay.prepared_by = "张三".to_string();
         pay.push_entry(Entry {
@@ -1246,19 +1251,21 @@ mod tests {
                  WHEN OLD.id = {second} BEGIN SELECT RAISE(ABORT, '核销记录被占用'); END;"
             ))
             .unwrap();
-        assert!(delete(&db, vid).is_err(), "清核销失败必须让删除失败");
+        assert!(delete(&db, pid).is_err(), "清核销失败必须让删除失败");
         assert_eq!(
             cnt(&db),
             2,
             "第 1 条核销记录不得被提交掉（回归前会只剩 1 条，而凭证还在）"
         );
-        assert!(get(&db, vid).unwrap().is_some(), "凭证必须还在");
+        assert!(get(&db, pid).unwrap().is_some(), "凭证必须还在");
 
         // 去掉阻塞后删除应成功，核销记录一并清干净
         db.conn().execute_batch("DROP TRIGGER t_block;").unwrap();
-        delete(&db, vid).unwrap();
-        assert!(get(&db, vid).unwrap().is_none());
+        delete(&db, pid).unwrap();
+        assert!(get(&db, pid).unwrap().is_none());
         assert_eq!(cnt(&db), 0);
+        // 应收凭证本身不受影响
+        assert!(get(&db, vid).unwrap().is_some());
     }
 
     /// 回归：已记账凭证不能删（`AND status<>'posted'` 守卫）。

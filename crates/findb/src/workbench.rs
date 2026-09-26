@@ -132,6 +132,25 @@ fn series(name: &str, color: &str, points: Vec<f64>) -> WbSeries {
     }
 }
 
+/// 区间内**已记账**凭证的借方发生额合计（Rust 侧 Decimal 累加，不走 SQL SUM）
+///
+/// 只认 `status='posted'`（全仓 H-3 口径），这样工作台的「本期发生额」与试算平衡、
+/// 账簿、往来核销是同一个口径。金额是 TEXT 列，`SUM(CAST(x AS REAL))` 会走二进制
+/// 浮点，累加后与试算平衡差分，所以必须逐行取回在 Rust 侧加。
+fn sum_posted_debit(db: &Db, from: Period, to: Period) -> DbResult<Money> {
+    let mut st = db.conn().prepare(
+        "SELECT e.debit
+         FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
+         WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2",
+    )?;
+    let rows = st
+        .query_map(rusqlite::params![from.ymm(), to.ymm()], |r| {
+            Ok(Money::parse_or_zero(&r.get::<_, String>(0)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().sum())
+}
+
 /// 按权限聚合（凭证/资金/销售/采购/仓管/生产/成本/报销/审批；报表域由 web 层追加）
 pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
     let n = n.clamp(3, 24);
@@ -154,30 +173,37 @@ pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
             [cur.ymm()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let turnover: f64 = db.conn().query_row(
-            "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0)
-             FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
-             WHERE v.status<>'void' AND e.period=?1",
-            [cur.ymm()],
-            |r| r.get(0),
-        )?;
+        // 本期发生额：只取**已记账**（H-3 口径，与试算平衡/账簿/往来核销一致），
+        // 且金额在 Rust 侧用 Decimal 累加——借方发生额是 TEXT 列，
+        // `SUM(CAST(... AS REAL))` 会走二进制浮点，与试算平衡差分。
+        // 回归：旧写法是 `status<>'void'` + `SUM(CAST(e.debit AS REAL))`，
+        // 工作台首页的「本期发生额」既含草稿又带浮点误差，与其他所有口径都对不上。
+        let turnover: f64 = sum_posted_debit(db, cur, cur)?.to_f64();
         out.cards.push(card("凭证", "unposted", "未记账凭证", unposted.to_string(), "张"));
         out.cards.push(card("凭证", "posted", "已记账凭证", posted.to_string(), "张"));
         out.cards.push(card("凭证", "turnover", "本期发生额", fmt2(turnover), "元"));
         let mut m: BTreeMap<i32, f64> = BTreeMap::new();
         let mut st = db.conn().prepare(
-            "SELECT e.period, COALESCE(SUM(CAST(e.debit AS REAL)),0)
+            "SELECT e.period, e.debit
              FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
-             WHERE v.status<>'void' AND e.period BETWEEN ?1 AND ?2
-             GROUP BY e.period",
+             WHERE v.status='posted' AND e.period BETWEEN ?1 AND ?2",
         )?;
         let rows = st
             .query_map(rusqlite::params![y0, y1], |r| {
-                Ok((r.get::<_, i32>(0)?, r.get::<_, f64>(1)?))
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    Money::parse_or_zero(&r.get::<_, String>(1)?),
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        // 逐月在 Rust 侧累加后再转 f64（f64 只用于画图，不参与账务计算）
+        let mut by_period: BTreeMap<i32, Money> = BTreeMap::new();
         for (p, v) in rows {
-            m.insert(p, v);
+            *by_period.entry(p).or_insert(Money::ZERO) += v;
+        }
+        for (p, v) in by_period {
+            m.insert(p, v.to_f64());
         }
         out.trends.push(trend(
             "凭证",
@@ -367,20 +393,28 @@ pub fn collect(db: &Db, user: &User, cur: Period, n: i32) -> DbResult<WbOut> {
         out.cards.push(card("生产", "orders", "本期生产订单", pos.len().to_string(), "份"));
         out.cards.push(card("生产", "running", "在产中", running.to_string(), "份"));
         out.cards.push(card("生产", "done", "已完工", done.to_string(), "份"));
-        // 生产投入（料工费归集）按期
+        // 生产投入（料工费归集）按期 —— 同样在 Rust 侧用 Decimal 累加
         let mut cost_m: BTreeMap<i32, f64> = BTreeMap::new();
         let mut st = db.conn().prepare(
-            "SELECT po.period, COALESCE(SUM(CAST(pc.amount AS REAL)),0)
+            "SELECT po.period, pc.amount
              FROM prod_cost pc JOIN production_order po ON po.id=pc.po_id
-             WHERE po.period BETWEEN ?1 AND ?2 GROUP BY po.period",
+             WHERE po.period BETWEEN ?1 AND ?2",
         )?;
         let rows = st
             .query_map(rusqlite::params![y0, y1], |r| {
-                Ok((r.get::<_, i32>(0)?, r.get::<_, f64>(1)?))
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    Money::parse_or_zero(&r.get::<_, String>(1)?),
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        let mut by_period: BTreeMap<i32, Money> = BTreeMap::new();
         for (p, v) in rows {
-            cost_m.insert(p, v);
+            *by_period.entry(p).or_insert(Money::ZERO) += v;
+        }
+        for (p, v) in by_period {
+            cost_m.insert(p, v.to_f64());
         }
         out.trends.push(trend(
             "生产",
@@ -606,6 +640,69 @@ mod tests {
 
     fn domains(out: &WbOut) -> Vec<&str> {
         out.cards.iter().map(|c| c.domain.as_str()).collect()
+    }
+
+    /// 工作台的「本期发生额」必须与试算平衡一致。
+    ///
+    /// 回归两处：① `status<>'void'` 把草稿也算进发生额（与 H-3 口径的试算平衡
+    /// 对不上）；② `SUM(CAST(e.debit AS REAL))` 走二进制浮点累加，与 Decimal
+    /// 口径差分。这里直接构造「含分位尾数、且一半是草稿」的数据来卡这两点。
+    #[test]
+    fn turnover_matches_trial_balance_posted_only() {
+        use fincore::{Entry, Voucher};
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        // 借方合计 = 0.1 + 0.2 = 0.3 这类分位尾数，REAL 累加会现形
+        let mk = |no: i32, debit: &str| -> i64 {
+            let mut v = Voucher::new(p, d, "记", no);
+            v.push_entry(Entry {
+                debit: Money::parse(debit).unwrap(),
+                aux: fincore::AuxRef {
+                    customer: Some("C01".into()),
+                    ..Default::default()
+                },
+                ..Entry::new(1, "112201", "应收")
+            });
+            v.push_entry(Entry {
+                credit: Money::parse(debit).unwrap(),
+                aux: fincore::AuxRef {
+                    customer: Some("C01".into()),
+                    ..Default::default()
+                },
+                ..Entry::new(2, "112201", "应收冲减")
+            });
+            crate::vouchers::save(&db, &mut v).unwrap()
+        };
+        let posted_a = mk(1, "0.10");
+        let posted_b = mk(2, "0.20");
+        let draft = mk(3, "999.00"); // 草稿不得计入
+        crate::vouchers::post(&db, posted_a, "u").unwrap();
+        crate::vouchers::post(&db, posted_b, "u").unwrap();
+        let _ = draft;
+
+        // 期望 = 已记账两张的借方合计，Rust 侧 Decimal 累加
+        let expect = Money::parse("0.10").unwrap() + Money::parse("0.20").unwrap();
+        let got = sum_posted_debit(&db, p, p).unwrap();
+        assert_eq!(
+            got,
+            expect,
+            "已记账发生额应为 0.30，草稿的 999.00 不得计入"
+        );
+
+        // 卡片上的「本期发生额」用的是同一个函数，且经 f64/2 位格式化后仍一致
+        let admin = User::new("a", "管理员", Role::Admin);
+        let out = collect(&db, &admin, p, 6).unwrap();
+        let card = out
+            .cards
+            .iter()
+            .find(|c| c.domain == "凭证" && c.key == "turnover")
+            .expect("应有本期发生额卡片");
+        assert_eq!(
+            card.value, "0.30",
+            "工作台本期发生额应为 0.30（含草稿会变成 999.30，REAL 累加会变成别的数）"
+        );
     }
 
     #[test]

@@ -10561,6 +10561,8 @@ fn open_entry_json(e: &findb::settle::OpenEntry) -> serde_json::Value {
         "settled": e.settled.fmt_money(),
         "open": e.open().fmt_money(),
         "dir": e.dir_label(),
+        // 已记账 = 可参与核销；false 仅在列表页勾了「含未记账」时出现
+        "posted": e.posted,
     })
 }
 
@@ -10600,14 +10602,26 @@ async fn get_settle_open(
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
     let include_all = q.get("all").map(|s| s == "1" || s == "true").unwrap_or(false);
+    // 「含未记账」只读开关（对标金蝶单据驱动模型：未审核单据在列表里看得见，
+    // 但不参与核销）。默认关闭——核销/账龄/催款一律只认已记账（H-3）。
+    // 注意：即使打开，这里返回的未记账行也只是**展示**，核销入口走
+    // `auto_settle`/`settle`，它们固定用 posted-only 的 `open_entries`。
+    let include_draft = q
+        .get("draft")
+        .map(|s| s == "1" || s == "true")
+        .unwrap_or(false);
     let db = state.db_for(&user.book_key)?;
-    let mut rows = findb::settle::open_entries(&db, account.trim(), upto, include_all)?;
+    let mut rows =
+        findb::settle::open_entries_with(&db, account.trim(), upto, include_all, !include_draft)?;
     if !include_all {
         rows.retain(|e| e.is_open());
     }
+    let draft_cnt = rows.iter().filter(|e| !e.posted).count();
     Ok(Json(json!({
         "account": account.trim(),
         "upto": period_to_str(upto),
+        "include_draft": include_draft,
+        "draft_count": draft_cnt,
         "rows": rows.iter().map(open_entry_json).collect::<Vec<_>>(),
     })))
 }

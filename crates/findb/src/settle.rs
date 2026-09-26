@@ -173,6 +173,22 @@ pub fn settle_in_tx(
         )
         .into());
     }
+    // 核销的**被核销方**（from_entry，即被冲销的应收/应付）必须已记账。
+    //
+    // 手工核销的 entry id 由前端传入，绕过了 open_entries 的 posted-only 过滤，
+    // 必须在这里兜住：拿一张草稿当债权去核销，那张凭证一删核销记录就没了。
+    // `OpenEntry::posted` 就是为此带到这里的。
+    //
+    // 注意**只卡 from 侧、不卡 to 侧**——这是刻意的，也是金蝶的做法：
+    // 收款单审核后即可与已记账的应收核销，而它自己的凭证往往还没记账
+    // （金蝶文档把「单据审核 → 核销 → 生成凭证」列为三个并列步骤）。
+    // FinBook 没有独立的应收单层，收款凭证就是那张凭证，所以 to 侧允许是草稿。
+    if !f.posted {
+        return Err(fincore::FinError::msg(
+            "被核销方必须是已记账的往来分录；未记账凭证请先记账（列表页可勾「含未记账」查看待记账往来）",
+        )
+        .into());
+    }
     // 检查超额
     let open_f = f.signed().abs() - settled_of(tx, from_entry)?;
     let open_t = t.signed().abs() - settled_of(tx, to_entry)?;
@@ -254,6 +270,12 @@ pub struct OpenEntry {
     pub debit: Money,
     pub credit: Money,
     pub settled: Money,
+    /// 所属凭证是否已记账。
+    ///
+    /// 核销 / 账龄 / 催款只认已记账（全仓 H-3 口径），所以默认查询不会返回
+    /// 未记账行，这个字段恒为 true。列表页勾了「含未记账」时才会出现 false 的行，
+    /// 用来在前端标注「仅供查看、不可核销」。
+    pub posted: bool,
 }
 
 impl OpenEntry {
@@ -286,12 +308,14 @@ impl OpenEntry {
 fn entry_of(conn: &Connection, entry_id: i64) -> DbResult<Option<OpenEntry>> {
     conn.query_row(
             "SELECT e.id, v.id, v.period, v.date, v.word, v.no, e.line, e.summary,
-                    e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
+                    e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit,
+                    v.status
              FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
              WHERE e.id=?1",
             rusqlite::params![entry_id],
             |r| {
                 let d: String = r.get(3)?;
+                let status: String = r.get(13)?;
                 Ok(OpenEntry {
                     entry_id: r.get(0)?,
                     voucher_id: r.get(1)?,
@@ -308,6 +332,7 @@ fn entry_of(conn: &Connection, entry_id: i64) -> DbResult<Option<OpenEntry>> {
                     debit: Money::parse_or_zero(&r.get::<_, String>(11)?),
                     credit: Money::parse_or_zero(&r.get::<_, String>(12)?),
                     settled: Money::ZERO,
+                    posted: status == "posted",
                 })
             },
         )
@@ -315,29 +340,53 @@ fn entry_of(conn: &Connection, entry_id: i64) -> DbResult<Option<OpenEntry>> {
         .map_err(Into::into)
 }
 
-/// 取某科目（含下级）截至某日的全部已记账往来分录，并填充已核销额
+/// 取某科目（含下级）截至某日的全部**已记账**往来分录，并填充已核销额。
 ///
-/// 口径与全仓 H-3 定案一致：**只取已记账**（`status = 'posted'`）。
-/// 早先写的是 `status != 'void'`，把草稿/已审核未记账也算成未核销往来，
-/// 于是自动核销、账龄、催款单都能对着一张还没入账的凭证做事。
+/// 口径与全仓 H-3 定案一致：**只取已记账**。早先写的是 `status != 'void'`，
+/// 把草稿/已审核未记账也算成未核销往来，于是自动核销、账龄、催款单都能对着
+/// 一张还没入账的凭证做事——那张凭证随时可删，核销记录会凭空消失。
+///
+/// 核销、账龄、催款**一律走本函数**，不要用 [`open_entries_with`] 放宽。
 pub fn open_entries(
     db: &Db,
     account: &str,
     upto: Period,
     include_all: bool,
 ) -> DbResult<Vec<OpenEntry>> {
-    let mut st = db.conn().prepare(
+    open_entries_with(db, account, upto, include_all, true)
+}
+
+/// 同 [`open_entries`]，但可显式要求**连未记账的一起返回**（`posted_only = false`）。
+///
+/// 只给往来核销**列表页的「含未记账」只读开关**用：让用户看得见待记账的往来，
+/// 避免以为数据丢了。金蝶的单据驱动模型里，未审核单据同样能在列表里看到、
+/// 只是不参与核销——这里复刻的就是那一层。返回行带 [`OpenEntry::posted`] = false，
+/// 前端据此标注「仅供查看」；核销入口（自动核销 / 手工核销）不读这个函数，
+/// 仍走 `open_entries`，所以未记账的行不可能被核销。
+pub fn open_entries_with(
+    db: &Db,
+    account: &str,
+    upto: Period,
+    include_all: bool,
+    posted_only: bool,
+) -> DbResult<Vec<OpenEntry>> {
+    // 已记账分支固定用字面量 'posted'（走索引），放宽分支才用参数
+    let status_clause = if posted_only { "= 'posted'" } else { "!= 'void'" };
+    let sql = format!(
         "SELECT e.id, v.id, v.period, v.date, v.word, v.no, e.line, e.summary,
-                e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
+                e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit,
+                v.status
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
          WHERE (e.account_code = ?1 OR e.account_code LIKE ?1||'%')
-           AND v.period <= ?2 AND v.status = 'posted'
+           AND v.period <= ?2 AND v.status {status_clause}
            AND (e.debit <> '0' OR e.credit <> '0')
-         ORDER BY v.date, v.no, e.line",
-    )?;
+         ORDER BY v.date, v.no, e.line"
+    );
+    let mut st = db.conn().prepare(&sql)?;
     let mut rows = st
         .query_map(rusqlite::params![account, upto.ymm()], |r| {
             let d: String = r.get(3)?;
+            let status: String = r.get(13)?;
             Ok(OpenEntry {
                 entry_id: r.get(0)?,
                 voucher_id: r.get(1)?,
@@ -354,6 +403,7 @@ pub fn open_entries(
                 debit: Money::parse_or_zero(&r.get::<_, String>(11)?),
                 credit: Money::parse_or_zero(&r.get::<_, String>(12)?),
                 settled: Money::ZERO,
+                posted: status == "posted",
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -508,12 +558,14 @@ fn open_entries_of(db: &Db, old: &[OpenEntry]) -> DbResult<Vec<OpenEntry>> {
     let mut out = Vec::with_capacity(old.len());
     let mut st = db.conn().prepare(
         "SELECT e.id, v.id, v.period, v.date, v.word, v.no, e.line, e.summary,
-                e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
+                e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit,
+                v.status
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id WHERE e.id=?1",
     )?;
     for id in ids {
         let mut e: OpenEntry = st.query_row(rusqlite::params![id], |r| {
             let d: String = r.get(3)?;
+            let status: String = r.get(13)?;
             Ok(OpenEntry {
                 entry_id: r.get(0)?,
                 voucher_id: r.get(1)?,
@@ -530,6 +582,7 @@ fn open_entries_of(db: &Db, old: &[OpenEntry]) -> DbResult<Vec<OpenEntry>> {
                 debit: Money::parse_or_zero(&r.get::<_, String>(11)?),
                 credit: Money::parse_or_zero(&r.get::<_, String>(12)?),
                 settled: Money::ZERO,
+                posted: status == "posted",
             })
         })?;
         e.settled = sm.get(&id).copied().unwrap_or(Money::ZERO);
@@ -1108,6 +1161,123 @@ mod tests {
         crate::vouchers::post(db, vid, "poster").unwrap();
         let entries = crate::vouchers::entries_of(db, vid).unwrap();
         (vid, entries[0].id)
+    }
+
+    /// 建一张**未记账**（草稿）的往来凭证，返回 (凭证 id, 112201 分录 id)
+    fn ar_voucher_draft(
+        db: &Db,
+        date: NaiveDate,
+        no: i32,
+        cust: &str,
+        amount: &str,
+        dir_debit: bool,
+        counterpart: &str,
+    ) -> (i64, i64) {
+        let mut v = Voucher::new(Period::from_date(date), date, "记", no);
+        let a = Money::parse(amount).unwrap();
+        let e1 = Entry {
+            debit: if dir_debit { a } else { Money::ZERO },
+            credit: if dir_debit { Money::ZERO } else { a },
+            aux: AuxRef {
+                customer: Some(cust.into()),
+                ..Default::default()
+            },
+            ..Entry::new(1, "112201", "往来")
+        };
+        let e2 = Entry {
+            debit: if dir_debit { Money::ZERO } else { a },
+            credit: if dir_debit { a } else { Money::ZERO },
+            ..Entry::new(2, counterpart, "往来")
+        };
+        v.push_entry(e1);
+        v.push_entry(e2);
+        let vid = crate::vouchers::save(db, &mut v).unwrap();
+        // 不 post —— 停在草稿
+        let entries = crate::vouchers::entries_of(db, vid).unwrap();
+        (vid, entries[0].id)
+    }
+
+    /// 「含未记账」只读开关：默认看不到草稿，开了能看到且 `posted=false`。
+    /// 对标金蝶单据驱动模型——未审核单据在列表里可见，但不参与核销。
+    #[test]
+    fn open_entries_with_can_show_drafts_readonly() {
+        let db = tmpdb("drafts");
+        let d1 = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        // 一张已记账 + 一张草稿
+        ar_voucher(&db, Period::new(2026, 1).unwrap(), d1, 1, "C01", "1000", true, "600101");
+        ar_voucher_draft(&db, d2, 2, "C01", "500", true, "600101");
+        let p = Period::new(2026, 1).unwrap();
+
+        // 默认（核销口径）：只有已记账那笔
+        let posted = open_entries(&db, "112201", p, false).unwrap();
+        assert_eq!(posted.len(), 1, "默认不应返回未记账行");
+        assert!(posted[0].posted);
+        assert_eq!(posted[0].open(), Money::parse("1000").unwrap());
+
+        // 打开开关：两笔都在，草稿那笔标 posted=false
+        let all = open_entries_with(&db, "112201", p, false, false).unwrap();
+        assert_eq!(all.len(), 2, "「含未记账」应能看到草稿行");
+        let drafts: Vec<&OpenEntry> = all.iter().filter(|e| !e.posted).collect();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].open(), Money::parse("500").unwrap());
+        assert!(all.iter().filter(|e| e.posted).count() == 1);
+    }
+
+    /// 核销的**被核销方**（from_entry）必须已记账——手工核销的 entry id 由前端传入，
+    /// 绕过了 open_entries 的 posted-only 过滤，只能靠 `settle` 自己兜住。
+    /// 拿草稿当债权去核销，那张凭证一删核销记录就没了。
+    /// 而 to 侧（收款单那张还没记账的凭证）允许是草稿——这正是金蝶的做法。
+    #[test]
+    fn settle_requires_posted_from_side() {
+        let db = tmpdb("unposted_settle");
+        let d1 = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let (_, e_ar_posted) =
+            ar_voucher(&db, Period::new(2026, 1).unwrap(), d1, 1, "C01", "1000", true, "600101");
+        // 对方用 1001（库存现金，不核算银行账户），避免 100201 要求 bank 辅助核算
+        let (_, e_cash_posted) =
+            ar_voucher(&db, Period::new(2026, 1).unwrap(), d2, 2, "C01", "600", false, "1001");
+
+        // from 侧是草稿 → 拒绝
+        let (_, e_ar_draft) = ar_voucher_draft(&db, d2, 3, "C01", "800", true, "600101");
+        let err = settle(&db, e_ar_draft, e_ar_posted, Money::parse("100").unwrap(), "u1")
+            .unwrap_err();
+        assert!(err.to_string().contains("已记账"), "草稿债权应被拒绝：{err}");
+        assert_eq!(
+            settled_of(db.conn(), e_ar_draft).unwrap(),
+            Money::ZERO,
+            "被拒后不得留下核销记录"
+        );
+
+        // to 侧是草稿（收款单凭证未记账）→ 允许，金蝶即此语义
+        let (_, e_receipt_draft) = ar_voucher_draft(&db, d2, 4, "C01", "400", false, "1001");
+        settle(
+            &db,
+            e_ar_posted,
+            e_receipt_draft,
+            Money::parse("400").unwrap(),
+            "u1",
+        )
+        .expect("已记账债权 + 未记账收款单应允许核销（对标金蝶「单据审核→核销→生成凭证」）");
+        assert_eq!(
+            settled_of(db.conn(), e_ar_posted).unwrap(),
+            Money::parse("400").unwrap()
+        );
+
+        // 两边都已记账 → 照常
+        settle(
+            &db,
+            e_ar_posted,
+            e_cash_posted,
+            Money::parse("600").unwrap(),
+            "u1",
+        )
+        .unwrap();
+        assert_eq!(
+            settled_of(db.conn(), e_ar_posted).unwrap(),
+            Money::parse("1000").unwrap()
+        );
     }
 
     #[test]

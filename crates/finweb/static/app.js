@@ -4335,6 +4335,7 @@ async function viewSettle(main) {
     <div class="toolbar">
       <label>往来科目 <input id="st-acct" value="1122" style="width:100px" /></label>
       <label>截止期间 <input id="st-upto" value="${esc(cur)}" style="width:90px" /></label>
+      <label title="核销/账龄/催款只认已记账分录（全仓 H-3 口径）。勾上可把待记账的往来一并列出查看，但它们不可核销——对标金蝶：未审核单据在列表里可见，但不参与核销。"><input type="checkbox" id="st-draft" /> 含未记账</label>
       <button class="btn" id="st-load">查询未核销</button>
       <div class="spacer"></div>
       <label>尾差 <input id="st-tol" value="0.01" style="width:60px" /></label>
@@ -4368,19 +4369,29 @@ async function viewSettle(main) {
   const upto = () => $("#st-upto", main).value.trim();
 
   function render() {
-    const totalOpen = rows.reduce((a, r) => a + (parseFloat(String(r.open).replace(/,/g, "")) || 0), 0);
-    $("#st-sum", main).innerHTML = `未核销 <b>${rows.length}</b> 笔，合计 <b>${totalOpen.toFixed(2)}</b>`;
-    $("#st-table", main).innerHTML = `<table class="grid"><thead><tr><th>日期</th><th>凭证号</th><th>往来对象</th><th>摘要</th><th>方向</th><th class="num">发生额</th><th class="num">已核销</th><th class="num">未核销</th><th>选择</th></tr></thead><tbody>${rows.length ? rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}</td><td>${esc(r.aux_key || "—")}</td><td>${esc(r.summary)}</td><td>${esc(r.dir)}</td><td class="num">${esc(r.debit === "0.00" ? r.credit : r.debit)}</td><td class="num">${esc(r.settled)}</td><td class="num">${esc(r.open)}</td><td>
-      <button class="btn sm ${selFrom === r.entry_id ? "primary" : "ghost"}" data-from="${r.entry_id}">原单</button>
-      <button class="btn sm ${selTo === r.entry_id ? "primary" : "ghost"}" data-to="${r.entry_id}">收/付</button></td></tr>`).join("") : `<tr><td colspan="9" class="muted" style="text-align:center;padding:16px">没有未核销分录</td></tr>`}</tbody></table>`;
+    // 未记账行只读：可查看、不可选为核销方（服务端 settle 也会拦，双保险）
+    const posted = rows.filter((r) => r.posted !== false);
+    const draftRows = rows.filter((r) => r.posted === false);
+    const sum = (list) => list.reduce((a, r) => a + (parseFloat(String(r.open).replace(/,/g, "")) || 0), 0);
+    let s = `未核销 <b>${posted.length}</b> 笔，合计 <b>${sum(posted).toFixed(2)}</b>`;
+    if (draftRows.length) s += `　<span class="muted">（另有 ${draftRows.length} 笔未记账，仅供查看、不可核销，合计 ${sum(draftRows).toFixed(2)}）</span>`;
+    $("#st-sum", main).innerHTML = s;
+    const rowHtml = (r) => {
+      const draft = r.posted === false;
+      return `<tr${draft ? ' style="opacity:.65"' : ""}><td>${esc(r.date)}</td><td>${esc(r.voucher_no)}${draft ? ' <span class="muted">未记账</span>' : ""}</td><td>${esc(r.aux_key || "—")}</td><td>${esc(r.summary)}</td><td>${esc(r.dir)}</td><td class="num">${esc(r.debit === "0.00" ? r.credit : r.debit)}</td><td class="num">${esc(r.settled)}</td><td class="num">${esc(r.open)}</td><td>
+      ${draft ? `<span class="muted" style="font-size:12px">待记账</span>` : `<button class="btn sm ${selFrom === r.entry_id ? "primary" : "ghost"}" data-from="${r.entry_id}">原单</button>
+      <button class="btn sm ${selTo === r.entry_id ? "primary" : "ghost"}" data-to="${r.entry_id}">收/付</button>`}</td></tr>`;
+    };
+    $("#st-table", main).innerHTML = `<table class="grid"><thead><tr><th>日期</th><th>凭证号</th><th>往来对象</th><th>摘要</th><th>方向</th><th class="num">发生额</th><th class="num">已核销</th><th class="num">未核销</th><th>选择</th></tr></thead><tbody>${rows.length ? rows.map(rowHtml).join("") : `<tr><td colspan="9" class="muted" style="text-align:center;padding:16px">没有未核销分录</td></tr>`}</tbody></table>`;
     $all("[data-from]", main).forEach((b) => b.onclick = () => { selFrom = parseInt(b.dataset.from, 10); render(); });
     $all("[data-to]", main).forEach((b) => b.onclick = () => { selTo = parseInt(b.dataset.to, 10); render(); });
   }
 
   async function load() {
     const a = acct(), u = upto();
+    const withDraft = $("#st-draft", main) && $("#st-draft", main).checked ? "&draft=1" : "";
     try {
-      const d = await api(`/settle/open?account=${encodeURIComponent(a)}&upto=${encodeURIComponent(u)}`);
+      const d = await api(`/settle/open?account=${encodeURIComponent(a)}&upto=${encodeURIComponent(u)}${withDraft}`);
       rows = d.rows || [];
       selFrom = selTo = null;
       $("#st-extra", main).innerHTML = "";
@@ -4469,6 +4480,7 @@ async function viewSettle(main) {
   if ($("#dn-reload", main)) $("#dn-reload", main).onclick = loadDunnings;
 
   $("#st-load", main).onclick = load;
+  if ($("#st-draft", main)) $("#st-draft", main).onchange = load;
   if ($("#st-auto", main)) $("#st-auto", main).onclick = async () => {
     const p = /^\d{6}$/.test(upto()) ? parseInt(upto(), 10) : 0;
     if (!(await confirmDialog(`对 ${acct()} 自动核销（等额优先，保守不勾错）？`, false))) return;

@@ -462,6 +462,12 @@ pub fn router(state: Arc<WebState>) -> Router {
             get(list_dunnings).post(create_dunning),
         )
         .route("/api/settle/dunnings/:id/status", post(dunning_status_ep))
+        // ---- 往来对账单（按期间对账 + 客户回签确认）----
+        .route(
+            "/api/settle/statements",
+            get(list_statements).post(create_statement),
+        )
+        .route("/api/settle/statements/:id/status", post(statement_status_ep))
         // ---- 账套内基础资料与系统功能（对齐桌面端 finui 补齐）----
         .route("/api/accounts", post(create_account).put(update_account))
         .route("/api/accounts/:code", delete(delete_account))
@@ -10762,6 +10768,149 @@ async fn get_settle_aging(
         "buckets": labels,
         "rows": rows,
     })))
+}
+
+// ---- 往来对账单（对标金蝶「客户对账单」：按期间出账单 + 客户回签确认）----
+
+#[derive(Deserialize)]
+struct StatementReq {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    account: String,
+    party_code: String,
+    #[serde(default)]
+    party_name: String,
+    /// 起始期间 ymm
+    from: i32,
+    /// 截止期间 ymm
+    to: i32,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct StatementStatusReq {
+    status: String,
+    /// 回签确认人（confirmed 时必填，用于留痕"谁替客户签的"）
+    #[serde(default)]
+    confirmed_by: String,
+}
+
+fn statement_json(s: &findb::statement::Statement) -> serde_json::Value {
+    json!({
+        "id": s.id,
+        "no": s.no,
+        "kind": s.kind,
+        "kind_label": s.kind_label(),
+        "account": s.account,
+        "party_code": s.party_code,
+        "party_name": s.party_name,
+        "from": period_to_str(s.period_from),
+        "to": period_to_str(s.period_to),
+        "begin_balance": s.begin_balance.fmt_money(),
+        "period_increase": s.period_increase.fmt_money(),
+        "period_decrease": s.period_decrease.fmt_money(),
+        "end_balance": s.end_balance.fmt_money(),
+        "line_count": s.line_count,
+        "status": s.status,
+        "status_label": s.status_label(),
+        "memo": s.memo,
+        "created_by": s.created_by,
+        "created_at": s.created_at,
+        "sent_at": s.sent_at,
+        "confirmed_by": s.confirmed_by,
+        "confirmed_at": s.confirmed_at,
+        "lines": s.lines.iter().map(|l| json!({
+            "date": l.date,
+            "doc_no": l.doc_no,
+            "summary": l.summary,
+            "increase": l.increase.fmt_money(),
+            "decrease": l.decrease.fmt_money(),
+            "balance": l.balance.fmt_money(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// 对账单列表（可按 kind=ar|ap 过滤）
+async fn list_statements(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let kind = q.get("kind").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let rows = findb::statement::list(&db, kind)?;
+    Ok(Json(json!({
+        "rows": rows.iter().map(statement_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// 生成对账单（服务端算期初/本期发生/期末并快照，不信前端金额）
+async fn create_statement(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<StatementReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    let from = period_checked(req.from)?;
+    let to = period_checked(req.to)?;
+    let s = findb::statement::create(
+        &db,
+        &req.kind,
+        &req.account,
+        &req.party_code,
+        &req.party_name,
+        from,
+        to,
+        &req.memo,
+        user.username(),
+    )?;
+    db.log(
+        user.username(),
+        "往来",
+        "生成对账单",
+        &format!("{} {} {}~{}", s.no, s.kind_label(), s.party_code, period_to_str(to)),
+    )?;
+    Ok(Json(statement_json(&s)))
+}
+
+/// 对账单状态流转：发出 / 客户回签确认 / 作废
+async fn statement_status_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<StatementStatusReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let db = state.db_for(&user.book_key)?;
+    // 回签确认必须留痕是谁确认的（客户签字 or 代签人），不能空着
+    let who = if req.status == "confirmed" {
+        let c = req.confirmed_by.trim();
+        if c.is_empty() {
+            return Err(AppError::bad_request("回签确认必须填写确认人"));
+        }
+        c
+    } else {
+        user.username()
+    };
+    findb::statement::set_status(&db, id, &req.status, who)?;
+    db.log(
+        user.username(),
+        "往来",
+        "对账单状态",
+        &format!(
+            "#{} → {}（确认人 {}）",
+            id,
+            findb::statement::status_label(&req.status),
+            who
+        ),
+    )?;
+    let s = findb::statement::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("对账单"))?;
+    Ok(Json(statement_json(&s)))
 }
 
 // ---- 催款单 / 对账函（应收催收闭环） ----

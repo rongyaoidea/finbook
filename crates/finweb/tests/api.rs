@@ -2808,6 +2808,182 @@ async fn settle_open_include_draft_is_readonly() {
     assert!(recs.is_empty(), "被拒的核销不得留下记录：{d}");
 }
 
+/// 往来对账单（对标金蝶「客户对账单」）：按期间出账单 → 发出 → 客户回签确认。
+///
+/// 与催款单不同：对账单走**完整流水**（含已核销），期初 + 本期增 - 减 = 期末，
+/// 且创建时快照，之后改凭证不影响已发出的单子。
+#[tokio::test]
+async fn statement_flow() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    /// 造一张 112201 应收凭证（带客户辅助核算），对方科目固定 1001 库存现金（无辅助核算）。
+    /// `dr`/`cr` 是 112201 侧的借贷方，对方科目自动取相反方向保证借贷必平。
+    async fn ar_voucher(
+        state: &Arc<WebState>,
+        sid: &str,
+        date: &str,
+        no: i32,
+        dr: &str,
+        cr: &str,
+        post_it: bool,
+    ) -> i64 {
+        let opp_dr = if dr == "0" { cr } else { "0" };
+        let opp_cr = if cr == "0" { dr } else { "0" };
+        // 期间必须与日期一致（否则被「日期与所属期间不一致」校验挡下）：YYYYMM
+        let ymm: i32 = format!("{}{}", &date[0..4], &date[5..7]).parse().unwrap();
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/vouchers",
+                sid,
+                serde_json::json!({
+                    "id": 0, "period": ymm, "date": date, "word": "记",
+                    "no": no, "attachments": 0, "memo": "对账单造数",
+                    "entries": [
+                        { "line": 1, "account_code": "112201", "summary": "应收", "debit": dr, "credit": cr,
+                          "aux": { "customer": "C01" } },
+                        { "line": 2, "account_code": "1001", "summary": "对方", "debit": opp_dr, "credit": opp_cr }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "录应收凭证：{date}");
+        let id: i64 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        if post_it {
+            let r = handlers::router(state.clone())
+                .oneshot(authed_post(
+                    &format!("/api/vouchers/{id}/post"),
+                    sid,
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "记账");
+        }
+        id
+    }
+
+    // 1 月形成 1000 欠款；1 月收 400；2 月草稿 900（不进对账单）
+    ar_voucher(&state, &sid, "2026-01-10", 1, "1000", "0", true).await;
+    ar_voucher(&state, &sid, "2026-01-20", 2, "0", "400", true).await;
+    ar_voucher(&state, &sid, "2026-02-10", 3, "900", "0", false).await;
+
+    // 无往来的客商 → 400
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/statements",
+            &sid,
+            serde_json::json!({ "kind": "ar", "account": "112201", "party_code": "NOBODY",
+                               "party_name": "", "from": 202601, "to": 202601, "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "无往来不应出对账单");
+
+    // 正常出账：期初 0 / 增 1000 / 减 400 / 期末 600
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/statements",
+            &sid,
+            serde_json::json!({ "kind": "ar", "account": "112201", "party_code": "C01",
+                               "party_name": "客户甲", "from": 202601, "to": 202601, "memo": "1月对账" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "生成对账单");
+    let s: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let sid_id = s["id"].as_i64().unwrap();
+    assert!(s["no"].as_str().unwrap().starts_with("DB202601"));
+    assert_eq!(s["status"], "draft");
+    assert_eq!(s["begin_balance"], "0.00");
+    assert_eq!(s["period_increase"], "1,000.00");
+    assert_eq!(s["period_decrease"], "400.00");
+    assert_eq!(s["end_balance"], "600.00");
+    // 草稿那笔不得进对账单
+    let lines = s["lines"].as_array().unwrap();
+    assert!(!lines.iter().any(|l| l["increase"].as_str() == Some("900.00")), "草稿不得入账：{lines:?}");
+    // 末行滚动余额 == 期末
+    assert_eq!(
+        lines.last().unwrap()["balance"].as_str(),
+        Some("600.00"),
+        "逐行滚动余额必须与期末一致"
+    );
+
+    // 状态机：草稿 → 已发出
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/statements/{sid_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "sent" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "发出对账单");
+    // 重复发出 → 400
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/statements/{sid_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "sent" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "已发出不应重复发出");
+
+    // 回签确认必须填确认人
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/statements/{sid_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "confirmed", "confirmed_by": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "回签必须填确认人");
+
+    // 正常回签
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/statements/{sid_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "confirmed", "confirmed_by": "客户王五" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "客户回签");
+    let s: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(s["status"], "confirmed");
+    assert_eq!(s["confirmed_by"], "客户王五");
+    // 已确认是终态：不能作废
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/settle/statements/{sid_id}/status"),
+            &sid,
+            serde_json::json!({ "status": "cancelled" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "已确认对账单不得作废");
+
+    // 快照语义：出账后再补一笔已记账，已发出的对账单数字不变
+    ar_voucher(&state, &sid, "2026-01-25", 4, "500", "0", true).await;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/settle/statements?kind=ar", &sid))
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let got = list["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_i64() == Some(sid_id))
+        .unwrap();
+    assert_eq!(got["end_balance"], "600.00", "已发出的对账单不得被后续业务改动");
+}
+
 /// P1：催款单/对账函——按客商快照未核销、状态流转、无欠款拒绝。
 #[tokio::test]
 async fn dunning_flow() {

@@ -24,7 +24,7 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 32;
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -676,6 +676,34 @@ CREATE TABLE IF NOT EXISTS dunning (
     detail_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_dunning_party ON dunning(kind, party_code, status);
+
+-- 往来对账单（v33：对标金蝶「客户对账单」，与催款单不同——按期间出对账单）
+-- 快照口径：创建时算好期初/本期发生/期末与明细行并落库，之后改凭证不影响已发出的对账单
+CREATE TABLE IF NOT EXISTS ar_statement (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    no            TEXT NOT NULL DEFAULT '',
+    kind          TEXT NOT NULL DEFAULT 'ar',  -- ar 应收对账单 / ap 应付对账单
+    account       TEXT NOT NULL DEFAULT '',
+    party_code    TEXT NOT NULL,
+    party_name    TEXT NOT NULL DEFAULT '',
+    period_from   INTEGER NOT NULL,
+    period_to     INTEGER NOT NULL,
+    begin_balance TEXT NOT NULL DEFAULT '0',   -- 期初余额（正=客户欠款）
+    period_debit  TEXT NOT NULL DEFAULT '0',   -- 本期增加（借方发生）
+    period_credit TEXT NOT NULL DEFAULT '0',   -- 本期减少（贷方发生）
+    end_balance   TEXT NOT NULL DEFAULT '0',   -- 期末 = 期初 + 借 - 贷
+    line_count    INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'draft', -- draft/sent/confirmed/cancelled
+    memo          TEXT NOT NULL DEFAULT '',
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT '',
+    sent_at       TEXT NOT NULL DEFAULT '',
+    confirmed_by  TEXT NOT NULL DEFAULT '',   -- 客户回签确认人
+    confirmed_at  TEXT NOT NULL DEFAULT '',
+    lines_json    TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_ar_statement_party
+    ON ar_statement(kind, party_code, period_to, status);
 
 -- 导出计划任务（v32：每日定时写 CSV 到 books_dir/exports/）
 CREATE TABLE IF NOT EXISTS export_schedule (

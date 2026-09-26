@@ -4362,6 +4362,15 @@ async function viewSettle(main) {
         ${can("voucher_new") ? `<button class="btn primary sm" id="dn-new">新建催款单</button>` : ""}
       </div>
       <div id="dn-list" class="muted" style="margin-top:8px">加载中…</div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h4 style="margin:0">往来对账单（对客户/供应商）</h4><span class="grow"></span>
+        <span class="muted" style="font-size:12px" id="stm-total"></span>
+        <button class="btn ghost sm" id="stm-reload">刷新</button>
+        ${can("voucher_new") ? `<button class="btn primary sm" id="stm-new">新建对账单</button>` : ""}
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">按期间出账单：期初 + 本期发生 = 期末，逐行带滚动余额；只取已记账分录。发出后数字锁定，客户回签确认即闭环。</div>
+      <div id="stm-list" class="muted" style="margin-top:8px">加载中…</div>
     </div>`;
   let selFrom = null, selTo = null, rows = [];
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -4478,6 +4487,88 @@ async function viewSettle(main) {
   };
   loadDunnings();
   if ($("#dn-reload", main)) $("#dn-reload", main).onclick = loadDunnings;
+
+  // ---- 往来对账单（对标金蝶「客户对账单」：期初 + 本期发生 = 期末 + 客户回签）----
+  const ymmOf = (s) => parseInt(String(s || "").replace(/-/g, ""), 10) || 0;
+  const loadStatements = async () => {
+    try {
+      const r = await api("/settle/statements");
+      const srows = r.rows || [];
+      const stMap = { draft: ["草稿", ""], sent: ["已发出", "warn"], confirmed: ["已回签", "ok"], cancelled: ["已作废", ""] };
+      const pending = srows.filter((s) => s.status === "sent").length;
+      $("#stm-total").textContent = srows.length ? `共 ${srows.length} 张${pending ? `，${pending} 张待回签` : ""}` : "";
+      $("#stm-list").innerHTML = srows.length
+        ? `<table class="grid"><thead><tr><th>单号</th><th>类型</th><th>客商</th><th>期间</th><th class="num">期初</th><th class="num">本期增</th><th class="num">本期减</th><th class="num">期末</th><th>状态</th><th>明细</th><th></th></tr></thead><tbody>${srows.map((s) => {
+            const st = stMap[s.status] || [s.status, ""];
+            const acts = can("voucher_new") ? [
+              s.status === "draft" ? `<button class="btn ghost sm" data-stm-st="${s.id}" data-to="sent">发出</button>` : "",
+              s.status === "sent" ? `<button class="btn ghost sm" data-stm-st="${s.id}" data-to="confirmed">客户回签</button>` : "",
+              (s.status === "draft" || s.status === "sent") ? `<button class="btn ghost sm" data-stm-st="${s.id}" data-to="cancelled">作废</button>` : "",
+            ].filter(Boolean).join(" ") : "";
+            return `<tr><td>${esc(s.no)}</td><td>${s.kind === "ar" ? '<span class="tag">应收</span>' : '<span class="tag warn">应付</span>'}</td>
+              <td>${esc(s.party_code)} ${esc(s.party_name || "")}</td>
+              <td class="muted">${esc(s.from)} ~ ${esc(s.to)}</td>
+              <td class="num">${fmt(s.begin_balance)}</td><td class="num">${fmt(s.period_increase)}</td><td class="num">${fmt(s.period_decrease)}</td>
+              <td class="num"><b>${fmt(s.end_balance)}</b></td>
+              <td><span class="tag ${st[1]}">${st[0]}</span></td>
+              <td><button class="btn ghost sm" data-stm-detail="${s.id}">查看</button></td><td class="row-actions">${acts}</td></tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">暂无对账单（点「新建对账单」按客商 + 期间生成）</div>`;
+      window._stmCache = srows;
+      $all("[data-stm-st]", main).forEach((b) => b.onclick = async () => {
+        const to = b.dataset.to;
+        let body = { status: to };
+        if (to === "confirmed") {
+          const who = prompt("回签确认人（客户签字人或代签人）", "");
+          if (who === null) return;
+          if (!who.trim()) { toast("回签确认必须填写确认人", "err"); return; }
+          body.confirmed_by = who.trim();
+        }
+        try { await post(`/settle/statements/${b.dataset.stmSt}/status`, body); toast("状态已更新", "ok"); loadStatements(); }
+        catch (e) { toast(e.message, "err"); }
+      });
+      $all("[data-stm-detail]", main).forEach((b) => b.onclick = () => {
+        const s = (window._stmCache || []).find((x) => x.id === parseInt(b.dataset.stmDetail, 10));
+        if (s) openStatementDetail(s);
+      });
+    } catch (e) { $("#stm-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  function openStatementDetail(s) {
+    const m = modal(`<h3>${esc(s.no)} · ${esc(s.kind_label)} <span class="muted" style="font-size:12px">${esc(s.party_code)} ${esc(s.party_name || "")} · ${esc(s.from)} ~ ${esc(s.to)}</span></h3>
+      <table class="grid" id="stm-table"><thead><tr><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">本期增</th><th class="num">本期减</th><th class="num">余额</th></tr></thead><tbody>
+      ${(s.lines || []).map((l) => `<tr><td>${esc(l.date)}</td><td>${esc(l.doc_no)}</td><td>${esc(l.summary)}</td><td class="num">${fmt(l.increase)}</td><td class="num">${fmt(l.decrease)}</td><td class="num">${fmt(l.balance)}</td></tr>`).join("")}
+      <tr><td colspan="3"><b>本期合计</b></td><td class="num"><b>${fmt(s.period_increase)}</b></td><td class="num"><b>${fmt(s.period_decrease)}</b></td><td class="num"><b>${fmt(s.end_balance)}</b></td></tr>
+      </tbody></table>
+      <div class="muted" style="font-size:12px;margin-top:6px">期初 ${fmt(s.begin_balance)}　制单 ${esc(s.created_by || "")}　${s.confirmed_by ? `回签确认 ${esc(s.confirmed_by)}` : ""}${s.memo ? `　${esc(s.memo)}` : ""}</div>
+      <div class="foot"><button class="btn ghost" id="stm-print">打印预览</button><button class="btn ghost" id="stm-close">关闭</button></div>`);
+    $("#stm-close", m).onclick = closeModal;
+    $("#stm-print", m).onclick = () => printPreview(`往来对账单 ${s.no}`, $("#stm-table", m));
+  }
+  if ($("#stm-new", main)) $("#stm-new").onclick = async () => {
+    const kind = prompt("类型：ar=应收对账单 / ap=应付对账单", "ar");
+    if (kind === null) return;
+    if (!["ar", "ap"].includes(kind.trim())) { toast("类型只能是 ar 或 ap", "err"); return; }
+    const party = prompt("客商编码（如 C01）", "");
+    if (party === null) return;
+    if (!party.trim()) { toast("客商编码不能为空", "err"); return; }
+    const pname = prompt("客商名称（可留空）", "");
+    if (pname === null) return;
+    const from = prompt("起始期间（YYYY-MM）", upto().slice(0, 7));
+    if (from === null) return;
+    const to = prompt("截止期间（YYYY-MM）", upto().slice(0, 7));
+    if (to === null) return;
+    if (!ymmOf(from) || !ymmOf(to)) { toast("期间格式应为 YYYY-MM", "err"); return; }
+    try {
+      const r = await post("/settle/statements", {
+        kind: kind.trim(), account: acct(), party_code: party.trim(), party_name: (pname || "").trim(),
+        from: ymmOf(from), to: ymmOf(to), memo: "",
+      });
+      toast(`已生成 ${r.no}，期末余额 ${fmt(r.end_balance)}`, "ok");
+      loadStatements();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  loadStatements();
+  if ($("#stm-reload", main)) $("#stm-reload", main).onclick = loadStatements;
 
   $("#st-load", main).onclick = load;
   if ($("#st-draft", main)) $("#st-draft", main).onchange = load;

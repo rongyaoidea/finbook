@@ -37,6 +37,7 @@ pub mod sales;
 pub mod schema;
 pub mod summaries;
 pub mod settle;
+pub mod statement;
 pub mod receipt;
 pub mod template;
 pub mod scm;

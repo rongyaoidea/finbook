@@ -166,10 +166,18 @@ pub fn full_name_map(db: &Db) -> DbResult<BTreeMap<String, String>> {
 }
 
 /// 档案被凭证引用的次数
+///
+/// 两侧补 `\x1f` 分隔符做**整段**匹配：`%customer=C001%` 会把
+/// `customer=C0011` 的引用也算进来，导致 C001 明明没被引用却删不掉。
 pub fn usage(db: &Db, kind: AuxKind, code: &str) -> DbResult<i64> {
-    let pattern = format!("%{}={}%", kind.code(), crate::escape_like(code));
+    let pattern = format!(
+        "%\u{1f}{}={}\u{1f}%",
+        kind.code(),
+        crate::escape_like(code)
+    );
     let c: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM voucher_entry WHERE aux_key LIKE ?1 ESCAPE '\\'",
+        "SELECT COUNT(*) FROM voucher_entry
+         WHERE (char(31) || aux_key || char(31)) LIKE ?1 ESCAPE '\\'",
         rusqlite::params![pattern],
         |r| r.get(0),
     )?;
@@ -254,6 +262,48 @@ mod tests {
 
         delete(&db, id).unwrap();
         assert!(get(&db, AuxKind::Customer, "C001").unwrap().is_none());
+    }
+
+    /// 引用计数必须按 `kind=code` **整段**匹配。
+    /// 回归：旧的 `%customer=C001%` 会把 `customer=C0011` 的引用也算进来，
+    /// 于是 C001 明明没有任何凭证引用，却因"被引用"而删不掉。
+    #[test]
+    fn usage_counts_exact_code_only() {
+        use fincore::{AuxRef, Entry, Money, Period, Voucher};
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        let mk = |cust: &str, no: i32| {
+            let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+            let mut v = Voucher::new(p, d, "记", no);
+            v.prepared_by = "张三".to_string();
+            v.push_entry(Entry {
+                debit: Money::parse("100").unwrap(),
+                aux: AuxRef {
+                    customer: Some(cust.into()),
+                    ..Default::default()
+                },
+                ..Entry::new(1, "112201", "应收货款")
+            });
+            v.push_entry(Entry {
+                credit: Money::parse("100").unwrap(),
+                ..Entry::new(2, "600101", "产品销售收入")
+            });
+            crate::vouchers::save(&db, &mut v).unwrap();
+        };
+        mk("C0011", 1);
+        mk("C0011", 2);
+        mk("ACME", 3);
+
+        assert_eq!(
+            usage(&db, AuxKind::Customer, "C001").unwrap(),
+            0,
+            "C001 未被引用，前缀相近的 C0011 / ACME 不得计入"
+        );
+        assert_eq!(usage(&db, AuxKind::Customer, "C0011").unwrap(), 2);
+        assert_eq!(usage(&db, AuxKind::Customer, "ACME").unwrap(), 1);
+        assert_eq!(usage(&db, AuxKind::Customer, "AC").unwrap(), 0);
+        assert_eq!(usage(&db, AuxKind::Supplier, "C0011").unwrap(), 0, "维度不同不算");
     }
 
     #[test]

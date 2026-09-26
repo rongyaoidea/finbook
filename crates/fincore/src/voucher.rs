@@ -186,14 +186,39 @@ impl AuxRef {
     }
     /// 稳定分组键，用于按"科目 + 辅助核算"聚合余额（不含现金流量项目）
     pub fn key(&self) -> String {
+        self.key_parts().join("\u{1f}")
+    }
+    /// 分组键的各个 `kind=value` 片段（[`AuxRef::key`] 的组成部分）。
+    ///
+    /// 持久层按辅助核算过滤时必须逐片段做**整段匹配**，不能拿 `key()` 整体做
+    /// 子串 `LIKE`——否则 `customer=C001` 会连带命中 `customer=C0011`。
+    pub fn key_parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
         for k in AuxKind::BALANCE_DIMS {
             if let Some(v) = self.get(*k) {
                 parts.push(format!("{}={}", k.code(), v));
             }
         }
-        parts.join("\u{1f}")
+        parts
     }
+
+    /// 分组键的包含判断：`key` 是否含有 `want` 的**全部** `kind=value` 片段。
+    ///
+    /// 片段按 `\u{1f}` 切开做**整段**比较（`Vec::contains`），因此
+    /// `customer=C001` 不会命中 `customer=C0011`。`want` 为空表示不限制。
+    ///
+    /// 这是"按辅助核算过滤分组键"的唯一口径：既不能拿整条 key 做子串 `LIKE`
+    /// （会带出前缀相近的其他客商），也不能要求整条 key 完全相等
+    /// （`customer=C001` 过滤就找不到 `customer=C001\x1fdept=D01` 的分录，
+    /// 会让自动核销与账龄静默漏掉带多个辅助维度的往来）。
+    pub fn key_contains(key: &str, want: &str) -> bool {
+        if want.is_empty() {
+            return true;
+        }
+        let have: Vec<&str> = key.split('\u{1f}').collect();
+        want.split('\u{1f}').all(|p| have.contains(&p))
+    }
+
     /// [`AuxRef::key`] 的逆运算，把分组键还原成 AuxRef
     ///
     /// 无法识别的维度直接忽略——分组键可能来自旧版本，宁可少还原也不要崩。
@@ -507,6 +532,32 @@ mod tests {
         big.entries[0].debit = Money::parse("100.01").unwrap();
         big.entries[1].credit = Money::parse("100.02").unwrap();
         assert!(!big.balanced());
+    }
+
+    #[test]
+    fn aux_key_contains_exact_segments() {
+        let sep = "\u{1f}";
+        let two = &format!("customer=C001{sep}dept=D01");
+        // 单维度过滤应命中多维度键
+        assert!(AuxRef::key_contains(two, "customer=C001"));
+        assert!(AuxRef::key_contains(two, "dept=D01"));
+        assert!(AuxRef::key_contains(two, two), "整条相等也应命中");
+        // 组合过滤：两个片段都要在
+        assert!(AuxRef::key_contains(two, &format!("customer=C001{sep}dept=D01")));
+        // 顺序无关
+        assert!(AuxRef::key_contains(two, &format!("dept=D01{sep}customer=C001")));
+        // 前缀不得命中
+        assert!(!AuxRef::key_contains("customer=C0011", "customer=C001"));
+        assert!(!AuxRef::key_contains(two, "customer=C0012"));
+        // 片段级前缀也不得命中
+        assert!(!AuxRef::key_contains(two, "dept=D0"));
+        // 缺一个片段就不算命中
+        assert!(!AuxRef::key_contains(two, &format!("customer=C001{sep}dept=D02")));
+        // 空 want = 不限制
+        assert!(AuxRef::key_contains(two, ""));
+        assert!(AuxRef::key_contains("", ""));
+        // 非该维度不算
+        assert!(!AuxRef::key_contains(two, "supplier=C001"));
     }
 
     #[test]

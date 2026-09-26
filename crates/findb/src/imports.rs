@@ -61,6 +61,8 @@ struct BeginLine {
     debit_accum: Option<Money>,
     /// 累计贷方
     credit_accum: Option<Money>,
+    /// 金额列无法识别的提示；非空表示本行金额不可信，调用方应丢弃该行
+    warn: Vec<String>,
 }
 
 /// 凭证行：统一提取后的标准化行
@@ -74,6 +76,8 @@ struct VoucherLine {
     credit: Money,
     /// 辅助核算（客户/银行等，CSV 里按列约定提取）
     aux: fincore::AuxRef,
+    /// 金额列无法识别的提示；非空表示本行金额不可信，调用方应丢弃该行
+    warn: Vec<String>,
 }
 
 /// 按模板从 CSV 行提取期初余额行
@@ -82,53 +86,63 @@ fn extract_begin_line(tmpl: ImportTemplate, f: &[String]) -> Option<BeginLine> {
     if code.is_empty() || !code.chars().any(|c| c.is_ascii_digit()) {
         return None;
     }
-    match tmpl {
+    let mut w = MoneyWarn::default();
+    let mut line = match tmpl {
         ImportTemplate::Generic => {
             // 科目编码, 方向, 金额
             if f.len() < 2 {
                 return None;
             }
-            let amt = parse_money(f.get(2).unwrap_or(&String::new()));
-            Some(BeginLine {
+            let amt = w.money("期初余额", f.get(2).map(|s| s.as_str()).unwrap_or(""));
+            BeginLine {
                 code,
                 direction: f.get(1).unwrap_or(&String::new()).trim().to_string(),
                 amount: amt,
                 debit_accum: None,
                 credit_accum: None,
-            })
+                warn: Vec::new(),
+            }
         }
         ImportTemplate::Kingdee => {
             // 科目编码, 科目名称, 方向, 期初余额, 累计借方, 累计贷方
             if f.len() < 4 {
                 return None;
             }
-            let amt = parse_money(f.get(3).unwrap_or(&String::new()));
-            Some(BeginLine {
+            let amt = w.money("期初余额", f.get(3).map(|s| s.as_str()).unwrap_or(""));
+            let debit_accum = f.get(4).map(|s| w.money("累计借方", s));
+            let credit_accum = f.get(5).map(|s| w.money("累计贷方", s));
+            BeginLine {
                 code,
                 direction: f.get(2).unwrap_or(&String::new()).trim().to_string(),
                 amount: amt,
-                debit_accum: f.get(4).map(|s| parse_money(s)),
-                credit_accum: f.get(5).map(|s| parse_money(s)),
-            })
+                debit_accum,
+                credit_accum,
+                warn: Vec::new(),
+            }
         }
         ImportTemplate::Yonyou => {
             // 科目编码, 科目名称, 期初借方, 期初贷方, 累计借方, 累计贷方
             if f.len() < 4 {
                 return None;
             }
-            let d = parse_money(f.get(2).unwrap_or(&String::new()));
-            let c = parse_money(f.get(3).unwrap_or(&String::new()));
+            let d = w.money("期初借方", f.get(2).map(|s| s.as_str()).unwrap_or(""));
+            let c = w.money("期初贷方", f.get(3).map(|s| s.as_str()).unwrap_or(""));
+            let debit_accum = f.get(4).map(|s| w.money("累计借方", s));
+            let credit_accum = f.get(5).map(|s| w.money("累计贷方", s));
             let dir = if d > Money::ZERO { "借" } else { "贷" };
             let amt = if d > Money::ZERO { d } else { c };
-            Some(BeginLine {
+            BeginLine {
                 code,
                 direction: dir.to_string(),
                 amount: amt,
-                debit_accum: f.get(4).map(|s| parse_money(s)),
-                credit_accum: f.get(5).map(|s| parse_money(s)),
-            })
+                debit_accum,
+                credit_accum,
+                warn: Vec::new(),
+            }
         }
-    }
+    };
+    line.warn = std::mem::take(&mut w.0);
+    Some(line)
 }
 
 /// 取 CSV 第 `i` 列（0 起），空串返回 None
@@ -143,53 +157,65 @@ fn extract_voucher_line(tmpl: ImportTemplate, f: &[String]) -> Option<VoucherLin
     }
     let date = parse_date(&f[0])?;
     let mut aux = fincore::AuxRef::default();
-    match tmpl {
+    let mut w = MoneyWarn::default();
+    let mut line = match tmpl {
         ImportTemplate::Generic => {
             // 日期, 凭证字, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]
             aux.customer = opt_field(f, 6);
             aux.bank = opt_field(f, 7);
-            Some(VoucherLine {
+            let debit = w.money("借方", f.get(4).map(|s| s.as_str()).unwrap_or(""));
+            let credit = w.money("贷方", f.get(5).map(|s| s.as_str()).unwrap_or(""));
+            VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
                 no: None,
                 summary: f.get(2).unwrap_or(&String::new()).trim().to_string(),
                 code: f.get(3).unwrap_or(&String::new()).trim().to_string(),
-                debit: parse_money(f.get(4).unwrap_or(&String::new())),
-                credit: parse_money(f.get(5).unwrap_or(&String::new())),
+                debit,
+                credit,
                 aux,
-            })
+                warn: Vec::new(),
+            }
         }
         ImportTemplate::Kingdee => {
             // 日期, 凭证字, 凭证号, 摘要, 科目编码, 科目名称, 借方, 贷方[, 客户, 银行]
             aux.customer = opt_field(f, 8);
             aux.bank = opt_field(f, 9);
-            Some(VoucherLine {
+            let debit = w.money("借方", f.get(6).map(|s| s.as_str()).unwrap_or(""));
+            let credit = w.money("贷方", f.get(7).map(|s| s.as_str()).unwrap_or(""));
+            VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
                 no: f.get(2).and_then(|s| s.trim().parse().ok()),
                 summary: f.get(3).unwrap_or(&String::new()).trim().to_string(),
                 code: f.get(4).unwrap_or(&String::new()).trim().to_string(),
-                debit: parse_money(f.get(6).unwrap_or(&String::new())),
-                credit: parse_money(f.get(7).unwrap_or(&String::new())),
+                debit,
+                credit,
                 aux,
-            })
+                warn: Vec::new(),
+            }
         }
         ImportTemplate::Yonyou => {
             // 日期, 凭证字号, 摘要, 科目编码, 借方, 贷方[, 客户, 银行]
             aux.customer = opt_field(f, 6);
             aux.bank = opt_field(f, 7);
-            Some(VoucherLine {
+            let debit = w.money("借方", f.get(4).map(|s| s.as_str()).unwrap_or(""));
+            let credit = w.money("贷方", f.get(5).map(|s| s.as_str()).unwrap_or(""));
+            VoucherLine {
                 date,
                 word: f.get(1).unwrap_or(&String::new()).trim().to_string(),
                 no: None,
                 summary: f.get(2).unwrap_or(&String::new()).trim().to_string(),
                 code: f.get(3).unwrap_or(&String::new()).trim().to_string(),
-                debit: parse_money(f.get(4).unwrap_or(&String::new())),
-                credit: parse_money(f.get(5).unwrap_or(&String::new())),
+                debit,
+                credit,
                 aux,
-            })
+                warn: Vec::new(),
+            }
         }
-    }
+    };
+    line.warn = std::mem::take(&mut w.0);
+    Some(line)
 }
 
 /// 读取 Excel 文件（.xlsx/.xls/.ods）第一个 sheet，返回所有行（每行是单元格列表）
@@ -319,7 +345,21 @@ pub fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
+/// 宽松金额解析：无法识别时按 0 处理（调用方自行决定是否可接受）。
+///
+/// 导入的金额列一律走 [`parse_money_strict`]——静默归零的金额比报错更难查；
+/// 这里保留宽松版给不需要报错、只要个数的场景。
+#[allow(dead_code)]
 fn parse_money(s: &str) -> Money {
+    parse_money_strict(s).unwrap_or(Money::ZERO)
+}
+
+/// 严格金额解析：无法识别时返回原因，交由调用方上报警告。
+///
+/// 括号是会计惯例里的负数：`(1234.56)` = -1234.56（金蝶/用友导出的红字就长这样）。
+/// 以前直接把 `(` `)` 连同其它非数字字符一起过滤掉，`(1234.56)` 变成了 **+1234.56**，
+/// 导入期初/凭证时方向整个反过来；此处与 `bank::parse_money` 的括号口径保持一致。
+fn parse_money_strict(s: &str) -> Result<Money, String> {
     // 先规范化 Unicode 字符：全角数字、Unicode 负号（U+2212）、全角括号等
     let normalized: String = s
         .chars()
@@ -332,12 +372,43 @@ fn parse_money(s: &str) -> Money {
             _ => c,
         })
         .collect();
+    let t = normalized.trim();
+    // 括号负数：先剥括号再取反（过滤字符会把括号直接吃掉，负号就丢了）
+    let (inner, neg) = match (t.starts_with('('), t.ends_with(')')) {
+        (true, true) => (&t[1..t.len() - 1], true),
+        _ => (t, false),
+    };
     // 去掉千分位逗号与货币符号，兼容 "1,234.56" / "¥1,234.56" / "−100"
-    let cleaned: String = normalized
+    let cleaned: String = inner
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
         .collect();
-    Money::parse(&cleaned).unwrap_or(Money::ZERO)
+    if cleaned.is_empty() {
+        if t.is_empty() {
+            return Ok(Money::ZERO);
+        }
+        return Err("金额格式不正确".to_string());
+    }
+    let v = Money::parse(&cleaned).map_err(|_| "金额格式不正确".to_string())?;
+    Ok(if neg { v.negated() } else { v })
+}
+
+/// 金额列解析的失败收集器：把"无法识别"的金额攒起来，随 `ImportResult.warnings` 上报，
+/// 而不是静默按 0 记账（期初按 0 记会让余额表凭空少一笔钱）。
+#[derive(Default)]
+struct MoneyWarn(Vec<String>);
+
+impl MoneyWarn {
+    /// 空串按 0；无法识别时记一条警告并返回 0（调用方见 `warn` 非空即丢行）
+    fn money(&mut self, label: &str, s: &str) -> Money {
+        match parse_money_strict(s) {
+            Ok(v) => v,
+            Err(e) => {
+                self.0.push(format!("{label}「{s}」{e}"));
+                Money::ZERO
+            }
+        }
+    }
 }
 
 fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
@@ -924,6 +995,14 @@ fn import_begin_rows(
         let Some(line) = extract_begin_line(tmpl, f) else {
             continue; // 表头 / 说明行
         };
+        if !line.warn.is_empty() {
+            // 金额无法识别：宁可丢行也不能按 0 记期初（余额表凭空少一笔钱最难查）
+            for w in line.warn {
+                res.warnings.push(format!("第 {} 行：{w}", i + 1));
+            }
+            res.skipped += 1;
+            continue;
+        }
         // 源科目 → 目标科目（用户映射）
         let src_code = line.code.clone();
         let code = apply_mapping(&src_code, mapping);
@@ -1011,6 +1090,27 @@ pub fn import_vouchers_bytes(
     import_vouchers_rows(db, period, &rows, who, mapping, tmpl)
 }
 
+/// 在调用方事务内保存一张凭证，失败时**整张回滚**。
+///
+/// `vouchers::save_in` 是「先插表头、再逐条插分录」，分录写到一半报错（例如某行
+/// 触发了 SQLite 约束）时表头已经留在调用方的事务里；导入循环只是记一条警告就
+/// 继续，最后 `commit()` 把这些**没通过任何校验的半张凭证**一起提交进账套。
+/// SAVEPOINT 把每张凭证圈成独立保存点，失败只回滚这一张。
+fn save_voucher_in_tx(tx: &rusqlite::Transaction, v: &mut Voucher) -> DbResult<i64> {
+    tx.execute("SAVEPOINT one_voucher", [])?;
+    match vouchers::save_in(tx, v) {
+        Ok(id) => {
+            tx.execute("RELEASE one_voucher", [])?;
+            Ok(id)
+        }
+        Err(e) => {
+            tx.execute("ROLLBACK TO one_voucher", [])?;
+            tx.execute("RELEASE one_voucher", [])?;
+            Err(e)
+        }
+    }
+}
+
 /// 导入凭证核心：按模板解析每一行（文本与 Excel 共用）
 fn import_vouchers_rows(
     db: &Db,
@@ -1045,7 +1145,7 @@ fn import_vouchers_rows(
                 res.skipped += 1;
                 return Ok(());
             }
-            match vouchers::save_in(&tx, &mut v) {
+            match save_voucher_in_tx(&tx, &mut v) {
                 Ok(_) => res.ok += 1,
                 Err(e) => {
                     res.warnings.push(format!("凭证 {} 导入失败：{e}", v.voucher_no()));
@@ -1057,10 +1157,18 @@ fn import_vouchers_rows(
         Ok(())
     };
 
-    for f in rows.iter() {
+    for (i, f) in rows.iter().enumerate() {
         let Some(line) = extract_voucher_line(tmpl, f) else {
             continue; // 表头 / 说明行
         };
+        if !line.warn.is_empty() {
+            // 金额无法识别：丢掉该分录（整张凭证随后会因借贷不平衡被跳过），
+            // 绝不按 0 写——半张凭证会静默进入账套
+            for w in line.warn {
+                res.warnings.push(format!("第 {} 行：{w}", i + 1));
+            }
+            continue;
+        }
         let date = line.date;
         // 同一（日期 + 凭证号）内共一张凭证：金蝶模板带凭证号，同日期多张凭证号应分开；
         // 通用/用友没有凭证号，靠"上一张已借贷平衡"识别同一天多张凭证的边界，
@@ -1340,5 +1448,163 @@ mod tests {
         assert_eq!(parse_money("－１２．３０"), Money::parse("-12.30").unwrap());
         // 全角字母不应变成数字（旧的 0xFFEE 偏移会把 Ａ 映射成 3）
         assert_eq!(parse_money("ＡＢＣ"), Money::ZERO);
+    }
+
+    /// 回归：`(1234.56)` 是会计惯例的**负数**。旧的 `parse_money` 把 `(` `)` 当
+    /// 无效字符过滤掉，`(1234.56)` 变成 +1234.56，导入期初/凭证时方向整个反过来。
+    #[test]
+    fn parse_money_parenthesised_is_negative() {
+        assert_eq!(
+            parse_money("(1234.56)"),
+            Money::parse("-1234.56").unwrap(),
+            "半角括号应解析为负数"
+        );
+        assert_eq!(
+            parse_money("（1234.56）"),
+            Money::parse("-1234.56").unwrap(),
+            "全角括号应解析为负数"
+        );
+        assert_eq!(parse_money("( 1,234.56 )"), Money::parse("-1234.56").unwrap());
+        assert_eq!(parse_money("(0)"), Money::ZERO, "红字 0 不应变成 -0 影响比较");
+        // 括号未闭合时不做取反，按原样过滤
+        assert_eq!(parse_money("(1234.56"), Money::parse("1234.56").unwrap());
+    }
+
+    /// 回归：方向列留空/无法识别时，方向靠金额正负推断，红字括号必须推成**贷方**。
+    ///
+    /// 旧的 `parse_money` 把 `(2000)` 过滤成 +2000，`parse_direction` 判成借方，
+    /// `import_begin_rows` 再 `abs()` 落成正 2000 —— 借贷整个反了。
+    #[test]
+    fn import_begin_paren_amount_keeps_credit_direction() {
+        let db = mem();
+        // 通用模板：方向列留空 → 方向由金额正负推断
+        let csv = "\u{feff}科目,方向,金额\n100201,,(2000)\n";
+        let res = import_begin(
+            &db,
+            csv,
+            "u1",
+            &std::collections::HashMap::new(),
+            ImportTemplate::Generic,
+        )
+        .unwrap();
+        assert_eq!(res.ok, 1, "应导入 1 条：{:?}", res.warnings);
+        let rows = balances::list_begin(&db).unwrap();
+        let bank = rows.iter().find(|r| r.account_code == "100201").unwrap();
+        assert_eq!(
+            bank.year_begin,
+            Money::parse("-2000").unwrap(),
+            "红字括号应落成贷方期初，回归前会记成 +2000（借方）"
+        );
+
+        // 金蝶模板：方向列写了无法识别的词（导出软件常写成"红字"之类）同样按金额正负推
+        let db2 = mem();
+        let csv2 = "\u{feff}科目编码,科目名称,方向,期初余额,累计借方,累计贷方\n\
+                    100201,银行存款-工行,红字,(2000),0,0\n";
+        let res2 = import_begin(
+            &db2,
+            csv2,
+            "u1",
+            &std::collections::HashMap::new(),
+            ImportTemplate::Kingdee,
+        )
+        .unwrap();
+        assert_eq!(res2.ok, 1, "应导入 1 条：{:?}", res2.warnings);
+        let rows2 = balances::list_begin(&db2).unwrap();
+        let bank2 = rows2.iter().find(|r| r.account_code == "100201").unwrap();
+        assert_eq!(bank2.year_begin, Money::parse("-2000").unwrap());
+    }
+
+    /// 回归：金额列无法识别必须丢行 + 报警告，而不是静默按 0 记账。
+    #[test]
+    fn import_begin_bad_amount_warns_and_skips_row() {
+        let db = mem();
+        let csv = "\u{feff}科目,方向,金额\n1001,借,待定\n100201,借,2000\n";
+        let res = import_begin(
+            &db,
+            csv,
+            "u1",
+            &std::collections::HashMap::new(),
+            ImportTemplate::Generic,
+        )
+        .unwrap();
+        assert_eq!(res.ok, 1, "只应导入金额正常的一行：{:?}", res.warnings);
+        assert_eq!(res.skipped, 1);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("待定")),
+            "应报出无法识别的金额：{:?}",
+            res.warnings
+        );
+        let rows = balances::list_begin(&db).unwrap();
+        assert_eq!(rows.len(), 1, "坏行不应落库：{:?}", rows);
+        assert!(rows.iter().all(|r| r.account_code != "1001"));
+    }
+
+    /// 回归：一张凭证在写分录中途失败时，不能留下"表头 + 半张分录"。
+    ///
+    /// `vouchers::save_in` 先插表头再逐条插分录；导入循环此前只是记一条警告就继续，
+    /// 末尾的 `commit()` 会把没通过任何校验的半张凭证一起提交进账套。
+    /// 回归用一条唯一索引制造"分录写到一半必失败"的局面（同一张凭证里两条同科目分录）。
+    #[test]
+    fn import_vouchers_mid_failure_leaves_no_partial_voucher() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE UNIQUE INDEX ux_test_entry ON voucher_entry(voucher_id, account_code)",
+            )
+            .unwrap();
+        // 第 1 张（两科目）正常；第 2 张两条同科目分录 → 第二条必触发唯一约束
+        let csv = "\u{feff}日期,凭证字,摘要,科目,借方,贷方\n\
+                  2026-01-05,记,收货款,100201,0,1000\n\
+                  2026-01-05,记,收货款,600101,1000,0\n\
+                  2026-01-06,记,冲销,1001,0,500\n\
+                  2026-01-06,记,冲销,1001,500,0\n";
+        let res = import_vouchers(
+            &db,
+            p,
+            csv,
+            "u1",
+            &std::collections::HashMap::new(),
+            ImportTemplate::Generic,
+        )
+        .unwrap();
+        assert_eq!(res.ok, 1, "只有第一张应成功：{:?}", res.warnings);
+        assert_eq!(res.skipped, 1, "失败的第二张应计跳过：{:?}", res.warnings);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("导入失败")),
+            "应记录失败原因：{:?}",
+            res.warnings
+        );
+        let cnt = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(cnt("SELECT COUNT(*) FROM voucher"), 1, "失败凭证的表头不应留下");
+        assert_eq!(
+            cnt("SELECT COUNT(*) FROM voucher_entry"),
+            2,
+            "只应留下第一张的 2 条分录（半张凭证已落库）"
+        );
+        // 逐张核对借贷合计，确保账上没有任何不平衡的凭证
+        let mut st = db
+            .conn()
+            .prepare("SELECT voucher_id, debit, credit FROM voucher_entry ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(st);
+        for id in rows.iter().map(|(id, _, _)| *id).collect::<std::collections::BTreeSet<_>>() {
+            let d: Money = rows
+                .iter()
+                .filter(|(i, _, _)| *i == id)
+                .map(|(_, d, _)| Money::parse_or_zero(d))
+                .sum();
+            let c: Money = rows
+                .iter()
+                .filter(|(i, _, _)| *i == id)
+                .map(|(_, _, c)| Money::parse_or_zero(c))
+                .sum();
+            assert_eq!(d, c, "凭证 #{id} 借贷不平衡（半张凭证落库）");
+        }
     }
 }

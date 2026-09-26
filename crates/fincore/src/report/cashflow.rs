@@ -183,12 +183,16 @@ pub fn build_cash_flow(
     unassigned: Money,
 ) -> CashFlowStatement {
     let mut groups: HashMap<CashFlowGroup, Vec<CashFlowLine>> = HashMap::new();
+    // 停用项目的金额并没有消失——现金照样动了。累加到 unassigned 里，
+    // 否则 net_increase 会凭空少一块，`ties()` 永远为假、报表与货币资金对不上。
+    let mut disabled_net = Money::ZERO;
 
     for it in items {
+        let (dr, cr) = amounts.get(&it.code).copied().unwrap_or((Money::ZERO, Money::ZERO));
         if it.disabled {
+            disabled_net += dr - cr;
             continue;
         }
-        let (dr, cr) = amounts.get(&it.code).copied().unwrap_or((Money::ZERO, Money::ZERO));
         // 保留红字冲回的符号（流入项目出现净流出时为负数），不能用零截断：
         // 截断会让表内净额与货币资金实际变动对不上，红字冲回被凭空抹掉。
         let (inflow, outflow) = match it.dir {
@@ -213,6 +217,9 @@ pub fn build_cash_flow(
     let operating_net = sum_net(&operating);
     let investing_net = sum_net(&investing);
     let financing_net = sum_net(&financing);
+
+    // 未归集 = 凭证上没标现金流量项目的 + 标了但项目被停用的
+    let unassigned = unassigned + disabled_net;
 
     CashFlowStatement {
         operating,
@@ -268,5 +275,36 @@ mod tests {
         );
         assert_eq!(stmt.unassigned, Money::parse("-500").unwrap());
         assert!(stmt.ties());
+    }
+
+    /// 停用某个现金流量项目不得让报表与货币资金脱钩。
+    /// 回归：早先 `if it.disabled { continue }` 直接丢弃该项目下的金额——
+    /// 既不进任何行也不进 unassigned，于是 `net_increase` 少一块、`ties()` 永远为假。
+    #[test]
+    fn disabled_item_still_ties_to_cash() {
+        let mut items = default_cash_flow_items();
+        // 停用 0101（销售商品收到的现金），它账上有 100000
+        items.iter_mut().find(|i| i.code == "0101").unwrap().disabled = true;
+        let mut amt = ItemAmounts::new();
+        amt.insert("0101".to_string(), (Money::parse("100000").unwrap(), Money::ZERO));
+        amt.insert("0104".to_string(), (Money::ZERO, Money::parse("40000").unwrap()));
+
+        // 货币资金实际增加了 60000
+        let stmt = build_cash_flow(
+            &items,
+            &amt,
+            Money::parse("10000").unwrap(),
+            Money::parse("70000").unwrap(),
+            Money::ZERO,
+        );
+        // 停用项目的 100000 转入 unassigned，0400 仍在表内
+        assert_eq!(stmt.operating_net, Money::parse("-40000").unwrap());
+        assert_eq!(stmt.unassigned, Money::parse("100000").unwrap());
+        assert_eq!(stmt.net_increase, Money::parse("60000").unwrap());
+        assert!(
+            stmt.ties(),
+            "停用项目后仍须与货币资金变动勾稽：{:?}",
+            stmt
+        );
     }
 }

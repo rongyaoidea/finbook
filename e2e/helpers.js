@@ -35,8 +35,27 @@ async function newBook(page, company) {
   }
 }
 
-/// 录一张凭证并保存（不记账）。rows: [{ code, summary, debit, credit, aux? }]
-async function postVoucher(page, { date, rows }) {
+/// 记账该期间全部草稿凭证。
+///
+/// 往来核销 / 账龄 / 催款只认**已记账**分录（全仓 H-3 口径，`settle::open_entries`
+/// 取 `status='posted'`），所以凡是要验证核销/报表口径的用例，录完凭证必须记账，
+/// 否则列表会是空的——那是正确行为，不是 bug。
+async function postAllDrafts(page, period) {
+  const r = await page.request.get(
+    `/api/vouchers?period=${encodeURIComponent(period)}&status=draft&limit=200`
+  );
+  if (!r.ok()) throw new Error(`列草稿凭证失败：${r.status()}`);
+  const list = await r.json();
+  for (const v of list || []) {
+    const p = await page.request.post(`/api/vouchers/${v.id}/post`, { data: {} });
+    if (!p.ok()) throw new Error(`记账凭证 ${v.id} 失败：${p.status()} ${await p.text()}`);
+  }
+  return (list || []).length;
+}
+
+/// 录一张凭证并保存。rows: [{ code, summary, debit, credit, aux? }]
+/// opts.post=true 时保存后立即记账（核销/报表类用例必须）。
+async function postVoucher(page, { date, rows, post = false }) {
   await page.click('.nav-item[data-view="vouchers"]');
   await page.click("#new-v");
   await page.fill("#v-date", date);
@@ -57,6 +76,10 @@ async function postVoucher(page, { date, rows }) {
   }
   await page.click("#v-save");
   await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
+  if (post) {
+    // date 形如 "2026-01-10" → 期间 202601
+    await postAllDrafts(page, date.slice(0, 7).replace("-", ""));
+  }
 }
 
-module.exports = { newBook, postVoucher };
+module.exports = { newBook, postVoucher, postAllDrafts };

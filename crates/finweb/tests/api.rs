@@ -2505,6 +2505,164 @@ async fn mrp_purchase_push() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "生产建议不可下推请购");
 }
 
+/// 发货/退货的收入凭证与库存流水必须**同一事务**。
+/// 回归：早先 `add_so_shipment` 先调 `so_income_voucher`（自行提交）再调
+/// `so_shipment_with_stock`（另一个事务）。第二步失败时收入与应收已入账提交，
+/// 却没有发货/出库记录 → 孤儿凭证。退货同理：超退报错但收入冲回已提交。
+#[tokio::test]
+async fn sales_shipment_and_return_are_atomic() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let dash: serde_json::Value = serde_json::from_str(
+        &body_string(
+            handlers::router(state.clone())
+                .oneshot(authed_get("/api/dashboard", &sid))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d13 = format!("{}-13", dash["current_period"].as_str().unwrap());
+
+    // 建一张已确认的销售订单，返回 (id, 单号)
+    async fn mk_so(
+        state: &Arc<WebState>,
+        sid: &str,
+        cur_ymm: i32,
+        d13: &str,
+        qty: &str,
+    ) -> (i64, String) {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/sales/so",
+                sid,
+                serde_json::json!({
+                    "id": 0, "period": cur_ymm, "date": d13,
+                    "customer_code": "C01", "customer_name": "客户甲",
+                    "status": "Confirmed", "memo": "原子性造数",
+                    "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": qty, "unit_price": "25", "tax_rate": "0" }]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "建销售订单");
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let id = v["id"].as_i64().unwrap();
+        // save_so 的响应里没有 `no` 字段，从列表接口取单号
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(
+                &format!("/api/sales/so?period={cur_ymm}"),
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "列销售订单");
+        let list: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let no = list["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("订单列表(rows)不是数组：{list}"))
+            .iter()
+            .find(|x| x["id"].as_i64() == Some(id))
+            .and_then(|x| x["no"].as_str())
+            .unwrap_or_else(|| panic!("列表里找不到 id={id} 的订单：{list}"))
+            .to_string();
+        (id, no)
+    }
+
+    // 统计摘要里提到该订单号的凭证数（收入确认凭证的摘要形如「发货确认 SO-xxx」）
+    async fn count_vouchers_for(
+        state: &Arc<WebState>,
+        sid: &str,
+        cur_ymm: i32,
+        so_no: &str,
+    ) -> usize {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(
+                &format!("/api/vouchers?period={cur_ymm}&limit=500"),
+                sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "列凭证");
+        let list: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        list.as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["summary"].as_str().unwrap_or("").contains(so_no))
+            .count()
+    }
+
+    // ── 场景 1：发货时仓库不存在 → 400，且不得留下任何收入凭证 ──
+    let (so1, no1) = mk_so(&state, &sid, cur_ymm, &d13, "10").await;
+    let before = count_vouchers_for(&state, &sid, cur_ymm, &no1).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so1, "period": cur_ymm, "date": d13, "qty": "4", "memo": "", "warehouse": "NOPE" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "非法仓库应 400");
+    assert_eq!(
+        before,
+        count_vouchers_for(&state, &sid, cur_ymm, &no1).await,
+        "发货失败不得留下收入凭证（原子性）"
+    );
+
+    // ── 场景 2：正常发货成功，凭证 + 出库都在 ──
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so1, "period": cur_ymm, "date": d13, "qty": "4", "memo": "", "warehouse": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "发货应成功");
+    let ok_body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(ok_body["voucher_id"].is_i64(), "发货应生成收入凭证：{ok_body}");
+    assert!(
+        count_vouchers_for(&state, &sid, cur_ymm, &no1).await > before,
+        "发货后凭证数应增加"
+    );
+
+    // ── 场景 3：退货超量 → 400，且不得留下收入冲回凭证 ──
+    let (so2, no2) = mk_so(&state, &sid, cur_ymm, &d13, "10").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so2, "period": cur_ymm, "date": d13, "qty": "4", "memo": "", "warehouse": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "先发货 4");
+    let before_ret = count_vouchers_for(&state, &sid, cur_ymm, &no2).await;
+    // 净发货只有 4，退 50 必须被拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/return",
+            &sid,
+            serde_json::json!({ "so_id": so2, "period": cur_ymm, "date": d13, "qty": "50", "memo": "", "warehouse": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超退应 400");
+    assert_eq!(
+        before_ret,
+        count_vouchers_for(&state, &sid, cur_ymm, &no2).await,
+        "超退失败不得留下收入冲回凭证（原子性）"
+    );
+}
+
 /// P1：催款单/对账函——按客商快照未核销、状态流转、无欠款拒绝。
 #[tokio::test]
 async fn dunning_flow() {
@@ -2559,6 +2717,36 @@ async fn dunning_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "发货");
+
+    // 发货生成的应收凭证是草稿，往来核销/催款单只认**已记账**分录（H-3 口径），
+    // 所以必须先记账，否则催款快照查不到任何未核销单据。
+    // 回归：open_entries 早先写 `status != 'void'`，草稿也被算成欠款 ——
+    // 那意味着可以对一张还没入账、随时可能删掉的凭证发催款函。
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/vouchers?period={cur_ymm}&status=draft"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "列草稿凭证");
+    let drafts: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let ar_vid = drafts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["summary"].as_str().unwrap_or("").contains("发货确认"))
+        .and_then(|v| v["id"].as_i64())
+        .expect("应存在发货确认的应收凭证草稿");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{ar_vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账应收凭证");
 
     // 生成催款单：快照未核销应收 100
     let resp = handlers::router(state.clone())
@@ -12339,3 +12527,1062 @@ async fn web_reverse_defaults_to_period_last_day() {
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["date"], serde_json::json!("2026-01-31"), "应取期间末日：{v}");
 }
+
+// ---------------------------------------------------------------------------
+// 回归测试：HTTP 层缺陷修复批次
+// ---------------------------------------------------------------------------
+
+/// 期初整批导入必须原子：第 2 行金额非法时，第 1 行也不能落地。
+///
+/// 修复前 `balances::upsert_begin` 是裸 `conn.execute`，每行各成一次隐式提交，
+/// 第 k 行失败会让前 k-1 行留在库里，客户端既无法判断落地了哪些行也无法安全重试。
+#[tokio::test]
+async fn begin_import_is_all_or_nothing() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!([
+                { "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null },
+                // 第 2 行金额非法 → 整批必须回滚（含第 1 行）
+                { "account_code": "2001", "dir": "debit", "yb": "不是数字", "ad": "0", "ac": "0", "qty": null },
+                { "account_code": "2202", "dir": "credit", "yb": "3000", "ad": "0", "ac": "0", "qty": null }
+            ]),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "第 2 行非法应 400：{b}");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        rows.as_array().unwrap().is_empty(),
+        "整批应回滚，一条都不能留下：{rows}"
+    );
+
+    // 修正后同一批（去掉坏行）应正常整批落地
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!([
+                { "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null },
+                { "account_code": "2001", "dir": "credit", "yb": "3000", "ad": "0", "ac": "0", "qty": null }
+            ]),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "合法批次应成功：{b}");
+    assert!(b.contains("\"count\":2"), "应写入 2 条：{b}");
+}
+
+/// 订单页付款/收款：付款流水写不进去时，绝不能留下可被审核生成凭证的孤立草稿收付款单。
+///
+/// 修复前三步各自分别提交且顺序是「先建单 → 再建边 → 再建流水」，流水一失败，
+/// 已提交的草稿单没有付款流水配对，而 `POST /api/funds/receipts/:id/audit`
+/// 会照样给它生成付款凭证。修复后依赖写入在前、单据最后建。
+#[tokio::test]
+async fn payment_registration_leaves_no_orphan_receipt() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d12 = format!("{}-12", dash["current_period"].as_str().unwrap());
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d12.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单");
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Confirmed", "memo": "收款造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建销售订单");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 让付款流水写不进去（触发器阻断 INSERT），模拟第 3 步失败
+    block_inserts(&state, "b1", "po_payment");
+    block_inserts(&state, "b1", "so_payment");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/payment",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d12.clone(), "amount": "10", "memo": "付" }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_server_error(),
+        "付款流水写失败应报错（当前 {}）",
+        resp.status()
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/payment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "amount": "10", "memo": "收" }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_server_error(),
+        "收款流水写失败应报错（当前 {}）",
+        resp.status()
+    );
+
+    // 关键断言：一条草稿收付款单都不该留下（它可被审核生成付款凭证）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/funds/receipts", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "收付款单列表应可用：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(
+        r["rows"].as_array().unwrap().len(),
+        0,
+        "付款/收款流水失败时不得留下孤立草稿收付款单：{b}"
+    );
+}
+
+/// 已提交的业务写入不能因为随后的审计日志失败而变成 500（否则客户端重试会重复入账）。
+///
+/// 手法：把 `audit_log` 表删掉，让所有 `db.log` 必然失败。修复前这些接口一律 500，
+/// 客户端看到失败重试就会再录一张付款单/订单/凭证。
+#[tokio::test]
+async fn audit_log_failure_does_not_fail_committed_mutations() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let d12 = format!("{cur_label}-12");
+    let d15 = format!("{cur_label}-15");
+    let d20 = format!("{cur_label}-20");
+
+    // 造数：采购入库 → 销售出库（给成本结转留销售出库）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d12.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d12.clone(), "qty": "10", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购入库");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Confirmed", "memo": "结转造数",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "4", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "qty": "4", "memo": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "销售出库");
+
+    // 让所有审计日志写入必然失败
+    block_inserts(&state, "b1", "audit_log");
+
+    // ① 采购付款：业务写入已提交，日志失败不得改判 500
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/payment",
+            &sid,
+            serde_json::json!({ "po_id": po_id, "period": cur_ymm, "date": d12.clone(), "amount": "10", "memo": "付" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "日志表坏了也不能让付款变 500：{b}");
+    let pay: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(pay["id"].as_i64().unwrap() > 0, "付款流水应已写入：{b}");
+
+    // ② 销售收款
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/payment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": cur_ymm, "date": d15.clone(), "amount": "10", "memo": "收" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "日志表坏了也不能让收款变 500：{b}");
+
+    // ③ 保存采购订单
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d15.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "日志坏了也要成",
+                "lines": [{ "item_code": "140301", "qty_ordered": "2", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "日志表坏了也不能让保存订单变 500：{b}");
+
+    // ④ 保存凭证（重试会多录一张，是最贵的重复写）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记", "no": 0,
+                "attachments": 0, "memo": "日志坏了也要成",
+                "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "s", "debit": "1", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "s", "debit": "0", "credit": "1" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "日志表坏了也不能让保存凭证变 500：{b}");
+
+    // ⑤ 销售成本结转：凭证已由 findb 提交，日志失败不得改判 500
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/sales-cost",
+            &sid,
+            serde_json::json!({ "period": cur_ymm, "method": "moving_average", "date": d20 }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "日志表坏了也不能让成本结转变 500：{b}");
+    let cost: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        cost["voucher_id"].as_i64().unwrap_or(0) > 0,
+        "结转凭证应已生成：{b}"
+    );
+}
+
+/// 被邀请进账套（成员而非归属者）的普通用户，在 `GET /api/books` 与登录返回里都能看到该账套。
+///
+/// 修复前 `RealmDb::list_books_for` 只按 `owner_username` 过滤，被邀请成员登录后
+/// 账套列表是空的（`select_book` 却认他），前端选账套页直接空掉。
+#[tokio::test]
+async fn invited_book_member_sees_book_in_list() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = boss_in_b1(&state).await;
+
+    // 平台开通一个非管理员账号（非归属者）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid,
+            serde_json::json!({ "username": "inv1", "display_name": "受邀会计", "password": "Init@123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号");
+    // boss（b1 管理员）把他拉进 b1，角色只读、非归属者
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss_sid,
+            serde_json::json!({
+                "username": "inv1", "display_name": "受邀会计", "password": "",
+                "role": "viewer", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "邀请为 b1 成员：{b}");
+
+    // 首登强制改密 → 改密
+    let (st, sid) = login(&state, "inv1", "Init@123456").await;
+    assert_eq!(st, StatusCode::OK, "inv1 平台登录");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sid,
+            serde_json::json!({ "old": "Init@123456", "new": "Pass123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "inv1 首登改密");
+
+    // 登录返回的账套列表应含 b1
+    let (st, sid2) = login(&state, "inv1", "Pass123456").await;
+    assert_eq!(st, StatusCode::OK, "inv1 再次登录");
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder().uri("/api/books").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "未带会话应 401");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/books", &sid2))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "GET /api/books：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        r["books"].as_array().unwrap().iter().any(|x| x["key"] == "b1"),
+        "被邀请成员应看到 b1：{b}"
+    );
+
+    // 选账套仍然可用（两条路径口径一致）
+    assert_eq!(
+        select_book(&state, &sid2, "b1").await,
+        StatusCode::OK,
+        "被邀请成员应能进入 b1"
+    );
+}
+
+/// 完工入库数量不得超过订单未完工数量（防超完工虚增库存与摊薄单位成本）。
+#[tokio::test]
+async fn prod_complete_rejects_over_completion() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_label = dash["current_period"].as_str().unwrap().to_string();
+    let d15 = format!("{cur_label}-15");
+    let d20 = format!("{cur_label}-20");
+
+    // 完工结转要求订单已归集到成本（无成本不许完工），先备齐标准价 + BOM 才能走到完工
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "moving_average", "standard_cost": "10" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "配标准价");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/bom",
+            &sid,
+            serde_json::json!({ "parent": "140501", "children": [{ "child": "140301", "qty": "2", "loss": "0" }] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "配 BOM");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "100", "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "下达生产订单：{b}");
+    let pid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/start"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开工");
+    // 领料 2×100 归集材料成本（BOM 2 件 × 标准价 10）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/issue"),
+            &sid,
+            serde_json::json!({ "date": d15.clone() }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "领料归集成本：{b}");
+
+    // 计划 100 件，未完工 100 件 → 报 999999 必须 400
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/complete"),
+            &sid,
+            serde_json::json!({ "qty": "999999", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "超量完工应 400：{b}");
+
+    // completed_qty 必须原封不动
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/prod", &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let o = r["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"].as_i64() == Some(pid))
+        .expect("列表应含该订单");
+    assert_eq!(money_num(o["completed_qty"].as_str().unwrap()), 0.0, "completed_qty 不应被推进：{o}");
+    assert_eq!(o["status"], "InProgress", "订单应仍在生产中：{o}");
+
+    // 计划量之内仍然放行
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/complete"),
+            &sid,
+            serde_json::json!({ "qty": "100", "date": d20.clone() }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "足量完工应放行：{b}");
+}
+
+/// 下载导入模板也要登录 + 账簿报表权限（原先是唯一无鉴权提取器的处理器）。
+#[tokio::test]
+async fn import_template_requires_login_and_book() {
+    let (state, _bd, _dir) = test_state();
+
+    // ① 完全未登录（网关已拦，补一道断言确保不退化）
+    let resp = handlers::router(state.clone())
+        .oneshot(Request::builder()
+            .uri("/api/import/template?kind=account")
+            .body(Body::empty())
+            .unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "未登录应 401");
+
+    // ② 已登录但没选账套：原先照样返回模板，现在必须拒（CurrentUser 要求已选账套）
+    let (_, sid) = login(&state, "boss", "Admin!2026").await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/import/template?kind=account", &sid))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "未选账套不应能取模板"
+    );
+
+    // ③ 进了账套的只读成员仍可下载（Report 在 viewer 权限集里）
+    let boss_sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid,
+            serde_json::json!({ "username": "tpl1", "display_name": "模板员", "password": "Init@123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss_sid,
+            serde_json::json!({
+                "username": "tpl1", "display_name": "模板员", "password": "",
+                "role": "viewer", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "邀请为 b1 只读成员");
+    let (st, tpl_sid) = login(&state, "tpl1", "Init@123456").await;
+    assert_eq!(st, StatusCode::OK, "tpl1 登录");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &tpl_sid,
+            serde_json::json!({ "old": "Init@123456", "new": "Pass123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "tpl1 首登改密");
+    assert_eq!(
+        select_book(&state, &tpl_sid, "b1").await,
+        StatusCode::OK,
+        "tpl1 进入 b1"
+    );
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/import/template?kind=account", &tpl_sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "只读成员应能下模板：{b}");
+    assert!(b.contains("库存现金"), "模板内容应照常返回：{b}");
+}
+
+/// 订单状态机（由 findb 的 scm 流转表把关，HTTP 层透传 400）：草稿不得一步跳到已完成，
+/// 草稿 → 已确认仍可用；已作废是终态。销售/采购两侧同口径。
+#[tokio::test]
+async fn order_transition_rejects_illegal_jump() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+    let d13 = format!("{}-13", dash["current_period"].as_str().unwrap());
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d13.clone(),
+                "customer_code": "C01", "customer_name": "客户甲",
+                "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "item_name": "原料", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建销售订单");
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": cur_ymm, "date": d13.clone(), "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Draft", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "10", "unit_price": "9", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单");
+    let po_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 草稿 → 已完成：两侧都必须拒绝
+    for (uri, what) in [
+        (format!("/api/sales/so/{so_id}/transition"), "销售订单"),
+        (format!("/api/procure/po/{po_id}/transition"), "采购订单"),
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(&uri, &sid, serde_json::json!({ "status": "Completed" })))
+            .await
+            .unwrap();
+        let st = resp.status();
+        let b = body_string(resp).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{what} 草稿不得直接跳已完成：{b}");
+    }
+    // 草稿 → 部分发货 同样非法
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "PartialShip" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "草稿不得直接跳部分发货：{b}");
+
+    // 状态没被改掉
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/sales/so?period={cur_ymm}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let o = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"].as_i64() == Some(so_id))
+        .expect("列表应含该订单");
+    assert_eq!(o["status"], "Draft", "非法流转不应改状态：{o}");
+
+    // 草稿 → 已确认：仍可用
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "草稿 → 已确认应放行：{b}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "草稿 → 已确认应放行：{b}");
+
+    // 已确认 → 已完成：findb 的状态机同样拒绝（发货进度只能由发货流水推进）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Completed" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "已确认不得手工跳已完成：{b}");
+
+    // 作废是出口
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Cancelled" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "已确认 → 已作废应放行：{b}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "已作废是终态，不许复活：{b}");
+}
+
+/// 凭证：修改时凭证字不可变（保住号段一致），自选号码撞号回 400 而不是 500。
+#[tokio::test]
+async fn voucher_word_immutable_and_duplicate_no_is_400() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let mk = |word: &str, no: i32, memo: &str| {
+        serde_json::json!({
+            "id": 0, "period": 202601, "date": "2026-01-15", "word": word, "no": no,
+            "attachments": 0, "memo": memo,
+            "entries": [
+                { "line": 1, "account_code": "1001", "summary": "s", "debit": "10", "credit": "0" },
+                { "line": 2, "account_code": "2001", "summary": "s", "debit": "0", "credit": "10" }
+            ]
+        })
+    };
+    let entries = |memo: &str| {
+        serde_json::json!([
+            { "line": 1, "account_code": "1001", "summary": memo, "debit": "10", "credit": "0" },
+            { "line": 2, "account_code": "2001", "summary": memo, "debit": "0", "credit": "10" }
+        ])
+    };
+
+    // 自动取号建一张 记-0001
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/vouchers", &sid, mk("记", 0, "原始")))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建凭证：{b}");
+    let vid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 改凭证字 记 → 银：必须拒绝（否则 银-0001 会占掉银字号的号）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": vid, "period": 202601, "date": "2026-01-15", "word": "银", "no": 0,
+                "attachments": 0, "memo": "改字", "entries": entries("改字")
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "凭证字不可改：{b}");
+
+    // 凭证字不变、只改摘要：放行且号不变
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": vid, "period": 202601, "date": "2026-01-15", "word": "记", "no": 0,
+                "attachments": 0, "memo": "只改摘要", "entries": entries("只改摘要")
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "同字修改应放行：{b}");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["word"], "记", "凭证字应保持不变：{v}");
+    assert_eq!(v["no"], 1, "号码应保持不变（号段不漂移）：{v}");
+    assert_eq!(v["memo"], "只改摘要", "其它字段应已更新：{v}");
+
+    // 自选号码撞上 记-0001：必须 400，不能是 500
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/vouchers", &sid, mk("记", 1, "撞号")))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "撞号应回 400 而不是 500：{b}");
+    assert!(!b.contains("UNIQUE"), "不该把 SQLite 约束错误透给用户：{b}");
+
+    // 换一个字就不撞，仍可自选
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post("/api/vouchers", &sid, mk("银", 1, "银字 1 号")))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "银字 1 号未被占用：{b}");
+}
+
+/// 往来期初合计：按金额格式（2 位小数）输出，且非 ar/ap 的 kind 不并进应付合计。
+#[tokio::test]
+async fn arap_opening_totals_money_and_no_misbucket() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let db = state.db_for("b1").expect("打开 b1");
+    let mk = |kind: &str, doc: &str, party: &str, amt: &str| findb::settle::ArapOpening {
+        id: 0,
+        kind: kind.to_string(),
+        party_code: party.to_string(),
+        party_name: party.to_string(),
+        doc_no: doc.to_string(),
+        doc_date: "2025-12-31".to_string(),
+        amount: fincore::Money::parse(amt).unwrap(),
+        memo: String::new(),
+        created_by: "boss".to_string(),
+    };
+    findb::settle::arap_opening_insert(&db, &mk("ar", "XSQ-1", "Q01", "5000"), "boss").unwrap();
+    findb::settle::arap_opening_insert(&db, &mk("ap", "CGQ-1", "S01", "3000.5"), "boss").unwrap();
+    // 脏数据：kind 写成大写 AR（导入笔误），绝不能被并进 total_ap
+    findb::settle::arap_opening_insert(&db, &mk("AR", "XSQ-2", "Q02", "7000"), "boss").unwrap();
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/arap-opening", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "往来期初列表：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(r["rows"].as_array().unwrap().len(), 3, "三行都应返回：{b}");
+    // 金额口径：2 位小数 + 千分位（fmt_qty 会印成 "5,000"）
+    assert_eq!(r["total_ar"], "5,000.00", "应收合计按金额格式：{b}");
+    assert_eq!(r["total_ap"], "3,000.50", "应付合计按金额格式：{b}");
+    // 大写 AR 那 7000 既不进 ar 也不进 ap
+    assert_eq!(r["unknown_kind"], 1, "未知 kind 应单独计数：{b}");
+    assert_eq!(
+        money_num(r["total_ar"].as_str().unwrap()) + money_num(r["total_ap"].as_str().unwrap()),
+        8000.5,
+        "合计不应把 7000 混进来：{b}"
+    );
+}
+
+/// 资产卡片漏传残值率时按 0（无残值）落库，而不是默默按 5% 记（会低估折旧）。
+#[tokio::test]
+async fn asset_omitted_residual_rate_defaults_zero() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"].as_str().unwrap().replace('-', "").parse().unwrap();
+
+    // 完全不带 residual_rate 字段
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets",
+            &sid,
+            serde_json::json!({
+                "id": 0, "code": "NR0001", "name": "漏传残值率", "category": "电子设备",
+                "spec": "", "dept": "财务部", "asset_account": "160101", "dep_account": "1602",
+                "expense_account": "660201", "original_value": "12000",
+                "life_months": 36, "method": "straight", "start_period": cur_ymm, "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建资产：{b}");
+    let aid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 显式传 0 仍合法（0 是合法残值率）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/assets",
+            &sid,
+            serde_json::json!({
+                "id": 0, "code": "NR0002", "name": "显式零残值", "category": "电子设备",
+                "spec": "", "dept": "财务部", "asset_account": "160101", "dep_account": "1602",
+                "expense_account": "660201", "original_value": "12000", "residual_rate": "0",
+                "life_months": 36, "method": "straight", "start_period": cur_ymm, "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "显式 0 残值率应合法");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/assets", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "资产列表：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let card = r["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"].as_i64() == Some(aid))
+        .expect("列表应含新资产");
+    assert_eq!(
+        money_num(card["residual_rate"].as_str().unwrap()),
+        0.0,
+        "漏传残值率应落 0 而不是 5：{card}"
+    );
+}
+
+/// 删除融资记录必须留审计痕迹（原先是资金模块唯一不写日志的删除口）。
+#[tokio::test]
+async fn delete_loan_writes_audit_log() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/loans",
+            &sid,
+            serde_json::json!({ "kind": "borrow", "no": "LLOG1", "bank": "工行",
+                "principal": "10000", "rate_pct": "4.5", "start_date": "2026-01-01",
+                "end_date": "2026-12-31", "memo": "待删融资" }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "建融资：{b}");
+    let lid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/loans/{lid}/delete"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "删除融资：{b}");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/logs?limit=20", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "操作日志：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        r.as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["module"] == "资金" && l["action"] == "删除融资" && l["detail"] == format!("#{lid}")),
+        "删除融资应留痕（资金/删除融资/#{lid}）：{b}"
+    );
+}
+
+/// 发票列表必须限量返回（原先 limit=None，一次把全库发票读进内存并整包序列化）。
+#[tokio::test]
+async fn invoice_list_is_bounded() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let db = state.db_for("b1").expect("打开 b1");
+    let mut sql = String::new();
+    for i in 1..=501 {
+        sql.push_str(&format!(
+            "INSERT INTO invoice(kind,code,number,date,buyer,seller,amount_tax,amount,tax,tax_rate,\
+             status,memo,attach_id,created_by,created_at,updated_at) VALUES(\
+             'out','INV','{i:04}','2026-01-15','买方{i}','卖方{i}','113.00','100.00','13.00','13',\
+             'pending','',0,'boss',datetime('now'),datetime('now'));\n"
+        ));
+    }
+    let tx = db.write_tx().expect("开事务");
+    tx.execute_batch(&sql).expect("批量造 501 张发票");
+    tx.commit().expect("提交造数");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "发票列表：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(r["limit"], 500, "应声明上限：{b}");
+    assert_eq!(r["rows"].as_array().unwrap().len(), 500, "最多回 500 行：{b}");
+    assert_eq!(r["truncated"], true, "超限时须回报截断：{b}");
+
+    // 收窄条件后不再截断
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices?keyword=0001", &sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "带关键字的发票列表：{b}");
+    let r: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        r["rows"].as_array().unwrap().len() < 500,
+        "收窄后不该再截断：{b}"
+    );
+    assert_eq!(r["truncated"], false, "收窄后不该报截断：{b}");
+}
+
+/// 造一个「往该表 INSERT 必失败」的 BEFORE INSERT 触发器。
+///
+/// 不能用 `DROP TABLE`：删表会让 `findb::schema::init` 的 `tables_complete` 快路径失效，
+/// 下一次 `Db::open` 就重跑 DDL 把表建回来，注入的故障自己消失了。触发器不在
+/// `tables_complete` 的检查范围内，能稳定撑住整个用例。
+fn block_inserts(state: &Arc<WebState>, book: &str, table: &str) {
+    let db = state.db_for(book).expect("打开账套");
+    db.conn()
+        .execute(
+            &format!(
+                "CREATE TRIGGER t_block_{table} BEFORE INSERT ON {table}
+                 BEGIN SELECT RAISE(ABORT, '测试注入：该表写入被阻断'); END"
+            ),
+            [],
+        )
+        .unwrap_or_else(|e| panic!("装 {table} 阻断触发器失败: {e}"));
+}
+
+

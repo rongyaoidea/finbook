@@ -509,8 +509,11 @@ fn get_item_cost(db: &Db, item_code: &str, period_ymm: i32) -> DbResult<Money> {
 // 退料管理
 // ===========================================================================
 
-/// 生产退料：把某物料的一部分退回库存（冲减领料）。
-/// 生成一条「其他入库」流水，数量为正、金额按最近采购价。
+/// 生产退料：把某物料的一部分退回库存（**冲减领料**）。
+///
+/// 「入库流水 + 冲减 prod_cost + 冲回领料凭证」必须与领料对称地在同一事务里做完：
+/// 旧实现只写了入库流水，`prod_cost` 里的直接材料原封不动，
+/// `prod_complete` 结转时把没冲减掉的金额全资本化进产成品成本。
 pub fn prod_return_materials(
     db: &Db,
     po_id: i64,
@@ -519,8 +522,9 @@ pub fn prod_return_materials(
     item_code: &str,
     qty: Money,
     memo: &str,
+    who: &str,
 ) -> DbResult<i64> {
-    use crate::business::{stock_insert, StockMove, StockKind};
+    use crate::business::{stock_insert_of, StockMove, StockKind};
 
     let order = get_prod_order(db, po_id)?.ok_or_else(|| FinError::msg("生产订单不存在"))?;
     if order.status != ProdStatus::InProgress && order.status != ProdStatus::Released {
@@ -531,23 +535,65 @@ pub fn prod_return_materials(
     }
     let unit_cost = get_item_cost(db, item_code, period.ymm())?;
     let amount = (qty * unit_cost).round2();
-    stock_insert(
-        db,
-        &StockMove {
-            id: 0,
-            period,
-            biz_date: return_date,
-            kind: StockKind::OtherIn,
-            item: item_code.to_string(),
-            warehouse: String::new(),
-            batch_no: String::new(),
-            qty,
-            price: unit_cost,
-            amount,
-            voucher_id: None,
-            memo: format!("生产退料 PO#{} {}", order.no, memo),
-        },
-    )
+    let tx = db.write_tx()?;
+    let mut move_record = StockMove {
+        id: 0,
+        period,
+        biz_date: return_date,
+        kind: StockKind::OtherIn,
+        item: item_code.to_string(),
+        warehouse: String::new(),
+        batch_no: String::new(),
+        qty,
+        price: unit_cost,
+        amount,
+        voucher_id: None,
+        memo: format!("生产退料 PO#{} {}", order.no, memo),
+    };
+    stock_insert_of(&tx, &mut move_record)?;
+    // 冲减已归集的直接材料成本（与 prod_issue_materials 的 add_cost_of 口径对称）
+    add_cost_of(&tx, po_id, CostType::Material, amount.negated(), "生产退料")?;
+    // 冲回领料结转凭证
+    return_voucher_in(&tx, period, return_date, &order, item_code, qty, amount, who)?;
+    tx.commit()?;
+    Ok(move_record.id)
+}
+
+/// 生产退料的冲回凭证：借 各物料科目 / 贷 生产成本-直接材料(500101)。
+///
+/// 是 [`material_voucher_in`] 的镜像。不能给 `material_voucher_in` 传负金额来实现：
+/// 那会生成借贷两侧都是负数的凭证（合计相等能过平衡校验，金额却是负的）。
+pub fn return_voucher_in(
+    tx: &rusqlite::Transaction,
+    period: Period,
+    date: NaiveDate,
+    order: &ProductionOrder,
+    item_code: &str,
+    qty: Money,
+    amount: Money,
+    who: &str,
+) -> DbResult<i64> {
+    use fincore::{AuxRef, Entry, Voucher, VoucherSource};
+    if amount.is_zero() {
+        return Ok(0);
+    }
+    let no = crate::vouchers::next_no_of(tx, period, "记")?;
+    let mut v = Voucher::new(period, date, "记", no);
+    v.prepared_by = who.to_string();
+    v.source = VoucherSource::Business;
+    v.memo = format!("生产退料 PO#{}", order.no);
+    v.push_entry(Entry {
+        debit: amount,
+        aux: AuxRef { item: Some(item_code.to_string()), ..Default::default() },
+        qty: Some(qty),
+        ..Entry::new(1, item_code, "生产退料")
+    });
+    v.push_entry(Entry {
+        credit: amount,
+        ..Entry::new(2, "500101", "生产退料")
+    });
+    v.renumber();
+    crate::vouchers::save_in(tx, &mut v)
 }
 
 // ===========================================================================
@@ -624,14 +670,37 @@ pub fn prod_complete(
 
     // 生成完工结转凭证：借 库存商品(140501) / 贷 生产成本各要素。
     // 材料、人工、制造费用分别由 500101 / 500102 / 500103 承接。
-    completion_voucher_in(&tx, order.period, complete_date, &order, completed_qty, who)?;
+    // 期间必须与库存流水同一个（用调用方传入的 `period`）：两者分处不同期间时，
+    // 会出现「货已入库、账在上一期」的错期，或凭证落在已结账期间里直接失败。
+    let voucher_id = completion_voucher_in(&tx, period, complete_date, &order, completed_qty, who)?;
+    // `None` = 没有可结转的成本，本次完工没有出凭证。绝不能像旧实现那样返回假的
+    // 凭证 id 0（调用方会把它当真实 id 存下来）。这里明确告知并留痕：
+    // 零成本订单既没领料也没归集人工/制造费用，完工入库金额本身就是 0，
+    // 账上没有分录并不矛盾——但必须让人看得见，而不是无声无息。
+    let no_voucher = voucher_id.is_none();
     tx.commit()?;
+    if no_voucher {
+        db.log(
+            who,
+            "生产",
+            "完工入库未结转",
+            &format!(
+                "PO#{} 完工入库 {} 件，但未归集到任何生产成本（材料/人工/制造费用均为 0），\
+                 本次未生成完工结转凭证；如本单应有料本，请检查是否漏领料或漏归集",
+                order.no,
+                completed_qty.fmt_qty()
+            ),
+        )?;
+    }
 
     Ok(move_id)
 }
 
 /// 生成完工入库结转凭证：借 库存商品(140501, 数量核算) / 贷 生产成本各要素科目。
 /// 金额取该订单累计归集的 材料/人工/制造费用（prod_cost）。
+///
+/// 返回 `Ok(None)` 表示没有可结转的成本（不出凭证）——早先返回假的凭证 id 0，
+/// 调用方 `commit()` 之后订单已完工、账上却一条分录都没有。
 pub fn completion_voucher(
     db: &Db,
     period: Period,
@@ -639,7 +708,7 @@ pub fn completion_voucher(
     order: &ProductionOrder,
     completed_qty: Money,
     who: &str,
-) -> DbResult<i64> {
+) -> DbResult<Option<i64>> {
     let tx = db.write_tx()?;
     let id = completion_voucher_in(&tx, period, date, order, completed_qty, who)?;
     tx.commit()?;
@@ -647,6 +716,8 @@ pub fn completion_voucher(
 }
 
 /// 在调用方事务内生成完工结转凭证（不发 BEGIN、不提交）。
+///
+/// `Ok(None)` = 无成本可结转、不出凭证（`Ok(Some(id))` 才是真的出了一张）。
 pub fn completion_voucher_in(
     tx: &rusqlite::Transaction,
     period: Period,
@@ -654,12 +725,12 @@ pub fn completion_voucher_in(
     order: &ProductionOrder,
     completed_qty: Money,
     who: &str,
-) -> DbResult<i64> {
+) -> DbResult<Option<i64>> {
     use fincore::{AuxRef, Entry, Voucher, VoucherSource};
     let (mat, lab, oh) = get_prod_cost_of(tx, order.id)?;
     let total = mat + lab + oh;
     if total.is_zero() || completed_qty.is_zero() {
-        return Ok(0);
+        return Ok(None);
     }
     let no = crate::vouchers::next_no_of(tx, period, "记")?;
     let mut v = Voucher::new(period, date, "记", no);
@@ -693,7 +764,7 @@ pub fn completion_voucher_in(
         idx += 1;
     }
     v.renumber();
-    crate::vouchers::save_in(tx, &mut v)
+    crate::vouchers::save_in(tx, &mut v).map(Some)
 }
 
 /// 某生产订单的领料流水笔数（按单限额领料的累计口径）
@@ -1122,6 +1193,178 @@ mod tests {
         assert_eq!(alloc[0].1, m("1000"));
     }
 
+    /// 建一张"进行中"的生产订单（item_code 由调用方给）
+    fn order_in_progress(db: &crate::Db, p: Period, no: &str, item: &str) -> ProductionOrder {
+        let tx = db.write_tx().unwrap();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        tx.execute(
+            "INSERT INTO production_order(period, no, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![
+                p.ymm(), no, "2026-01-05", item, "成品",
+                "10", "0", "in_progress", "WC01", "u1", "",
+                now.clone(), now.clone()
+            ],
+        )
+        .unwrap();
+        let id = tx.last_insert_rowid();
+        tx.commit().unwrap();
+        get_prod_order(db, id).unwrap().unwrap()
+    }
+
+    /// 给物料备一条带价采购入库（`get_item_cost` 的取价来源）
+    fn seed_item_cost(db: &crate::Db, p: Period, item: &str, price: &str) {
+        use crate::business::{stock_insert, StockKind, StockMove};
+        stock_insert(
+            db,
+            &StockMove {
+                id: 0,
+                period: p,
+                biz_date: NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+                kind: StockKind::Purchase,
+                item: item.to_string(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: m("100"),
+                price: m(price),
+                amount: m("100") * m(price),
+                voucher_id: None,
+                memo: "建账入库".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// 回归：生产退料必须冲减 `prod_cost` 并出冲回凭证。
+    /// 旧实现只写了一条入库流水，doc 写着"冲减领料"却什么都没冲，
+    /// `prod_complete` 结转时把没冲减掉的金额全资本化进产成品。
+    #[test]
+    fn prod_return_materials_reverses_cost_and_voucher() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        seed_item_cost(&db, p, "140301", "10");
+        let order = order_in_progress(&db, p, "SC2026019001", "140501");
+        // 先领料 10 件 → 材料成本 100
+        add_cost(&db, order.id, CostType::Material, m("100"), "生产领料").unwrap();
+        assert_eq!(get_prod_cost(&db, order.id).unwrap().0, m("100"));
+
+        // 退料 3 件 → 成本应减 30，并出冲回凭证
+        prod_return_materials(&db, order.id, d, p, "140301", m("3"), "多领退回", "u1").unwrap();
+        assert_eq!(
+            get_prod_cost(&db, order.id).unwrap().0,
+            m("70"),
+            "退料必须冲减 prod_cost（回归前仍是 100，完工结转会多资本化 30）"
+        );
+        // 冲回凭证：借 140301 / 贷 500101 = 30
+        let vs = crate::vouchers::list(
+            &db,
+            &crate::vouchers::VoucherQuery {
+                keyword: Some("生产退料".into()),
+                ..crate::vouchers::VoucherQuery::period(p)
+            },
+        )
+        .unwrap();
+        assert_eq!(vs.len(), 1, "应有一张退料冲回凭证：{:?}", vs);
+        let v = crate::vouchers::get(&db, vs[0].id).unwrap().unwrap();
+        assert!(v.balanced());
+        let dr: Money = v.entries.iter().map(|e| e.debit).sum();
+        let cr: Money = v.entries.iter().map(|e| e.credit).sum();
+        assert_eq!(dr, m("30"), "冲回金额应与退料金额一致");
+        assert_eq!(cr, m("30"));
+        assert!(v.entries.iter().any(|e| e.account_code == "140301" && e.debit == m("30")));
+        assert!(v.entries.iter().any(|e| e.account_code == "500101" && e.credit == m("30")));
+        // 入库流水也在
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM stock_move WHERE kind='other_in' AND item='140301'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// 回归：零成本订单完工不得"无声完成"。
+    /// 旧的 `completion_voucher_in` 在总成本为 0 时返回假的凭证 id 0，
+    /// 调用方丢弃它并 `commit()` —— 订单已完工、库存已入库、账上一条分录都没有，
+    /// 而且**没有任何痕迹**说明本该有分录。现在：出凭证与否由 `Option` 明说，
+    /// 且没出凭证时必须留一条操作日志。
+    #[test]
+    fn prod_complete_warns_when_no_voucher_produced() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let order = order_in_progress(&db, p, "SC2026019002", "140501");
+        // 没有任何成本归集
+        prod_complete(&db, order.id, d, p, m("5"), "u1").unwrap();
+        // 订单已完工、库存已入
+        assert_eq!(
+            get_prod_order(&db, order.id).unwrap().unwrap().status,
+            crate::scm::ProdStatus::Completed
+        );
+        let moves: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM stock_move", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moves, 1);
+        // 账上确实没有凭证（回归前会留下一条"凭证 id = 0"的假象）
+        let vids: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM voucher", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vids, 0, "无成本不该凭空出一张凭证");
+        // 但必须留痕：操作日志里要写明"未结转"
+        let logged: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE module='生产' AND action='完工入库未结转'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1, "零成本完工必须留操作日志（回归前完全无声）");
+        // 公开的 completion_voucher 在无成本时返回 None 而不是假 id
+        assert_eq!(
+            completion_voucher(&db, p, d, &order, m("5"), "u1").unwrap(),
+            None
+        );
+    }
+
+    /// 回归：完工入库的库存流水与结转凭证必须落在同一期间。
+    /// 旧实现里流水用调用方传入的 `period`、凭证用 `order.period`，
+    /// 两者不同时会出现"货已入库、账在另一期"的错期。
+    #[test]
+    fn prod_complete_uses_same_period_for_move_and_voucher() {
+        let db = mem();
+        let p1 = Period::new(2026, 1).unwrap();
+        let p2 = Period::new(2026, 2).unwrap();
+        let order = order_in_progress(&db, p1, "SC2026019003", "140501");
+        add_cost(&db, order.id, CostType::Material, m("100"), "生产领料").unwrap();
+        // 2 月完工，但订单期间是 1 月：流水与凭证都必须在 2 月（调用方期间）
+        prod_complete(&db, order.id, NaiveDate::from_ymd_opt(2026, 2, 10).unwrap(), p2, m("5"), "u1")
+            .unwrap();
+        let mv_period: i32 = db
+            .conn()
+            .query_row(
+                "SELECT period FROM stock_move WHERE memo LIKE '完工入库%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v_period: i32 = db
+            .conn()
+            .query_row(
+                "SELECT period FROM voucher WHERE memo LIKE '完工入库%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mv_period, p2.ymm(), "库存流水应在调用方期间");
+        assert_eq!(v_period, p2.ymm(), "结转凭证必须与库存流水同期（回归前落在订单期间）");
+    }
+
     #[test]
     fn transfer_vouchers_balanced() {
         let db = mem();
@@ -1170,7 +1413,9 @@ mod tests {
         // 归集人工，完工结转：借 140501=90 / 贷 500101=60 + 500102=30
         add_cost(&db, po_id, CostType::Material, m("60"), "领料").unwrap();
         add_cost(&db, po_id, CostType::Labor, m("30"), "人工").unwrap();
-        let vcid = completion_voucher(&db, p, date, &order, m("3"), "u1").unwrap();
+        let vcid = completion_voucher(&db, p, date, &order, m("3"), "u1")
+            .unwrap()
+            .expect("有成本就应出凭证");
         let (di, ce) = dc(&db, vcid);
         assert_eq!(di, m("90"));
         assert_eq!(ce, m("90"));

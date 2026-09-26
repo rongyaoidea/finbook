@@ -291,10 +291,16 @@ pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult
         .ok_or_else(|| FinError::msg(format!("工序 {op_id} 不存在")))?;
     let new_qty = cur.0 + qty;
     let new_hours = cur.1 + hours;
-    let status = if new_qty.is_positive() {
-        "in_progress"
-    } else {
-        "pending"
+    // 状态只做「推进」不做「回退」：已完工（done）的工序不能被一次报工打回
+    // in_progress/pending，否则生产进度（prod_progress）会凭空倒退
+    let status = match tx.query_row(
+        "SELECT status FROM prod_op WHERE id=?1",
+        rusqlite::params![op_id],
+        |r| r.get::<_, String>(0),
+    )? {
+        s if s == "done" => "done",
+        _ if new_qty.is_positive() => "in_progress",
+        _ => "pending",
     };
     tx.execute(
         "UPDATE prod_op SET qty_done=?2, hours=?3, status=?4 WHERE id=?1",
@@ -306,10 +312,13 @@ pub fn prod_op_report(db: &Db, op_id: i64, qty: Money, hours: Money) -> DbResult
 
 /// 手工标记某工序完成
 pub fn prod_op_finish(db: &Db, op_id: i64) -> DbResult<()> {
-    db.conn().execute(
+    let n = db.conn().execute(
         "UPDATE prod_op SET status='done' WHERE id=?1",
         rusqlite::params![op_id],
     )?;
+    if n == 0 {
+        return Err(FinError::not_found(format!("工序 {op_id} 不存在")).into());
+    }
     Ok(())
 }
 
@@ -1282,6 +1291,11 @@ pub fn approval_list(db: &Db, limit: i64) -> DbResult<Vec<Approval>> {
 ///
 /// 通过：当前节点标记 approve，若有下一节点则推进，否则整单 approved。
 /// 驳回：整单 rejected，不再流转。
+///
+/// 全流程在同一事务里「读 → 条件写」：节点动作与整单状态都用带前置条件的
+/// `UPDATE ... WHERE <原状态>`（比较并交换），命中 0 行即被别人抢先或状态已变。
+/// 原来的写法把状态判断放在事务外、写入又不带条件，两个人同时点「通过」会各写一次，
+/// 后一个还会把前一个审批人的意见整条覆盖掉。
 pub fn approval_act(
     db: &Db,
     id: i64,
@@ -1289,7 +1303,10 @@ pub fn approval_act(
     approve: bool,
     comment: &str,
 ) -> DbResult<Approval> {
-    let ap = approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
+    let action = if approve { "approve" } else { "reject" };
+    let tx = db.write_tx()?;
+    // 事务内读当前状态：审批流本身的可见性也必须在同一事务里判
+    let ap = approval_get_of(&tx, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
     if ap.status != "pending" {
         return Err(FinError::msg(format!("审批流已{}，不能再操作", ap.status)).into());
     }
@@ -1305,50 +1322,118 @@ pub fn approval_act(
         ))
         .into());
     }
-    let action = if approve { "approve" } else { "reject" };
-    let tx = db.write_tx()?;
-    tx.execute(
-        "UPDATE approval_step SET action=?1, comment=?2, acted_at=?3 WHERE id=?4",
+    // 节点动作：只允许写「还没人动过」的节点，防止重复审批 / 覆盖他人意见
+    let n = tx.execute(
+        "UPDATE approval_step SET action=?1, comment=?2, acted_at=?3
+         WHERE id=?4 AND (action IS NULL OR action='')",
         rusqlite::params![action, comment, now(), cur.id],
     )?;
+    if n == 0 {
+        return Err(FinError::state("该节点已被审批，请刷新后重试").into());
+    }
     if approve {
         let next = ap.current_node + 1;
         let has_next = ap.steps.iter().any(|s| s.seq == next);
-        if has_next {
+        let n = if has_next {
             tx.execute(
-                "UPDATE approval SET current_node=?2 WHERE id=?1",
-                rusqlite::params![id, next],
-            )?;
+                "UPDATE approval SET current_node=?2 WHERE id=?1 AND status='pending' AND current_node=?3",
+                rusqlite::params![id, next, ap.current_node],
+            )?
         } else {
             tx.execute(
-                "UPDATE approval SET status='approved', finished_at=?2 WHERE id=?1",
-                rusqlite::params![id, now()],
-            )?;
+                "UPDATE approval SET status='approved', finished_at=?2
+                 WHERE id=?1 AND status='pending' AND current_node=?3",
+                rusqlite::params![id, now(), ap.current_node],
+            )?
+        };
+        if n == 0 {
+            return Err(FinError::state("审批流状态已被他人变更，请刷新后重试").into());
         }
     } else {
-        tx.execute(
-            "UPDATE approval SET status='rejected', finished_at=?2 WHERE id=?1",
-            rusqlite::params![id, now()],
+        let n = tx.execute(
+            "UPDATE approval SET status='rejected', finished_at=?2
+             WHERE id=?1 AND status='pending' AND current_node=?3",
+            rusqlite::params![id, now(), ap.current_node],
         )?;
+        if n == 0 {
+            return Err(FinError::state("审批流状态已被他人变更，请刷新后重试").into());
+        }
     }
     tx.commit()?;
     approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流读取失败").into())
 }
 
 /// 撤销审批流（仅申请人、且还在第一节点）
+///
+/// 同样用条件更新（pending + 仍在第一节点），避免与并发的审批动作互相覆盖。
 pub fn approval_cancel(db: &Db, id: i64, who: &str) -> DbResult<()> {
-    let ap = approval_get(db, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
+    let tx = db.write_tx()?;
+    let ap = approval_get_of(&tx, id)?.ok_or_else(|| FinError::msg("审批流不存在"))?;
     if ap.applicant != who {
         return Err(FinError::msg("只有申请人可以撤销审批流").into());
     }
     if ap.status != "pending" || ap.current_node > 1 {
         return Err(FinError::msg("审批已流转，不能撤销").into());
     }
-    db.conn().execute(
-        "UPDATE approval SET status='cancelled', finished_at=?2 WHERE id=?1",
+    let n = tx.execute(
+        "UPDATE approval SET status='cancelled', finished_at=?2
+         WHERE id=?1 AND status='pending' AND current_node=1",
         rusqlite::params![id, now()],
     )?;
+    if n == 0 {
+        return Err(FinError::state("审批流状态已被他人变更，请刷新后重试").into());
+    }
+    tx.commit()?;
     Ok(())
+}
+
+/// 同 [`approval_get`]，但只依赖连接：审批的「读状态 → 条件写」必须在同一事务内。
+fn approval_get_of(conn: &rusqlite::Connection, id: i64) -> DbResult<Option<Approval>> {
+    let ap = conn
+        .query_row(
+            &format!("SELECT {AP_COLS} FROM approval WHERE id=?1"),
+            rusqlite::params![id],
+            map_approval_head,
+        )
+        .optional()?;
+    let Some(mut ap) = ap else {
+        return Ok(None);
+    };
+    let mut st = conn.prepare(
+        "SELECT id,approval_id,seq,approver,action,comment,acted_at FROM approval_step
+         WHERE approval_id=?1 ORDER BY seq",
+    )?;
+    ap.steps = st
+        .query_map(rusqlite::params![id], |r| {
+            Ok(ApprovalStep {
+                id: r.get(0)?,
+                approval_id: r.get(1)?,
+                seq: r.get(2)?,
+                approver: r.get(3)?,
+                action: r.get(4)?,
+                comment: r.get(5)?,
+                acted_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(ap))
+}
+
+/// 只映射表头（分录由调用方另行加载）
+fn map_approval_head(r: &rusqlite::Row) -> rusqlite::Result<Approval> {
+    let id: i64 = r.get(0)?;
+    Ok(Approval {
+        id,
+        biz_kind: r.get(1)?,
+        biz_id: r.get(2)?,
+        title: r.get(3)?,
+        applicant: r.get(4)?,
+        current_node: r.get(5)?,
+        status: r.get(6)?,
+        created_at: r.get(7)?,
+        finished_at: r.get(8)?,
+        steps: Vec::new(),
+    })
 }
 
 // ===========================================================================
@@ -1525,13 +1610,30 @@ pub fn archive_verify(a: &EArchive) -> bool {
 }
 
 /// 自动生成档案号：YYYYMM-kind-seq
+///
+/// 序号取已有档案号的**最大数字后缀 + 1**，不是 `COUNT(*) + 1`：
+/// 删掉一张档案后 COUNT 会回落，下一张就复用了已存在的号，撞上
+/// `e_archive` 的 UNIQUE(period, kind, file_no)——而档案号的唯一性正是
+/// 电子会计档案「同一期间同一类目不得重号」合规项的硬要求。
 pub fn archive_next_no(db: &Db, period: Period, kind: &str) -> DbResult<String> {
-    let cnt: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM e_archive WHERE period=?1 AND kind=?2",
-        rusqlite::params![period.ymm(), kind],
-        |r| r.get(0),
+    let mut st = db.conn().prepare(
+        "SELECT file_no FROM e_archive WHERE period=?1 AND kind=?2",
     )?;
-    Ok(format!("{}-{}-{:03}", period.ymm(), kind, cnt + 1))
+    let rows = st
+        .query_map(rusqlite::params![period.ymm(), kind], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
+    let max = rows
+        .iter()
+        .filter_map(|no| {
+            // 号的形状是 `YYYYMM-kind-NNN`，取最后一段数字；非本函数生成的号忽略
+            no.rsplit('-')
+                .next()
+                .and_then(|tail| tail.trim().parse::<i64>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    Ok(format!("{}-{}-{:03}", period.ymm(), kind, max + 1))
 }
 
 // ===========================================================================
@@ -2418,6 +2520,119 @@ mod tests {
         assert!(approval_act(&db, id, "bob", true, "").is_err());
     }
 
+    /// 回归：同一节点重复审批必须失败，且不能覆盖第一位审批人的意见。
+    /// 旧实现的状态判断在事务外、写入又不带条件，第二次「通过」会成功并覆盖 comment。
+    #[test]
+    fn approval_act_twice_fails_and_keeps_first_comment() {
+        let db = tmpdb("appr_twice");
+        let id = approval_start(&db, "claim", 9, "报销单", "alice", &["bob".into()]).unwrap();
+        let ap = approval_act(&db, id, "bob", true, "第一次：同意").unwrap();
+        assert_eq!(ap.status, "approved");
+        assert!(
+            approval_act(&db, id, "bob", true, "第二次：也同意").is_err(),
+            "重复审批必须报错"
+        );
+        assert!(
+            approval_act(&db, id, "bob", false, "反悔").is_err(),
+            "已完成的单据不能再驳回"
+        );
+        let ap2 = approval_get(&db, id).unwrap().unwrap();
+        assert_eq!(ap2.status, "approved", "整单状态不应被第二次操作改写");
+        let s = ap2.steps.iter().find(|s| s.seq == 1).unwrap();
+        assert_eq!(s.action, "approve");
+        assert_eq!(
+            s.comment, "第一次：同意",
+            "第二位审批人的意见不应覆盖第一位"
+        );
+
+        // 单线程复现「读状态 → 写」之间被别人抢先的落点：节点已写过 action、
+        // 而整单还停在 pending。旧实现的 `UPDATE approval_step ... WHERE id=?`
+        // 没有 `action` 前置条件，会直接覆盖掉先到者的意见并"成功"返回。
+        let id2 = approval_start(&db, "claim", 10, "报销单", "alice", &["bob".into()]).unwrap();
+        let step_id: i64 = db
+            .conn()
+            .query_row("SELECT id FROM approval_step WHERE approval_id=?1", [id2], |r| r.get(0))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE approval_step SET action='approve', comment='先到的审批人：同意', acted_at='x'
+                 WHERE id=?1",
+                [step_id],
+            )
+            .unwrap();
+        assert!(
+            approval_act(&db, id2, "bob", true, "后到的审批人：也同意").is_err(),
+            "已写过的节点不得被再次审批（回归前会成功返回并覆盖意见）"
+        );
+        let s2 = approval_get(&db, id2).unwrap().unwrap().steps.remove(0);
+        assert_eq!(s2.action, "approve");
+        assert_eq!(
+            s2.comment, "先到的审批人：同意",
+            "先到者的审批意见不得被覆盖"
+        );
+    }
+
+    /// 回归：撤销审批必须带状态条件，否则与并发的审批动作互相覆盖。
+    #[test]
+    fn approval_cancel_is_guarded() {
+        let db = tmpdb("appr_cancel");
+        let id = approval_start(&db, "claim", 11, "报销单", "alice", &["bob".into()]).unwrap();
+        // 非申请人不能撤
+        assert!(approval_cancel(&db, id, "carol").is_err());
+        // 申请人可撤；撤完再撤必须报错
+        approval_cancel(&db, id, "alice").unwrap();
+        assert_eq!(approval_get(&db, id).unwrap().unwrap().status, "cancelled");
+        assert!(approval_cancel(&db, id, "alice").is_err(), "重复撤销必须报错");
+        // 已流转的单据不能撤
+        let id2 = approval_start(&db, "claim", 12, "报销单", "alice", &["bob".into()]).unwrap();
+        approval_act(&db, id2, "bob", true, "").unwrap();
+        assert!(approval_cancel(&db, id2, "alice").is_err());
+    }
+
+    /// 回归：已完工的工序再报一次工不能被退回 in_progress（生产进度会凭空倒退）。
+    #[test]
+    fn prod_op_report_keeps_done_status() {
+        let db = tmpdb("opkeep");
+        let p = Period::new(2026, 1).unwrap();
+        let mut order = crate::scm::ProductionOrder {
+            id: 0, no: String::new(), period: p, date: p.first_day(),
+            item_code: "FG01".into(), item_name: "成品".into(),
+            planned_qty: m("10"), completed_qty: Money::ZERO,
+            status: crate::scm::ProdStatus::Released, work_center: String::new(),
+            prepared_by: "u1".into(), memo: String::new(),
+            order_kind: "inhouse".into(), supplier_code: String::new(),
+            supplier_name: String::new(), plan_start: String::new(), plan_end: String::new(),
+        };
+        order.no = crate::scm::prod_next_no(&db, p).unwrap();
+        let po_id = crate::scm::prod_save(&db, &mut order).unwrap();
+        routing_save(&db, "FG01", &[
+            RoutingOp { id: 0, item_code: "FG01".into(), version: String::new(), seq: 1,
+                op_code: "OP1".into(), op_name: "下料".into(), work_center: "WC1".into(),
+                std_hours: m("2"), rate: m("50"), qc_required: false },
+        ]).unwrap();
+        prod_op_init_from_routing(&db, po_id, "FG01").unwrap();
+        let ops = prod_op_list(&db, po_id).unwrap();
+        prod_op_finish(&db, ops[0].id).unwrap();
+        assert_eq!(prod_op_list(&db, po_id).unwrap()[0].status, "done");
+        // 再报工：数量/工时累加，但状态必须仍是 done
+        prod_op_report(&db, ops[0].id, m("3"), m("1")).unwrap();
+        let op = prod_op_list(&db, po_id).unwrap().remove(0);
+        assert_eq!(op.status, "done", "已完工工序不能被报工打回");
+        assert_eq!(op.qty_done, m("3"));
+        // 进度仍是 100%
+        assert_eq!(prod_progress(&db, po_id).unwrap().done_ops, 1);
+    }
+
+    /// 回归：`prod_op_finish` 必须校验工序存在，不能对不存在的 id 静默成功。
+    #[test]
+    fn prod_op_finish_rejects_unknown_op() {
+        let db = tmpdb("op404");
+        assert!(
+            prod_op_finish(&db, 999_999).is_err(),
+            "不存在的工序应报错（否则界面提示成功、实际没改任何数据）"
+        );
+    }
+
     #[test]
     fn archive_and_verify() {
         let db = tmpdb("arch");
@@ -2433,6 +2648,35 @@ mod tests {
         assert!(!archive_verify(&tampered));
         // 重复 file_no 归档报错
         assert!(archive_create(&db, p, "voucher", "x", &no, "{}", "admin").is_err());
+    }
+
+    /// 回归：档案号必须唯一。旧的 `COUNT(*)+1` 在删掉一张档案后会复用一个已存在的号，
+    /// 直接撞上 `e_archive` 的 UNIQUE(period, kind, file_no)。
+    #[test]
+    fn archive_next_no_survives_deletion() {
+        let db = tmpdb("arch2");
+        let p = Period::new(2026, 1).unwrap();
+        for i in 1..=3 {
+            let no = archive_next_no(&db, p, "voucher").unwrap();
+            assert_eq!(no, format!("202601-voucher-{i:03}"));
+            archive_create(&db, p, "voucher", &format!("第{i}张"), &no, "{}", "admin").unwrap();
+        }
+        // 删掉中间一张（-002）
+        let victim = archive_list(&db, p, Some("voucher"))
+            .unwrap()
+            .into_iter()
+            .find(|a| a.file_no == "202601-voucher-002")
+            .unwrap();
+        db.conn()
+            .execute("DELETE FROM e_archive WHERE id=?1", [victim.id])
+            .unwrap();
+        // 下一个号必须接着 003 往后走，不能回落成 002
+        let no = archive_next_no(&db, p, "voucher").unwrap();
+        assert_eq!(
+            no, "202601-voucher-004",
+            "删档后档案号不可复用（回归前会退回 002 并撞唯一索引）"
+        );
+        assert!(archive_create(&db, p, "voucher", "第4张", &no, "{}", "admin").is_ok());
     }
 
     #[test]

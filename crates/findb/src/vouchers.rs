@@ -137,8 +137,12 @@ const VOUCHER_COLS: &str = "id,period,date,word,no,status,attachments,prepared_b
 
 /// 按 id 读取（含分录）
 pub fn get(db: &Db, id: i64) -> DbResult<Option<Voucher>> {
-    let mut v = db
-        .conn()
+    get_of(db.conn(), id)
+}
+
+/// 同 [`get`]，但只依赖连接：删除凭证的「读 → 校验 → 清核销 → 删」要收在同一事务内。
+fn get_of(conn: &rusqlite::Connection, id: i64) -> DbResult<Option<Voucher>> {
+    let mut v = conn
         .query_row(
             &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
             rusqlite::params![id],
@@ -146,13 +150,17 @@ pub fn get(db: &Db, id: i64) -> DbResult<Option<Voucher>> {
         )
         .optional()?;
     if let Some(ref mut v) = v {
-        v.entries = entries_of(db, id)?;
+        v.entries = entries_on(conn, id)?;
     }
     Ok(v)
 }
 
 pub fn entries_of(db: &Db, voucher_id: i64) -> DbResult<Vec<Entry>> {
-    let mut stmt = db.conn().prepare(
+    entries_on(db.conn(), voucher_id)
+}
+
+fn entries_on(conn: &rusqlite::Connection, voucher_id: i64) -> DbResult<Vec<Entry>> {
+    let mut stmt = conn.prepare(
         "SELECT id,voucher_id,line,summary,account_code,aux_json,debit,credit,qty,price,
                 currency,amount_for,rate,settle_type,settle_no,biz_date,cf_item
          FROM voucher_entry WHERE voucher_id=?1 ORDER BY line",
@@ -253,12 +261,20 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
         params.push(Box::new(format!("{}%", crate::escape_like(code))));
     }
     if let Some(ref aux) = q.aux {
-        let key = aux.key();
-        if !key.is_empty() {
+        // 逐维度整段匹配，不能把整条 aux_key 当子串 LIKE：
+        //   旧写法 `aux_key LIKE '%customer=C001%'` 会连带命中 `customer=C0011`，
+        //   也会把 `project=ACME` 命中到按 `customer=AC` 过滤的查询上（实测确认）。
+        // 现在把两侧都补上 \x1f 分隔符再匹配整段，等价于 Rust 侧
+        // `balances::aux_key_contains` 的"按维度切开逐段精确匹配"语义。
+        for part in aux.key_parts() {
             sql.push_str(
-                " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.aux_key LIKE ? ESCAPE '\\')",
+                " AND EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id
+                             AND (char(31) || e.aux_key || char(31)) LIKE ? ESCAPE '\\')",
             );
-            params.push(Box::new(format!("%{}%", crate::escape_like(&key))));
+            params.push(Box::new(format!(
+                "%\u{1f}{}\u{1f}%",
+                crate::escape_like(&part)
+            )));
         }
     }
     if let Some(ref kw) = q.keyword {
@@ -467,35 +483,30 @@ fn save_on(tx: &rusqlite::Connection, v: &mut Voucher) -> DbResult<i64> {
 
 /// 删除凭证（连同分录，外键 ON DELETE CASCADE）
 ///
-/// 顺序是「记下磁盘附件 → 删库并提交 → 再删文件」。反过来做（旧实现先删文件）
-/// 一旦删库失败——状态被拦、拿不到写锁、外键报错——凭证还留在账上而附件文件已经
-/// 没了，变成引用空文件的坏账。删文件失败只留下孤儿文件，无害得多。
+/// 「读凭证 → 校验 → 清核销 → 删表」整体收在一个 `write_tx` 里：核销清理是逐条
+/// `DELETE`，第 3 条失败时前两条已经在别的事务里提交，凭证却还在——账上留着一条
+/// 已核销的凭证，核销记录却只剩半截，比删不掉更难查。
+///
+/// 文件删除在提交之后做：反过来做（旧实现先删文件）一旦删库失败——状态被拦、
+/// 拿不到写锁、外键报错——凭证还留在账上而附件文件已经没了，变成引用空文件的坏账。
+/// 删文件失败只留下孤儿文件，无害得多。
 pub fn delete(db: &Db, id: i64) -> DbResult<()> {
-    // 持久层最后防线：状态与结账线在这里再校验一次，UI/Web 漏检也删不掉
-    let v = get(db, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
-    // 启用审核环节的账套：已审核凭证须先反审核才能删除
-    if v.status == VoucherStatus::Audited && db.options().enable_audit {
-        return Err(FinError::state("已审核凭证不能删除，请先反审核").into());
-    }
-    fincore::engine::validate_delete(&v, crate::periods::closed_upto(db)?).into_result()?;
-    // 删除前清掉该凭证分录上的核销配对（手工/收付款自动核销），避免留下悬空核销记录
-    let mut st = db
-        .conn()
-        .prepare("SELECT id FROM voucher_entry WHERE voucher_id=?1")?;
-    let entry_ids: Vec<i64> = st
-        .query_map([id], |r| r.get::<_, i64>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(st);
-    for e in entry_ids {
-        crate::settle::unsettle_entry(db, e)?;
-    }
+    // 附件清单先取（attach::list 是纯读，与事务无关）
     let files: Vec<String> = crate::attach::list(db, id)?
         .into_iter()
         .filter(|a| !a.inline)
         .filter_map(|a| a.path)
         .collect();
-    db.conn()
-        .execute("DELETE FROM voucher WHERE id=?1", rusqlite::params![id])?;
+    if db.conn().is_autocommit() {
+        let tx = db.write_tx()?;
+        delete_in(&tx, id)?;
+        tx.commit()?;
+    } else {
+        // 调用方（如 receipt_unaudit）已开启事务：复用它，失败由它整体回滚。
+        // 这里再 BEGIN 会被 SQLite 拒掉（cannot start a transaction within a
+        // transaction），所以必须走同连接直写这条路。
+        delete_in_of(db.conn(), id)?;
+    }
     let dir = crate::attach::dir_of(db);
     for rel in files {
         // 与 attach::delete 保持同样的路径约束，避免越出附件目录
@@ -503,6 +514,44 @@ pub fn delete(db: &Db, id: i64) -> DbResult<()> {
             continue;
         }
         let _ = std::fs::remove_file(dir.join(rel));
+    }
+    Ok(())
+}
+
+/// 在调用方已开启的事务里删凭证（不 commit）：供已有事务的流程复用。
+pub fn delete_in(tx: &rusqlite::Transaction, id: i64) -> DbResult<()> {
+    delete_in_of(tx, id)
+}
+
+fn delete_in_of(conn: &rusqlite::Connection, id: i64) -> DbResult<()> {
+    // 持久层最后防线：状态与结账线在这里再校验一次，UI/Web 漏检也删不掉
+    let v = get_of(conn, id)?.ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+    // 启用审核环节的账套：已审核凭证须先反审核才能删除
+    if v.status == VoucherStatus::Audited && crate::options_of(conn).enable_audit {
+        return Err(FinError::state("已审核凭证不能删除，请先反审核").into());
+    }
+    fincore::engine::validate_delete(&v, crate::periods::closed_upto_of(conn)?).into_result()?;
+    // 删除前清掉该凭证分录上的核销配对（手工/收付款自动核销），避免留下悬空核销记录
+    let entry_ids: Vec<i64> = {
+        let mut st = conn.prepare("SELECT id FROM voucher_entry WHERE voucher_id=?1")?;
+        let ids = st
+            .query_map([id], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids
+    };
+    for e in entry_ids {
+        conn.execute(
+            "DELETE FROM settle_record WHERE from_entry=?1 OR to_entry=?1",
+            rusqlite::params![e],
+        )?;
+    }
+    // 条件删除：状态在上面的校验与本次写入之间若被改动（并发反记账/作废），这里拒绝
+    let n = conn.execute(
+        "DELETE FROM voucher WHERE id=?1 AND status<>'posted'",
+        rusqlite::params![id],
+    )?;
+    if n == 0 {
+        return Err(FinError::state("凭证状态已变化，请刷新后重试").into());
     }
     Ok(())
 }
@@ -1056,6 +1105,65 @@ mod tests {
         v
     }
 
+    /// 辅助核算过滤必须按维度**整段**匹配。
+    /// 回归：旧实现把整条 aux_key 包成 `%key%` 做子串 LIKE，导致
+    /// 按 `customer=C001` 过滤会连带返回 `customer=C0011` 的凭证，
+    /// 按 `customer=AC` 过滤会返回 `customer=ACME` 的凭证（财务上的越权读取）。
+    #[test]
+    fn aux_filter_is_exact_segment_match() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        let mk = |cust: &str, no: i32| {
+            let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+            let mut v = Voucher::new(p, d, "记", no);
+            v.prepared_by = "张三".to_string();
+            v.push_entry(Entry {
+                debit: Money::parse("100").unwrap(),
+                aux: AuxRef {
+                    customer: Some(cust.into()),
+                    ..Default::default()
+                },
+                ..Entry::new(1, "112201", "应收货款")
+            });
+            v.push_entry(Entry {
+                credit: Money::parse("100").unwrap(),
+                ..Entry::new(2, "600101", "产品销售收入")
+            });
+            let id = save(&db, &mut v).unwrap();
+            post(&db, id, "张三").unwrap();
+            id
+        };
+        let id_c001 = mk("C001", 1);
+        let id_c0011 = mk("C0011", 2);
+        let id_acme = mk("ACME", 3);
+
+        let ids_for = |cust: &str| -> Vec<i64> {
+            let mut want = AuxRef::default();
+            want.customer = Some(cust.to_string());
+            let mut q = VoucherQuery::period(p);
+            q.aux = Some(want);
+            let mut ids: Vec<i64> = list(&db, &q).unwrap().iter().map(|v| v.id).collect();
+            ids.sort();
+            ids
+        };
+
+        // 对照：不过滤时三张都在
+        let all: Vec<i64> = list(&db, &VoucherQuery::period(p))
+            .unwrap()
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(all.len(), 3, "对照：不过滤应返回 3 张");
+
+        assert_eq!(ids_for("C001"), vec![id_c001], "C001 不得带上 C0011");
+        assert_eq!(ids_for("C0011"), vec![id_c0011]);
+        assert_eq!(ids_for("ACME"), vec![id_acme]);
+        assert!(ids_for("AC").is_empty(), "AC 是子串不是整段，不应命中 ACME");
+        assert!(ids_for("C00").is_empty());
+        assert!(ids_for("C002").is_empty(), "不存在的客户不应命中任何凭证");
+    }
+
     #[test]
     fn save_get_delete() {
         let db = mem();
@@ -1070,6 +1178,100 @@ mod tests {
         assert_eq!(got.entries[1].aux.bank.as_deref(), Some("B01"));
         assert!(got.balanced());
 
+        delete(&db, id).unwrap();
+        assert!(get(&db, id).unwrap().is_none());
+    }
+
+    /// 回归：删除凭证的「校验 + 清核销 + 删表」必须整体原子。
+    ///
+    /// 旧实现把校验与清核销都放在事务外、每条 `unsettle_entry` 各自提交：
+    /// 3 条分录里第 3 条清核销失败时，前 2 条核销记录已经被提交并消失，凭证却还在，
+    /// 账上留下一张「分录挂账、但核销记录只剩半截」的凭证。
+    #[test]
+    fn delete_rolls_back_unsettle_on_failure() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        // 待删凭证：两条应收分录（600 / 700），各自与收款凭证的应收分录核销
+        let mut v = Voucher::new(p, d, "记", 1);
+        v.prepared_by = "张三".to_string();
+        for (i, amt) in ["600", "700"].iter().enumerate() {
+            v.push_entry(Entry {
+                debit: Money::parse(amt).unwrap(),
+                aux: AuxRef { customer: Some("C01".into()), ..Default::default() },
+                ..Entry::new(i as i32 * 2 + 1, "112201", "应收")
+            });
+            v.push_entry(Entry {
+                credit: Money::parse(amt).unwrap(),
+                ..Entry::new(i as i32 * 2 + 2, "600101", "收入")
+            });
+        }
+        let vid = save(&db, &mut v).unwrap();
+        // 收款凭证：贷应收 600 / 700（草稿即可——核销不要求已记账，而已记账的凭证
+        // 本来就删不掉，不适合验证删凭证时的清核销原子性）
+        let mut pay = Voucher::new(p, d, "记", 2);
+        pay.prepared_by = "张三".to_string();
+        pay.push_entry(Entry {
+            debit: Money::parse("1300").unwrap(),
+            aux: AuxRef { bank: Some("B01".into()), ..Default::default() },
+            ..Entry::new(1, "100201", "收款")
+        });
+        for (i, amt) in ["600", "700"].iter().enumerate() {
+            pay.push_entry(Entry {
+                credit: Money::parse(amt).unwrap(),
+                aux: AuxRef { customer: Some("C01".into()), ..Default::default() },
+                ..Entry::new(i as i32 + 2, "112201", "冲应收")
+            });
+        }
+        let pid = save(&db, &mut pay).unwrap();
+        let e = entries_of(&db, vid).unwrap();
+        let f = entries_of(&db, pid).unwrap();
+        crate::settle::settle(&db, e[0].id, f[1].id, Money::parse("600").unwrap(), "u").unwrap();
+        crate::settle::settle(&db, e[2].id, f[2].id, Money::parse("700").unwrap(), "u").unwrap();
+        let cnt = |db: &Db| -> i64 {
+            db.conn().query_row("SELECT COUNT(*) FROM settle_record", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(cnt(&db), 2);
+
+        // 让第 2 条核销记录删不掉：删凭证必须整体失败，且第 1 条核销记录必须还在
+        let second: i64 = db
+            .conn()
+            .query_row("SELECT id FROM settle_record ORDER BY id LIMIT 1 OFFSET 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        db.conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER t_block BEFORE DELETE ON settle_record
+                 WHEN OLD.id = {second} BEGIN SELECT RAISE(ABORT, '核销记录被占用'); END;"
+            ))
+            .unwrap();
+        assert!(delete(&db, vid).is_err(), "清核销失败必须让删除失败");
+        assert_eq!(
+            cnt(&db),
+            2,
+            "第 1 条核销记录不得被提交掉（回归前会只剩 1 条，而凭证还在）"
+        );
+        assert!(get(&db, vid).unwrap().is_some(), "凭证必须还在");
+
+        // 去掉阻塞后删除应成功，核销记录一并清干净
+        db.conn().execute_batch("DROP TRIGGER t_block;").unwrap();
+        delete(&db, vid).unwrap();
+        assert!(get(&db, vid).unwrap().is_none());
+        assert_eq!(cnt(&db), 0);
+    }
+
+    /// 回归：已记账凭证不能删（`AND status<>'posted'` 守卫）。
+    #[test]
+    fn delete_rejects_posted_voucher() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = sample(p, 5, 1);
+        let id = save(&db, &mut v).unwrap();
+        post(&db, id, "张三").unwrap();
+        assert!(delete(&db, id).is_err(), "已记账凭证不得删除");
+        assert!(get(&db, id).unwrap().is_some());
+        unpost(&db, id).unwrap();
         delete(&db, id).unwrap();
         assert!(get(&db, id).unwrap().is_none());
     }

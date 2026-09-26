@@ -464,6 +464,39 @@ pub struct ReconcileItem {
     pub detail: String,
 }
 
+/// 统计"还有多少笔没处理干净"。
+///
+/// **查询失败绝不能当成 0**：结账前的控制项在 `SQLITE_BUSY` / 表损坏 / 表缺失时
+/// 报"0 笔未处理"，对账照样通过——一个会在出错时静默放行的控制比没有控制更糟。
+/// 这里把错误一并带回，由调用方出一项 `ok: false` 的检查。
+fn loose_count(db: &Db, sql: &str, period: fincore::Period) -> Result<i64, String> {
+    db.conn()
+        .query_row(sql, rusqlite::params![period.ymm()], |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
+/// 统一的检查项：计数成功就按 0 判定，失败则 `ok: false` 并说明原因
+fn loose_item(
+    db: &Db,
+    name: &str,
+    sql: &str,
+    period: fincore::Period,
+    ok_detail: impl Fn(i64) -> String,
+) -> ReconcileItem {
+    match loose_count(db, sql, period) {
+        Ok(n) => ReconcileItem {
+            name: name.into(),
+            ok: n == 0,
+            detail: ok_detail(n),
+        },
+        Err(e) => ReconcileItem {
+            name: name.into(),
+            ok: false,
+            detail: format!("统计失败：{e}（不能据此判断是否已处理干净）"),
+        },
+    }
+}
+
 /// 期末对账：试算平衡 + 总账/明细账一致 + 银行未达账项 + 未生成凭证的业务单据。
 /// 返回检查项清单，全部 ok 即对账通过。
 pub fn period_reconcile(db: &Db, period: fincore::Period) -> DbResult<Vec<ReconcileItem>> {
@@ -514,40 +547,43 @@ pub fn period_reconcile(db: &Db, period: fincore::Period) -> DbResult<Vec<Reconc
     }
 
     // 3. 银行未达账项（本期银行对账单未勾对的笔数）
-    let unmatched: i64 = db.conn().query_row(
+    out.push(loose_item(
+        db,
+        "银行未达账项",
         "SELECT COUNT(*) FROM bank_statement WHERE period=?1 AND entry_id IS NULL",
-        rusqlite::params![period.ymm()],
-        |r| r.get(0),
-    ).unwrap_or(0);
-    out.push(ReconcileItem {
-        name: "银行未达账项".into(),
-        ok: unmatched == 0,
-        detail: format!("本期银行对账单未勾对 {unmatched} 笔"),
-    });
+        period,
+        |n| format!("本期银行对账单未勾对 {n} 笔"),
+    ));
 
     // 4. 未生成凭证的业务单据（存货流水/工资/报销 缺 voucher_id）
-    let biz_loose = {
-        let a: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM stock_move WHERE period=?1 AND voucher_id IS NULL",
-            rusqlite::params![period.ymm()],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        let b: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM payroll WHERE period=?1 AND voucher_id IS NULL",
-            rusqlite::params![period.ymm()],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        let c: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM expense_claim WHERE period=?1 AND status='paid' AND voucher_id IS NULL",
-            rusqlite::params![period.ymm()],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        a + b + c
-    };
-    out.push(ReconcileItem {
-        name: "业务单据生成凭证".into(),
-        ok: biz_loose == 0,
-        detail: format!("存货/工资/报销尚有 {biz_loose} 笔未生成凭证"),
+    const BIZ_SQLS: [&str; 3] = [
+        "SELECT COUNT(*) FROM stock_move WHERE period=?1 AND voucher_id IS NULL",
+        "SELECT COUNT(*) FROM payroll WHERE period=?1 AND voucher_id IS NULL",
+        "SELECT COUNT(*) FROM expense_claim WHERE period=?1 AND status='paid' AND voucher_id IS NULL",
+    ];
+    let mut loose = 0i64;
+    let mut biz_errs: Vec<String> = Vec::new();
+    for sql in BIZ_SQLS {
+        match loose_count(db, sql, period) {
+            Ok(n) => loose += n,
+            Err(e) => biz_errs.push(e),
+        }
+    }
+    out.push(if biz_errs.is_empty() {
+        ReconcileItem {
+            name: "业务单据生成凭证".into(),
+            ok: loose == 0,
+            detail: format!("存货/工资/报销尚有 {loose} 笔未生成凭证"),
+        }
+    } else {
+        ReconcileItem {
+            name: "业务单据生成凭证".into(),
+            ok: false,
+            detail: format!(
+                "统计失败：{}（不能据此判断是否已生成凭证）",
+                biz_errs.join("；")
+            ),
+        }
     });
 
     Ok(out)
@@ -839,6 +875,45 @@ mod tests {
         let items = period_reconcile(&db, p).unwrap();
         assert!(items.len() >= 3);
         assert!(items.iter().all(|i| i.ok), "空账套+平衡凭证应全部通过：{:?}", items.iter().map(|i| &i.name).collect::<Vec<_>>());
+    }
+
+    /// 回归：COUNT 查询失败绝不能当成"0 笔未处理"让对账通过。
+    /// 旧的三个 `unwrap_or(0)` 在表缺失 / SQLITE_BUSY 时报"未勾对 0 笔"，
+    /// 结账前的控制项就在出错的情况下静默放行。
+    #[test]
+    fn period_reconcile_reports_query_failure_instead_of_zero() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        cash_voucher(&db, p, 5, vec![("1001", "借", "500", Some("0101")), ("600101", "贷", "500", None)]);
+        // 正常时全部通过
+        assert!(period_reconcile(&db, p).unwrap().iter().all(|i| i.ok));
+
+        // 制造真实的查询失败：把银行对账单表改名
+        db.conn()
+            .execute_batch("ALTER TABLE bank_statement RENAME TO bank_statement_x;")
+            .unwrap();
+        let items = period_reconcile(&db, p).unwrap();
+        assert!(
+            !items.iter().all(|i| i.ok),
+            "查询失败时对账不得通过：{:?}",
+            items
+        );
+        let bank = items.iter().find(|i| i.name == "银行未达账项").unwrap();
+        assert!(!bank.ok, "银行未达账项必须报失败");
+        assert!(
+            bank.detail.contains("统计失败"),
+            "必须说明是统计失败而非 0 笔：{}",
+            bank.detail
+        );
+
+        // 业务单据那一项同理
+        db.conn()
+            .execute_batch("ALTER TABLE expense_claim RENAME TO expense_claim_x;")
+            .unwrap();
+        let items = period_reconcile(&db, p).unwrap();
+        let biz = items.iter().find(|i| i.name == "业务单据生成凭证").unwrap();
+        assert!(!biz.ok, "业务单据项必须报失败");
+        assert!(biz.detail.contains("统计失败"), "{}", biz.detail);
     }
 
     #[test]

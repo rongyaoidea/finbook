@@ -260,14 +260,43 @@ pub fn so_shipment_with_stock(
     memo: &str,
     warehouse: &str,
 ) -> DbResult<i64> {
+    let (rid, _) = so_shipment_all(db, so_id, period, date, qty, memo, warehouse, "")?;
+    Ok(rid)
+}
+
+/// 发货全链：收入确认凭证 + 执行行 + 销售出库流水，**全部落在同一个事务里**。
+///
+/// 为什么不拆成两个各自 commit 的函数：早先 Web 入口先调 `so_income_voucher`
+/// （自己开事务并提交）再调 `so_shipment_with_stock`（另一个事务）。第二步失败时
+/// 收入与应收已经入账并提交，却没有任何发货/出库记录——退货超量、或仓库编码不存在
+/// 都会踩到，留下无法自动撤销的孤儿凭证。本函数把三处写入合并，`?` 任意一处失败
+/// 全部回滚。
+///
+/// 返回 `(发货执行行 id, 收入凭证 id 或 None)`。`who` 为空表示不生成收入凭证
+/// （保留旧的「只记库存不出凭证」调用方式）。
+pub fn so_shipment_all(
+    db: &Db,
+    so_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+    warehouse: &str,
+    who: &str,
+) -> DbResult<(i64, Option<i64>)> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("发货数量必须为正数").into());
     }
     let so = crate::scm::so_get(db, so_id)?
         .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
-    let line = first_so_line(&so)?;
-    let item = line.item_code.clone();
+    let item = first_so_line(&so)?.item_code.clone();
     let tx = db.write_tx()?;
+    // 收入确认先做：它内部的「已发完不重复确认」要读净发货量，与执行行同事务才准确
+    let ivid = if who.is_empty() {
+        None
+    } else {
+        so_income_voucher_in(&tx, &so, qty, date, who)?
+    };
     tx.execute(
         "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
         rusqlite::params![
@@ -290,7 +319,7 @@ pub fn so_shipment_with_stock(
         warehouse,
     )?;
     tx.commit()?;
-    Ok(rid)
+    Ok((rid, ivid))
 }
 
 /// 退货：负执行行 + 销售流水回库（正数量）同事务；**超退防呆**（本次 ≤ 净发货，
@@ -304,13 +333,30 @@ pub fn so_return_with_stock(
     memo: &str,
     warehouse: &str,
 ) -> DbResult<i64> {
+    let (rid, _) = so_return_all(db, so_id, period, date, qty, memo, warehouse, "")?;
+    Ok(rid)
+}
+
+/// 退货全链：收入冲回凭证 + 退货执行行 + 回库流水，**全部同一事务**。
+/// 与 [`so_shipment_all`] 对称，见该函数的「为什么不拆成两个事务」说明。
+pub fn so_return_all(
+    db: &Db,
+    so_id: i64,
+    period: Period,
+    date: NaiveDate,
+    qty: Money,
+    memo: &str,
+    warehouse: &str,
+    who: &str,
+) -> DbResult<(i64, Option<i64>)> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("退货数量必须为正数").into());
     }
     let so = crate::scm::so_get(db, so_id)?
         .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
-    let line = first_so_line(&so)?;
-    let item = line.item_code.clone();
+    let item = first_so_line(&so)?.item_code.clone();
+    // 超退校验放在任何写入之前：早先它在第二个事务里，报错时第一个事务的收入
+    // 冲回凭证已经提交了
     let shipped = so_shipment_sum(db, so_id)?;
     if qty > shipped {
         return Err(fincore::FinError::state(format!(
@@ -321,6 +367,11 @@ pub fn so_return_with_stock(
         .into());
     }
     let tx = db.write_tx()?;
+    let ivid = if who.is_empty() {
+        None
+    } else {
+        so_income_voucher_in(&tx, &so, qty.negated(), date, who)?
+    };
     tx.execute(
         "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
         rusqlite::params![
@@ -343,15 +394,20 @@ pub fn so_return_with_stock(
         warehouse,
     )?;
     tx.commit()?;
-    Ok(rid)
+    Ok((rid, ivid))
 }
 
-pub fn so_shipment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
-    let mut st = db.conn().prepare("SELECT qty FROM so_shipment WHERE so_id=?1")?;
+/// 净发货量（连接级）：发货执行行数量之和（退货以负行计入）。
+pub fn so_shipment_sum_on(conn: &rusqlite::Connection, so_id: i64) -> DbResult<Money> {
+    let mut st = conn.prepare("SELECT qty FROM so_shipment WHERE so_id=?1")?;
     let rows = st
         .query_map([so_id], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows.iter().map(|s| m(s)).sum())
+}
+
+pub fn so_shipment_sum(db: &Db, so_id: i64) -> DbResult<Money> {
+    so_shipment_sum_on(db.conn(), so_id)
 }
 
 // ---------------- 发货通知（对标金蝶发货通知单） ----------------
@@ -484,11 +540,28 @@ pub fn so_income_voucher(
     let Some(so) = crate::scm::so_get(db, so_id)? else {
         return Err(fincore::FinError::not_found("销售订单").into());
     };
+    let tx = db.write_tx()?;
+    let vid = so_income_voucher_in(&tx, &so, delta_qty, date, who)?;
+    tx.commit()?;
+    Ok(vid)
+}
+
+/// [`so_income_voucher`] 的事务内版本：写入调用方的事务，**不自行 commit**。
+///
+/// 供 [`so_shipment_all`] / [`so_return_all`] 把「收入确认 + 库存流水」合成单事务；
+/// 直接调本函数时调用方负责 commit。
+pub fn so_income_voucher_in(
+    tx: &rusqlite::Transaction,
+    so: &crate::scm::SalesOrder,
+    delta_qty: Money,
+    date: NaiveDate,
+    who: &str,
+) -> DbResult<Option<i64>> {
     let total_qty: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
     if total_qty.is_zero() || (so.total_amount.is_zero() && so.total_tax.is_zero()) {
         return Ok(None);
     }
-    let shipped = so_shipment_sum(db, so_id)?;
+    let shipped = so_shipment_sum_on(tx, so.id)?;
     let eff = if delta_qty.is_positive() {
         let remaining = total_qty - shipped;
         if !remaining.is_positive() {
@@ -512,10 +585,9 @@ pub fn so_income_voucher(
         return Ok(None);
     }
     let ret = eff.is_negative();
-    let biz = db.options().biz_accounts.clone();
+    let biz = crate::options_of(tx).biz_accounts.clone();
     let period = fincore::Period::from_date(date);
-    let tx = db.write_tx()?;
-    let no = crate::vouchers::next_no_of(&tx, period, "记")?;
+    let no = crate::vouchers::next_no_of(tx, period, "记")?;
     let mut v = fincore::Voucher::new(period, date, "记", no);
     v.prepared_by = who.to_string();
     v.source = fincore::VoucherSource::Business;
@@ -563,8 +635,7 @@ pub fn so_income_voucher(
         });
     }
     v.renumber();
-    let vid = crate::vouchers::save_in(&tx, &mut v)?;
-    tx.commit()?;
+    let vid = crate::vouchers::save_in(tx, &mut v)?;
     Ok(Some(vid))
 }
 // ===========================================================================

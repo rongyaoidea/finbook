@@ -122,13 +122,48 @@ pub fn po_get(db: &Db, id: i64) -> DbResult<Option<PurchaseOrder>> {
     Ok(Some(po))
 }
 
+/// 采购订单合法状态流转
+///
+/// 已完成/已作废是终态，不能回退；进行中的单子也不能凭空跳回草稿。
+/// 收货/入库进度由 `po_progress` 推进，不接受手工往回拨。
+fn po_transition_ok(from: PoStatus, to: PoStatus) -> bool {
+    use PoStatus::*;
+    match (from, to) {
+        (a, b) if a == b => true, // 幂等
+        (Draft, Confirmed) | (Draft, Cancelled) => true,
+        (Confirmed, PartialIn) | (Confirmed, Cancelled) => true,
+        (PartialIn, Completed) | (PartialIn, Cancelled) => true,
+        _ => false,
+    }
+}
+
 /// 采购订单状态流转（草稿 → 已确认 / 作废）
+///
+/// 只改状态列，绝不把明细整表读出再 `po_save` 写回——`po_save` 会 `DELETE` + 重插
+/// 全部 `po_line`，这期间并发入库记上的 `qty_received` 会被这轮回滚覆盖。
+/// 写入用「原状态」做条件（比较并交换），命中 0 行即状态已被他人改动。
 pub fn po_set_status(db: &Db, id: i64, to: PoStatus) -> DbResult<()> {
-    let Some(mut po) = po_get(db, id)? else {
-        return Err(FinError::not_found("采购订单").into());
-    };
-    po.status = to;
-    po_save(db, &mut po)?;
+    let from: String = db
+        .conn()
+        .query_row("SELECT status FROM purchase_order WHERE id=?1", [id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| FinError::not_found("采购订单"))?;
+    let cur = status_from::<PoStatus>(&from).unwrap_or(PoStatus::Draft);
+    if !po_transition_ok(cur, to) {
+        return Err(FinError::state(format!(
+            "采购订单不能从「{}」流转到「{}」",
+            cur.label(),
+            to.label()
+        ))
+        .into());
+    }
+    let n = db.conn().execute(
+        "UPDATE purchase_order SET status=?2 WHERE id=?1 AND status=?3",
+        rusqlite::params![id, serde_json::to_value(&to)?.as_str().unwrap(), from],
+    )?;
+    if n == 0 {
+        return Err(FinError::state("采购订单状态已被他人变更，请刷新后重试").into());
+    }
     Ok(())
 }
 
@@ -631,13 +666,78 @@ pub fn so_get(db: &Db, id: i64) -> DbResult<Option<SalesOrder>> {
     Ok(Some(so))
 }
 
-/// 订单状态流转（草稿 → 已确认 / 作废）：信用检查在 so_save 内把关
+/// 销售订单合法状态流转
+///
+/// 已完成/已作废是终态；进行中的单子不能凭空跳回草稿。
+/// 发货进度由 `so_progress_update` 自动推进，手工流转只负责确认与作废。
+fn so_transition_ok(from: SoStatus, to: SoStatus) -> bool {
+    use SoStatus::*;
+    match (from, to) {
+        (a, b) if a == b => true, // 幂等
+        (Draft, Confirmed) | (Draft, Cancelled) => true,
+        (Confirmed, PartialShip) | (Confirmed, Cancelled) => true,
+        (PartialShip, Completed) | (PartialShip, Cancelled) => true,
+        _ => false,
+    }
+}
+
+/// 订单状态流转（草稿 → 已确认 / 作废）
+///
+/// 只改状态列，绝不把明细整表读出再 `so_save` 写回——`so_save` 会 `DELETE` + 重插
+/// 全部 `so_line`，这期间并发发货记上的 `qty_shipped` 会被这轮回滚覆盖。
+/// 写入用「原状态」做条件（比较并交换），命中 0 行即状态已被他人改动。
 pub fn so_set_status(db: &Db, id: i64, to: SoStatus) -> DbResult<()> {
-    let Some(mut so) = so_get(db, id)? else {
-        return Err(FinError::not_found("销售订单").into());
-    };
-    so.status = to;
-    so_save(db, &mut so)?;
+    // 只读表头：信用检查需要总额、客户与期间，但不需要任何一行明细
+    let (from, total, customer, period) = db
+        .conn()
+        .query_row(
+            "SELECT status, total_amount, customer_code, period FROM sales_order WHERE id=?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Money::parse_or_zero(&r.get::<_, String>(1)?),
+                    r.get::<_, String>(2)?,
+                    Period::from_ymm(r.get(3)?),
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found("销售订单"))?;
+    let cur = status_from::<SoStatus>(&from).unwrap_or(SoStatus::Draft);
+    if !so_transition_ok(cur, to) {
+        return Err(FinError::state(format!(
+            "销售订单不能从「{}」流转到「{}」",
+            cur.label(),
+            to.label()
+        ))
+        .into());
+    }
+    // 信用控制（对标金蝶，口径与 so_save 完全一致）：credit_check 只计非草稿非作废订单，
+    // 旧状态已计入的先剔除，状态流转不改金额所以再加回同一笔。
+    if !matches!(to, SoStatus::Draft | SoStatus::Cancelled) && !customer.is_empty() {
+        let (mut used, limit, _) = crate::sales::credit_check(db, &customer, period)?;
+        if !matches!(cur, SoStatus::Draft | SoStatus::Cancelled) {
+            used -= total;
+        }
+        used += total;
+        if !limit.is_zero() && used > limit {
+            return Err(FinError::state(format!(
+                "客户 {} 信用额度不足：占用 {}，额度 {}（信用额度在辅助档案·客户中设置）",
+                customer,
+                used.fmt_money(),
+                limit.fmt_money()
+            ))
+            .into());
+        }
+    }
+    let n = db.conn().execute(
+        "UPDATE sales_order SET status=?2 WHERE id=?1 AND status=?3",
+        rusqlite::params![id, serde_json::to_value(&to)?.as_str().unwrap(), from],
+    )?;
+    if n == 0 {
+        return Err(FinError::state("销售订单状态已被他人变更，请刷新后重试").into());
+    }
     Ok(())
 }
 
@@ -662,9 +762,17 @@ pub fn so_progress_update(db: &Db, id: i64) -> DbResult<()> {
         SoStatus::PartialShip
     };
     if to != so.status {
+        // 同样用原状态做条件：并发发货时不会把别人刚推进的状态改回去。
+        // 命中 0 行说明状态在这期间已被并发改写（另一笔发货已推进过），此时本函数
+        // 算出的 `to` 已经过时，直接放弃即可——这是"由发货流水派生的状态"，
+        // 报错只会把一次正常操作变成 500。
         db.conn().execute(
-            "UPDATE sales_order SET status=?2 WHERE id=?1",
-            rusqlite::params![id, serde_json::to_value(to)?.as_str().unwrap()],
+            "UPDATE sales_order SET status=?2 WHERE id=?1 AND status=?3",
+            rusqlite::params![
+                id,
+                serde_json::to_value(to)?.as_str().unwrap(),
+                serde_json::to_value(so.status)?.as_str().unwrap()
+            ],
         )?;
     }
     Ok(())
@@ -931,6 +1039,144 @@ mod tests {
         let id = so_save(&db, &mut so).unwrap();
         assert!(id > 0);
         so_delete(&db, id).unwrap();
+    }
+
+    /// 回归：状态流转不得把明细整表读出再写回。
+    /// 旧实现 `so_get → 改状态 → so_save`，`so_save` 会 DELETE+重插全部 so_line，
+    /// 期间并发记上的 qty_shipped 会被这轮回滚覆盖。
+    #[test]
+    fn so_set_status_keeps_concurrent_line_progress() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut so = SalesOrder::new(p, NaiveDate::from_ymd(2026, 1, 10), "C001", "客户B", "u1");
+        so.no = so_next_no(&db, p).unwrap();
+        so.lines.push(SoLine {
+            id: 0, so_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("50"), qty_shipped: Money::ZERO,
+            unit_price: m("12"), tax_rate: m("0.13"),
+            amount: m("600"), tax_amount: m("78"),
+            memo: String::new(),
+        });
+        let id = so_save(&db, &mut so).unwrap();
+        so_set_status(&db, id, SoStatus::Confirmed).unwrap();
+        // 模拟并发出货：直接写 qty_shipped（发货回写走 sales.rs，不在本文件）
+        db.conn()
+            .execute(
+                "UPDATE so_line SET qty_shipped=?2 WHERE so_id=?1",
+                rusqlite::params![id, "20"],
+            )
+            .unwrap();
+        so_set_status(&db, id, SoStatus::Cancelled).unwrap();
+        let got = so_get(&db, id).unwrap().unwrap();
+        assert_eq!(got.status, SoStatus::Cancelled);
+        assert_eq!(
+            got.lines[0].qty_shipped,
+            m("20"),
+            "状态流转不得回滚明细上的并发进度（回归前会被 so_save 清成 0）"
+        );
+    }
+
+    /// 回归：非法状态流转必须被状态机拦下。
+    /// 旧实现什么状态都能改（已完成可回草稿、已作废可复活）。
+    #[test]
+    fn so_set_status_rejects_illegal_transitions() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut so = SalesOrder::new(p, NaiveDate::from_ymd(2026, 1, 10), "C001", "客户B", "u1");
+        so.no = so_next_no(&db, p).unwrap();
+        so.lines.push(SoLine {
+            id: 0, so_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("50"), qty_shipped: Money::ZERO,
+            unit_price: m("12"), tax_rate: m("0.13"),
+            amount: m("600"), tax_amount: m("78"),
+            memo: String::new(),
+        });
+        let id = so_save(&db, &mut so).unwrap();
+        // 草稿不能直接跳到已完成
+        assert!(so_set_status(&db, id, SoStatus::Completed).is_err());
+        // 作废是终态，不能复活
+        so_set_status(&db, id, SoStatus::Cancelled).unwrap();
+        assert!(so_set_status(&db, id, SoStatus::Confirmed).is_err());
+        assert!(so_set_status(&db, id, SoStatus::Draft).is_err());
+        assert_eq!(so_get(&db, id).unwrap().unwrap().status, SoStatus::Cancelled);
+        // 订单不存在要报错
+        assert!(so_set_status(&db, 999_999, SoStatus::Confirmed).is_err());
+    }
+
+    /// 回归：`so_progress_update` 是「由发货流水派生的状态」，只能推进、不能复活。
+    /// 作废/草稿单据上挂着发货流水时，进度同步不得把它们改成"部分发货/已完成"。
+    #[test]
+    fn so_progress_update_never_resurrects_draft_or_cancelled() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut so = SalesOrder::new(p, NaiveDate::from_ymd(2026, 1, 10), "C001", "客户B", "u1");
+        so.no = so_next_no(&db, p).unwrap();
+        so.lines.push(SoLine {
+            id: 0, so_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("50"), qty_shipped: Money::ZERO,
+            unit_price: m("12"), tax_rate: m("0.13"),
+            amount: m("600"), tax_amount: m("78"),
+            memo: String::new(),
+        });
+        let id = so_save(&db, &mut so).unwrap();
+        // 造一条已发货流水：数量 20 < 订购 50 → 派生状态应是"部分发货"
+        db.conn()
+            .execute(
+                "INSERT INTO so_shipment(so_id, period, date, qty, memo)
+                 VALUES(?1, ?2, '2026-01-12', 20, '')",
+                rusqlite::params![id, p.ymm()],
+            )
+            .unwrap();
+        // 草稿：进度同步不动它（发货通知要求先确认订单）
+        so_progress_update(&db, id).unwrap();
+        assert_eq!(so_get(&db, id).unwrap().unwrap().status, SoStatus::Draft);
+        // 确认 → 部分发货
+        so_set_status(&db, id, SoStatus::Confirmed).unwrap();
+        so_progress_update(&db, id).unwrap();
+        assert_eq!(so_get(&db, id).unwrap().unwrap().status, SoStatus::PartialShip);
+        // 作废 → 进度同步不得复活
+        so_set_status(&db, id, SoStatus::Cancelled).unwrap();
+        so_progress_update(&db, id).unwrap();
+        assert_eq!(
+            so_get(&db, id).unwrap().unwrap().status,
+            SoStatus::Cancelled,
+            "已作废订单不得被进度同步改回部分发货"
+        );
+    }
+
+    /// 回归：采购订单状态流转同样不得整表回写明细、且要过状态机。
+    #[test]
+    fn po_set_status_is_guarded_and_keeps_lines() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = PurchaseOrder::new(p, NaiveDate::from_ymd(2026, 1, 5), "S001", "供应商A", "u1");
+        po.no = po_next_no(&db, p).unwrap();
+        po.lines.push(PoLine {
+            id: 0, po_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("100"), qty_received: Money::ZERO,
+            unit_price: m("10"), tax_rate: m("0.13"),
+            amount: m("1000"), tax_amount: m("130"),
+            memo: String::new(),
+        });
+        let id = po_save(&db, &mut po).unwrap();
+        po_set_status(&db, id, PoStatus::Confirmed).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE po_line SET qty_received=?2 WHERE po_id=?1",
+                rusqlite::params![id, "40"],
+            )
+            .unwrap();
+        po_set_status(&db, id, PoStatus::Cancelled).unwrap();
+        let got = po_get(&db, id).unwrap().unwrap();
+        assert_eq!(got.status, PoStatus::Cancelled);
+        assert_eq!(got.lines[0].qty_received, m("40"), "状态流转不得回滚并发入库量");
+        // 终态不可复活；不存在的单据要报错
+        assert!(po_set_status(&db, id, PoStatus::Draft).is_err());
+        assert!(po_set_status(&db, 999_999, PoStatus::Confirmed).is_err());
     }
     
     #[test]

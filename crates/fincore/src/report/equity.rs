@@ -67,11 +67,17 @@ impl EquityStatement {
         }
     }
 
-    /// 勾稽：年初 + 本年增减 == 年末
+    /// 勾稽：每一行与合计都要满足「年初 + 本年增减 == 年末」
+    ///
+    /// 早先只查合计，于是两行各自不平但方向相反时会相互抵消、合计照样对得上，
+    /// 表就带着内部矛盾通过了勾稽。逐行查才能发现这种情况。
     pub fn ties(&self) -> bool {
-        (self.total.begin + self.total.change - self.total.end)
-            .round2()
-            .is_zero()
+        self.lines
+            .iter()
+            .all(|l| (l.begin + l.change - l.end).round2().is_zero())
+            && (self.total.begin + self.total.change - self.total.end)
+                .round2()
+                .is_zero()
     }
 }
 
@@ -105,5 +111,25 @@ mod tests {
         assert!(stmt.lines.is_empty());
         assert_eq!(stmt.total.begin, Money::ZERO);
         assert!(stmt.ties());
+    }
+
+    /// 逐行勾稽：两行各自不平但方向相反时，合计仍对得上，必须被识别出来。
+    #[test]
+    fn ties_checks_each_line_not_just_total() {
+        // 实收资本 应为 100+100=200 却填 100（少 100）
+        // 盈余公积 应为  50+50=100 却填 200（多 100）→ 合计恰好抵消
+        let stmt = EquityStatement::build(&[
+            ("实收资本".into(), m("100"), m("100"), m("100")),
+            ("盈余公积".into(), m("50"), m("50"), m("200")),
+        ]);
+        assert_eq!(
+            stmt.total.begin + stmt.total.change,
+            stmt.total.end,
+            "前置条件：合计必须是对得上的"
+        );
+        assert!(
+            !stmt.ties(),
+            "合计对得上但两行各自不平，必须判为不勾稽"
+        );
     }
 }

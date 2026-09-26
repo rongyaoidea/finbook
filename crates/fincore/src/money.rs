@@ -401,6 +401,27 @@ impl Mul<i64> for Money {
     }
 }
 
+/// 乘数抽象：统一 `Money` 的三种乘数（`Money` / `Decimal` / `i64`），
+/// 仅作为 [`Money::checked_mul`] 的参数约束使用（inherent 方法，调用点无需引入本 trait）。
+pub trait Multiplier {
+    fn multiplier_dec(self) -> Decimal;
+}
+impl Multiplier for Money {
+    fn multiplier_dec(self) -> Decimal {
+        self.0
+    }
+}
+impl Multiplier for Decimal {
+    fn multiplier_dec(self) -> Decimal {
+        self
+    }
+}
+impl Multiplier for i64 {
+    fn multiplier_dec(self) -> Decimal {
+        Decimal::from(self)
+    }
+}
+
 /// 除数抽象：统一 `Money` 的三种除数（`Money` / `Decimal` / `i64`），
 /// 仅作为 [`Money::checked_div`] 的参数约束使用（inherent 方法，调用点无需引入本 trait）。
 pub trait Divisor {
@@ -440,6 +461,30 @@ impl Money {
         } else {
             Some(Money(self.0 / d))
         }
+    }
+
+    /// 乘法（防溢出）：`rust_decimal` 的 `*` 在结果超出 ~7.9e28 时**直接 panic**。
+    ///
+    /// 与 [`Money::checked_div`] 同源的问题：运算符版本把"算不动"变成"进程崩"。
+    /// 账务链路的乘数被 `validate_for_save` 的单条分录上限（1e15）约束住，
+    /// 但**报表公式可以把两个余额相乘**（`QM("1001")*QM("1002")`，各 1e15 → 1e30），
+    /// Web 端被 CatchPanicLayer 兜成 500，桌面端直接崩进程。
+    /// 因此凡用户输入能到达的计算一律走本方法，溢出返回 `None` 由调用方报错。
+    #[inline]
+    pub fn checked_mul<R: Multiplier>(self, rhs: R) -> Option<Money> {
+        self.0.checked_mul(rhs.multiplier_dec()).map(Money)
+    }
+
+    /// 加法（防溢出），语义同 [`Money::checked_mul`]
+    #[inline]
+    pub fn checked_add(self, rhs: Money) -> Option<Money> {
+        self.0.checked_add(rhs.0).map(Money)
+    }
+
+    /// 减法（防溢出），语义同 [`Money::checked_mul`]
+    #[inline]
+    pub fn checked_sub(self, rhs: Money) -> Option<Money> {
+        self.0.checked_sub(rhs.0).map(Money)
     }
 }
 impl AddAssign for Money {

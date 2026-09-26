@@ -316,6 +316,10 @@ fn entry_of(conn: &Connection, entry_id: i64) -> DbResult<Option<OpenEntry>> {
 }
 
 /// 取某科目（含下级）截至某日的全部已记账往来分录，并填充已核销额
+///
+/// 口径与全仓 H-3 定案一致：**只取已记账**（`status = 'posted'`）。
+/// 早先写的是 `status != 'void'`，把草稿/已审核未记账也算成未核销往来，
+/// 于是自动核销、账龄、催款单都能对着一张还没入账的凭证做事。
 pub fn open_entries(
     db: &Db,
     account: &str,
@@ -327,7 +331,7 @@ pub fn open_entries(
                 e.account_code, e.aux_key, COALESCE(e.settle_no,''), e.debit, e.credit
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
          WHERE (e.account_code = ?1 OR e.account_code LIKE ?1||'%')
-           AND v.period <= ?2 AND v.status != 'void'
+           AND v.period <= ?2 AND v.status = 'posted'
            AND (e.debit <> '0' OR e.credit <> '0')
          ORDER BY v.date, v.no, e.line",
     )?;
@@ -376,6 +380,8 @@ pub struct AutoSettleResult {
     pub exact: usize,
     /// 尾数清零（余额小于阈值直接抹平）的笔数
     pub written_off: usize,
+    /// 核销失败的提示（尾数抹平等「尽力而为」的动作，失败不阻断整批，但必须可见）
+    pub warnings: Vec<String>,
 }
 
 /// 自动核销
@@ -472,10 +478,21 @@ pub fn auto_settle(
                     if let Some(other) = g.iter().find(|x| {
                         x.entry_id != id && x.is_open() && (x.debit > Money::ZERO) != (d.debit > Money::ZERO)
                     }) {
-                        let _ = settle(db, id, other.entry_id, left, who);
-                        res.pairs += 1;
-                        res.written_off += 1;
-                        res.amount += left;
+                        // 尾数抹平是「尽力而为」：失败不阻断整批，但也绝不能计数——
+                        // 旧写法丢弃错误后照样 pairs/amount +=，界面显示"已核销 N 笔"
+                        // 而库里一条核销记录都没有。
+                        match settle(db, id, other.entry_id, left, who) {
+                            Ok(_) => {
+                                res.pairs += 1;
+                                res.written_off += 1;
+                                res.amount += left;
+                            }
+                            Err(e) => res.warnings.push(format!(
+                                "分录 {} 的尾数 {} 抹平失败：{e}",
+                                id,
+                                left.fmt_money()
+                            )),
+                        }
                     }
                 }
             }
@@ -1191,9 +1208,45 @@ mod tests {
         assert_eq!(total, Money::parse("200").unwrap());
     }
 
+    /// 回归：尾数抹平失败时不得计数。
+    ///
+    /// 旧写法 `let _ = settle(...); res.pairs += 1; res.written_off += 1;` 把错误丢掉
+    /// 照样计数，界面显示"已核销 N 笔 / 金额 X"，库里却没有那条核销记录
+    /// （本例 X 甚至超过实际核销总额）。
     #[test]
-    fn aging_report() {
-        let db = tmpdb("aging");
+    fn auto_settle_does_not_count_failed_writeoff() {
+        let db = tmpdb("auto_wo");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        // 应收 100；收款 99.99；再一笔 0.005 的收款（尾数比应收的 0.01 尾差还小）
+        let (_, e_ar) = ar_voucher(&db, p, d, 1, "C01", "100", true, "600101");
+        ar_voucher(&db, p, d, 2, "C01", "99.99", false, "100201");
+        ar_voucher(&db, p, d, 3, "C01", "0.005", false, "100201");
+
+        let res = auto_settle(&db, "1122", p, Money::parse("0.01").unwrap(), "u").unwrap();
+        assert_eq!(
+            res.written_off, 0,
+            "抹平失败不得计入 written_off：{res:?}"
+        );
+        assert!(
+            res.warnings.iter().any(|w| w.contains("抹平失败")),
+            "抹平失败必须进 warnings：{res:?}"
+        );
+        // 计数必须与库里的核销记录一致
+        let really = settled_of(db.conn(), e_ar).unwrap();
+        assert_eq!(
+            res.amount, really,
+            "统计金额必须等于实际核销额（回归前会把失败的抹平也算进去）：{res:?}"
+        );
+        assert_eq!(
+            res.pairs,
+            list(&db, "1122").unwrap().len(),
+            "核销笔数必须等于实际记录数：{res:?}"
+        );
+    }
+
+    #[test]
+    fn aging_report() {        let db = tmpdb("aging");
         let p = Period::new(2026, 3).unwrap();
         let d1 = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2025, 6, 1).unwrap();

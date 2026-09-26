@@ -143,12 +143,14 @@ pub fn analyze(
             });
         // 未来日期的单据（days 为负）按 0 天处理，不能落进"最旧"档虚增长账龄
         let days = (as_of - it.date).num_days().max(0);
-        if days > line.max_days {
-            line.max_days = days;
-        }
         if open.is_negative() {
+            // 贷方性质（预收/预付）不进账龄桶，也不能参与"最长账龄"统计——
+            // 否则一笔 5 年前的预收款会把客户真实只有 11 天的应收撑成 5 年。
             line.credit_total += open.abs();
             continue;
+        }
+        if days > line.max_days {
+            line.max_days = days;
         }
         let d = days.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let idx = buckets.iter().position(|b| b.contains(d));
@@ -270,6 +272,22 @@ mod tests {
         assert_eq!(lines[0].total, m("1000"));
         assert_eq!(lines[0].credit_total, m("1500"));
         assert_eq!(lines[0].net(), m("-500"));
+    }
+
+    /// 贷方单据（预收）不参与 `max_days`。
+    /// 回归：早先把 `max_days` 更新放在贷方 `continue` 之前，
+    /// 客户一笔 5 年前的大额预收会把 11 天的新应收显示成 5 年账龄。
+    #[test]
+    fn credit_side_does_not_inflate_max_days() {
+        let as_of = d(2026, 3, 31);
+        let items = vec![
+            item("C01", d(2026, 3, 20), "1000", "0"), // 11 天，应收
+            item("C01", d(2021, 1, 1), "-9000", "0"), // 5 年前，预收
+        ];
+        let lines = analyze(&items, as_of, &buckets_by_days()).unwrap();
+        assert_eq!(lines[0].total, m("1000"));
+        assert_eq!(lines[0].credit_total, m("9000"));
+        assert_eq!(lines[0].max_days, 11, "贷方预收不得抬高最长账龄");
     }
 
     #[test]

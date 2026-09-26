@@ -109,6 +109,11 @@ pub struct FxAdjLine {
 pub const FX_GAIN_ACCOUNT: &str = "660304";
 
 /// 试算期末调汇（不生成凭证）
+///
+/// 取数口径与全仓 H-3 定案一致：**只取已记账**（`status = 'posted'`）。
+/// 早先写的是 `status != 'void'`，草稿与已审核未记账的外币分录都会被算进基数，
+/// 而 `fx_adjust` 自己生成的调汇凭证正是草稿——重复调汇会把自己的上次输出
+/// 当成基数再调一次，汇兑损益越滚越大。
 pub fn fx_calc(db: &Db, period: Period) -> DbResult<Vec<FxAdjLine>> {
     let rates = fx_list(db, period)?;
     if rates.is_empty() {
@@ -118,7 +123,7 @@ pub fn fx_calc(db: &Db, period: Period) -> DbResult<Vec<FxAdjLine>> {
     let mut st = db.conn().prepare(
         "SELECT e.account_code, e.aux_key, e.currency, e.debit, e.credit, e.rate, e.amount_for
          FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
-         WHERE v.period <= ?1 AND v.status != 'void'
+         WHERE v.period <= ?1 AND v.status = 'posted'
            AND e.currency IS NOT NULL AND e.currency <> ''
            AND (e.debit <> '0' OR e.credit <> '0')
          ORDER BY e.account_code, e.aux_key, e.currency",
@@ -528,6 +533,8 @@ pub fn at_run(
 ) -> DbResult<(Vec<i64>, Vec<String>)> {
     // 锁被毒化（前次执行 panic 过）不影响正确性：取锁只为串行化，接管即可
     let _serial = AT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 目的科目为 Auto 方向时要按科目表的余额方向判定，先把科目表读出来
+    let chart = crate::accounts::chart(db)?;
     let previews = at_preview_all(db, period)?;
     let mut ids = Vec::new();
     let mut skips = Vec::new();
@@ -546,7 +553,23 @@ pub fn at_run(
         } else {
             r.offset_account.clone()
         };
-        let dst_is_debit = r.dst_dir != EntryDir::Credit;
+        let dst_is_debit = match r.dst_dir {
+            EntryDir::Debit => true,
+            EntryDir::Credit => false,
+            // Auto = 按目的科目的余额方向取（与 at_preview 里 src_dir 的 Auto 同一口径）。
+            // 旧写法 `dst_dir != EntryDir::Credit` 把 Auto 一律当借方，计提到贷方科目
+            // （如 2211 应付职工薪酬）时金额会记到错的一侧。
+            EntryDir::Auto => match chart.get(&r.dst_account) {
+                Some(a) => a.dir == fincore::Direction::Debit,
+                None => {
+                    skips.push(format!(
+                        "{}：目的科目 {} 不在科目表里，无法判定自动方向，已跳过",
+                        r.name, r.dst_account
+                    ));
+                    continue;
+                }
+            },
+        };
         // 判重 → 取号 → 写凭证收进同一事务。判重本质是「先查后插」，跨事务时
         // 并发执行会各生成一张、各计提一次；这里权威判重放在事务内，即便绕过
         // 上面的进程内串行锁（跨进程、或未来改成多线程调度）也不会重复计提。
@@ -923,6 +946,74 @@ mod tests {
         assert_eq!(e3[0].account_code, "6403");
         assert_eq!(e3[0].debit, Money::parse("210").unwrap()); // 3000 × 7%
         assert_eq!(e3[1].account_code, "222103");
+    }
+
+    /// 回归：`dst_dir = Auto`（按目的科目余额方向取）不能一律当借方。
+    /// 计提到贷方科目（221101 工资）时金额必须落在贷方。
+    #[test]
+    fn auto_transfer_auto_dir_follows_destination_account() {
+        let db = tmpdb("atauto");
+        let p = Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        // 制造费用借方发生 1000
+        post_voucher(
+            &db,
+            p,
+            d,
+            1,
+            &[("510101", "1000", "0"), ("1001", "0", "1000")],
+        );
+        // 目的科目 221101 工资是贷方科目，dst_dir=Auto
+        let rule = AutoTransfer {
+            id: 0,
+            name: "计提工资".into(),
+            sort: 10,
+            active: true,
+            src_account: "510101".into(),
+            src_aux: String::new(),
+            src_kind: SrcKind::Debit,
+            src_dir: EntryDir::Debit,
+            ratio: Money::ONE,
+            ratio_mode_is_ratio: true,
+            dst_account: "221101".into(),
+            dst_aux: String::new(),
+            dst_dir: EntryDir::Auto,
+            offset_account: "1001".into(),
+            summary: "计提工资".into(),
+            memo: String::new(),
+        };
+        let rid = at_insert(&db, &rule).unwrap();
+        let (ids, skips) = at_run(&db, p, d, "u").unwrap();
+        assert_eq!(ids.len(), 1, "{skips:?}");
+        let e = crate::vouchers::entries_of(&db, ids[0]).unwrap();
+        let dst = e.iter().find(|x| x.account_code == "221101").unwrap();
+        assert_eq!(
+            dst.credit,
+            Money::parse("1000").unwrap(),
+            "贷方科目的自动方向应记在贷方（回归前记成借方）"
+        );
+        assert_eq!(dst.debit, Money::ZERO);
+        let off = e.iter().find(|x| x.account_code == "1001").unwrap();
+        assert_eq!(off.debit, Money::parse("1000").unwrap());
+        assert_eq!(off.credit, Money::ZERO);
+        let v = crate::vouchers::get(&db, ids[0]).unwrap().unwrap();
+        assert!(v.balanced());
+
+        // 目的科目不存在时不得猜方向，必须跳过并说明原因
+        at_delete(&db, rid).unwrap();
+        let rule2 = AutoTransfer {
+            name: "指向不存在科目".into(),
+            sort: 20,
+            dst_account: "9999".into(),
+            ..rule.clone()
+        };
+        at_insert(&db, &rule2).unwrap();
+        let (ids2, skips2) = at_run(&db, p, d, "u").unwrap();
+        assert!(ids2.is_empty());
+        assert!(
+            skips2.iter().any(|s| s.contains("9999")),
+            "应说明因科目不存在而跳过：{skips2:?}"
+        );
     }
 
     #[test]

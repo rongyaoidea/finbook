@@ -629,19 +629,20 @@ pub fn gl_reconcile(
     period: Period,
     user: Option<&fincore::user::User>,
 ) -> DbResult<ReconReport> {
-    // 库存侧
+    // 库存侧：逐行取文本在 Rust 侧用 Decimal 累加（金额是 TEXT 列，SUM/CAST 会走
+    // REAL 丢精度，违反本模块「绝不用 SQL SUM 算钱」的口径）
     let mut stock: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
-    let mut st = db.conn().prepare(
-        "SELECT item, COALESCE(SUM(CAST(amount AS REAL)),0)
-         FROM stock_move WHERE item <> '' AND period <= ?1 GROUP BY item",
-    )?;
+    let mut st = db
+        .conn()
+        .prepare("SELECT item, amount FROM stock_move WHERE item <> '' AND period <= ?1")?;
     let mv_rows = st
         .query_map([period.ymm()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            Ok((r.get::<_, String>(0)?, Money::parse_or_zero(&r.get::<_, String>(1)?)))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
     for (item, v) in mv_rows {
-        stock.insert(item, Money::parse_or_zero(&format!("{v:.4}")));
+        *stock.entry(item).or_insert(Money::ZERO) += v;
     }
     // 总账侧：存货辅助余额（自账套首期累计至 period）
     let start = db.options().start_period;
@@ -711,6 +712,32 @@ pub struct AcctDetailRow {
     pub status: String,
 }
 
+/// 某科目在期初余额表里的期初合计（全部辅助核算行）
+///
+/// 口径与 [`BalanceSnapshot::load`] 完全一致：`年初 + 累计借 − 累计贷`。
+/// 年中建账（`import_begin`）只往 `begin_balance` 写数据，`voucher_entry` 里一条都没有；
+/// 期初只从分录算就会显示 0，与余额表、账簿的同一口径自相矛盾。
+fn begin_balance_of(db: &Db, account: &str) -> DbResult<Money> {
+    let mut st = db.conn().prepare(
+        "SELECT year_begin, debit_accum, credit_accum FROM begin_balance WHERE account_code = ?1",
+    )?;
+    let rows = st
+        .query_map([account], |r| {
+            Ok((
+                read_money(r, 0)?,
+                read_money(r, 1)?,
+                read_money(r, 2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
+    let mut sum = Money::ZERO;
+    for (yb, ad, ac) in rows {
+        sum += yb + ad - ac;
+    }
+    Ok(sum)
+}
+
 /// 科目明细账：期初（from 之前累计）+ from..to 分录逐笔运行余额。
 /// 口径：**status = 'posted' 已记账**（与试算平衡 H-3 完全一致——草稿/已审未记账不进）；
 /// 余额 = 借 − 贷 累计（贷余为负）。返回 (期初余额, 明细行)。
@@ -720,7 +747,9 @@ pub fn account_detail(
     from: Period,
     to: Period,
 ) -> DbResult<(Money, Vec<AcctDetailRow>)> {
-    // 期初（逐行文本汇总，与 batch_balance 同模式）
+    // 期初 = 期初余额表（begin_balance）+ from 之前的已记账分录，两者与账簿同口径
+    let mut begin = begin_balance_of(db, account)?;
+    // 逐行文本汇总，与 batch_balance 同模式（绝不 SQL SUM）
     let mut st = db.conn().prepare(
         "SELECT e.debit, e.credit FROM voucher_entry e
          JOIN voucher v ON v.id = e.voucher_id
@@ -731,10 +760,10 @@ pub fn account_detail(
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let begin: Money = begin_rows
+    begin += begin_rows
         .iter()
         .map(|(d, c)| Money::parse_or_zero(d) - Money::parse_or_zero(c))
-        .sum();
+        .sum::<Money>();
     // 明细
     let mut st = db.conn().prepare(
         "SELECT v.date, v.id, v.no, v.word, v.memo, v.status, e.summary, e.debit, e.credit
@@ -892,6 +921,25 @@ pub struct LedgerQuery {
     /// 数据范围科目区间（由 with_user_scope 填充）
     pub code_from: Option<String>,
     pub code_to: Option<String>,
+}
+
+impl Default for LedgerQuery {
+    /// 基准期间：仅供 `..Default::default()` 的测试/便捷构造使用，
+    /// 业务调用点一律显式给 `from` / `to`。
+    fn default() -> Self {
+        let p = Period::new(2026, 1).expect("基准期间必然合法");
+        Self {
+            code: String::new(),
+            include_children: false,
+            aux: None,
+            from: p,
+            to: p,
+            posted_only: true,
+            prepared_by: None,
+            code_from: None,
+            code_to: None,
+        }
+    }
 }
 
 impl LedgerQuery {
@@ -1779,6 +1827,8 @@ mod tests {
 mod drill_tests {
     use super::*;
     use crate::tests::mem;
+    use fincore::account::AuxKind;
+    use fincore::voucher::Entry;
 
     #[test]
     fn account_detail_smoke() {
@@ -1808,5 +1858,94 @@ mod drill_tests {
         assert_eq!(begin, Money::ZERO);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].balance, Money::parse("100").unwrap());
+    }
+
+    /// 回归：`account_detail` 的期初必须与 `ledger()` 同源，都含期初余额表。
+    ///
+    /// 年中建账时 `import_begin` 只写 `begin_balance`、`voucher_entry` 一条都没有，
+    /// 期初只从分录算就会显示 0：余额表有金额、钻取进去期初却是 0，两边打架。
+    #[test]
+    fn account_detail_begin_matches_ledger() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        // 年中建账：只有期初余额表，没有历史凭证
+        crate::imports::import_begin(
+            &db,
+            "\u{feff}科目,方向,金额\n100201,借,50000\n",
+            "u1",
+            &std::collections::HashMap::new(),
+            crate::imports::ImportTemplate::Generic,
+        )
+        .unwrap();
+        // 当期再记一张已记账凭证：借管理费用 / 贷银行
+        let mut v = fincore::Voucher::new(p, p.first_day(), "记", 1);
+        v.push_entry(Entry {
+            debit: Money::parse("1000").unwrap(),
+            ..Entry::new(1, "660201", "付办公费")
+        });
+        let mut e2 = Entry::new(2, "100201", "付办公费");
+        e2.aux.set(AuxKind::Bank, Some("B01".into()));
+        e2.credit = Money::parse("1000").unwrap();
+        v.push_entry(e2);
+        let vid = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, vid, "u").unwrap();
+
+        let chart = accounts::chart(&db).unwrap();
+        let lq = LedgerQuery {
+            code: "100201".into(),
+            from: p,
+            to: p,
+            posted_only: true,
+            ..LedgerQuery::default()
+        };
+        let led = ledger(&db, &chart, &lq).unwrap();
+        let (begin, rows) = account_detail(&db, "100201", p, p).unwrap();
+        assert_eq!(
+            begin,
+            Money::parse("50000").unwrap(),
+            "期初必须取期初余额表（回归前恒为 0）"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].balance, Money::parse("49000").unwrap());
+        // 与账簿末行运行余额必须一致
+        assert_eq!(
+            rows.last().unwrap().balance,
+            led.last().unwrap().balance,
+            "钻取运行余额必须与账簿一致（回归前差 50000）"
+        );
+    }
+
+    /// 回归：金额不得用 `SUM(CAST(amount AS REAL))` 汇总。
+    /// REAL 是二进制浮点，`0.1 + 0.2 != 0.3`，而 4 位格式化还会把 TEXT 里
+    /// 更长的小数位直接截断；逐行在 Rust 侧用 Decimal 累加才可控。
+    #[test]
+    fn gl_reconcile_sums_stock_amount_exactly() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        crate::auxs::insert(
+            &db,
+            &fincore::auxiliary::AuxEntity::new(AuxKind::Item, "I01", "存货A"),
+        )
+        .unwrap();
+        // 三笔 1.00005 的入库流水：Decimal 合计 3.00015
+        // （直接写 SQL：金额列是 TEXT，仓储层的 money_param 会按 2 位显示精度存，
+        //   这里要验证的是"聚合"这一步对长小数的处理）
+        for _ in 0..3 {
+            db.conn()
+                .execute(
+                    "INSERT INTO stock_move(period, biz_date, kind, item, qty, price, amount, memo)
+                     VALUES(?1, ?2, 'purchase', 'I01', '1', '1.00005', '1.00005', '')",
+                    rusqlite::params![p.ymm(), p.first_day().format("%Y-%m-%d").to_string()],
+                )
+                .unwrap();
+        }
+        let r = gl_reconcile(&db, p, None).unwrap();
+        let row = r.rows.iter().find(|x| x.item == "I01").unwrap();
+        assert_eq!(
+            row.stock_value,
+            Money::parse("3.00015").unwrap(),
+            "库存侧金额必须精确求和（回归前 REAL + 4 位格式化会截成 3.0001）"
+        );
+        assert_eq!(r.stock_total, Money::parse("3.00015").unwrap());
     }
 }

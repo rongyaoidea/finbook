@@ -208,13 +208,20 @@ pub fn receipt_audit(db: &Db, id: i64, who: &str) -> DbResult<(i64, usize)> {
 
     // 未清挂账（事务外先读；settle_in_tx 会在事务内复校验未核销额）
     let mut open = crate::settle::open_entries(db, &root, period, false)?;
-    open.retain(|e| e.aux_key == aux_key);
+    // 按辅助核算过滤必须用「包含 wanted 的全部片段」，不能要求整条 aux_key 完全相等：
+    // 往来科目常同时核算部门/项目，凭证分录的键是 `customer=C001\x1fdept=D01`，
+    // 而收款单只填了客户。整条相等会把这些分录全滤掉 → FIFO 分摊落空 →
+    // 收款全额退回预收、往来一直不核销（金额不会错，但核销与账龄静默失效）。
+    open.retain(|e| AuxRef::key_contains(&e.aux_key, &aux_key));
     let want_debit_side = receipt; // 收款冲借方挂账；付款冲贷方挂账
     open.retain(|e| if want_debit_side { e.debit > Money::ZERO } else { e.credit > Money::ZERO });
 
-    // FIFO 分摊：按日期顺序逐笔吃掉挂账，分组到各往来叶子科目
+    // FIFO 分摊：按日期顺序逐笔吃掉挂账，分组到各往来叶子科目。
+    // 分组键必须是「科目 + 挂账分录的完整辅助核算」：多维往来科目（客户+部门等）
+    // 若只按科目分组、辅助核算沿用收款单自己的（只有客户），生成的核销分录会因
+    // 「核算部门，必须填写部门」被校验挡下，整笔收款审核失败。
     let mut remaining = amount;
-    let mut leg_alloc: std::collections::BTreeMap<String, Money> =
+    let mut leg_alloc: std::collections::BTreeMap<String, (Money, AuxRef)> =
         std::collections::BTreeMap::new();
     let mut allocs: Vec<(i64, String, Money)> = Vec::new(); // (挂账分录 id, 科目, 金额)
     for e in &open {
@@ -224,13 +231,19 @@ pub fn receipt_audit(db: &Db, id: i64, who: &str) -> DbResult<(i64, usize)> {
         let take = remaining.min(e.open());
         if take.is_positive() {
             allocs.push((e.entry_id, e.account_code.clone(), take));
-            *leg_alloc.entry(e.account_code.clone()).or_insert(Money::ZERO) += take;
+            // 键带上 aux_key，同一科目不同辅助组合分行
+            let ek = format!("{}\u{1f}{}", e.account_code, e.aux_key);
+            let ea = AuxRef::from_key(&e.aux_key);
+            let slot = leg_alloc.entry(ek).or_insert((Money::ZERO, ea));
+            slot.0 += take;
             remaining -= take;
         }
     }
-    // 多余/无挂账 → 落账套默认往来科目（预收/预付性质）
+    // 多余/无挂账 → 落账套默认往来科目（预收/预付性质），辅助核算用收款单自己的
     if remaining.is_positive() || leg_alloc.is_empty() {
-        *leg_alloc.entry(party_base.clone()).or_insert(Money::ZERO) += remaining;
+        let pk = format!("{}\u{1f}{}", party_base, aux.key());
+        let slot = leg_alloc.entry(pk).or_insert((Money::ZERO, aux.clone()));
+        slot.0 += remaining;
     }
 
     let tx = db.write_tx()?;
@@ -265,26 +278,29 @@ pub fn receipt_audit(db: &Db, id: i64, who: &str) -> DbResult<(i64, usize)> {
             ..Entry::new(line, fund.as_str(), summary.as_str())
         });
         line += 1;
-        for (acct, alloc) in &leg_alloc {
+        for (slot_key, (alloc, ea)) in &leg_alloc {
             if alloc.is_zero() {
                 continue;
             }
+            // 键是 "科目\x1faux_key"，取回科目名
+            let acct = slot_key.split('\u{1f}').next().unwrap_or(slot_key);
             v.push_entry(Entry {
                 credit: *alloc,
-                aux: aux.clone(),
-                ..Entry::new(line, acct.as_str(), summary.as_str())
+                aux: ea.clone(),
+                ..Entry::new(line, acct, summary.as_str())
             });
             line += 1;
         }
     } else {
-        for (acct, alloc) in &leg_alloc {
+        for (slot_key, (alloc, ea)) in &leg_alloc {
             if alloc.is_zero() {
                 continue;
             }
+            let acct = slot_key.split('\u{1f}').next().unwrap_or(slot_key);
             v.push_entry(Entry {
                 debit: *alloc,
-                aux: aux.clone(),
-                ..Entry::new(line, acct.as_str(), summary.as_str())
+                aux: ea.clone(),
+                ..Entry::new(line, acct, summary.as_str())
             });
             line += 1;
         }
@@ -434,6 +450,60 @@ mod tests {
         }
         let id = crate::vouchers::save(db, &mut v).unwrap();
         crate::vouchers::post(db, id, "u").unwrap();
+    }
+
+    /// 应收分录带**多个**辅助维度时，收款单只填客户也必须能自动核销。
+    /// 回归：`open.retain(|e| e.aux_key == aux_key)` 要求整条 aux_key 完全相等，
+    /// 而凭证分录的键是 `customer=C01\x1fdept=D01`、收款单的键只有 `customer=C01`，
+    /// 于是 FIFO 分摊落空、收款全额退回预收，往来永远不核销。
+    #[test]
+    fn receipt_autosettles_multi_dim_aux() {
+        use fincore::account::{Account, AcctCategory, AuxKind, AuxMask};
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        // 建一个同时核算客户 + 部门的应收叶子科目（内置 1122 只核算客户）
+        let mut a = Account::new("112299", "多维应收", AcctCategory::Asset);
+        a.aux = AuxMask::NONE.with(AuxKind::Customer).with(AuxKind::Dept);
+        crate::accounts::insert(&db, &a).unwrap();
+        // 对方科目：不核算任何辅助维度
+        crate::accounts::insert(
+            &db,
+            &Account::new("600199", "多维对方科目", AcctCategory::Income),
+        )
+        .unwrap();
+
+        // 挂账 1000：分录带 customer=C01 + dept=D01
+        let date = d(2026, 1, 5);
+        let mut v = Voucher::new(p, date, "记", crate::vouchers::next_no(&db, p, "记").unwrap());
+        v.push_entry(Entry {
+            debit: m("1000"),
+            aux: AuxRef {
+                customer: Some("C01".into()),
+                dept: Some("D01".into()),
+                ..Default::default()
+            },
+            ..Entry::new(1, "112299", "多维挂账")
+        });
+        v.push_entry(Entry {
+            credit: m("1000"),
+            ..Entry::new(2, "600199", "多维挂账")
+        });
+        let id = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, id, "u").unwrap();
+
+        // 收款单只填客户 C01（不填部门）
+        let doc_id = receipt_create(&db, "receipt", d(2026, 1, 10), "100201", "C01", m("600"), "", "u")
+            .unwrap();
+        receipt_audit(&db, doc_id, "u").unwrap();
+
+        let settled = crate::settle::list(&db, "112299").unwrap();
+        assert_eq!(
+            settled.len(),
+            1,
+            "多维辅助的应收应被自动核销，实际核销记录：{settled:?}"
+        );
+        assert_eq!(settled[0].amount, m("600"), "核销金额应为 600");
     }
 
     #[test]

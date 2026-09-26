@@ -1059,28 +1059,39 @@ pub fn ac_save(db: &Db, c: &mut AssetCount) -> DbResult<i64> {
 }
 
 /// 盘点过账：盘亏（found=false）的资产标记为 Idle 并记录
+///
+/// 幂等：先做条件更新抢占 `draft → posted`，已被过账（或不存在）的单据直接拒绝。
+/// 原来的 `UPDATE ... WHERE id=?1` 没有状态守卫，重复点两次过账就会再记一次盘亏，
+/// 卡片备注也会滚成「…盘亏盘亏盘亏」。
 pub fn ac_post(db: &Db, id: i64) -> DbResult<usize> {
-    let mut st = db.conn().prepare(
-        "SELECT asset_id, found FROM asset_count_line WHERE ac_id=?1",
+    let tx = db.write_tx()?;
+    let claimed = tx.execute(
+        "UPDATE asset_count SET status='posted' WHERE id=?1 AND status='draft'",
+        [id],
     )?;
+    if claimed == 0 {
+        return Err(fincore::FinError::state("盘点单状态已变化（可能已过账）").into());
+    }
+    let mut st = tx.prepare("SELECT asset_id, found FROM asset_count_line WHERE ac_id=?1")?;
     let lines: Vec<(i64, bool)> = st
         .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
     let mut n = 0;
-    let tx = db.write_tx()?;
     for (asset_id, found) in lines {
         if !found {
             if let Some(mut a) = get(db, asset_id)? {
                 if a.status != AssetStatus::Disposed {
                     a.status = AssetStatus::Idle;
-                    a.memo = format!("{} 盘亏", a.memo);
+                    // 备注是「追加」语义：先剥掉可能已存在的盘亏后缀，避免重复过账/多次
+                    // 盘点把同一句话堆成一长串
+                    a.memo = format!("{} 盘亏", a.memo.trim_end_matches(" 盘亏").trim_end());
                     update(db, &a)?;
                     n += 1;
                 }
             }
         }
     }
-    tx.execute("UPDATE asset_count SET status='posted' WHERE id=?1", [id])?;
     tx.commit()?;
     Ok(n)
 }
@@ -1254,5 +1265,55 @@ mod tests {
         let cid = ac_save(&db, &mut c).unwrap();
         assert_eq!(ac_post(&db, cid).unwrap(), 1);
         assert_eq!(get(&db, id).unwrap().unwrap().status, AssetStatus::Idle);
+    }
+
+    /// 回归：盘点过账必须幂等。旧的 `UPDATE ... WHERE id=?1` 没有状态守卫，
+    /// 第二次过账照样成功并再记一次盘亏，卡片备注滚成「…盘亏盘亏」。
+    #[test]
+    fn ac_post_twice_fails_and_memo_has_single_loss_tag() {
+        let db = tmpdb("ac_post2");
+        let id = insert(&db, &asset("GD0001", "10000", 60)).unwrap();
+        let p = Period::new(2026, 2).unwrap();
+        let mut c = AssetCount {
+            id: 0, no: ac_next_no(&db, p).unwrap(), period: p,
+            date: NaiveDate::from_ymd_opt(2026, 2, 28).unwrap(),
+            status: "draft".into(), prepared_by: "张三".into(), memo: String::new(),
+            lines: vec![(id, false, "盘亏".to_string())],
+        };
+        let cid = ac_save(&db, &mut c).unwrap();
+        assert_eq!(ac_post(&db, cid).unwrap(), 1);
+        let after_first = get(&db, id).unwrap().unwrap();
+        assert_eq!(after_first.status, AssetStatus::Idle);
+        assert_eq!(after_first.memo, " 盘亏", "首过账应只记一次盘亏：{:?}", after_first.memo);
+        // 第二次过账必须报错，且不得再次改写卡片
+        assert!(
+            ac_post(&db, cid).is_err(),
+            "重复过账必须报错（回归前会返回 Ok 并再追加一次「盘亏」）"
+        );
+        let after_second = get(&db, id).unwrap().unwrap();
+        assert_eq!(after_second.memo, after_first.memo, "备注不应被重复追加");
+        assert_eq!(
+            after_second.memo.matches("盘亏").count(),
+            1,
+            "备注里只能有一个「盘亏」：{:?}",
+            after_second.memo
+        );
+        // 单据本身也应是已过账
+        let st: String = db
+            .conn()
+            .query_row("SELECT status FROM asset_count WHERE id=?1", [cid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "posted");
+        // 重新草拟一张单盘同一张卡：备注仍不得堆叠
+        let mut c2 = AssetCount {
+            id: 0, no: ac_next_no(&db, p).unwrap(), period: p,
+            date: NaiveDate::from_ymd_opt(2026, 2, 28).unwrap(),
+            status: "draft".into(), prepared_by: "张三".into(), memo: String::new(),
+            lines: vec![(id, false, "盘亏".to_string())],
+        };
+        let cid2 = ac_save(&db, &mut c2).unwrap();
+        ac_post(&db, cid2).unwrap();
+        let memo = get(&db, id).unwrap().unwrap().memo;
+        assert_eq!(memo.matches("盘亏").count(), 1, "多次盘点不得堆叠备注：{memo:?}");
     }
 }

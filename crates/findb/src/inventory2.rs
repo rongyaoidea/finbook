@@ -238,7 +238,7 @@ pub fn assemble(
     children: &[(String, Money)],
     memo: &str,
 ) -> DbResult<()> {
-    use crate::business::{stock_insert, StockKind, StockMove};
+    use crate::business::{stock_insert_of, StockKind, StockMove};
     if children.is_empty() {
         return Err(fincore::FinError::msg("组装至少需要一个子件").into());
     }
@@ -267,42 +267,42 @@ pub fn assemble(
         plan.push((item.clone(), *qty, unit, amount));
     }
     let wh = crate::warehouse::resolve(db, "")?;
+    // 整张组装单一个事务：逐条 `stock_insert` 各自提交时，中间失败会留下
+    // 「子件已出、成品没进」——库存凭空少掉（`transfer_do` 已是这个写法）
+    let tx = db.write_tx()?;
     for (item, qty, unit, amount) in &plan {
-        stock_insert(
-            db,
-            &StockMove {
-                id: 0,
-                period,
-                biz_date: date,
-                kind: StockKind::OtherOut,
-                item: item.clone(),
-                warehouse: wh.clone(),
-                batch_no: String::new(),
-                qty: qty.negated(),
-                price: *unit,
-                amount: *amount,
-                voucher_id: None,
-                memo: format!("组装 {}", memo),
-            },
-        )?;
-    }
-    stock_insert(
-        db,
-        &StockMove {
+        let mut move_record = StockMove {
             id: 0,
             period,
             biz_date: date,
-            kind: StockKind::OtherIn,
-            item: parent.to_string(),
-            warehouse: wh,
+            kind: StockKind::OtherOut,
+            item: item.clone(),
+            warehouse: wh.clone(),
             batch_no: String::new(),
-            qty: Money::ONE,
-            price: total,
-            amount: total,
+            qty: qty.negated(),
+            price: *unit,
+            amount: *amount,
             voucher_id: None,
             memo: format!("组装 {}", memo),
-        },
-    )?;
+        };
+        stock_insert_of(&tx, &mut move_record)?;
+    }
+    let mut parent_move = StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: StockKind::OtherIn,
+        item: parent.to_string(),
+        warehouse: wh,
+        batch_no: String::new(),
+        qty: Money::ONE,
+        price: total,
+        amount: total,
+        voucher_id: None,
+        memo: format!("组装 {}", memo),
+    };
+    stock_insert_of(&tx, &mut parent_move)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -317,7 +317,7 @@ pub fn disassemble(
     children: &[(String, Money)],
     memo: &str,
 ) -> DbResult<()> {
-    use crate::business::{stock_insert, StockKind, StockMove};
+    use crate::business::{stock_insert_of, StockKind, StockMove};
     if children.is_empty() {
         return Err(fincore::FinError::msg("拆卸至少需要一个子件").into());
     }
@@ -343,24 +343,25 @@ pub fn disassemble(
     }
     let total = unit; // 成品出库 1 件
     let wh = crate::warehouse::resolve(db, "")?;
+    // 整张拆卸单一个事务：成品出库与 N 条子件入库必须同生共死，
+    // 否则中途失败会留下「成品已出、子件没进」的窟窿
+    let tx = db.write_tx()?;
     // 成品出库
-    stock_insert(
-        db,
-        &StockMove {
-            id: 0,
-            period,
-            biz_date: date,
-            kind: StockKind::OtherOut,
-            item: parent.to_string(),
-            warehouse: wh.clone(),
-            batch_no: String::new(),
-            qty: Money::ONE.negated(),
-            price: unit,
-            amount: total,
-            voucher_id: None,
-            memo: format!("拆卸 {}", memo),
-        },
-    )?;
+    let mut parent_move = StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: StockKind::OtherOut,
+        item: parent.to_string(),
+        warehouse: wh.clone(),
+        batch_no: String::new(),
+        qty: Money::ONE.negated(),
+        price: unit,
+        amount: total,
+        voucher_id: None,
+        memo: format!("拆卸 {}", memo),
+    };
+    stock_insert_of(&tx, &mut parent_move)?;
     // 子件入库：按数量比例分摊成本，尾差归最后一行
     let mut allocated = Money::ZERO;
     let last = children.len() - 1;
@@ -376,24 +377,23 @@ pub fn disassemble(
         let price = amount
             .checked_div(qty.0)
             .expect("子件数量已判正");
-        stock_insert(
-            db,
-            &StockMove {
-                id: 0,
-                period,
-                biz_date: date,
-                kind: StockKind::OtherIn,
-                item: item.clone(),
-                warehouse: wh.clone(),
-                batch_no: String::new(),
-                qty: *qty,
-                price,
-                amount,
-                voucher_id: None,
-                memo: format!("拆卸 {}", memo),
-            },
-        )?;
+        let mut child_move = StockMove {
+            id: 0,
+            period,
+            biz_date: date,
+            kind: StockKind::OtherIn,
+            item: item.clone(),
+            warehouse: wh.clone(),
+            batch_no: String::new(),
+            qty: *qty,
+            price,
+            amount,
+            voucher_id: None,
+            memo: format!("拆卸 {}", memo),
+        };
+        stock_insert_of(&tx, &mut child_move)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -430,67 +430,72 @@ pub fn form_convert(
     }
     let amount = qty * unit;
     let wh = crate::warehouse::resolve(db, "")?;
-    use crate::business::{stock_insert, StockKind, StockMove};
-    stock_insert(
-        db,
-        &StockMove {
-            id: 0,
-            period,
-            biz_date: date,
-            kind: StockKind::OtherOut,
-            item: from_item.to_string(),
-            warehouse: wh.clone(),
-            batch_no: String::new(),
-            qty: qty.negated(),
-            price: unit,
-            amount,
-            voucher_id: None,
-            memo: format!("形态转换 {}", memo),
-        },
-    )?;
-    stock_insert(
-        db,
-        &StockMove {
-            id: 0,
-            period,
-            biz_date: date,
-            kind: StockKind::OtherIn,
-            item: to_item.to_string(),
-            warehouse: String::new(),
-            batch_no: String::new(),
-            qty,
-            price: unit,
-            amount,
-            voucher_id: None,
-            memo: format!("形态转换 {}", memo),
-        },
-    )?;
+    use crate::business::{stock_insert_of, StockKind, StockMove};
+    // 出库与入库同事务：只写进一半就是凭空少一批存货
+    let tx = db.write_tx()?;
+    let mut out_move = StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: StockKind::OtherOut,
+        item: from_item.to_string(),
+        warehouse: wh.clone(),
+        batch_no: String::new(),
+        qty: qty.negated(),
+        price: unit,
+        amount,
+        voucher_id: None,
+        memo: format!("形态转换 {}", memo),
+    };
+    stock_insert_of(&tx, &mut out_move)?;
+    let mut in_move = StockMove {
+        id: 0,
+        period,
+        biz_date: date,
+        kind: StockKind::OtherIn,
+        item: to_item.to_string(),
+        warehouse: String::new(),
+        batch_no: String::new(),
+        qty,
+        price: unit,
+        amount,
+        voucher_id: None,
+        memo: format!("形态转换 {}", memo),
+    };
+    stock_insert_of(&tx, &mut in_move)?;
+    tx.commit()?;
     Ok(())
 }
 
 /// 低于安全库存的存货：item_plan.safety_stock > 0 且现有库存（流水汇总）< 安全量。
 /// 返回 (存货, 现有库存, 安全库存)——工作台仓管预警与低库存待办数据源。
 pub fn below_safety(db: &Db) -> DbResult<Vec<(String, Money, Money)>> {
+    // 数量/安全库存都是 TEXT 列：CAST(... AS REAL) 求和会走二进制浮点
+    // （0.1 + 0.2 != 0.3），逐行取文本在 Rust 侧用 Decimal 累加
     let mut st = db.conn().prepare(
-        "SELECT item_code, CAST(safety_stock AS REAL) FROM item_plan
+        "SELECT item_code, safety_stock FROM item_plan
          WHERE CAST(safety_stock AS REAL) > 0 ORDER BY item_code",
     )?;
-    let plans: Vec<(String, f64)> = st
+    let plans: Vec<(String, String)> = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(st);
     let mut out = Vec::new();
-    for (item, safety) in plans {
-        let on: f64 = db.conn().query_row(
-            "SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM stock_move WHERE item=?1 AND qc_status=''",
-            [&item],
-            |r| r.get(0),
-        )?;
+    for (item, safety_s) in plans {
+        let safety = Money::parse_or_zero(&safety_s);
+        if !safety.is_positive() {
+            continue;
+        }
+        let mut st = db
+            .conn()
+            .prepare("SELECT qty FROM stock_move WHERE item=?1 AND qc_status=''")?;
+        let qs: Vec<String> = st
+            .query_map([&item], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        let on: Money = qs.iter().map(|q| Money::parse_or_zero(q)).sum();
         if on < safety {
-            out.push((
-                item,
-                Money::parse_or_zero(&format!("{on:.4}")),
-                Money::parse_or_zero(&format!("{safety:.4}")),
-            ));
+            out.push((item, on, safety));
         }
     }
     Ok(out)
@@ -996,5 +1001,137 @@ mod tests {
         assert_eq!(rm1_unit, m("10"), "成品成本 20 全部摊给唯一子件（2 件 → 单价 10）");
         // 成品已无库存 → 再拆拒绝
         assert!(disassemble(&db, p, d, "FG", &[("RM1".into(), m("1"))], "拆").is_err());
+    }
+
+    /// 回归：组装/拆卸/形态转换的 N 条流水必须同事务，要么全写要么全不写。
+    ///
+    /// 旧写法逐条 `stock_insert`（各自自动提交）：子件出库已提交、成品入库失败时
+    /// 库存凭空少掉，没有任何一条对冲流水。回归用一条唯一索引把「第二条流水」
+    /// 变成必失败，再断言第一条也没留下。
+    #[test]
+    fn assemble_is_all_or_nothing() {
+        use crate::business::{stock_insert, StockKind, StockMove};
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        for (item, qty, price) in [("RM1", "2", "5"), ("RM2", "1", "10")] {
+            stock_insert(
+                &db,
+                &StockMove {
+                    id: 0,
+                    period: p,
+                    biz_date: d,
+                    kind: StockKind::OtherIn,
+                    item: item.into(),
+                    warehouse: String::new(),
+                    batch_no: String::new(),
+                    qty: m(qty),
+                    price: m(price),
+                    amount: m(qty) * m(price),
+                    voucher_id: None,
+                    memo: "建账".into(),
+                },
+            )
+            .unwrap();
+        }
+        // 让第二条（RM2 出库）必失败：只在本次组装的流水上装一个"第 2 条起拒绝"的触发器
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE t_cnt(n INTEGER NOT NULL);
+                 INSERT INTO t_cnt(n) VALUES(0);
+                 CREATE TRIGGER t_cap BEFORE INSERT ON stock_move
+                 WHEN NEW.memo = '组装 全有全无'
+                 BEGIN
+                   UPDATE t_cnt SET n = n + 1;
+                   SELECT CASE WHEN (SELECT n FROM t_cnt) > 1
+                               THEN RAISE(ABORT, '触发器：第二条流水不允许写入') END;
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            assemble(
+                &db,
+                p,
+                d,
+                "FG",
+                &[("RM1".into(), m("2")), ("RM2".into(), m("1"))],
+                "全有全无"
+            )
+            .is_err(),
+            "第二条流水写失败时整单必须失败"
+        );
+        // 关键断言：一条流水都不能留下（RM1/RM2 仍是入库时的 2 / 1）
+        let moves: Vec<(String, String)> = {
+            let mut st = db
+                .conn()
+                .prepare("SELECT item, memo FROM stock_move ORDER BY id")
+                .unwrap();
+            let v = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            v
+        };
+        assert_eq!(
+            moves.len(),
+            2,
+            "组装失败时不得留下任何一条流水（回归前会留下 RM1 的出库）：{moves:?}"
+        );
+        assert!(moves.iter().all(|(_, memo)| memo == "建账"), "{moves:?}");
+        // 成品也没入库
+        assert_eq!(
+            warehouse_stock(&db, "FG")
+                .unwrap()
+                .iter()
+                .map(|w| w.qty)
+                .sum::<Money>(),
+            Money::ZERO
+        );
+    }
+
+    /// 回归：低库存预警必须保留数量的完整精度。
+    /// 旧实现走 `SUM(CAST(qty AS REAL))` 再 `format!("{v:.4}")`：REAL 是二进制浮点，
+    /// 4 位格式化还会把 6 位小数的数量（Money::QTY_DP）直接截断。
+    #[test]
+    fn below_safety_uses_exact_decimal() {
+        let db = mem();
+        crate::advanced::item_plan_upsert(
+            &db,
+            &crate::advanced::ItemPlan {
+                item_code: "S1".into(),
+                safety_stock: m("2"),
+                lead_days: 0,
+                lot_size: Money::ZERO,
+            },
+        )
+        .unwrap();
+        let p = Period::new(2026, 1).unwrap();
+        crate::business::stock_insert(
+            &db,
+            &crate::business::StockMove {
+                id: 0,
+                period: p,
+                biz_date: p.first_day(),
+                kind: crate::business::StockKind::Purchase,
+                item: "S1".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: m("1.234567"),
+                price: m("1"),
+                amount: m("1.23"),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        let low = below_safety(&db).unwrap();
+        assert_eq!(low.len(), 1, "1.234567 < 2，应报低库存：{low:?}");
+        assert_eq!(
+            low[0].1,
+            m("1.234567"),
+            "现存量必须保留 6 位小数（回归前被 REAL + 4 位格式化截成 1.2346）"
+        );
+        assert_eq!(low[0].2, m("2"));
     }
 }

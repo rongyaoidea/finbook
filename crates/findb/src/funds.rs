@@ -1024,13 +1024,23 @@ pub fn cash_count_get(db: &Db, id: i64) -> DbResult<Option<CashCount>> {
 }
 
 /// 保存现金盘点：账面余额按「资金日报（按日）」口径重算快照（仅已记账），差异随之计算。
+///
+/// 科目必须落在当日资金日报的科目集合（现金/银行类）里：找不到时**不能**当成账面 0，
+/// 否则 `cash_count_voucher` 会把实盘金额整笔当成盘亏记上去。
 pub fn cash_count_save(db: &Db, c: &mut CashCount) -> DbResult<i64> {
     c.period = Period::from_date(c.date);
-    let book = funds_daily_by_date(db, c.date)?
-        .into_iter()
+    let daily = funds_daily_by_date(db, c.date)?;
+    let book = daily
+        .iter()
         .find(|r| r.account_code == c.account_code)
         .map(|r| r.end)
-        .unwrap_or(Money::ZERO);
+        .ok_or_else(|| {
+            fincore::FinError::validate(format!(
+                "科目 {} 不是 {} 的现金/银行科目，取不到账面余额（资金日报只统计现金与银行类科目）",
+                c.account_code,
+                c.date.format("%Y-%m-%d")
+            ))
+        })?;
     c.book_amount = book;
     c.diff = c.counted - book;
     let id = if c.id > 0 {
@@ -2096,6 +2106,65 @@ mod tests {
         assert!(cash_count_voucher(&db, c3.id, "u").is_err());
         // 相符的记录可以删除
         cash_count_delete(&db, c3.id).unwrap();
+    }
+
+    /// 回归：盘点科目不在当日资金日报的科目集合（现金/银行类）里时必须报错。
+    /// 旧的 `unwrap_or(Money::ZERO)` 把"没这个科目"当成"账面为零"，
+    /// 于是 `cash_count_voucher` 把整笔实盘当成盘亏记上去。
+    #[test]
+    fn cash_count_save_rejects_non_cash_account() {
+        let db = tmpdb("ccbad");
+        let p = Period::new(2026, 1).unwrap();
+        let d0 = d(2026, 1, 5);
+        let mut v = Voucher::new(p, d0, "记", crate::vouchers::next_no(&db, p, "记").unwrap());
+        v.push_entry(fincore::Entry {
+            debit: mon("5000"),
+            ..fincore::Entry::new(1, "1001", "存现")
+        });
+        v.push_entry(fincore::Entry {
+            credit: mon("5000"),
+            ..fincore::Entry::new(2, "600101", "收入")
+        });
+        let id = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, id, "u").unwrap();
+
+        // 2202（应付账款）不是现金/银行科目：取不到账面余额，必须拒绝而不是按 0 记
+        let mut bad = CashCount {
+            id: 0,
+            period: p,
+            date: d(2026, 1, 20),
+            account_code: "2202".into(),
+            book_amount: Money::ZERO,
+            counted: mon("3000"),
+            diff: Money::ZERO,
+            memo: String::new(),
+            voucher_id: None,
+            created_by: "u".into(),
+            created_at: String::new(),
+        };
+        assert!(
+            cash_count_save(&db, &mut bad).is_err(),
+            "非现金/银行科目盘点必须报错（回归前会按账面 0 记成盘亏 3000）"
+        );
+        assert_eq!(bad.id, 0, "失败的保存不应留下记录");
+        assert_eq!(cash_count_list(&db).unwrap().len(), 0);
+
+        // 现金科目照常可用
+        let mut ok = CashCount {
+            id: 0,
+            period: p,
+            date: d(2026, 1, 20),
+            account_code: "1001".into(),
+            book_amount: Money::ZERO,
+            counted: mon("3000"),
+            diff: Money::ZERO,
+            memo: String::new(),
+            voucher_id: None,
+            created_by: "u".into(),
+            created_at: String::new(),
+        };
+        cash_count_save(&db, &mut ok).unwrap();
+        assert_eq!(ok.book_amount, mon("5000"));
     }
 
     #[test]

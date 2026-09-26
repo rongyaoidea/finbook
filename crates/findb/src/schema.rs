@@ -1567,8 +1567,15 @@ fn migrate_v9(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
-/// v9 → v10：routing 表 UNIQUE 从 (item_code,seq) 扩展为 (item_code,version,seq)，
-/// 需重建；prod_op 补 worker 列。
+/// v9 → v10 补列：prod_op 派工工人。
+///
+/// 与 [`migrate_v10`] 的 routing 重建是**两件互不依赖的事**，必须各自独立判存：
+/// 早先把补列挂在 `if column_exists(conn,"routing","version") { return }` 之后，
+/// 于是 `routing.version` 已存在的账套永远拿不到 `prod_op.worker`，
+/// 之后每个 `prod_op_*` 查询都报 "no such column: worker"。
+const MIGRATE_V10: &[(&str, &str, &str)] = &[("prod_op", "worker", "TEXT NOT NULL DEFAULT ''")];
+
+/// v9 → v10：routing 表 UNIQUE 从 (item_code,seq) 扩展为 (item_code,version,seq)，需重建。
 fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
     if column_exists(conn, "routing", "version")? {
         return Ok(());
@@ -1592,9 +1599,6 @@ fn migrate_v10(conn: &Connection) -> Result<(), DbError> {
          ALTER TABLE routing_new RENAME TO routing;
          CREATE INDEX IF NOT EXISTS idx_routing_item ON routing(item_code, version);",
     )?;
-    if !column_exists(conn, "prod_op", "worker")? {
-        conn.execute("ALTER TABLE prod_op ADD COLUMN worker TEXT NOT NULL DEFAULT ''", [])?;
-    }
     Ok(())
 }
 
@@ -1753,6 +1757,7 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V8)?;
             migrate_v9(conn)?;
             migrate_v10(conn)?;
+            migrate_generic(conn, MIGRATE_V10)?;
             migrate_generic(conn, MIGRATE_V17)?;
             migrate_v18(conn)?;
             migrate_generic(conn, MIGRATE_V19)?;
@@ -1833,4 +1838,39 @@ pub fn version(conn: &Connection) -> i64 {
         |r| r.get(0),
     )
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：`prod_op.worker` 的迁移不能挂在 `migrate_v10` 的 `routing.version` 守卫之后。
+    ///
+    /// 老写法是「routing 重建 + 补 worker」串在一个 `if column_exists(routing.version)
+    /// { return }` 里：`routing.version` 已存在的账套直接早退，永远拿不到 worker 列，
+    /// 之后每个 `prod_op_*` 查询都报 "no such column: worker"。
+    /// 这里走真实的 `init` 迁移链，验证的是"接线"而不只是两个函数各自正确。
+    #[test]
+    fn prod_op_worker_migrated_even_when_routing_version_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        // 造出「routing 已有 version、prod_op 缺 worker、版本号未到最新」的存量账套
+        conn.execute_batch(
+            "ALTER TABLE prod_op DROP COLUMN worker;
+             INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','9');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "prod_op", "worker").unwrap());
+        assert!(column_exists(&conn, "routing", "version").unwrap());
+
+        init(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "prod_op", "worker").unwrap(),
+            "routing 迁移早退时也必须补上 prod_op.worker（回归前 init 跑完仍缺这一列）"
+        );
+        // 幂等：再跑一次不报错
+        init(&conn).unwrap();
+        assert!(column_exists(&conn, "prod_op", "worker").unwrap());
+    }
 }

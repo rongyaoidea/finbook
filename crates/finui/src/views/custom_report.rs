@@ -38,6 +38,8 @@ pub struct CustomReportView {
     pub checks: Vec<(usize, usize, String)>,
     /// 设计器底部实时预览的取数结果
     pub preview: Vec<Vec<Money>>,
+    /// 取数告警（公式写错 / 取数失败的单元格按 0 占位，这里说明原因）
+    pub warnings: Vec<String>,
     /// 设计稿版本号：结构或公式有改动就 +1，用来触发预览重算
     pub draft_ver: usize,
     pub dirty: bool,
@@ -58,6 +60,7 @@ impl Default for CustomReportView {
             columns_text: String::new(),
             checks: Vec::new(),
             preview: Vec::new(),
+            warnings: Vec::new(),
             draft_ver: 0,
             dirty: true,
             key: String::new(),
@@ -124,11 +127,18 @@ impl CustomReportView {
 
         self.values.clear();
         self.preview.clear();
+        self.warnings.clear();
+        // 用 detailed 版本：公式写错或取数失败的单元格按 0 占位，但把原因收进
+        // self.warnings 展示。旧的 custom_report_values 直接丢弃 warnings，
+        // 预览会显示一片像样的 0，公式明明是错的却看不出来。
         match self.tab {
             CrTab::Preview => {
                 if let Some(c) = &cur {
-                    match mgmt::custom_report_values(ctx.db(), c, p, Some(ctx.user())) {
-                        Ok(v) => self.values = v,
+                    match mgmt::custom_report_values_detailed(ctx.db(), c, p, Some(ctx.user())) {
+                        Ok((v, w)) => {
+                            self.values = v;
+                            self.warnings = w;
+                        }
                         Err(e) => ctx.error(e.to_string()),
                     }
                 }
@@ -137,8 +147,11 @@ impl CustomReportView {
                 // 先克隆出来再算，避免取数期间一直借用 self.draft
                 let d = self.draft.clone();
                 if let Some(d) = &d {
-                    match mgmt::custom_report_values(ctx.db(), d, p, Some(ctx.user())) {
-                        Ok(v) => self.preview = v,
+                    match mgmt::custom_report_values_detailed(ctx.db(), d, p, Some(ctx.user())) {
+                        Ok((v, w)) => {
+                            self.preview = v;
+                            self.warnings = w;
+                        }
                         Err(e) => ctx.error(e.to_string()),
                     }
                 }
@@ -274,6 +287,7 @@ impl CustomReportView {
             None => widgets::empty_hint(ui, "还没有自定义报表，点「新建」开始设计"),
             Some(c) => {
                 ui.add_space(4.0);
+                render_warnings(ui, &self.warnings);
                 render_report(ui, "cr_preview", &c, &self.values);
             }
         }
@@ -550,6 +564,7 @@ impl CustomReportView {
         if d.lines.is_empty() {
             ui.label(RichText::new("还没有行，先点「加行」并填写公式").weak());
         } else {
+            render_warnings(ui, &self.warnings);
             render_report(ui, "cr_design_preview", &d, &self.preview);
         }
     }
@@ -595,6 +610,26 @@ fn apply_columns(d: &mut CustomReport, text: &str) {
 }
 
 /// 渲染一张报表：首列是行名（带缩进、可加粗），其余列是取数结果
+/// 取数告警区：失败单元格按 0 占位，这里必须把原因摆出来，
+/// 否则报表上是一片像样的 0，公式明明写错了却看不出来。
+fn render_warnings(ui: &mut Ui, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    ui.group(|ui| {
+        ui.label(
+            RichText::new(format!("取数告警 {} 条（以下单元格按 0 显示）", warnings.len()))
+                .strong(),
+        );
+        for w in warnings.iter().take(20) {
+            ui.label(RichText::new(format!("· {w}")).color(ui.visuals().warn_fg_color));
+        }
+        if warnings.len() > 20 {
+            ui.label(RichText::new(format!("…另有 {} 条", warnings.len() - 20)).weak());
+        }
+    });
+}
+
 fn render_report(ui: &mut Ui, id: &str, r: &CustomReport, values: &[Vec<Money>]) {
     let mut cols = vec![widgets::TCol::new("项目", 260.0)];
     for c in &r.columns {

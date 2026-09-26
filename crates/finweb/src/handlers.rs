@@ -24,7 +24,7 @@ use findb::vouchers::{self, VoucherQuery};
 use serde_json::json;
 
 use crate::dto::*;
-use crate::realm::RealmDb;
+use crate::realm::{RealmBook, RealmDb};
 use crate::state::{
     period_to_str, parse_money_checked, parse_period, clear_cookie_header, AppError, CurrentUser, RealmUser,
     WebState,
@@ -611,13 +611,47 @@ async fn get_setup_status(State(state): State<Arc<WebState>>) -> Result<Json<Set
     }))
 }
 
-/// 账套列表（需登录）：管理员返回全部，普通用户只返回自己创建的
+/// 账套可见列表：管理员全部可见；其余按授权三层（管理员 / 归属者 / 账套内成员）取并集。
+///
+/// `RealmDb::list_books_for` 只按 `owner_username` 过滤，realm 层不便改动，故在此补齐
+/// 「被邀请成员」这一支——`create_user` 会为非归属的平台账号建账套成员行，而
+/// `select_book` / `CurrentUser` 的授权判定都认这条成员行，两边口径必须一致，
+/// 否则被邀请成员登录后看不到自己被邀请进的账套（能进却列不出来）。
+///
+/// 逐个账套查成员行的取数方式与 `select_book` 逐字一致；账套打不开（文件损坏等）
+/// 同样透出 500 而不是吞成"不可见"，避免用一个假象掩盖真实故障。
+fn visible_books(
+    state: &WebState,
+    username: &str,
+    is_admin: bool,
+) -> Result<Vec<RealmBook>, AppError> {
+    let mut books = state.realm.list_books_for(username, is_admin)?;
+    if is_admin {
+        return Ok(books);
+    }
+    for b in state.realm.list_books_for(username, true)? {
+        if books.iter().any(|x| x.key == b.key) {
+            continue;
+        }
+        let is_member = match state.db_for(&b.key) {
+            Ok(db) => users::get(&db, username).ok().flatten().is_some(),
+            Err(e) => return Err(e.into()),
+        };
+        if is_member {
+            books.push(b);
+        }
+    }
+    books.sort_by_key(|b| b.id);
+    Ok(books)
+}
+
+/// 账套列表（需登录）：管理员返回全部，普通用户返回自己创建的 + 被邀请加入的
 /// 同时返回平台身份摘要（前端在"已登录未选账套"状态下据此渲染选择页）
 async fn list_books(
     State(state): State<Arc<WebState>>,
     user: RealmUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let books = state.realm.list_books_for(&user.username, user.is_admin)?;
+    let books = visible_books(&state, &user.username, user.is_admin)?;
     let items: Vec<serde_json::Value> = books
         .iter()
         .map(|b| json!({ "key": b.key, "company": b.company, "owner": b.owner_username }))
@@ -739,8 +773,8 @@ async fn post_login(
         state.default_period,
         "", // 账套登录后由"选择账套"设定
     );
-    // 返回该用户可进入的账套列表（管理员=全部，普通=本人创建）
-    let books = state.realm.list_books_for(&username, ru.is_admin)?;
+    // 返回该用户可进入的账套列表（管理员=全部，普通=本人创建 + 被邀请加入的成员）
+    let books = visible_books(&state, &username, ru.is_admin)?;
     let book_list: Vec<serde_json::Value> = books
         .iter()
         .map(|b| json!({ "key": b.key, "company": b.company, "owner": b.owner_username }))
@@ -1541,6 +1575,8 @@ async fn reset_platform_password(
     }
     check_password(&state, &req.new)?;
     state.realm.reset_password(&username, &req.new, &state.policy())?;
+    // 口令已变，立即吊销该账号的全部旧会话（被盗会话不能继续用满 7 天）
+    state.sessions.remove_by_username(&username);
     if let Ok(Some(ru)) = state.realm.get_user(&username) {
         let _ = state.realm.sync_password_to_books(
             &state.books_dir,
@@ -2679,8 +2715,13 @@ async fn save_voucher(
         user.require(Perm::VoucherNew)?;
     }
     let db = state.db_for(&user.book_key)?;
-    let period = parse_period(&req.period.to_string())
-        .unwrap_or_else(|| current_period(&state, &user));
+    // 期间非法（如 202513）直接 400：静默落到当前期间会把凭证写进错误的账期。
+    // 0 保持原语义 = 当前期间（与 renumber / reverse 一致）。
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
     let date = NaiveDate::parse_from_str(&req.date, "%Y-%m-%d")
         .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?;
     let word = if req.word.is_empty() {
@@ -2715,8 +2756,18 @@ async fn save_voucher(
                 existing.period.label()
             )));
         }
+        // 凭证字在修改时不可变：号段按 (期间, 凭证字, 号码) 唯一，中途换字会让本凭证
+        // 占住另一字下的同一号（那可能已经是别人的凭证），或在该字下留一个永久断号——
+        // 因为 existing.no 不会跟着重新取号。与上面"期间不可改"同一口径的处理：
+        // 要换字请作废后重录。客户端不传 word（空串）时视为不表达意图，保留原字。
+        let explicit_word = req.word.trim();
+        if !explicit_word.is_empty() && explicit_word != existing.word {
+            return Err(AppError::bad_request(format!(
+                "凭证字不可由「{}」改为「{}」（号段按凭证字独立编号），如需换字请作废后重录",
+                existing.word, explicit_word
+            )));
+        }
         existing.date = date;
-        existing.word = word.clone();
         existing.attachments = req.attachments;
         existing.memo = req.memo.clone();
         prev_entries = existing.entries.clone();
@@ -2731,6 +2782,15 @@ async fn save_voucher(
             )));
         }
         let no = if req.no > 0 {
+            // 调用方自选号码撞上 UNIQUE(period,word,no) 时 rusqlite 约束错误会一路冒成
+            // AppError::Db → HTTP 500（看着像服务端坏了，其实是用户填重了）。
+            // 预先查一次占用并回 400；并发下仍可能漏判，那时唯一索引继续兜底。
+            if vouchers::no_taken(&db, period, &word, req.no, 0)? {
+                return Err(AppError::bad_request(format!(
+                    "凭证号 {}-{:04} 已被占用，请换一个号或留空自动取号",
+                    word, req.no
+                )));
+            }
             req.no
         } else {
             vouchers::next_no(&db, period, &word)?
@@ -2837,12 +2897,15 @@ async fn save_voucher(
     // 保存为「未记账」，核对无误后在界面点「记账」确认入账（无审核环节）
     v.status = VoucherStatus::Draft;
     let id = vouchers::save(&db, &mut v)?;
-    db.log(
+    // 凭证已提交：日志失败不得把请求打成 500，否则客户端重试会多录一张凭证
+    if let Err(e) = db.log(
         user.username(),
         "凭证",
         if req.id > 0 { "修改" } else { "新增" },
         &v.voucher_no(),
-    )?;
+    ) {
+        eprintln!("[finweb] 写操作日志失败（凭证 {id}）: {e}");
+    }
     Ok(Json(json!({"id": id})))
 }
 
@@ -3057,7 +3120,7 @@ async fn voucher_reverse(
         return Err(AppError::forbidden("无权冲销该凭证"));
     }
     let period = if req.period > 0 {
-        parse_period(&req.period.to_string()).unwrap_or_else(|| current_period(&state, &user))
+        period_checked(req.period)?
     } else {
         current_period(&state, &user)
     };
@@ -3097,7 +3160,8 @@ async fn voucher_renumber(
         return Err(AppError::forbidden("数据范围受限的账号不能执行断号重排"));
     }
     let period = if req.period > 0 {
-        parse_period(&req.period.to_string()).unwrap_or_else(|| current_period(&state, &user))
+        // 非法期间（如 202513）必须 400：静默落到当前期间会重排错期间的凭证号
+        period_checked(req.period)?
     } else {
         current_period(&state, &user)
     };
@@ -3350,17 +3414,26 @@ async fn list_invoices(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
+    // 上限 500 条（与凭证报表列表同口径）：limit=None 等于不限，把全库发票一次性
+    // 读进内存并整包序列化。超限时按开票日期倒序截断，truncated 回报给调用方，
+    // 让它收窄筛选条件而不是误以为"就这么多"。
+    const INVOICE_LIST_MAX: i64 = 500;
     let rows = findb::invoices::list(
         &db,
         &findb::invoices::InvoiceQuery {
             kind: if q.kind.is_empty() { None } else { Some(q.kind) },
             status: if q.status.is_empty() { None } else { Some(q.status) },
             keyword: if q.keyword.is_empty() { None } else { Some(q.keyword) },
-            limit: None,
+            limit: Some(INVOICE_LIST_MAX),
         },
     )?;
     let items: Vec<serde_json::Value> = rows.iter().map(invoice_json).collect();
-    Ok(Json(json!({ "rows": items, "total": items.len() })))
+    Ok(Json(json!({
+        "rows": items,
+        "total": items.len(),
+        "limit": INVOICE_LIST_MAX,
+        "truncated": items.len() as i64 >= INVOICE_LIST_MAX,
+    })))
 }
 
 async fn invoice_summary(
@@ -3484,6 +3557,12 @@ async fn invoice_set_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::VoucherEdit)?;
     let db = state.db_for(&user.book_key)?;
+    // 归属校验：状态机接口同样不得改他人录入的发票（否则绕过 update_invoice 的守卫）
+    let existing = findb::invoices::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("发票不存在"))?;
+    if existing.created_by != user.username() && !user.user.is_admin() {
+        return Err(AppError::forbidden("无权修改他人录入的发票状态"));
+    }
     let inv = findb::invoices::set_status(&db, id, &req.status, user.username())?;
     Ok(Json(invoice_json(&inv)))
 }
@@ -3555,18 +3634,25 @@ async fn list_arap_opening(
         .map(String::as_str)
         .filter(|k| !k.is_empty());
     let rows = findb::settle::arap_opening_list(&db, kind)?;
+    // 合计按 kind 显式分列：原来的 `if ar {…} else {ap += …}` 会把空串、大小写笔误
+    // （"AR"）等一切非 "ar" 的行默默并进应付合计，让用户看到一个凭空变大的数。
+    // 未知 kind 单独计数回报，既不混进 ar/ap 也不因此整页报错（行明细照常返回，
+    // 用户能自己看出来是哪几条有问题）。金额一律 fmt_money（fmt_qty 只留 6 位小数
+    // 且去尾零，5000.00 会印成 "5000"，与本文件其它金额字段口径不一致）。
     let (mut ar, mut ap) = (Money::ZERO, Money::ZERO);
+    let mut unknown_kind = 0usize;
     for r in &rows {
-        if r.kind == "ar" {
-            ar += r.amount;
-        } else {
-            ap += r.amount;
+        match r.kind.as_str() {
+            "ar" => ar += r.amount,
+            "ap" => ap += r.amount,
+            _ => unknown_kind += 1,
         }
     }
     Ok(Json(json!({
         "rows": rows,
-        "total_ar": ar.fmt_qty(),
-        "total_ap": ap.fmt_qty(),
+        "total_ar": ar.fmt_money(),
+        "total_ap": ap.fmt_money(),
+        "unknown_kind": unknown_kind,
     })))
 }
 
@@ -3594,9 +3680,15 @@ async fn items_master(
 }
 
 /// 下载导入模板（列头 + 示例行；主数据三平台列头一致，CSV 带 BOM 供 Excel 直接打开）
+///
+/// 与其余导入接口一样挂登录 + Report 权限：模板虽只含静态列头，但它是导入入口的
+/// 一半（另一半 `import_analyze` 严管），放行未登录请求会让"能否探测本系统用哪些
+/// 科目/存货字段"绕过所有鉴权。
 async fn import_template(
+    user: CurrentUser,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
+    user.require(Perm::Report)?;
     let kind = q.get("kind").map(String::as_str).unwrap_or("");
     let rows: Vec<Vec<&str>> = match kind {
         "aux" => vec![
@@ -4385,6 +4477,7 @@ async fn export_payroll(
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
     let list = business::payroll_list(&db, period)?;
+    let list = scope_payroll(&user, &list);
     let mut rows = vec![[
         "员工", "部门", "应发", "社保(个人)", "公积金(个人)", "专项附加", "个税", "实发",
         "社保(单位)", "公积金(单位)",
@@ -4432,6 +4525,11 @@ async fn export_claims(
         .filter(|s| !s.is_empty())
         .map(|s| business::ClaimStatus::parse(s));
     let list = business::claim_list(&db, period, status)?;
+    // 「仅看本人经手的业务单据」：报销按申请人匹配当前登录人（与 list_claims 一致）
+    let list: Vec<&business::Claim> = list
+        .iter()
+        .filter(|c| doc_in_scope(&user, &c.applicant))
+        .collect();
     let mut rows = vec![[
         "单号", "业务日期", "申请人", "部门", "事由", "金额", "状态", "审批人", "付款人",
     ]
@@ -4836,7 +4934,11 @@ async fn get_custom_report(
         .get("period")
         .and_then(|s| parse_period(s))
         .unwrap_or_else(|| current_period(&state, &user));
-    let values = findb::mgmt::custom_report_values(&db, &r, period, Some(&user.user))?;
+    // 用 detailed 版本：公式写错/取数失败（数据库忙、脏数据）时该单元格按 0 占位，
+    // 但**必须把原因回传**。旧的 `custom_report_values` 直接丢弃 warnings，
+    // 报表会打印出一片像样的 0 而用户完全看不出哪里错了——财务报表最坏的失败模式。
+    let (values, warnings) =
+        findb::mgmt::custom_report_values_detailed(&db, &r, period, Some(&user.user))?;
     let matrix: Vec<Vec<String>> = values
         .iter()
         .map(|row| row.iter().map(|m| m.fmt_money()).collect())
@@ -4845,6 +4947,7 @@ async fn get_custom_report(
         "report": custom_json(&r),
         "period": period_to_str(period),
         "values": matrix,
+        "warnings": warnings,
     })))
 }
 
@@ -5506,6 +5609,25 @@ async fn add_po_payment(
     let po = findb::scm::po_get(&db, req.po_id)?
         .ok_or_else(|| AppError::not_found("采购订单不存在"))?;
     // 审核流：先落草稿收付款单（凭证由审核人审核时同事务生成并自动核销）
+    //
+    // 写入顺序刻意是「依赖数据先、单据最后」：findb 目前没有 receipt_create /
+    // po_payment_add 的 `_in(tx,…)` 变体，无法开一个事务把三步包在一起，于是只能
+    // 调换顺序收敛失败面——先建单、后建付款流水，一旦建付款流水失败就会留下一个
+    // 没有任何付款流水的孤立草稿单，而它仍可被
+    // `POST /api/funds/receipts/:id/audit` 审核并生成付款凭证。
+    // 残留的非原子性：建单成功后若勾稽建边失败，会留下「有付款流水、无勾稽边」的记录，
+    // 业务数据本身仍自洽（单据与流水成对），仅勾稽边缺失，可在「票款勾稽」手工补。
+    let id = findb::procurement::po_payment_add(
+        &db,
+        &findb::procurement::PoPayment {
+            id: 0,
+            po_id: req.po_id,
+            period,
+            date,
+            amount,
+            memo: req.memo.clone(),
+        },
+    )?;
     let doc_id = findb::receipt::receipt_create(
         &db,
         "payment",
@@ -5518,18 +5640,8 @@ async fn add_po_payment(
     )?;
     // 票↔款勾稽：本订单已下推进项发票与本次收付款单自动建边
     findb::docflow::link_receipt_to_src_invoice(&db, "po", req.po_id, doc_id)?;
-    let id = findb::procurement::po_payment_add(
-        &db,
-        &findb::procurement::PoPayment {
-            id: 0,
-            po_id: req.po_id,
-            period,
-            date,
-            amount,
-            memo: req.memo,
-        },
-    )?;
-    db.log(
+    // 审计日志失败不得把已提交的付款变成 500：客户端重试会重复入账（见 sales_cost_ep 同理）
+    if let Err(e) = db.log(
         user.username(),
         "采购",
         "采购付款登记",
@@ -5538,7 +5650,9 @@ async fn add_po_payment(
             req.po_id,
             amount.fmt_money()
         ),
-    )?;
+    ) {
+        eprintln!("[finweb] 写操作日志失败（采购付款登记 #{doc_id}）: {e}");
+    }
     Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
 
@@ -5677,9 +5791,20 @@ async fn add_so_shipment(
     ) {
         return Err(AppError::bad_request("订单未确认，不能发货（请先「确认」订单）"));
     }
-    // 确认收入与应收（比例法；先出凭证再落发货流水，金额为零时无凭证）
-    let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty, date, user.username())?;
-    let id = findb::sales::so_shipment_with_stock(&db, req.so_id, period, date, qty, &req.memo, &req.warehouse)?;
+    // 收入确认凭证 + 发货执行行 + 销售出库流水**同一事务**：
+    // 早先拆成 so_income_voucher（自行提交）+ so_shipment_with_stock（另一个事务），
+    // 第二步失败（仓库不存在等）时收入与应收已入账提交，却没有任何发货记录，
+    // 留下无法自动撤销的孤儿凭证。
+    let (id, ivid) = findb::sales::so_shipment_all(
+        &db,
+        req.so_id,
+        period,
+        date,
+        qty,
+        &req.memo,
+        &req.warehouse,
+        user.username(),
+    )?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     // 出库成功 → 完成该订单最早一条待发通知（备货指令闭环）
     let _ = findb::sales::notice_fulfill_on_shipment(&db, req.so_id)?;
@@ -5712,9 +5837,20 @@ async fn add_so_return(
     ) {
         return Err(AppError::bad_request("订单未确认，不能退货（请先「确认」订单）"));
     }
-    // 冲回收入与应收（负向比例；封顶已发货量）
-    let ivid = findb::sales::so_income_voucher(&db, req.so_id, qty.negated(), date, user.username())?;
-    let id = findb::sales::so_return_with_stock(&db, req.so_id, period, date, qty, &req.memo, &req.warehouse)?;
+    // 收入冲回凭证 + 退货执行行 + 回库流水**同一事务**。
+    // 关键收益：超退校验现在在任何写入之前。旧写法先提交收入冲回凭证，
+    // 再由 so_return_with_stock 报「退货数量超过净发货」——收入和应收已被冲掉，
+    // 却没有退货单，用户只看到一个 400。
+    let (id, ivid) = findb::sales::so_return_all(
+        &db,
+        req.so_id,
+        period,
+        date,
+        qty,
+        &req.memo,
+        &req.warehouse,
+        user.username(),
+    )?;
     findb::scm::so_progress_update(&db, req.so_id)?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "voucher_id": ivid })))
 }
@@ -5749,6 +5885,13 @@ async fn add_so_payment(
     let so = findb::scm::so_get(&db, req.so_id)?
         .ok_or_else(|| AppError::not_found("销售订单不存在"))?;
     // 审核流：先落草稿收付款单（凭证由审核人审核时同事务生成并自动核销）
+    //
+    // 写入顺序与 add_po_payment 刻意一致：依赖数据（收款流水）先落，草稿收付款单最后建。
+    // findb 没有 so_payment_add / receipt_create 的 `_in(tx,…)` 变体，三步无法共事务，
+    // 只能靠顺序收敛失败面——建单在前时，建流水失败会留下可被审核并生成付款凭证的孤立草稿单。
+    // 残留的非原子性：建单成功后勾稽建边失败，仅缺一条勾稽边，业务数据仍自洽。
+    let id =
+        findb::sales::so_payment_add(&db, req.so_id, period, date, amount, &req.memo)?;
     let doc_id = findb::receipt::receipt_create(
         &db,
         "receipt",
@@ -5761,9 +5904,8 @@ async fn add_so_payment(
     )?;
     // 票↔款勾稽：本订单已下推的销项发票与本次收付款单自动建边
     findb::docflow::link_receipt_to_src_invoice(&db, "so", req.so_id, doc_id)?;
-    let id =
-        findb::sales::so_payment_add(&db, req.so_id, period, date, amount, &req.memo)?;
-    db.log(
+    // 审计日志失败不得把已提交的收款变成 500：客户端重试会重复入账
+    if let Err(e) = db.log(
         user.username(),
         "销售",
         "销售收款登记",
@@ -5772,7 +5914,9 @@ async fn add_so_payment(
             req.so_id,
             amount.fmt_money()
         ),
-    )?;
+    ) {
+        eprintln!("[finweb] 写操作日志失败（销售收款登记 #{doc_id}）: {e}");
+    }
     Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
 
@@ -6187,6 +6331,10 @@ fn po_status_parse(s: &str) -> Result<findb::scm::PoStatus, AppError> {
     })
 }
 
+// 状态机本身在 findb：scm::so_transition_ok / po_transition_ok 由
+// so_set_status / po_set_status 强制，草稿 → 已完成这类跳变由 findb 拒（FinError::state
+// → 400）。这里不再复制一份流转表——两份图必然漂移，且 HTTP 层无从得知 findb 何时调整。
+
 async fn list_so(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -6376,8 +6524,14 @@ async fn transition_so(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = so_status_parse(&req.status)?;
+    // 状态机由 findb 的 so_set_status 把关（非法跳变 → 400）
     findb::scm::so_set_status(&db, id, to)?;
-    db.log(user.username(), "销售", "销售订单状态", &format!("#{} → {}", id, to.label()))?;
+    // 状态已提交：日志失败不得把请求打成 500，否则客户端重试会重复流转
+    if let Err(e) =
+        db.log(user.username(), "销售", "销售订单状态", &format!("#{} → {}", id, to.label()))
+    {
+        eprintln!("[finweb] 写操作日志失败（销售订单状态 #{id}）: {e}");
+    }
     Ok(Json(json!({ "ok": true, "status": to.label() })))
 }
 
@@ -6525,12 +6679,15 @@ async fn save_po(
             );
         }
     }
-    db.log(
+    // 审计日志失败不得把已提交的订单变成 500：客户端重试会重复下单
+    if let Err(e) = db.log(
         user.username(),
         "采购",
         "保存采购订单",
         &format!("#{} {} {} 不含税 {}", id, po.no, code, po.total_amount.fmt_money()),
-    )?;
+    ) {
+        eprintln!("[finweb] 写操作日志失败（保存采购订单 #{id}）: {e}");
+    }
     Ok(Json(json!({
         "ok": true,
         "id": id,
@@ -6548,8 +6705,14 @@ async fn transition_po(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = po_status_parse(&req.status)?;
+    // 同 transition_so：状态机由 findb 的 po_set_status 把关（非法跳变 → 400）
     findb::scm::po_set_status(&db, id, to)?;
-    db.log(user.username(), "采购", "采购订单状态", &format!("#{} → {}", id, to.label()))?;
+    // 状态已提交：日志失败不得把请求打成 500，否则客户端重试会重复流转
+    if let Err(e) =
+        db.log(user.username(), "采购", "采购订单状态", &format!("#{} → {}", id, to.label()))
+    {
+        eprintln!("[finweb] 写操作日志失败（采购订单状态 #{id}）: {e}");
+    }
     Ok(Json(json!({ "ok": true, "status": to.label() })))
 }
 
@@ -7551,10 +7714,23 @@ async fn prod_complete_ep(
     let db = state.db_for(&user.book_key)?;
     let order = findb::manufacturing::get_prod_order(&db, id)?
         .ok_or_else(|| AppError::bad_request("生产订单不存在"))?;
+    // 完工数量必须落在 [1, 未完工数量] 区间：prod_complete 把 completed_qty 直接覆盖写，
+    // 其唯一守卫是条件更新 status='in_progress'——那只防重复完工，拦不住超完工。
+    // 不设上限时 {"qty":"999999"} 会把 100 件的订单推进 999999，并按 total_cost/999999
+    // 摊出单位成本、连带虚增库存商品。
+    let remain = order.planned_qty - order.completed_qty;
     let qty = if req.qty.trim().is_empty() {
-        order.planned_qty - order.completed_qty
+        remain
     } else {
-        parse_money_checked(&req.qty)?
+        let q = parse_money_checked(&req.qty)?;
+        if q > remain {
+            return Err(AppError::bad_request(format!(
+                "完工数量 {} 超过订单未完工数量 {}",
+                q.fmt_qty(),
+                remain.fmt_qty()
+            )));
+        }
+        q
     };
     if !qty.is_positive() {
         return Err(AppError::bad_request("完工数量必须大于 0（或订单已全部完工）"));
@@ -9307,6 +9483,11 @@ async fn delete_loan(
     user.require(Perm::VoucherNew)?;
     let db = state.db_for(&user.book_key)?;
     findb::funds::loan_delete(&db, id)?;
+    // 融资记录挂着结算凭证与还款凭证，是资金模块里审计最敏感的一类，
+    // 删除必须留痕（与 save_loan / delete_bill / delete_advance / delete_receipt 同口径）。
+    // 这里保留 `?`：删除动作本身幂等（重试不会二次产生业务写入），
+    // 与"提交后再写日志"导致的重复入账不是同一类问题。
+    db.log(user.username(), "资金", "删除融资", &format!("#{id}"))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -9610,12 +9791,16 @@ async fn sales_cost_ep(
     )?;
     match vid {
         Some(id) => {
-            db.log(
+            // 结转凭证已由 stock_cost_voucher 提交；此处日志失败不能再把请求打成 500，
+            // 否则客户端重试会重复结转（findb 只按期间防重，重试得到的是另一个错误）。
+            if let Err(e) = db.log(
                 user.username(),
                 "存货",
                 "结转销售成本",
                 &format!("{} 凭证#{id}", period_to_str(period)),
-            )?;
+            ) {
+                eprintln!("[finweb] 写操作日志失败（结转销售成本 凭证#{id}）: {e}");
+            }
             Ok(Json(json!({ "ok": true, "voucher_id": id })))
         }
         None => Ok(Json(json!({
@@ -9723,8 +9908,11 @@ fn asset_from_req(r: &AssetReq) -> Result<findb::assets::Asset, AppError> {
     if !original.is_positive() {
         return Err(AppError::bad_request("资产原值必须大于 0"));
     }
+    // 残值率缺省 = 0（无残值），不是 5%：字段按百分数录入，0 本身是合法值，
+    // 漏传表单若被当成 5% 会凭空抬高残值、低估折旧。取 0 是会计中性的默认值；
+    // 确有残值的资产必须显式录入残值率。
     let rate = if r.residual_rate.trim().is_empty() {
-        Money::parse("0.05").unwrap_or(Money::ZERO)
+        Money::ZERO
     } else {
         parse_money_checked(&r.residual_rate)?
             .checked_div(rust_decimal::Decimal::from(100))
@@ -11001,13 +11189,18 @@ async fn save_begin(
             return Err(AppError::forbidden(format!("无权维护科目 {code} 的期初余额")));
         }
     }
+    // 期初整批导入必须原子：upsert_begin 里是裸 conn.execute，每行各自成隐式事务，
+    // 第 k 行失败时前 k-1 行已经提交，客户端既无法判断落地了哪些行，也无法安全重试。
+    // 改为在调用方事务里逐行 upsert_begin_on（事务可 Deref 成 Connection），
+    // 整批要么全成、要么全回滚；操作日志同事务写入，不会出现"数据进了、日志没进"。
+    let tx = db.write_tx()?;
     let mut n = 0;
     for r in rows {
         let code = r.account_code.trim();
         if code.is_empty() {
             continue;
         }
-        let yb = Money::parse_or_zero(&r.yb);
+        let yb = parse_money_checked(&r.yb)?;
         let year_begin = match r.dir {
             Direction::Debit => yb,
             Direction::Credit => -yb,
@@ -11017,18 +11210,26 @@ async fn save_begin(
             account_code: code.to_string(),
             aux: r.aux,
             year_begin,
-            debit_accum: Money::parse_or_zero(&r.ad),
-            credit_accum: Money::parse_or_zero(&r.ac),
+            debit_accum: parse_money_checked(&r.ad)?,
+            credit_accum: parse_money_checked(&r.ac)?,
             qty_begin: r
                 .qty
                 .as_ref()
                 .filter(|s| !s.trim().is_empty())
-                .map(|s| Money::parse_or_zero(s)),
+                .map(|s| parse_money_checked(s))
+                .transpose()?,
         };
-        balances::upsert_begin(&db, &br)?;
+        balances::upsert_begin_on(&tx, &br)?;
         n += 1;
     }
-    db.log(user.username(), "期初", "保存期初余额", &format!("保存 {} 条", n))?;
+    findb::log_on(
+        &tx,
+        user.username(),
+        "期初",
+        "保存期初余额",
+        &format!("保存 {} 条", n),
+    )?;
+    tx.commit().map_err(findb::DbError::from)?;
     Ok(Json(json!({"ok": true, "count": n})))
 }
 
@@ -11179,7 +11380,11 @@ async fn restore_backup(
             state2.books.register(&path, 16);
         }
         let db = state2.db_for(&key)?;
-        db.log(&username, "系统", "恢复账套", &format!("从 {file_name} 恢复"))?;
+        // 账套文件已被覆盖，恢复已完成；此处日志失败不能把请求打成 500，
+        // 否则客户端看到失败会重试恢复，重复覆盖刚恢复好的库。
+        if let Err(e) = db.log(&username, "系统", "恢复账套", &format!("从 {file_name} 恢复")) {
+            eprintln!("[finweb] 写操作日志失败（恢复账套 {file_name}）: {e}");
+        }
         Ok(())
     })
     .await
@@ -11452,6 +11657,17 @@ struct PayrollInput {
     memo: String,
 }
 
+/// 工资行的数据范围过滤（列表 / 导出 / 银行代发 / 个税申报表共用，避免各处漏抄）
+/// 部门范围与「仅看本人经手的业务单据」叠加，与 own_doc_only 口径一致。
+fn scope_payroll<'a>(
+    user: &CurrentUser,
+    rows: &'a [business::Payroll],
+) -> Vec<&'a business::Payroll> {
+    rows.iter()
+        .filter(|r| user.user.data_scope.allows_dept(&r.dept) && doc_in_scope(user, &r.employee))
+        .collect()
+}
+
 async fn list_payroll(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -11461,19 +11677,10 @@ async fn list_payroll(
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let rows = business::payroll_list(&db, period)?;
-    // 数据范围·部门：配置了部门范围时只看本部门工资行（与 own_doc_only 叠加）
-    let rows: Vec<business::Payroll> = rows
+    let rows: Vec<business::Payroll> = scope_payroll(&user, &rows)
         .into_iter()
-        .filter(|r| user.user.data_scope.allows_dept(&r.dept))
+        .cloned()
         .collect();
-    // 「仅看本人经手的业务单据」：工资按员工姓名匹配当前登录人
-    let rows: Vec<business::Payroll> = if user.user.data_scope.own_doc_only {
-        rows.into_iter()
-            .filter(|r| r.employee == user.user.display_name || r.employee == user.user.username)
-            .collect()
-    } else {
-        rows
-    };
     Ok(Json(rows))
 }
 
@@ -11496,6 +11703,7 @@ async fn export_payroll_bank_file(
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let rows = business::payroll_list(&db, period)?;
+    let rows = scope_payroll(&user, &rows);
     let mut out = vec![vec!["账号".to_string(), "户名".to_string(), "金额".to_string()]];
     let mut skipped = 0usize;
     for p in &rows {
@@ -11542,6 +11750,9 @@ async fn get_payroll_slip(
     if employee.is_empty() {
         return Err(AppError::bad_request("缺少 employee 参数"));
     }
+    if !doc_in_scope(&user, employee) {
+        return Err(AppError::forbidden("数据范围受限，不能查看他人的工资条"));
+    }
     let p = business::payroll_get(&db, period, employee)?
         .ok_or_else(|| AppError::not_found("该员工本期无工资记录"))?;
     let ytd = business::payroll_ytd(&db, period, employee)?;
@@ -11574,6 +11785,8 @@ async fn get_payroll_tax_report(
     let db = state.db_for(&user.book_key)?;
     let period = query_period(&state, &user, &q);
     let rows = business::payroll_list(&db, period)?;
+    // 数据范围：受限账号只出自己（或本部门）的工资行，与列表口径一致
+    let rows = scope_payroll(&user, &rows);
     let items: Vec<serde_json::Value> = rows
         .iter()
         .map(|p| {

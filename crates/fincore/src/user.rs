@@ -314,7 +314,9 @@ impl Default for PasswordPolicy {
 impl PasswordPolicy {
     /// 校验口令，返回第一个不满足的规则
     pub fn check(&self, pwd: &str) -> Result<(), String> {
-        if pwd.len() < self.min_len {
+        // 按**字符**数而不是字节数：4 个汉字是 12 字节但只有 4 个字符，
+        // 用 len() 会让「口令长度不能少于 8 位」被 4 个汉字骗过。
+        if pwd.chars().count() < self.min_len {
             return Err(format!("口令长度不能少于 {} 位", self.min_len));
         }
         if self.need_letter && !pwd.chars().any(|c| c.is_ascii_alphabetic()) {
@@ -330,11 +332,12 @@ impl PasswordPolicy {
     }
     /// 口令强度 0~4，用于界面上的进度条
     pub fn strength(&self, pwd: &str) -> u8 {
+        let n = pwd.chars().count();
         let mut s = 0u8;
-        if pwd.len() >= self.min_len {
+        if n >= self.min_len {
             s += 1;
         }
-        if pwd.len() >= 12 {
+        if n >= 12 {
             s += 1;
         }
         if pwd.chars().any(|c| c.is_ascii_alphabetic()) && pwd.chars().any(|c| c.is_ascii_digit()) {
@@ -553,9 +556,12 @@ impl User {
         if !has_account_limit {
             return true;
         }
-        // 凭证可能横跨多个科目，只要有一个分录落在范围内就可见；
-        // 但也要保证分录本身不与范围冲突（取"任一可见"语义）。
-        v.entries.iter().any(|e| scope.allows_account(&e.account_code))
+        // 「全部科目都在范围内」= 逐条 `all`：一张凭证若有一条分录落在范围外
+        // （例如范围 1122..1122，凭证含 1001 + 1122），整张凭证都不该可见。
+        // 早先这里是 `any`，与上面注释的规格相反——范围外的科目金额会随整张
+        // 凭证一起泄露（实测确认）。空凭证视为不可见更安全，但没有分录的凭证
+        // 本不该存在，这里按"无可见证据"处理。
+        v.entries.iter().all(|e| scope.allows_account(&e.account_code))
     }
 }
 
@@ -779,6 +785,112 @@ mod tests {
         let admin = User::new("admin", "管理员", Role::Admin);
         assert!(!admin.data_scope.own_voucher_only);
         assert!(admin.data_scope.is_unrestricted());
+    }
+
+    /// 科目数据范围是「全部科目都在范围内」语义（AND），不是「任一命中」（OR）。
+    /// 回归：范围 1122..1122 时，含 1001（越权）+ 1122（在范围）的凭证早先
+    /// 用 `.any()` 判定为可见，把范围外科目的金额一起泄露了。
+    #[test]
+    fn can_see_voucher_requires_all_entries_in_scope() {
+        use crate::money::Money;
+        use crate::period::Period;
+        use crate::voucher::{Entry, Voucher};
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let mut u = User::new("acc1", "会计一", Role::Accountant);
+        u.data_scope.account_from = "1122".into();
+        u.data_scope.account_to = "1122".into();
+
+        let mk = |codes: &[&str]| -> Voucher {
+            let mut v = Voucher::new(Period::new(2026, 1).unwrap(), d, "记", 1);
+            v.prepared_by = "acc1".into();
+            for (i, c) in codes.iter().enumerate() {
+                let mut e = Entry::new(i as i32 + 1, *c, "s");
+                if i % 2 == 0 {
+                    e.debit = Money::parse("100").unwrap();
+                } else {
+                    e.credit = Money::parse("100").unwrap();
+                }
+                v.entries.push(e);
+            }
+            v.renumber();
+            v
+        };
+
+        assert!(
+            u.can_see_voucher(&mk(&["1122", "112201"])),
+            "全部在范围内应可见"
+        );
+        // 1001 在 1122..1122 之外 → 整张不可见
+        assert!(
+            !u.can_see_voucher(&mk(&["1122", "1001"])),
+            "只要有一条分录越界，整张凭证都不可见"
+        );
+        assert!(
+            !u.can_see_voucher(&mk(&["1122", "6001"])),
+            "对方科目越界同样不可见"
+        );
+        // 空范围不限制
+        let mut un = User::new("acc2", "会计二", Role::Accountant);
+        assert!(un.can_see_voucher(&mk(&["1122", "1001"])));
+    }
+
+    /// 口令长度按**字符**计，不是字节。
+    /// 回归：`pwd.len()` 是字节数，4 个汉字（12 字节）能通过「8 位 + 字母 + 数字」
+    /// 之外的宽松策略；纯汉字口令在关掉 need_letter/need_digit 后就能过 8 位门槛。
+    #[test]
+    fn password_length_counts_chars_not_bytes() {
+        let mut p = PasswordPolicy::default();
+        // 默认策略：纯汉字被 need_letter 拦下
+        assert!(p.check("密码密码").is_err());
+        // 关掉字母/数字要求后，4 个汉字（12 字节 / 4 字符）必须仍然不达标
+        p.need_letter = false;
+        p.need_digit = false;
+        let four_cn = "密码密码"; // 4 字
+        assert_eq!(four_cn.len(), 12, "4 个汉字应为 12 字节");
+        assert_eq!(four_cn.chars().count(), 4);
+        assert!(p.check(four_cn).is_err(), "4 个字符不满足 8 位要求");
+        // 8 个汉字应当达标
+        assert!(p.check("密码密码密码密码").is_ok());
+        // 强度条同样按字符计
+        assert!(p.strength(four_cn) < p.strength("Abcdefgh1234"));
+    }
+
+    /// 科目范围按定长编码的字典序比较——这是**有意**的语义，不是 bug。
+    /// 上界 `hi` 意为「hi 及其所有下级 + 字典序在 hi 之前的兄弟子树」，
+    /// 下界 `lo` 意为「lo 及其所有下级」。锁住这个语义，避免以后被"修"成别的。
+    #[test]
+    fn account_scope_range_semantics() {
+        use crate::account::{CodeScheme, Chart};
+        let mut sc = DataScope::default();
+        // 默认方案 4-2-2-2-2 下合法编码长度只有 4/6/8/10/12
+        let scheme = CodeScheme::default();
+        for c in ["1001", "100201", "10020101"] {
+            assert!(scheme.is_valid_code(c), "{c} 应为合法编码");
+        }
+        assert!(!scheme.is_valid_code("10015"), "5 位不是合法编码");
+
+        sc.account_from = "1002".into();
+        sc.account_to = "1002".into();
+        assert!(sc.allows_account("1002"));
+        assert!(sc.allows_account("100201"), "上界应含其下级");
+        assert!(sc.allows_account("10020101"), "上界含其整棵子树");
+        assert!(!sc.allows_account("1001"), "下界之外不可见");
+        assert!(!sc.allows_account("1003"));
+        // 注：`allows_account` 是纯字符串前缀比较，非法编码（如 5 位的 "10021"）
+        // 会被 starts_with 判成 1002 的下级。这不是漏洞——`CodeScheme::is_valid_code`
+        // 在建科目时就拒掉非级长边界编码，这类值不可能进科目表。
+
+        // 只设上界 = 从最早到该子树
+        sc.account_from = String::new();
+        sc.account_to = "1122".into();
+        assert!(sc.allows_account("1001"), "字典序在前的兄弟子树应可见");
+        assert!(sc.allows_account("1122"));
+        assert!(sc.allows_account("112201"));
+        assert!(!sc.allows_account("1123"), "上界之后不可见");
+
+        // 两端都空 = 不限制
+        assert!(DataScope::default().is_unrestricted());
+        assert!(DataScope::default().allows_account("9999"));
     }
 
     #[test]

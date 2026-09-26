@@ -23,15 +23,20 @@ use crate::money::Money;
 use crate::{FinError, Period};
 
 /// 取数上下文
+///
+/// 取数一律返回 `Result`：余额快照读失败（库被锁、数据行损坏）与"这个科目就是 0"
+/// 在报表上是两件完全不同的事。返回裸 `Money` 会让调用方把前者静默变成 0，
+/// 于是报表印出一份看着很正常的数字，而底下的取数其实根本没成功——财务上最坏的
+/// 失败模式。
 pub trait FormulaSource {
     /// 期初余额（带符号：借为正）
-    fn qc(&self, code: &str, period: Period, dir: Option<&str>) -> Money;
+    fn qc(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, FinError>;
     /// 期末余额（带符号）
-    fn qm(&self, code: &str, period: Period, dir: Option<&str>) -> Money;
+    fn qm(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, FinError>;
     /// 本期发生额（dir 为"借"/"贷"取单方向，None 取借贷差额）
-    fn fs(&self, code: &str, period: Period, dir: Option<&str>) -> Money;
+    fn fs(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, FinError>;
     /// 本年累计发生额
-    fn lfs(&self, code: &str, period: Period, dir: Option<&str>) -> Money;
+    fn lfs(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, FinError>;
 }
 
 // ---------------- 词法 ----------------
@@ -193,11 +198,17 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Tok::Plus => {
                     self.bump();
-                    v += self.term()?;
+                    let t = self.term()?;
+                    v = v
+                        .checked_add(t)
+                        .ok_or_else(|| FinError::msg("公式运算溢出：加法超出可表示范围"))?;
                 }
                 Tok::Minus => {
                     self.bump();
-                    v -= self.term()?;
+                    let t = self.term()?;
+                    v = v
+                        .checked_sub(t)
+                        .ok_or_else(|| FinError::msg("公式运算溢出：减法超出可表示范围"))?;
                 }
                 _ => break,
             }
@@ -211,7 +222,13 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Tok::Star => {
                     self.bump();
-                    v = v * self.factor()?.inner();
+                    let f = self.factor()?;
+                    // 不能用 `*` 运算符：rust_decimal 乘法溢出会 panic，
+                    // 而公式里 `QM("1001")*QM("1002")` 两个大余额相乘就能踩到
+                    // （实测 1e15 × 1e15 = 1e30 > Decimal 上限 ~7.9e28）。
+                    v = v
+                        .checked_mul(f.inner())
+                        .ok_or_else(|| FinError::msg("公式运算溢出：乘法超出可表示范围"))?;
                 }
                 Tok::Slash => {
                     self.bump();
@@ -309,19 +326,27 @@ impl<'a> Parser<'a> {
         let a = |i: usize| -> Option<String> { args.get(i).cloned().flatten() };
         let code = a(0)
             .ok_or_else(|| FinError::msg(format!("{name}() 缺少科目参数")))?;
-        // 期间偏移：允许 -1 / -12 这类写法，也容忍历史公式里的 "-1.00" 小数写法
+        // 期间偏移：允许 -1 / -12 这类写法，也容忍历史公式里的 "-1.00" 小数写法。
+        // 解析不出来必须报错——旧的 `unwrap_or(0)` 会把 `QM("1001","abc")` 静默
+        // 当成"本期"，报表数字看着正常但口径是错的，财务上比报错难查得多。
         let offset: i32 = match a(1) {
             Some(s) => {
                 let t = s.trim().replace(',', "");
                 if t.is_empty() {
                     0
                 } else {
-                    t.parse::<i32>().ok().or_else(|| {
-                        Money::parse(&t)
-                            .ok()
-                            .and_then(|m| m.inner().trunc().to_i32())
-                    })
-                    .unwrap_or(0)
+                    t.parse::<i32>()
+                        .ok()
+                        .or_else(|| {
+                            Money::parse(&t)
+                                .ok()
+                                .and_then(|m| m.inner().trunc().to_i32())
+                        })
+                        .ok_or_else(|| {
+                            FinError::msg(format!(
+                                "{name}() 的期间偏移无法解析：{s}（应为整数，如 0 / -1 / -12）"
+                            ))
+                        })?
                 }
             }
             None => 0,
@@ -330,11 +355,11 @@ impl<'a> Parser<'a> {
         let dir = a(2);
         let dir = dir.as_deref().map(|s| s.trim());
         match name.to_ascii_uppercase().as_str() {
-            "QC" => Ok(self.src.qc(&code, period, dir)),
-            "QM" => Ok(self.src.qm(&code, period, dir)),
-            "FS" => Ok(self.src.fs(&code, period, dir)),
-            "LFS" => Ok(self.src.lfs(&code, period, dir)),
-            "JE" => Ok(self.src.qm(&code, period, dir).abs()),
+            "QC" => self.src.qc(&code, period, dir),
+            "QM" => self.src.qm(&code, period, dir),
+            "FS" => self.src.fs(&code, period, dir),
+            "LFS" => self.src.lfs(&code, period, dir),
+            "JE" => self.src.qm(&code, period, dir).map(|m| m.abs()),
             _ => Err(FinError::msg(format!("不支持的函数：{name}"))),
         }
     }
@@ -365,17 +390,17 @@ pub fn eval(src: &str, ctx: &dyn FormulaSource, period: Period) -> Result<Money,
 pub fn check(src: &str) -> Result<(), FinError> {
     struct Null;
     impl FormulaSource for Null {
-        fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            Money::ZERO
+        fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(Money::ZERO)
         }
-        fn qm(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            Money::ZERO
+        fn qm(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(Money::ZERO)
         }
-        fn fs(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            Money::ZERO
+        fn fs(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(Money::ZERO)
         }
-        fn lfs(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            Money::ZERO
+        fn lfs(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(Money::ZERO)
         }
     }
     let t = src.trim();
@@ -417,17 +442,17 @@ mod tests {
 
     struct Fake(HashMap<&'static str, Money>);
     impl FormulaSource for Fake {
-        fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            self.0.get("qc").copied().unwrap_or(Money::ZERO)
+        fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(self.0.get("qc").copied().unwrap_or(Money::ZERO))
         }
-        fn qm(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            self.0.get("qm").copied().unwrap_or(Money::ZERO)
+        fn qm(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(self.0.get("qm").copied().unwrap_or(Money::ZERO))
         }
-        fn fs(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            self.0.get("fs").copied().unwrap_or(Money::ZERO)
+        fn fs(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(self.0.get("fs").copied().unwrap_or(Money::ZERO))
         }
-        fn lfs(&self, _: &str, _: Period, _: Option<&str>) -> Money {
-            self.0.get("lfs").copied().unwrap_or(Money::ZERO)
+        fn lfs(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+            Ok(self.0.get("lfs").copied().unwrap_or(Money::ZERO))
         }
     }
 
@@ -488,5 +513,157 @@ mod tests {
         assert!(check("QM(\"1001\"").is_err());
         let r = referenced_accounts("QM(\"1001\")+QM(\"1002\")-FS(\"6001\",,\"贷\")");
         assert_eq!(r, vec!["1001", "1002", "6001"]);
+    }
+
+    /// 记录每次取数落在哪个期间，用来验证期间偏移
+    struct Spy {
+        seen: std::cell::RefCell<Vec<i32>>,
+        val: Money,
+    }
+    impl FormulaSource for Spy {
+        fn qc(&self, _c: &str, p: Period, _d: Option<&str>) -> Result<Money, FinError> {
+            self.seen.borrow_mut().push(p.ymm());
+            Ok(self.val)
+        }
+        fn qm(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+            self.qc(c, p, d)
+        }
+        fn fs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+            self.qc(c, p, d)
+        }
+        fn lfs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+            self.qc(c, p, d)
+        }
+    }
+
+    /// 乘法溢出必须报错而不是 panic。
+    /// 回归：`QM("1001")*QM("1002")` 两个 1e15 余额相乘 = 1e30 > Decimal 上限
+    /// ~7.9e28，`rust_decimal` 的 `*` 会 panic（Web 端 500、桌面端崩进程）。
+    #[test]
+    fn mul_overflow_is_error_not_panic() {
+        struct Big;
+        impl FormulaSource for Big {
+            fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+                Ok(Money::parse("999999999999999.99").unwrap())
+            }
+            fn qm(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn fs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn lfs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+        }
+        let p = Period::new(2026, 1).unwrap();
+        // 确认在 unchecked 路径上确实会 panic（证明本测试不是空转）
+        let raw = Money::parse("999999999999999.99").unwrap();
+        assert!(
+            std::panic::catch_unwind(|| raw * raw.0).is_err(),
+            "rust_decimal 乘法仍应溢出 panic，说明 overflow 前提成立"
+        );
+        for f in [
+            "QM(\"1001\")*QM(\"1002\")",
+            "(QM(\"1001\")*QM(\"1002\"))*QM(\"1003\")",
+        ] {
+            let err = eval(f, &Big, p).unwrap_err();
+            assert!(err.to_string().contains("溢出"), "{f} 应报溢出：{err}");
+        }
+        // 未溢出的乘法照常工作
+        assert_eq!(e("2*3"), Money::parse("6").unwrap());
+    }
+
+    #[test]
+    fn add_overflow_is_error() {
+        struct Big;
+        impl FormulaSource for Big {
+            fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+                // 7e28，两项相加即 1.4e29 > Decimal 上限 ~7.9e28
+                Ok(Money::parse("70000000000000000000000000000").unwrap())
+            }
+            fn qm(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn fs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn lfs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+        }
+        let err = eval(
+            "QM(\"1001\")+QM(\"1002\")",
+            &Big,
+            Period::new(2026, 1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("溢出"), "{err}");
+    }
+
+    /// 期间偏移解析不出来必须报错。
+    /// 回归：旧的 `unwrap_or(0)` 让 `QM("1001","abc")` 静默取本期数据。
+    #[test]
+    fn bad_period_offset_is_error() {        let spy = Spy {
+            seen: std::cell::RefCell::new(Vec::new()),
+            val: Money::ZERO,
+        };
+        let err = eval("QM(\"1001\",\"abc\")", &spy, p()).unwrap_err();
+        assert!(
+            err.to_string().contains("期间偏移"),
+            "应报期间偏移解析失败：{err}"
+        );
+        assert!(spy.seen.borrow().is_empty(), "解析失败时不应取数");
+
+        // 合法偏移仍然照常工作
+        let spy2 = Spy {
+            seen: std::cell::RefCell::new(Vec::new()),
+            val: Money::ZERO,
+        };
+        eval("QM(\"1001\",-1)", &spy2, p()).unwrap();
+        eval("QM(\"1001\",,)", &spy2, p()).unwrap();
+        assert_eq!(spy2.seen.borrow().as_slice(), &[202512, 202601]);
+    }
+
+    /// 取数失败必须一路冒泡成错误，不能变成 0。
+    /// 回归：旧的 `FormulaSource` 返回裸 `Money`，余额快照读失败（库被锁、行损坏）
+    /// 与"这个科目就是 0"在报表上完全一样——印出一份看着正常的数字，底下的取数
+    /// 其实根本没成功。
+    #[test]
+    fn source_error_propagates_instead_of_zero() {
+        struct Broken;
+        impl FormulaSource for Broken {
+            fn qc(&self, _: &str, _: Period, _: Option<&str>) -> Result<Money, FinError> {
+                Err(FinError::db("余额快照读取失败"))
+            }
+            fn qm(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn fs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+            fn lfs(&self, c: &str, p: Period, d: Option<&str>) -> Result<Money, FinError> {
+                self.qc(c, p, d)
+            }
+        }
+        for f in [
+            "QC(\"1001\")",
+            "QM(\"1001\")",
+            "FS(\"6001\")",
+            "LFS(\"6001\")",
+            "JE(\"1001\")",
+            "QM(\"1001\")+1",
+        ] {
+            let err = eval(f, &Broken, p()).unwrap_err();
+            assert!(
+                err.to_string().contains("余额快照读取失败"),
+                "{f} 应把取数错误抛出来，而不是当成 0：{err}"
+            );
+        }
+        // 纯数字与空公式仍照常返回 0（无取数可失败）
+        assert_eq!(eval("100", &Broken, p()).unwrap(), Money::parse("100").unwrap());
+        assert_eq!(eval("   ", &Broken, p()).unwrap(), Money::ZERO);
+        // check() 用的 Null 取数实现应返回 Ok，纯语法检查不受影响
+        assert!(check("QM(\"1001\")+1").is_ok());
     }
 }

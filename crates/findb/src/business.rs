@@ -268,6 +268,9 @@ pub struct StockSummary {
 /// 存货收发存汇总——**结转口径：仅统计销售出库（kind=sale，含退货正行抵减）**。
 /// 领料/形态转换/组装/调拨等非销售出库不属主营业务成本，已在行级过滤排除
 ///（否则制造业账下领料会被虚增结转进 6401）。
+///
+/// 收发存四栏（收入/发出的数量与金额）均为**本期**发生额；成本引擎内部仍重放
+/// 期前全部流水以保证移动加权单价正确——两者口径不同是有意为之。
 pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Vec<StockSummary>> {
     let mut items = stock_items(db)?;
     items.sort();
@@ -356,6 +359,13 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
             };
             // 引擎跑全部行（含领料/转换/调拨），保证成本序列与单价正确
             let cost = st.apply(&mv, method)?;
+            // 收发存汇总的 in_* / out_* 是「本期」发生额，不是 inception 至今累计。
+            // 成本引擎必须重放全部历史（否则移动加权单价会错），但汇总口径只能取
+            // 本期——早先这里对全部行累加，导致 2 月结转销售成本时把 1 月的 COGS
+            // 再计一遍，主营业务成本虚增（MonthAverage 分支一直是对的）。
+            if r.period.ymm() != period.ymm() {
+                continue;
+            }
             if r.qty.is_positive() {
                 s.in_qty += r.qty;
                 s.in_amount += if r.amount.is_zero() {
@@ -369,21 +379,19 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
                 let c = cost.unwrap_or(Money::ZERO);
                 s.out_amount += c;
                 // 回写本期的出库成本（失败必须上抛：静默吞错会留下"汇总已改、流水未改"的错账）
-                if r.period.ymm() == period.ymm() {
-                    stock_update_amount(
-                        db,
-                        r.id,
-                        if s.out_qty.is_zero() {
-                            Money::ZERO
-                        } else {
-                            // 数量为 0 时单位成本按 0（原"除零返 0"口径显式化，守卫与旧行为一致）
-                            c.checked_div(r.qty.abs())
-                                .unwrap_or(Money::ZERO)
-                                .round2()
-                        },
-                        c,
-                    )?;
-                }
+                stock_update_amount(
+                    db,
+                    r.id,
+                    if s.out_qty.is_zero() {
+                        Money::ZERO
+                    } else {
+                        // 数量为 0 时单位成本按 0（原"除零返 0"口径显式化，守卫与旧行为一致）
+                        c.checked_div(r.qty.abs())
+                            .unwrap_or(Money::ZERO)
+                            .round2()
+                    },
+                    c,
+                )?;
             }
         }
         s.end_qty = st.qty;
@@ -1611,6 +1619,48 @@ mod tests {
 
         let st = stock_state(&db, "P001", p, CostMethod::MovingAverage).unwrap();
         assert_eq!(st.qty, m("70"));
+    }
+
+    /// 收发存汇总的收发两栏必须是**本期**发生额，不能是 inception 至今累计。
+    ///
+    /// 回归：引擎重放全部历史是对的（移动加权单价要靠它），但早先把
+    /// `in_*` / `out_*` 也对全部历史累加，导致 2 月结转销售成本时把 1 月的
+    /// COGS 再计一遍。单期间测试测不出来（累计 == 本期），必须跨期。
+    #[test]
+    fn stock_summary_is_current_period_only() {
+        let db = tmpdb("stockperiod");
+        let p1 = Period::new(2026, 1).unwrap();
+        let p2 = Period::new(2026, 2).unwrap();
+        // 1 月：入 100@10，销售 40 → 1 月 COGS = 400
+        stock_insert(&db, &mv(p1, d(2026, 1, 5), StockKind::Purchase, "100", "10")).unwrap();
+        stock_insert(&db, &mv(p1, d(2026, 1, 20), StockKind::Sale, "-40", "0")).unwrap();
+        // 2 月：销售 30，单价仍是 10 → 2 月 COGS = 300
+        stock_insert(&db, &mv(p2, d(2026, 2, 10), StockKind::Sale, "-30", "0")).unwrap();
+
+        let s1 = stock_summary(&db, p1, CostMethod::MovingAverage).unwrap();
+        assert_eq!(s1[0].in_qty, m("100"), "1 月收入数量");
+        assert_eq!(s1[0].in_amount, m("1000"), "1 月收入金额");
+        assert_eq!(s1[0].out_qty, m("40"), "1 月发出数量");
+        assert_eq!(s1[0].out_amount, m("400"), "1 月发出成本");
+        assert_eq!(s1[0].end_qty, m("60"), "1 月末结存数量");
+        assert_eq!(s1[0].end_amount, m("600"), "1 月末结存金额");
+
+        // 关键断言：2 月的 out_amount 只能是 300，不能是 400+300=700
+        let s2 = stock_summary(&db, p2, CostMethod::MovingAverage).unwrap();
+        assert_eq!(s2[0].in_qty, m("0"), "2 月无入库");
+        assert_eq!(s2[0].in_amount, m("0"), "2 月无入库金额");
+        assert_eq!(s2[0].out_qty, m("30"), "2 月发出数量只算本期");
+        assert_eq!(s2[0].out_amount, m("300"), "2 月发出成本不得累计 1 月");
+        assert_eq!(s2[0].end_qty, m("30"), "2 月末结存数量");
+        assert_eq!(s2[0].end_amount, m("300"), "2 月末结存金额");
+        assert_eq!(s2[0].unit_cost, m("10"), "移动加权单价仍由全部历史决定");
+
+        // 结转销售成本凭证也必须只带本期成本
+        let id = stock_cost_voucher(&db, p2, d(2026, 2, 28), CostMethod::MovingAverage, "6401", "140501", "u")
+            .unwrap()
+            .expect("2 月应生成结转凭证");
+        let v = crate::vouchers::get(&db, id).unwrap().unwrap();
+        assert_eq!(v.debit_total(), m("300"), "2 月结转成本凭证金额");
     }
 
     #[test]

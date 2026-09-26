@@ -660,7 +660,7 @@ impl<'a> ReportCtx<'a> {
         self.user = Some(u);
         self
     }
-    fn snap(&self, period: Period) -> DbResult<BalanceSnapshot> {
+    fn snap(&self, period: Period) -> Result<BalanceSnapshot, fincore::FinError> {
         let mut c = self.cache.borrow_mut();
         if let Some(s) = c.get(&period.ymm()) {
             return Ok(s.clone());
@@ -669,48 +669,34 @@ impl<'a> ReportCtx<'a> {
         if let Some(u) = self.user {
             bq = bq.with_user_scope(u);
         }
-        let s = BalanceSnapshot::load(self.db, &bq)?;
+        let s = BalanceSnapshot::load(self.db, &bq).map_err(fincore::FinError::from)?;
         c.insert(period.ymm(), s.clone());
         Ok(s)
     }
 }
 
 impl<'a> FormulaSource for ReportCtx<'a> {
-    fn qc(&self, code: &str, period: Period, _dir: Option<&str>) -> Money {
-        self.snap(period)
-            .map(|s| s.for_account(code, None).begin)
-            .unwrap_or(Money::ZERO)
+    fn qc(&self, code: &str, period: Period, _dir: Option<&str>) -> Result<Money, fincore::FinError> {
+        Ok(self.snap(period)?.for_account(code, None).begin)
     }
-    fn qm(&self, code: &str, period: Period, _dir: Option<&str>) -> Money {
-        self.snap(period)
-            .map(|s| s.for_account(code, None).end())
-            .unwrap_or(Money::ZERO)
+    fn qm(&self, code: &str, period: Period, _dir: Option<&str>) -> Result<Money, fincore::FinError> {
+        Ok(self.snap(period)?.for_account(code, None).end())
     }
-    fn fs(&self, code: &str, period: Period, dir: Option<&str>) -> Money {
-        match self.snap(period) {
-            Ok(s) => {
-                let r = s.for_account(code, None);
-                match dir {
-                    Some(d) if d.starts_with('借') || d.eq_ignore_ascii_case("J") => r.debit,
-                    Some(d) if d.starts_with('贷') || d.eq_ignore_ascii_case("D") => r.credit,
-                    _ => r.debit - r.credit,
-                }
-            }
-            Err(_) => Money::ZERO,
-        }
+    fn fs(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, fincore::FinError> {
+        let r = self.snap(period)?.for_account(code, None);
+        Ok(match dir {
+            Some(d) if d.starts_with('借') || d.eq_ignore_ascii_case("J") => r.debit,
+            Some(d) if d.starts_with('贷') || d.eq_ignore_ascii_case("D") => r.credit,
+            _ => r.debit - r.credit,
+        })
     }
-    fn lfs(&self, code: &str, period: Period, dir: Option<&str>) -> Money {
-        match self.snap(period) {
-            Ok(s) => {
-                let r = s.for_account(code, None);
-                match dir {
-                    Some(d) if d.starts_with('借') || d.eq_ignore_ascii_case("J") => r.ytd_debit,
-                    Some(d) if d.starts_with('贷') || d.eq_ignore_ascii_case("D") => r.ytd_credit,
-                    _ => r.ytd_debit - r.ytd_credit,
-                }
-            }
-            Err(_) => Money::ZERO,
-        }
+    fn lfs(&self, code: &str, period: Period, dir: Option<&str>) -> Result<Money, fincore::FinError> {
+        let r = self.snap(period)?.for_account(code, None);
+        Ok(match dir {
+            Some(d) if d.starts_with('借') || d.eq_ignore_ascii_case("J") => r.ytd_debit,
+            Some(d) if d.starts_with('贷') || d.eq_ignore_ascii_case("D") => r.ytd_credit,
+            _ => r.ytd_debit - r.ytd_credit,
+        })
     }
 }
 
@@ -749,25 +735,56 @@ impl CustomReport {
 }
 
 /// 求值整个自定义报表，返回 `行 × 列` 的金额矩阵（`user` = 数据范围，None 不限制）
+///
+/// 失败单元格按 0 占位、原因在 [`custom_report_values_detailed`] 的 warnings 里。
+/// 报表要能整张显示出来，不能因为一格公式写错就什么都没有；但**必须把原因带给
+/// 用户**——静默的 0 在财务上比报错难查得多。
 pub fn custom_report_values(
     db: &Db,
     r: &CustomReport,
     period: Period,
     user: Option<&fincore::user::User>,
 ) -> DbResult<Vec<Vec<Money>>> {
+    custom_report_values_detailed(db, r, period, user).map(|(v, _)| v)
+}
+
+/// 同 [`custom_report_values`]，但一并返回每个失败单元格的（行, 列, 原因）。
+pub fn custom_report_values_detailed(
+    db: &Db,
+    r: &CustomReport,
+    period: Period,
+    user: Option<&fincore::user::User>,
+) -> DbResult<(Vec<Vec<Money>>, Vec<String>)> {
     let mut ctx = ReportCtx::new(db);
     if let Some(u) = user {
         ctx = ctx.with_user(u);
     }
     let mut out = Vec::with_capacity(r.lines.len());
-    for l in &r.lines {
+    let mut warnings: Vec<String> = Vec::new();
+    for (li, l) in r.lines.iter().enumerate() {
         let mut row = Vec::with_capacity(r.columns.len());
-        for f in &l.formulas {
-            row.push(formula::eval(f, &ctx, period).unwrap_or(Money::ZERO));
+        for (ci, f) in l.formulas.iter().enumerate() {
+            if f.trim().is_empty() {
+                row.push(Money::ZERO);
+                continue;
+            }
+            match formula::eval(f, &ctx, period) {
+                Ok(v) => row.push(v),
+                Err(e) => {
+                    warnings.push(format!(
+                        "第 {} 行「{}」第 {} 列公式「{}」取数失败：{e}（该格显示 0）",
+                        li + 1,
+                        l.name,
+                        ci + 1,
+                        f
+                    ));
+                    row.push(Money::ZERO);
+                }
+            }
         }
         out.push(row);
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 /// 列出全部自定义报表
@@ -1025,6 +1042,66 @@ mod tests {
         let list = custom_list(&db).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].lines.len(), 2);
+    }
+
+    /// 回归：自定义报表的取数失败必须以警告形式暴露，不能静默变成 0。
+    /// 旧的 `formula::eval(...).unwrap_or(Money::ZERO)` 让"余额快照读失败"和
+    /// "这个科目就是 0"在报表上完全一样。
+    #[test]
+    fn custom_report_surfaces_formula_errors_as_warnings() {
+        let db = tmpdb("custom_err");
+        let p = Period::new(2026, 1).unwrap();
+        post(&db, p, 1, &[("100201", "50000", "0", None), ("600101", "0", "50000", None)]);
+        let mut r = CustomReport::new("custom.err", "错误报表", vec!["金额".into()]);
+        r.lines.push(CustomLine {
+            name: "正常".into(),
+            indent: 0,
+            formulas: vec!["QM(\"100201\")".into()],
+            bold: false,
+        });
+        r.lines.push(CustomLine {
+            name: "除零".into(),
+            indent: 0,
+            formulas: vec!["QM(\"100201\")/(QM(\"600101\")-QM(\"600101\"))".into()],
+            bold: false,
+        });
+        r.lines.push(CustomLine {
+            name: "语法错".into(),
+            indent: 0,
+            formulas: vec!["XX(\"100201\")".into()],
+            bold: false,
+        });
+        let (vals, warns) = custom_report_values_detailed(&db, &r, p, None).unwrap();
+        assert_eq!(vals[0][0], m("50000"), "正常格仍应取到数");
+        assert_eq!(warns.len(), 2, "两个坏公式都要报出来：{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("除零")), "{warns:?}");
+        assert!(warns.iter().any(|w| w.contains("不支持的函数")), "{warns:?}");
+        // 旧接口保持签名，坏格仍按 0 占位（整张报表要能显示出来）
+        let vals2 = custom_report_values(&db, &r, p, None).unwrap();
+        assert_eq!(vals2[1][0], Money::ZERO);
+        assert_eq!(vals2[2][0], Money::ZERO);
+    }
+
+    /// 回归：取数侧的数据库错误（而不是公式语法错）也必须冒泡成警告。
+    /// 把 `begin_balance` 表改名，制造真实的取数失败。
+    #[test]
+    fn custom_report_warns_when_snapshot_query_fails() {
+        let db = tmpdb("custom_db_err");
+        let p = Period::new(2026, 1).unwrap();
+        let mut r = CustomReport::new("custom.dberr", "取数失败", vec!["金额".into()]);
+        r.lines.push(CustomLine {
+            name: "银行存款".into(),
+            indent: 0,
+            formulas: vec!["QM(\"100201\")".into()],
+            bold: false,
+        });
+        db.conn()
+            .execute_batch("ALTER TABLE begin_balance RENAME TO begin_balance_x;")
+            .unwrap();
+        let (vals, warns) = custom_report_values_detailed(&db, &r, p, None).unwrap();
+        assert_eq!(vals[0][0], Money::ZERO, "取数失败时该格显示 0");
+        assert_eq!(warns.len(), 1, "取数失败必须上报，不能静默 0：{warns:?}");
+        assert!(warns[0].contains("取数失败"), "{warns:?}");
     }
 
     #[test]

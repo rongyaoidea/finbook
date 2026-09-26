@@ -112,8 +112,23 @@ function modal(html, wide) {
   const mask = document.createElement("div");
   mask.className = "modal-mask";
   mask.innerHTML = `<div class="modal ${wide ? "wide" : ""}">${html}</div>`;
+  // 无障碍：弹窗语义 + 标题标签
+  mask.setAttribute("role", "dialog");
+  mask.setAttribute("aria-modal", "true");
+  const title = mask.querySelector("h3");
+  if (title) mask.setAttribute("aria-label", title.textContent.trim());
   root.appendChild(mask);
   mask.addEventListener("click", (e) => { if (e.target === mask) closeModal(); });
+  // 焦点陷阱：Tab 在弹窗内循环（不跑到背后页面）
+  mask.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const f = [...mask.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
   modalStack.push(mask);
   // 焦点移入弹窗首个可聚焦元素
   const first = mask.querySelector("input, select, textarea, button");
@@ -141,6 +156,9 @@ function confirmDialog(message, danger) {
     const root = document.getElementById("modal-root");
     const mask = document.createElement("div");
     mask.className = "modal-mask";
+    mask.setAttribute("role", "dialog");
+    mask.setAttribute("aria-modal", "true");
+    mask.setAttribute("aria-label", "确认操作");
     mask.innerHTML = `<div class="modal">
       <h3>确认操作</h3>
       <p class="muted" style="margin:0 0 16px;line-height:1.6">${esc(message)}</p>
@@ -963,9 +981,9 @@ function renderShell() {
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
         <span class="grow"></span>
-        <button class="btn ghost sm" id="ui-scale-btn" title="界面字号（点击切换）">Aa 标准</button>
-        <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
-        <button class="btn ghost sm" id="help-btn" title="快捷键与帮助（按 ? 唤起）">?</button>
+        <button class="btn ghost sm" id="ui-scale-btn" title="界面字号（点击切换）" aria-label="界面字号">Aa 标准</button>
+        <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）" aria-label="通知">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
+        <button class="btn ghost sm" id="help-btn" title="快捷键与帮助（按 ? 唤起）" aria-label="快捷键与帮助">?</button>
         <button class="btn ghost sm" id="switch-book">切换账套</button>
         <button class="btn ghost sm" id="change-pwd">修改口令</button>
         <button class="btn ghost sm" id="logout">退出登录</button>
@@ -981,7 +999,7 @@ function renderShell() {
               html += `<div class="group">${esc(n.group)}</div>`;
               lastGroup = n.group;
             }
-            html += `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}">${n.label}</button>`;
+            html += `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}"${n.id === state.view ? ' aria-current="page"' : ""}>${n.label}</button>`;
           }
           return html;
         })()}
@@ -1114,9 +1132,24 @@ async function viewDashboard(main) {
       </div>`).join("");
     wbHtml = `<div class="toolbar" style="border:0;padding:6px 0">${nSel}</div>${cardsHtml}${todoHtml}${trendHtml}`;
   }
+  const firstRun = Number(d.vouchers) === 0 ? `
+    <div class="panel first-run">
+      <div class="fr-title">三步开始记账</div>
+      <div class="fr-steps">
+        <div class="fr-step"><b>1</b> 维护科目与期初（基础资料 → 会计科目 / 期初建账；旧账套可「数据导入」迁移）</div>
+        <div class="fr-step"><b>2</b> 录入第一张凭证（凭证 → 记账凭证 → 新增凭证）</div>
+        <div class="fr-step"><b>3</b> 期末处理（结转损益 → 记账 → 结账）</div>
+      </div>
+      <div class="fr-actions">
+        <button class="btn primary sm" data-fr-go="vouchers">去录凭证</button>
+        <button class="btn ghost sm" data-fr-go="imports">数据导入</button>
+        <button class="btn ghost sm" data-fr-go="begin">期初建账</button>
+      </div>
+    </div>` : "";
   main.innerHTML = `
     <h2>我的工作台</h2>
     ${adminBanner}
+    ${firstRun}
     <div class="cards">
       <div class="card"><div class="k">公司名称</div><div class="v" style="font-size:16px">${esc(d.company || "—")}</div></div>
       <div class="card"><div class="k">当前会计期间</div><div class="v">${esc(d.current_period)}</div></div>
@@ -1130,6 +1163,7 @@ async function viewDashboard(main) {
     ${wbHtml}`;
   if ($("#wb-n")) $("#wb-n").onchange = (e) => { state.wbPeriods = Number(e.target.value); viewDashboard(main); };
   $all("[data-wb-go]").forEach((b) => b.onclick = () => { state.view = b.dataset.wbGo; renderMain(); });
+  $all("[data-fr-go]").forEach((b) => b.onclick = () => { state.view = b.dataset.frGo; renderMain(); });
 }
 
 // ===========================================================================
@@ -1525,7 +1559,18 @@ async function loadVouchers() {
   if (st) url += `&status=${st}`;
   let rows;
   try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="${can("voucher_post") ? 10 : 9}" style="color:var(--err)">${esc(e.message)} <button class="btn ghost sm" id="v-retry">重试</button></td></tr>`; const rb = $("#v-retry", tb); if (rb) rb.addEventListener("click", loadVouchers); return; }
-  if (!rows.length) { tb.innerHTML = `<tr><td colspan="9" class="muted">暂无凭证</td></tr>`; return; }
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="9"><div class="empty-state">
+      <div class="es-title">还没有凭证</div>
+      <div class="es-hint">点击「新增凭证」录入第一张；已有旧账套数据可到「数据导入」迁移凭证。</div>
+      <div class="es-actions"><button class="btn primary sm" id="v-empty-new">新增凭证</button><button class="btn ghost sm" id="v-empty-import">去导入</button></div>
+    </div></td></tr>`;
+    const b1 = $("#v-empty-new");
+    if (b1) b1.onclick = () => openVoucherEditor(null);
+    const b2 = $("#v-empty-import");
+    if (b2) b2.onclick = () => { state.view = "imports"; renderMain(); };
+    return;
+  }
   const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
   tb.innerHTML = rows.map((v) => {
     const s = stMap[v.status] || [v.status_label, ""];

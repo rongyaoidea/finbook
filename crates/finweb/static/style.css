@@ -559,6 +559,8 @@ table.grid { min-width: 100%; }
   /* 触摸目标（原 ~28px 太小）与手机可读性 */
   .btn.sm { min-height: 36px; }
   table.grid { font-size: 14px; }
+  .panel { -webkit-overflow-scrolling: touch; }
+  #main table.grid td { max-width: 24ch; }
   .nt-drawer { width: 100vw; max-width: 100vw; }
 }
 
@@ -582,6 +584,23 @@ table.grid { min-width: 100%; }
 
 /* ── loading 骨架态 ───────────────────────────────────────── */
 .loading { color: var(--muted); padding: 24px; text-align: center; }
+
+/* ── 空态与首启引导 ───────────────────────────────────────── */
+.empty-state { text-align: center; padding: 30px 12px; }
+.empty-state .es-title { font-weight: 600; color: var(--text-dim); margin-bottom: 4px; }
+.empty-state .es-hint { font-size: 12.5px; color: var(--muted); margin-bottom: 12px; }
+.empty-state .es-actions { display: inline-flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+
+.first-run { padding: 14px 16px; }
+.first-run .fr-title { font-weight: 700; margin-bottom: 8px; }
+.first-run .fr-steps { display: flex; flex-direction: column; gap: 6px; }
+.first-run .fr-step { font-size: 13px; color: var(--text-dim); display: flex; gap: 8px; align-items: baseline; }
+.first-run .fr-step b {
+  flex: none; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--primary-t); color: var(--primary);
+  font-size: 11px; display: inline-flex; align-items: center; justify-content: center;
+}
+.first-run .fr-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 
 /* ── 管理员 · 财务分析图表 ─────────────────────────────────── */
 .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }

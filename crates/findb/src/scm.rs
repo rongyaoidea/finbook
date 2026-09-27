@@ -506,6 +506,16 @@ pub struct Atp {
     pub incoming: Money,
     pub committed: Money,
     pub atp: Money,
+    /// 在途里**已排期**的部分（有 `plan_end`，能给客户一个具体日期）
+    pub incoming_dated: Money,
+    /// 在途里**没排期**的部分 —— 有量但答不出交期
+    ///
+    /// 刻意与 `incoming_dated` 分开而不是只给个总数。销售问「这批什么时候能到」，
+    /// 一个合并后的「在途 500」回答不了：其中 300 有排期、200 没排期，
+    /// 而没排期那 200 **根本不能用来承诺交期**。合成一个数，承诺日期就成了编的。
+    pub incoming_undated: Money,
+    /// 在途里最早的计划完工日（`incoming_dated > 0` 时才有值）
+    pub earliest_ready: String,
 }
 
 pub fn atp(db: &Db, item: &str) -> DbResult<Atp> {
@@ -537,24 +547,46 @@ pub fn atp(db: &Db, item: &str) -> DbResult<Atp> {
 
     // 在途：已下推但未完工的生产订单剩余量（草稿也算——草稿是已认领的产能）
     let mut incoming = Money::ZERO;
+    let (mut incoming_dated, mut incoming_undated) = (Money::ZERO, Money::ZERO);
+    let mut earliest_ready = String::new();
     {
         let mut st = db.conn().prepare(
-            "SELECT planned_qty, completed_qty FROM production_order
+            "SELECT planned_qty, completed_qty, plan_end FROM production_order
              WHERE item_code=?1 AND status NOT IN ('completed','cancelled')",
         )?;
         let rows = st.query_map([code], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
             ))
         })?;
+        let mut dated = Money::ZERO;
+        let mut undated = Money::ZERO;
+        let mut earliest: Option<NaiveDate> = None;
         for r in rows {
-            let (p, c) = r?;
+            let (p, c, plan_end) = r?;
             let left = Money::parse_or_zero(&p) - Money::parse_or_zero(&c);
-            if left.is_positive() {
-                incoming += left;
+            if !left.is_positive() {
+                continue;
+            }
+            incoming += left;
+            // `plan_end` 是**计划员排的**，不是系统算的（仓里没有工作中心产能数据，
+            // 编不出真实完工日）。所以有排期的才给日期，没排期的就明说答不出来。
+            match NaiveDate::parse_from_str(plan_end.trim(), "%Y-%m-%d") {
+                Ok(d) => {
+                    dated += left;
+                    earliest = Some(match earliest {
+                        Some(e) if e <= d => e,
+                        _ => d,
+                    });
+                }
+                Err(_) => undated += left,
             }
         }
+        incoming_dated = dated;
+        incoming_undated = undated;
+        earliest_ready = earliest.map(|d| d.to_string()).unwrap_or_default();
     }
 
     // 已占用：已确认销售订单未发货量（草稿/作废不占用——草稿还不是承诺）
@@ -616,6 +648,56 @@ pub fn atp(db: &Db, item: &str) -> DbResult<Atp> {
         on_hand,
         incoming,
         committed,
+        incoming_dated,
+        incoming_undated,
+        earliest_ready,
+    })
+}
+
+/// 「到某日为止可承诺量」= 现货 + **计划完工日 ≤ 该日**的在途 − 已占用
+///
+/// 刻意**不把没排期的在途算进来**：那部分有量但没有日期，答不出「什么时候到」，
+/// 算进来等于给一个自己都给不出的交期承诺。未排期的量在 `Atp.incoming_undated`
+/// 里单列，由界面明确提示「这批没排期，不能用来承诺交期」。
+pub fn atp_until(db: &Db, item: &str, on: NaiveDate) -> DbResult<Atp> {
+    let a = atp(db, item)?;
+    if a.incoming_undated.is_zero() && a.incoming_dated.is_zero() {
+        return Ok(a);
+    }
+    // 已排期在途按 plan_end 逐单累计到该日为止的部分
+    let mut ready = Money::ZERO;
+    let code = item.trim();
+    if !code.is_empty() {
+        let mut st = db.conn().prepare(
+            "SELECT planned_qty, completed_qty, plan_end FROM production_order
+             WHERE item_code=?1 AND status NOT IN ('completed','cancelled')",
+        )?;
+        let rows = st.query_map([code], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (p, c, plan_end) = r?;
+            let left = Money::parse_or_zero(&p) - Money::parse_or_zero(&c);
+            if !left.is_positive() {
+                continue;
+            }
+            if let Ok(d) = NaiveDate::parse_from_str(plan_end.trim(), "%Y-%m-%d") {
+                if d <= on {
+                    ready += left;
+                }
+            }
+        }
+    }
+    Ok(Atp {
+        // 这个口径下的「在途」只含有日期保证的那部分
+        incoming: ready,
+        incoming_dated: ready,
+        atp: a.on_hand + ready - a.committed,
+        ..a
     })
 }
 
@@ -1603,6 +1685,142 @@ mod tests {
         }
     }
 
+    /// 在途必须分成「已排期 / 未排期」，未排期的不能用来承诺交期
+    ///
+    /// 仓里**没有工作中心产能数据**（`work_center` 是自由文本），所以系统编不出
+    /// 真实完工日 —— 只有**计划员自己排的** `plan_end` 才是有依据的日期。
+    ///
+    /// 所以合成一个「在途 500」是危险的：其中 300 有排期、200 没有，
+    /// 而那 200 根本给不出交期。合成一个数，销售拿去承诺就变成了编的。
+    #[test]
+    fn atp_separates_dated_and_undated_incoming() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        // 300 已排期（1 月 20 日完工），200 没排期
+        let a1 = mk_prod(&db, p, d, "300", ProdStatus::InProgress);
+        let _a2 = mk_prod(&db, p, d, "200", ProdStatus::InProgress);
+        db.conn()
+            .execute(
+                "UPDATE production_order SET plan_start='2026-01-10', plan_end='2026-01-20' WHERE id=?1",
+                [a1],
+            )
+            .unwrap();
+
+        let r = atp(&db, "A").unwrap();
+        assert_eq!(r.incoming, m("500"), "总数不变");
+        assert_eq!(r.incoming_dated, m("300"), "只有排了期的才算有交期");
+        assert_eq!(r.incoming_undated, m("200"), "没排期的要单列出来");
+        assert_eq!(r.earliest_ready, "2026-01-20", "最早完工日");
+    }
+
+    /// 「到某日为止可承诺量」只认有日期保证的那部分
+    #[test]
+    fn atp_until_only_counts_incoming_scheduled_by_that_date() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        // 现货 100
+        crate::business::stock_insert(
+            &db,
+            &crate::business::StockMove {
+                id: 0, period: p, biz_date: d, kind: crate::business::StockKind::Purchase,
+                item: "A".into(), warehouse: String::new(), batch_no: String::new(),
+                qty: m("100"), price: m("1"), amount: m("100"),
+                voucher_id: None, memo: String::new(),
+            },
+        )
+        .unwrap();
+        // 300 在 1/20 完工，200 没排期
+        let a1 = mk_prod(&db, p, d, "300", ProdStatus::InProgress);
+        let _a2 = mk_prod(&db, p, d, "200", ProdStatus::InProgress);
+        db.conn()
+            .execute(
+                "UPDATE production_order SET plan_start='2026-01-10', plan_end='2026-01-20' WHERE id=?1",
+                [a1],
+            )
+            .unwrap();
+
+        // 1/15 之前：只有现货（1/20 完工的那 300 还不算数）
+        let early = atp_until(&db, "A", NaiveDate::from_ymd(2026, 1, 15)).unwrap();
+        assert_eq!(early.incoming, Money::ZERO, "1/20 完工的量在 1/15 不可承诺");
+        assert_eq!(early.atp, m("100"), "1/15 只能承诺现货 100");
+
+        // 1/20 当天：300 算进来；没排期的 200 仍然不算
+        let later = atp_until(&db, "A", NaiveDate::from_ymd(2026, 1, 20)).unwrap();
+        assert_eq!(later.incoming, m("300"), "1/20 完工的量在 1/20 可承诺");
+        assert_eq!(
+            later.atp,
+            m("400"),
+            "现货 100 + 有日期的在途 300；未排期的 200 不给日期就不承诺"
+        );
+        // 原始口径仍然保留在字段里，界面要能同时说「总量」和「有保证的量」
+        assert_eq!(later.incoming_undated, m("200"), "未排期部分不能被这个口径吞掉");
+    }
+
+    /// 排期校验：格式不对、完工早于开工都必须被拒
+    ///
+    /// 回归背景：`prod_schedule` 原来是**裸写** —— 连日期格式都不查，于是
+    /// 「完工日早于开工日」这种自相矛盾的排期能直接进库。而 ATP 的日期承诺
+    /// 要拿 `plan_end` 当依据：排期错了，承诺日期就是错的，且没有任何提示。
+    #[test]
+    fn prod_schedule_rejects_bad_dates() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        let id = mk_prod(&db, p, d, "10", ProdStatus::Released);
+
+        // 完工早于开工
+        let e = prod_schedule(
+            &db,
+            &[(id, "2026-01-20".to_string(), "2026-01-10".to_string())],
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("早于开工日"), "实际 {:?}", e);
+
+        // 格式不对
+        let e = prod_schedule(
+            &db,
+            &[(id, "2026/01/10".to_string(), "2026-01-20".to_string())],
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("格式"), "实际 {:?}", e);
+
+        // 整批校验：后面有一行不合法，前面那行也不能落库（静默跳过一半更难排查）
+        let ok_id = mk_prod(&db, p, d, "20", ProdStatus::Released);
+        let read = |id: i64| -> String {
+            db.conn()
+                .query_row(
+                    "SELECT COALESCE(plan_start,'') FROM production_order WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let before = read(ok_id);
+        assert!(
+            prod_schedule(
+                &db,
+                &[
+                    (ok_id, "2026-01-10".to_string(), "2026-01-20".to_string()),
+                    (id, "2026-01-25".to_string(), "2026-01-20".to_string()),
+                ]
+            )
+            .is_err()
+        );
+        assert_eq!(before, read(ok_id), "整批失败时不该有半批落库");
+
+        // 合法排期能写进去
+        assert_eq!(
+            prod_schedule(
+                &db,
+                &[(ok_id, "2026-01-10".to_string(), "2026-01-20".to_string())]
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     /// 下推生产订单把 ATP 从「欠」拉到「够」——这正是 ATP 存在的意义
     ///
     /// 断言的是**变化**而不是某一时刻的绝对值：承诺之前就能看到
@@ -2119,6 +2337,24 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
 
 /// 细排：批量写回计划开工/完工日（仅未完工订单可排；条件更新防误写终态单）
 pub fn prod_schedule(db: &Db, items: &[(i64, String, String)]) -> DbResult<usize> {
+    // 先整批校验再落库：原来这里是裸写，连日期格式与 `end >= start` 都不查，
+    // 于是「完工日早于开工日」这种自相矛盾的排期能直接存进库，而 ATP/交期
+    // 承诺会拿它当依据 —— 排期错了，承诺日期就是错的，且没有任何提示。
+    //
+    // 整批校验（而不是逐行跳过）：批量排期本来就是一次操作，
+    // 静默跳过一半比整体失败更难排查。
+    for (id, start, end) in items {
+        let s = NaiveDate::parse_from_str(start.trim(), "%Y-%m-%d")
+            .map_err(|_| fincore::FinError::state(format!("生产订单 {id}：开工日格式应为 YYYY-MM-DD，收到「{start}」")))?;
+        let e = NaiveDate::parse_from_str(end.trim(), "%Y-%m-%d")
+            .map_err(|_| fincore::FinError::state(format!("生产订单 {id}：完工日格式应为 YYYY-MM-DD，收到「{end}」")))?;
+        if e < s {
+            return Err(fincore::FinError::state(format!(
+                "生产订单 {id}：完工日 {end} 早于开工日 {s}"
+            ))
+            .into());
+        }
+    }
     let tx = db.write_tx()?;
     let now_s = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut n = 0usize;

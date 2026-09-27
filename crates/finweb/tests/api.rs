@@ -7796,6 +7796,183 @@ async fn landed_cost_on_sold_goods_goes_to_expense() {
     let _ = (sid, num);
 }
 
+/// ATP 的日期口径：未排期的在途**不能**用来承诺交期
+///
+/// 回归背景：仓里没有工作中心产能数据（`work_center` 是自由文本、`routing.std_hours`
+/// 只参与算成本），所以系统编不出真实完工日 —— 只有计划员自己排的 `plan_end` 才
+/// 有依据。把有排期和没排期的在途合成一个「在途 500」拿去承诺客户，就是编日期。
+#[tokio::test]
+async fn atp_endpoint_splits_dated_incoming_and_honours_date_param() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+
+    // 现货 100
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("100").unwrap();
+        let p = fincore::Money::parse("1").unwrap();
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140501".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+    }
+    // 两张产单：300 排到 1/20 完工，200 没排期
+    {
+        let db = state.db_for("b1").unwrap();
+        for (qty, plan_end) in [("300", "2026-01-20"), ("200", "")] {
+            let per = fincore::Period::new(2026, 1).unwrap();
+            let mut o = findb::scm::ProductionOrder {
+                id: 0,
+                // `prod_save` 不自动取号（handler 才取），直调引擎时必须自己给，
+                // 否则撞 UNIQUE 约束、报的是 SQLite 原始错误而不是可读的提示
+                no: findb::scm::prod_next_no(&db, per).unwrap(),
+                period: fincore::Period::new(2026, 1).unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 6).unwrap(),
+                item_code: "140501".into(),
+                item_name: "成品甲".into(),
+                planned_qty: fincore::Money::parse(qty).unwrap(),
+                completed_qty: fincore::Money::ZERO,
+                status: findb::scm::ProdStatus::InProgress,
+                work_center: String::new(),
+                so_id: 0,
+                prepared_by: "boss".into(),
+                memo: String::new(),
+                order_kind: "inhouse".into(),
+                supplier_code: String::new(),
+                supplier_name: String::new(),
+                plan_start: if plan_end.is_empty() { String::new() } else { "2026-01-10".into() },
+                plan_end: plan_end.into(),
+            };
+            let id = findb::scm::prod_save(&db, &mut o).unwrap();
+            if !plan_end.is_empty() {
+                findb::scm::prod_schedule(
+                    &db,
+                    &[(id, "2026-01-10".to_string(), plan_end.to_string())],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    // 不带 date：总量口径，在途分成已排期/未排期
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140501", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(num(&v["on_hand"]), 100.0);
+    assert_eq!(num(&v["incoming"]), 500.0);
+    assert_eq!(num(&v["incoming_dated"]), 300.0, "排了期的才算有交期");
+    assert_eq!(num(&v["incoming_undated"]), 200.0, "没排期的要单列");
+    assert_eq!(v["earliest_ready"], serde_json::json!("2026-01-20"));
+
+    // date=2026-01-15：1/20 完工的还不算数，只认现货
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140501&date=2026-01-15", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(num(&v["incoming"]), 0.0, "1/20 完工的量在 1/15 不可承诺");
+    assert_eq!(num(&v["atp"]), 100.0, "1/15 只能承诺现货 100");
+    assert_eq!(v["as_of"], serde_json::json!("2026-01-15"));
+    // 未排期的部分不能被这个口径吞掉，界面要能同时说「总量」和「有保证的量」
+    assert_eq!(num(&v["incoming_undated"]), 200.0);
+
+    // date=2026-01-20：300 算进来；未排期的 200 仍然不算
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140501&date=2026-01-20", &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(num(&v["incoming"]), 300.0);
+    assert_eq!(num(&v["atp"]), 400.0, "现货 100 + 有日期的在途 300");
+    assert!(
+        v["date_formula"].as_str().unwrap_or("").contains("未排期的在途不计入"),
+        "响应要带日期口径说明：{v}"
+    );
+
+    // 日期格式错误要明确报错
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140501&date=2026/01/20", &sid))
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "日期格式不对必须被拒");
+}
+
+/// 排期接口必须拒掉自相矛盾的日期
+///
+/// 回归背景：`prod_schedule` 原来是**裸写** —— 连日期格式都不查，于是「完工日早于
+/// 开工日」能直接进库。而 ATP 的日期承诺要拿 `plan_end` 当依据：排期错了，
+/// 承诺日期就是错的，而且没有任何提示。
+#[tokio::test]
+async fn prod_schedule_rejects_end_before_start() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "140501", "qty": "10" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "建产单应成功：{b}");
+    let id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/schedule",
+            &sid,
+            // 字段名是 start / end（`SchedItem`），不是 plan_start / plan_end
+            serde_json::json!({ "items": [{ "id": id, "start": "2026-01-20", "end": "2026-01-10" }] }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert!(st.is_client_error(), "完工早于开工必须被拒（拿到 {st}）");
+    assert!(b.contains("早于开工日"), "要说清原因：{b}");
+
+    // 顺带钉住一个刚被校验暴露的入口缺陷：`SchedItem` 的 start/end 带
+    // `#[serde(default)]`，所以**字段名写错就会静默变成空串**。以前这会把
+    // 空日期直接写进库（排期看起来成功、实际什么都没排）；现在必须明确报错。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/schedule",
+            &sid,
+            serde_json::json!({ "items": [{ "id": id, "plan_start": "2026-01-10", "plan_end": "2026-01-20" }] }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert!(st.is_client_error(), "字段名写错导致日期为空，必须被拒（拿到 {st}）");
+    assert!(b.contains("格式"), "要说清是日期格式问题：{b}");
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {

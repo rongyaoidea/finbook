@@ -68,6 +68,27 @@ test("销售订单下推生产订单：草稿不可推、确认后可推、ATP �
   await expect(page.locator("#pp-ok")).toBeVisible({ timeout: 10_000 });
   await page.click("#pp-ok");
   await expect(page.locator("#pp-err")).toContainText("没有可再下推", { timeout: 10_000 });
+
+  // 下推过的那批产单**没排期** → 界面必须明说它给不出交期
+  //
+  // 仓里没有工作中心产能数据，系统编不出真实完工日；只有计划员排的 plan_end
+  // 才是有依据的日期。所以「在途 100」不能直接拿去承诺客户 —— 界面上要把
+  // 已排期/未排期分开，并说明未排期的那部分不能用来承诺交期。
+  await page.click("#pp-cancel");
+  await page.locator(`[data-so-prod="${confId}"]`).click();
+  await expect(page.locator("#pp-ok")).toBeVisible({ timeout: 10_000 });
+  const dlg2 = page.locator(".modal-mask").last();
+  await expect(dlg2).toContainText("在途·已排期");
+  await expect(dlg2).toContainText("在途·未排期");
+  await expect(page.locator("#pp-warn")).toContainText("没有排期", { timeout: 10_000 });
+  await expect(page.locator("#pp-warn")).toContainText("给不出交期");
+  await expect(page.locator("#pp-warn")).toContainText("系统不会把它算进");
+  // 要货日期输入：填了就现算「到该日为止可承诺量」
+  await expect(page.locator("#pp-date")).toBeVisible();
+  await page.fill("#pp-date", "2026-01-20");
+  await page.locator("#pp-date").dispatchEvent("change");
+  await expect(page.locator("#pp-until")).toContainText("可承诺", { timeout: 10_000 });
+  await expect(page.locator("#pp-until")).toContainText("之前");
 });
 
 test("存货成本差异：点明不算哪几档、点明与订单级差异是两个口径", async ({ page }) => {

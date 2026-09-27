@@ -5881,7 +5881,7 @@ async function openPushProd(soId, after) {
     return;
   }
   const line = (so.lines || [])[0] || {};
-  const num = (v) => Number(v) || 0;
+  const num = (v) => Number(String(v).replace(/,/g, "")) || 0;
   const remain = num(line.qty_ordered) - num(line.qty_shipped);
   const sign = (v) => (num(v) < 0 ? "var(--err)" : num(v) > 0 ? "var(--ok)" : "inherit");
   const mask = modal(`
@@ -5893,10 +5893,20 @@ async function openPushProd(soId, after) {
     </div>
     <div class="cards" style="margin-bottom:10px">
       <div class="card"><div class="k">现有可用库存</div><div class="v">${esc(a.on_hand)}</div></div>
-      <div class="card"><div class="k">在途（未完工产单）</div><div class="v">${esc(a.incoming)}</div></div>
+      <div class="card"><div class="k">在途·已排期</div><div class="v">${esc(a.incoming_dated)}${
+        a.earliest_ready ? `<div class="muted" style="font-size:11px">最早 ${esc(a.earliest_ready)}</div>` : ""
+      }</div></div>
+      <div class="card"><div class="k">在途·未排期</div><div class="v" style="color:${Number(a.incoming_undated) > 0 ? "var(--warn)" : "inherit"}">${esc(a.incoming_undated)}</div></div>
       <div class="card"><div class="k">已占用（已确认订单）</div><div class="v">${esc(a.committed)}</div></div>
       <div class="card"><div class="k">可承诺量 ATP</div><div class="v" style="color:${sign(a.atp)}">${esc(a.atp)}</div></div>
     </div>
+    ${Number(a.incoming_undated) > 0 ? `<div class="banner unset" id="pp-warn" style="margin-bottom:10px">
+      <b>${esc(a.incoming_undated)} 件在途没有排期</b>，给不出交期 —— 拿去承诺客户就是编的。
+      系统不会把它算进「到某日为止可承诺量」；要让这些量能承诺，去「生产 → 细排」给产单排上计划完工日。
+    </div>` : ""}
+    <div class="field"><label>客户要货日期 <span class="muted" style="font-weight:400">（选填：算「到该日为止可承诺量」）</span></label>
+      <input id="pp-date" placeholder="YYYY-MM-DD" /></div>
+    <div id="pp-until" class="muted" style="font-size:12px;line-height:1.7"></div>
     <div class="field"><label>下推数量 <span class="muted" style="font-weight:400">（留空 = 认领全部 ${esc(remain)}）</span></label>
       <input id="pp-qty" placeholder="${esc(remain)}" /></div>
     <p class="muted" style="font-size:12px;line-height:1.7">
@@ -5909,6 +5919,27 @@ async function openPushProd(soId, after) {
       <button class="btn primary" id="pp-ok">确认下推</button>
     </div>`);
   $("#pp-cancel", mask).onclick = () => closeModal();
+  // 填了要货日期就现算「到该日为止可承诺量」：这是销售真正要的那个答案，
+  // 而不是一个没有日期的总数。
+  $("#pp-date", mask).onchange = async (ev) => {
+    const box = $("#pp-until", mask);
+    const d = ev.target.value.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+      box.textContent = "";
+      return;
+    }
+    try {
+      const r = await api(`/atp?item=${encodeURIComponent(((so.lines || [])[0] || {}).item_code || "")}&date=${d}`);
+      const q = (v) => Number(String(v).replace(/,/g, "")) || 0;
+      const can = q(r.atp) > 0;
+      box.innerHTML = can
+        ? `<b>${esc(d)} 之前可承诺 ${esc(r.atp)}</b>（现货 ${esc(r.on_hand)} + 计划完工日 ≤ 该日的在途 ${esc(r.incoming)}）。`
+        : `<b style="color:var(--err)">${esc(d)} 之前可承诺不了</b>（可承诺 ${esc(r.atp)}）。` +
+          `缺口 ${esc(Math.abs(q(r.atp)))} —— 要么提前计划完工日，要么与客户改期，别先答应下来。`;
+    } catch (e) {
+      box.textContent = e.message;
+    }
+  };
   $("#pp-ok", mask).onclick = async () => {
     const errBox = $("#pp-err", mask);
     errBox.style.display = "none";

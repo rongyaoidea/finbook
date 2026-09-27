@@ -12,6 +12,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
 use fincore::{Account, AuxEntity, AuxKind, AuxMask, AuxQuery, AuxRef, BookOptions, Direction, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
 use fincore::user::Perm;
+use tracing::error;
 use findb::accounts;
 use findb::advanced;
 use findb::{auxs, business, template};
@@ -641,7 +642,7 @@ async fn serve_index(State(state): State<Arc<WebState>>) -> Response {
         Ok(h) => h,
         Err(e) => {
             // 路径只进服务端日志，避免未登录即可探测文件系统布局
-            eprintln!("[finweb] 读取 index.html 失败 {}: {e}", path.display());
+            error!(path = %path.display(), error = %e, "读取 index.html 失败");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "服务器内部错误，请稍后重试" })),
@@ -1256,15 +1257,31 @@ async fn get_atp(
         return Err(AppError::bad_request("缺少存货编码 item"));
     }
     let a = findb::scm::atp(&db, item)?;
-    Ok(Json(json!({
+    let mut out = json!({
         "item": a.item,
         "on_hand": a.on_hand,
         "incoming": a.incoming,
+        "incoming_dated": a.incoming_dated,
+        "incoming_undated": a.incoming_undated,
+        "earliest_ready": a.earliest_ready,
         "committed": a.committed,
         "atp": a.atp,
         "formula": "ATP = 现有可用库存 + 在途（未完工生产计划） − 已占用（已确认订单未发货）",
         "note": "待检（来料检验未转正）库存不计入可用；草稿/作废订单不占用；在途含已下推的草稿产单（草稿也是已认领的产能）",
-    })))
+    });
+    // 带 date 时改用「到该日为止可承诺量」口径：只认**有计划完工日且不晚于该日**的
+    // 在途。没排期的那部分答不出「什么时候到」，算进来等于给一个自己都给不出的
+    // 交期承诺 —— 所以它单列在 incoming_undated，由界面提示「不能用来承诺交期」。
+    if let Some(d) = q.get("date").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let on = NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?;
+        let u = findb::scm::atp_until(&db, item, on)?;
+        out["as_of"] = json!(d);
+        out["incoming"] = json!(u.incoming);
+        out["atp"] = json!(u.atp);
+        out["date_formula"] = json!("到该日为止 = 现有可用 + 计划完工日 ≤ 该日的在途 − 已占用（**未排期的在途不计入**，它没有交期）");
+    }
+    Ok(Json(out))
 }
 
 #[derive(serde::Deserialize)]
@@ -1980,7 +1997,7 @@ async fn delete_book(
     let p = std::path::PathBuf::from(&book.path);
     if p.exists() {
         if let Err(e) = std::fs::remove_file(&p) {
-            eprintln!("[finweb] 删除账套文件失败 {}: {e}", p.display());
+            error!(path = %p.display(), error = %e, "删除账套文件失败");
         }
         let _ = std::fs::remove_file(format!("{}-wal", p.display()));
         let _ = std::fs::remove_file(format!("{}-shm", p.display()));
@@ -3456,7 +3473,7 @@ async fn save_voucher(
         if req.id > 0 { "修改" } else { "新增" },
         &v.voucher_no(),
     ) {
-        eprintln!("[finweb] 写操作日志失败（凭证 {id}）: {e}");
+        error!(voucher = id, error = %e, "写操作日志失败（凭证）");
     }
     Ok(Json(json!({"id": id})))
 }
@@ -6490,7 +6507,7 @@ async fn add_po_payment(
             amount.fmt_money()
         ),
     ) {
-        eprintln!("[finweb] 写操作日志失败（采购付款登记 #{doc_id}）: {e}");
+        error!(doc_id, error = %e, "写操作日志失败（采购付款登记）");
     }
     Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
@@ -6754,7 +6771,7 @@ async fn add_so_payment(
             amount.fmt_money()
         ),
     ) {
-        eprintln!("[finweb] 写操作日志失败（销售收款登记 #{doc_id}）: {e}");
+        error!(doc_id, error = %e, "写操作日志失败（销售收款登记）");
     }
     Ok(Json(json!({ "ok": true, "id": id, "doc_id": doc_id, "status": "draft" })))
 }
@@ -7521,7 +7538,7 @@ async fn transition_so(
     if let Err(e) =
         db.log(user.username(), "销售", "销售订单状态", &format!("#{} → {}", id, to.label()))
     {
-        eprintln!("[finweb] 写操作日志失败（销售订单状态 #{id}）: {e}");
+        error!(id, error = %e, "写操作日志失败（销售订单状态）");
     }
     Ok(Json(json!({ "ok": true, "status": to.label() })))
 }
@@ -7677,7 +7694,7 @@ async fn save_po(
         "保存采购订单",
         &format!("#{} {} {} 不含税 {}", id, po.no, code, po.total_amount.fmt_money()),
     ) {
-        eprintln!("[finweb] 写操作日志失败（保存采购订单 #{id}）: {e}");
+        error!(id, error = %e, "写操作日志失败（保存采购订单）");
     }
     Ok(Json(json!({
         "ok": true,
@@ -7716,7 +7733,7 @@ async fn transition_po(
     if let Err(e) =
         db.log(user.username(), "采购", "采购订单状态", &format!("#{} → {}", id, to.label()))
     {
-        eprintln!("[finweb] 写操作日志失败（采购订单状态 #{id}）: {e}");
+        error!(id, error = %e, "写操作日志失败（采购订单状态）");
     }
     Ok(Json(json!({ "ok": true, "status": to.label() })))
 }
@@ -10851,7 +10868,7 @@ async fn sales_cost_ep(
                 "结转销售成本",
                 &format!("{} 凭证#{id}", period_to_str(period)),
             ) {
-                eprintln!("[finweb] 写操作日志失败（结转销售成本 凭证#{id}）: {e}");
+                error!(voucher = id, error = %e, "写操作日志失败（结转销售成本凭证）");
             }
             Ok(Json(json!({ "ok": true, "voucher_id": id })))
         }
@@ -12592,7 +12609,7 @@ async fn restore_backup(
         // 账套文件已被覆盖，恢复已完成；此处日志失败不能把请求打成 500，
         // 否则客户端看到失败会重试恢复，重复覆盖刚恢复好的库。
         if let Err(e) = db.log(&username, "系统", "恢复账套", &format!("从 {file_name} 恢复")) {
-            eprintln!("[finweb] 写操作日志失败（恢复账套 {file_name}）: {e}");
+            error!(file = %file_name, error = %e, "写操作日志失败（恢复账套）");
         }
         Ok(())
     })

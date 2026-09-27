@@ -1112,7 +1112,7 @@ pub fn outsource_fee(db: &Db, po_id: i64, amount: Money, date: NaiveDate, who: &
 pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> {
     let row = db.conn()
         .query_row(
-            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name, plan_start, plan_end
+            "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty, status, work_center, so_id, prepared_by, memo, order_kind, supplier_code, supplier_name, plan_start, plan_end
              FROM production_order WHERE id=?",
             [po_id],
             |r| Ok(ProductionOrder {
@@ -1126,13 +1126,14 @@ pub fn get_prod_order(db: &Db, po_id: i64) -> DbResult<Option<ProductionOrder>> 
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 status: crate::scm::prod_status_from(&r.get::<_, String>(8)?),
                 work_center: r.get(9)?,
-                prepared_by: r.get(10)?,
-                memo: r.get(11)?,
-                order_kind: r.get(12)?,
-                supplier_code: r.get(13)?,
-                supplier_name: r.get(14)?,
-                plan_start: r.get(15)?,
-                plan_end: r.get(16)?,
+                so_id: r.get(10)?,
+                prepared_by: r.get(11)?,
+                memo: r.get(12)?,
+                order_kind: r.get(13)?,
+                supplier_code: r.get(14)?,
+                supplier_name: r.get(15)?,
+                plan_start: r.get(16)?,
+                plan_end: r.get(17)?,
             }),
         );
     match row {
@@ -1395,7 +1396,7 @@ mod tests {
             id: po_id, no: "SC2026010002".into(), period: p, date,
             item_code: "140501".into(), item_name: "成品X".into(),
             planned_qty: m("3"), completed_qty: m("0"),
-            status: ProdStatus::InProgress, work_center: "WC01".into(),
+            status: ProdStatus::InProgress, work_center: "WC01".into(), so_id: 0,
             prepared_by: "u1".into(), memo: "".into(),
             order_kind: "inhouse".into(),
             supplier_code: String::new(),

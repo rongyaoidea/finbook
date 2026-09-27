@@ -612,6 +612,7 @@ CREATE TABLE IF NOT EXISTS production_order (
     completed_qty   TEXT NOT NULL DEFAULT '0',
     status          TEXT NOT NULL DEFAULT 'draft',
     work_center     TEXT NOT NULL DEFAULT '',
+    so_id           INTEGER NOT NULL DEFAULT 0, -- 来源销售订单（0=独立建单）
     prepared_by     TEXT NOT NULL DEFAULT '',
     memo            TEXT NOT NULL DEFAULT '',
     order_kind      TEXT NOT NULL DEFAULT 'inhouse', -- inhouse 自制 / outsourcing 委外
@@ -1472,6 +1473,10 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     ("production_order", "completed_qty", "TEXT NOT NULL DEFAULT '0'"),
     ("production_order", "status", "TEXT NOT NULL DEFAULT 'draft'"),
     ("production_order", "work_center", "TEXT NOT NULL DEFAULT ''"),
+    // 来源销售订单：0 = 独立建单（备货/MRP 建议）。有了它才能回答
+    // 「这批货是哪张销售订单要的」——否则产销之间在数据上是断的，
+    // 生产完了也只能靠人肉记忆去对上订单。
+    ("production_order", "so_id", "INTEGER NOT NULL DEFAULT 0"),
     ("production_order", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
     ("production_order", "memo", "TEXT NOT NULL DEFAULT ''"),
     ("production_order", "created_at", "TEXT NOT NULL DEFAULT ''"),

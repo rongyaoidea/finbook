@@ -274,6 +274,11 @@ pub struct ProductionOrder {
     pub completed_qty: Money,
     pub status: ProdStatus,
     pub work_center: String,
+    /// 来源销售订单（0 = 独立建单：备货或 MRP 建议）
+    ///
+    /// 产销之间在数据上必须是连着的。缺这一列时，「这批货是哪张订单要的」
+    /// 只能靠人肉记忆，而缺货时更无法反查「哪些订单正等着这批料」。
+    pub so_id: i64,
     pub prepared_by: String,
     pub memo: String,
     /// inhouse 自制 / outsourcing 委外
@@ -479,6 +484,232 @@ fn po_receipt_qty_map(
         *map.entry(po_id).or_insert(Money::ZERO) += Money::parse_or_zero(&qty);
     }
     Ok(map)
+}
+
+/// 某存货的可承诺量（ATP, Available to Promise）
+///
+/// ```text
+/// ATP = 现有可用库存 + 在途（已下达未完工的生产订单剩余量） − 已占用（已确认销售订单未发货量）
+/// ```
+///
+/// **为什么销售订单确认时必须看 ATP**：ERP 里最贵的两类错，一类是接了不该接的
+/// 单（超卖），另一类是拒了本该接的单（丢生意）。而「拒单」几乎总是因为 ATP
+/// 算错——只减已占用、不加在途，会把「三天后就能做完的量」误判成不可承诺；
+/// 只加库存不减占用，则会在多张订单抢同一批料时超卖。
+///
+/// 三个数都分别返回而不只给结果：只看一个 ATP 数字，被算错了也不知道错在哪。
+/// 数量列同样是 TEXT 存储，所以三处都在 Rust 侧累加（沿用全库约定）。
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Atp {
+    pub item: String,
+    pub on_hand: Money,
+    pub incoming: Money,
+    pub committed: Money,
+    pub atp: Money,
+}
+
+pub fn atp(db: &Db, item: &str) -> DbResult<Atp> {
+    let code = item.trim();
+    if code.is_empty() {
+        return Ok(Atp::default());
+    }
+
+    // 现有可用库存：排除待检（来料检验未转正的货不可领用，算进 ATP 就是虚承诺）
+    let mut on_hand = Money::ZERO;
+    {
+        let mut st = db
+            .conn()
+            .prepare("SELECT qty, qc_status FROM stock_move WHERE item=?1")?;
+        let rows = st.query_map([code], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        for r in rows {
+            let (qty, qc) = r?;
+            if qc == "pending" {
+                continue;
+            }
+            on_hand += Money::parse_or_zero(&qty);
+        }
+    }
+
+    // 在途：已下推但未完工的生产订单剩余量（草稿也算——草稿是已认领的产能）
+    let mut incoming = Money::ZERO;
+    {
+        let mut st = db.conn().prepare(
+            "SELECT planned_qty, completed_qty FROM production_order
+             WHERE item_code=?1 AND status NOT IN ('completed','cancelled')",
+        )?;
+        let rows = st.query_map([code], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+            ))
+        })?;
+        for r in rows {
+            let (p, c) = r?;
+            let left = Money::parse_or_zero(&p) - Money::parse_or_zero(&c);
+            if left.is_positive() {
+                incoming += left;
+            }
+        }
+    }
+
+    // 已占用：已确认销售订单未发货量（草稿/作废不占用——草稿还不是承诺）
+    //
+    // 两个坑都在这里踩过：
+    //
+    // 1. 刻意**不在 SQL 里按状态字符串过滤**。`SoStatus` 没有 `code()`、也没有
+    //    serde rename，库里存的是首字母大写的 `"Draft"`/`"Confirmed"`，而
+    //    `PoStatus`/`ProdStatus` 用的是小写 `code()`。照小写写
+    //    `NOT IN ('draft',...)` 的结果是**一个都没排除掉**——草稿单被算成占用，
+    //    ATP 凭空少 5。状态改在 Rust 侧用 `status_from` 解析，大小写写错也不会
+    //    静默失效。
+    // 2. 已发货量**必须从 `so_shipment` 汇总，不能读 `so_line.qty_shipped`**——
+    //    后者是建表后从未被任何代码回写的冗余列（只有 `so_list` 的读路径做了
+    //    实时汇总）。用它算 ATP 会把已发完的订单继续算成占用，ATP 变成负数，
+    //    于是「明明发完了却说承诺不了」。
+    let mut shipped_by_so: std::collections::HashMap<i64, Money> = std::collections::HashMap::new();
+    {
+        let mut st = db.conn().prepare("SELECT so_id, qty FROM so_shipment")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            let (so_id, qty) = r?;
+            *shipped_by_so.entry(so_id).or_insert(Money::ZERO) += Money::parse_or_zero(&qty);
+        }
+    }
+    let mut committed = Money::ZERO;
+    {
+        let mut st = db.conn().prepare(
+            "SELECT l.so_id, l.qty_ordered, s.status
+             FROM so_line l JOIN sales_order s ON s.id = l.so_id
+             WHERE l.item_code=?1",
+        )?;
+        let rows = st.query_map([code], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (so_id, ordered, status) = r?;
+            if matches!(
+                status_from::<SoStatus>(&status),
+                None | Some(SoStatus::Draft) | Some(SoStatus::Cancelled)
+            ) {
+                continue;
+            }
+            let shipped = *shipped_by_so.get(&so_id).unwrap_or(&Money::ZERO);
+            let left = Money::parse_or_zero(&ordered) - shipped;
+            if left.is_positive() {
+                committed += left;
+            }
+        }
+    }
+
+    Ok(Atp {
+        item: code.to_string(),
+        atp: on_hand + incoming - committed,
+        on_hand,
+        incoming,
+        committed,
+    })
+}
+
+/// 销售订单下推生产订单
+///
+/// 产销之间在数据上必须是连着的：以前 `production_order` 没有 `so_id`，生产
+/// 出来的货与谁要它没有任何记录对应关系，于是「这批货是哪张订单要的」只能靠
+/// 人肉记忆，缺货时更无法反查「哪些订单正等着这批料」。
+///
+/// 下推数量**封顶到该订单还没下推的余量**（订购 − 已发货 − 已下推生产），
+/// 理由与销售发货封顶完全一样：金额/数量封顶与实物封顶必须同一个口径，
+/// 否则会出现「订单说下推了 100、实际只认领了 60」这种对不上的状态。
+pub fn prod_from_so(
+    db: &Db,
+    so_id: i64,
+    period: Period,
+    date: NaiveDate,
+    want: Option<Money>,
+    who: &str,
+) -> DbResult<i64> {
+    let so = so_get(db, so_id)?
+        .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
+    if matches!(so.status, SoStatus::Draft | SoStatus::Cancelled) {
+        return Err(fincore::FinError::state(format!(
+            "订单 {} 是「{}」，先确认才能下推生产",
+            so.no,
+            so.status.label()
+        ))
+        .into());
+    }
+    let line = so
+        .lines
+        .first()
+        .ok_or_else(|| fincore::FinError::state("销售订单没有明细行"))?;
+    let item = line.item_code.clone();
+
+    // 已下推生产量（所有非作废的生产订单都算——草稿也是已认领的产能，
+    // 只排除 cancelled，否则同一张订单可以无限重复下推）
+    let mut pushed = Money::ZERO;
+    {
+        let mut st = db.conn().prepare(
+            "SELECT planned_qty FROM production_order
+             WHERE so_id=?1 AND status <> 'cancelled'",
+        )?;
+        let rows = st.query_map([so_id], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            pushed += Money::parse_or_zero(&r?);
+        }
+    }
+    let shipped: Money = crate::sales::so_shipment_sum(db, so_id)?;
+    let remain = line.qty_ordered - shipped - pushed;
+    if !remain.is_positive() {
+        return Err(fincore::FinError::state(format!(
+            "订单 {} 没有可再下推的量（订购 {}，已发 {}，已下推生产 {}）",
+            so.no, line.qty_ordered, shipped, pushed
+        ))
+        .into());
+    }
+    let qty = match want {
+        Some(w) if w.is_positive() => w.min(remain),
+        _ => remain,
+    };
+
+    let mut order = ProductionOrder {
+        id: 0,
+        no: prod_next_no(db, period)?,
+        period,
+        date,
+        item_code: item,
+        item_name: line.item_name.clone(),
+        planned_qty: qty,
+        completed_qty: Money::ZERO,
+        status: ProdStatus::Released,
+        work_center: String::new(),
+        so_id,
+        prepared_by: who.to_string(),
+        memo: format!("下推自销售订单 {}", so.no),
+        order_kind: "inhouse".to_string(),
+        supplier_code: String::new(),
+        supplier_name: String::new(),
+        plan_start: String::new(),
+        plan_end: String::new(),
+    };
+    let id = prod_save(db, &mut order)?;
+    crate::docflow::link_add(db, "so", so_id, "prod", id, "销售订单下推生产订单")?;
+    if qty < remain {
+        db.log(
+            who,
+            "生产",
+            "下推截断",
+            &format!("{} 申请 {want:?}，实际下推 {qty}（剩余 {remain}）", so.no),
+        )?;
+    }
+    Ok(id)
 }
 
 /// 按已收数量推导已收货金额（价税合计口径）
@@ -1226,6 +1457,260 @@ mod tests {
         );
     }
 
+    /// ATP = 现有可用 + 在途 − 已占用
+    ///
+    /// 三个分量分别断言，而不是只断言结果：只看一个 ATP 数字，
+    /// 被算错了也不知道错在哪一项。
+    #[test]
+    fn atp_is_onhand_plus_incoming_minus_committed() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+
+        // 现有库存 20
+        for _ in 0..2 {
+            let q = m("10");
+            crate::business::stock_insert(
+                &db,
+                &crate::business::StockMove {
+                    id: 0, period: p, biz_date: d,
+                    kind: crate::business::StockKind::Purchase,
+                    item: "A".into(), warehouse: String::new(), batch_no: String::new(),
+                    qty: q, price: m("1"), amount: m("10"),
+                    voucher_id: None, memo: String::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        // 一张已确认的销售订单要 30 件（占用 30），一张草稿要 5 件（不占用）
+        mk_so(&db, p, d, "Confirmed", "30", "A");
+        mk_so(&db, p, d, "Draft", "5", "A");
+
+        // 一张生产订单在产 15 件（在途 +15）
+        mk_prod(&db, p, d, "15", ProdStatus::InProgress);
+
+        let a = atp(&db, "A").unwrap();
+        assert_eq!(a.on_hand, m("20"), "现有可用库存");
+        assert_eq!(a.committed, m("30"), "只算已确认订单，草稿不占用");
+        assert_eq!(a.incoming, m("15"), "未完工生产计划算在途");
+        assert_eq!(a.atp, m("5"), "20 + 15 − 30 = 5");
+    }
+
+    /// 待检库存不计入 ATP
+    ///
+    /// 来料检验未转正的货**不可领用**，算进 ATP 就是对客户虚承诺交期。
+    #[test]
+    fn atp_excludes_qc_pending_stock() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        let id = crate::business::stock_insert(
+            &db,
+            &crate::business::StockMove {
+                id: 0, period: p, biz_date: d,
+                kind: crate::business::StockKind::Purchase,
+                item: "A".into(), warehouse: String::new(), batch_no: String::new(),
+                qty: m("50"), price: m("1"), amount: m("50"),
+                voucher_id: None, memo: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(atp(&db, "A").unwrap().on_hand, m("50"));
+        db.conn()
+            .execute("UPDATE stock_move SET qc_status='pending' WHERE id=?1", [id])
+            .unwrap();
+        let a = atp(&db, "A").unwrap();
+        assert_eq!(a.on_hand, Money::ZERO, "待检不可领用，不能算进可承诺量");
+        assert_eq!(a.atp, Money::ZERO);
+    }
+
+    /// 已完工 / 已作废的生产订单不再算在途；已发货/作废的销售订单不再占用
+    #[test]
+    fn atp_excludes_terminal_states() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        mk_prod(&db, p, d, "20", ProdStatus::Completed);
+        mk_prod(&db, p, d, "30", ProdStatus::Cancelled);
+        // Completed 的订单必须已发完（否则夹具本身不真实：状态说发完了、
+        // 发货记录却是 0，ATP 会把这 40 件算成还占着）
+        mk_so_ship(&db, p, d, "Completed", "40", "40", "A");
+        mk_so(&db, p, d, "Cancelled", "50", "A");
+        let a = atp(&db, "A").unwrap();
+        assert_eq!(a.incoming, Money::ZERO, "完工/作废的产单不是在途");
+        assert_eq!(a.committed, Money::ZERO, "已发货完/作废的订单不占用");
+    }
+
+    /// 销售订单下推生产订单：数量封顶到未下推余量，且产销两单在数据上连着
+    ///
+    /// 回归背景：`production_order` 以前**没有 so_id**，产出的货与谁要它没有任何
+    /// 记录对应，「这批货是哪张订单要的」只能靠人肉记忆。
+    #[test]
+    fn prod_push_from_sales_order_is_capped_and_linked() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        let so_id = mk_so(&db, p, d, "Confirmed", "100", "A");
+
+        // 第一次下推 → 全量 100
+        let p1 = prod_from_so(&db, so_id, p, d, None, "u1").unwrap();
+        let o1 = prod_get(&db, p1).unwrap().unwrap();
+        assert_eq!(o1.so_id, so_id, "生产订单必须记住来源销售订单");
+        assert_eq!(o1.planned_qty, m("100"));
+        assert!(o1.memo.contains("下推自销售订单"), "{}", o1.memo);
+
+        // 再下推 → 已全部认领，拒绝
+        assert!(
+            prod_from_so(&db, so_id, p, d, None, "u1").is_err(),
+            "全部下推后不该还能再推（否则产销对不上）"
+        );
+
+        // 部分发货后再新建一张订单，验证「订购 − 已发 − 已下推」的封顶口径
+        let so2 = mk_so(&db, p, d, "Confirmed", "100", "A");
+        let p2 = prod_from_so(&db, so2, p, d, Some(m("30")), "u1").unwrap();
+        assert_eq!(prod_get(&db, p2).unwrap().unwrap().planned_qty, m("30"));
+        // 再申请 999 → 封顶到 70
+        let p3 = prod_from_so(&db, so2, p, d, Some(m("999")), "u1").unwrap();
+        assert_eq!(
+            prod_get(&db, p3).unwrap().unwrap().planned_qty,
+            m("70"),
+            "申请 999 只能下推未认领的 70"
+        );
+        // 作废一张后，那部分额度回来
+        db.conn()
+            .execute(
+                "UPDATE production_order SET status='cancelled' WHERE id=?1",
+                [p3],
+            )
+            .unwrap();
+        let p4 = prod_from_so(&db, so2, p, d, None, "u1").unwrap();
+        assert_eq!(prod_get(&db, p4).unwrap().unwrap().planned_qty, m("70"));
+    }
+
+    /// 草稿 / 作废的销售订单不能下推生产
+    #[test]
+    fn prod_push_rejects_draft_and_cancelled_sales_order() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        for st in ["Draft", "Cancelled"] {
+            let id = mk_so(&db, p, d, st, "10", "A");
+            assert!(
+                prod_from_so(&db, id, p, d, None, "u1").is_err(),
+                "{st} 状态的销售订单不该能下推生产"
+            );
+        }
+    }
+
+    /// 下推生产订单把 ATP 从「欠」拉到「够」——这正是 ATP 存在的意义
+    ///
+    /// 断言的是**变化**而不是某一时刻的绝对值：承诺之前就能看到
+    /// 「现货不够，但下推生产之后够了」，而不是只能靠事后看库存。
+    #[test]
+    fn atp_reflects_newly_pushed_production() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd(2026, 1, 5);
+        let so_id = mk_so(&db, p, d, "Confirmed", "60", "A");
+
+        // 下推之前：无现货、无在途，而订单已占用 60 → ATP 为负（承诺不了）
+        let before = atp(&db, "A").unwrap();
+        assert_eq!(before.on_hand, Money::ZERO);
+        assert_eq!(before.incoming, Money::ZERO);
+        assert_eq!(before.committed, m("60"));
+        assert_eq!(before.atp, m("-60"), "没有现货也没有在途时不该承诺得了 60 件");
+
+        // 下推 60 件生产
+        prod_from_so(&db, so_id, p, d, None, "u1").unwrap();
+        let after = atp(&db, "A").unwrap();
+        assert_eq!(after.incoming, m("60"), "下推后在途 +60");
+        assert_eq!(after.committed, m("60"), "占用不变（订单还是已确认）");
+        assert_eq!(
+            after.atp,
+            Money::ZERO,
+            "在途抵掉占用后才够承诺——这才是「可承诺量」"
+        );
+    }
+
+    fn mk_so(db: &Db, p: Period, d: NaiveDate, status: &str, qty: &str, item: &str) -> i64 {
+        mk_so_ship(db, p, d, status, qty, "0", item)
+    }
+
+    /// 造销售订单；`ship` = 已发货数量（Completed 状态必须已发完，否则夹具本身不真实）
+    fn mk_so_ship(
+        db: &Db,
+        p: Period,
+        d: NaiveDate,
+        status: &str,
+        qty: &str,
+        ship: &str,
+        item: &str,
+    ) -> i64 {
+        let mut so = SalesOrder::new(p, d, "C001", "客户B", "u1");
+        so.no = so_next_no(db, p).unwrap();
+        so.lines.push(SoLine {
+            id: 0,
+            so_id: 0,
+            item_code: item.to_string(),
+            item_name: "成品".to_string(),
+            qty_ordered: Money::parse(qty).unwrap(),
+            qty_shipped: Money::ZERO,
+            unit_price: m("10"),
+            tax_rate: m("0.13"),
+            amount: Money::parse(qty).unwrap() * m("10"),
+            tax_amount: Money::ZERO,
+            memo: String::new(),
+        });
+        so.status = status_from::<SoStatus>(status).unwrap_or(SoStatus::Draft);
+        let id = so_save(db, &mut so).unwrap();
+        if so.status != SoStatus::Draft {
+            so_set_status(db, id, so.status).unwrap();
+        }
+        if !Money::parse(ship).unwrap().is_zero() {
+            db.conn()
+                .execute(
+                    "INSERT INTO so_shipment(so_id, period, date, qty, memo) VALUES(?1,?2,?3,?4,'')",
+                    rusqlite::params![id, p.ymm(), d.to_string(), ship],
+                )
+                .unwrap();
+        }
+        id
+    }
+
+    fn mk_prod(db: &Db, p: Period, d: NaiveDate, qty: &str, status: ProdStatus) -> i64 {
+        let mut o = ProductionOrder {
+            id: 0,
+            no: prod_next_no(db, p).unwrap(),
+            period: p,
+            date: d,
+            item_code: "A".into(),
+            item_name: "成品".into(),
+            planned_qty: Money::parse(qty).unwrap(),
+            completed_qty: Money::ZERO,
+            status: ProdStatus::Released,
+            work_center: String::new(),
+            so_id: 0,
+            prepared_by: "u1".into(),
+            memo: String::new(),
+            order_kind: "inhouse".into(),
+            supplier_code: String::new(),
+            supplier_name: String::new(),
+            plan_start: String::new(),
+            plan_end: String::new(),
+        };
+        let id = prod_save(db, &mut o).unwrap();
+        if status != ProdStatus::Released {
+            db.conn()
+                .execute(
+                    "UPDATE production_order SET status=?2 WHERE id=?1",
+                    rusqlite::params![id, status.code()],
+                )
+                .unwrap();
+        }
+        id
+    }
+
     #[test]
     fn po_crud() {
         let db = mem();
@@ -1491,14 +1976,14 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
     let id = if order.id > 0 {
         tx.execute(
             "UPDATE production_order SET period=?, date=?, item_code=?, item_name=?,
-             planned_qty=?, completed_qty=?, status=?, work_center=?, prepared_by=?, memo=?,
+             planned_qty=?, completed_qty=?, status=?, work_center=?, so_id=?, prepared_by=?, memo=?,
              order_kind=?, supplier_code=?, supplier_name=?, plan_start=?, plan_end=?, updated_at=?
              WHERE id=?",
             rusqlite::params![
                 order.period.ymm(), order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 order.status.code(),
-                order.work_center, order.prepared_by, order.memo,
+                order.work_center, order.so_id, order.prepared_by, order.memo,
                 order.order_kind, order.supplier_code, order.supplier_name,
                 order.plan_start, order.plan_end,
                 now, order.id
@@ -1508,14 +1993,14 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
     } else {
         tx.execute(
             "INSERT INTO production_order(period, no, date, item_code, item_name,
-             planned_qty, completed_qty, status, work_center, prepared_by, memo,
+             planned_qty, completed_qty, status, work_center, so_id, prepared_by, memo,
              order_kind, supplier_code, supplier_name, plan_start, plan_end, created_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)",
             rusqlite::params![
                 order.period.ymm(), order.no, order.date, order.item_code, order.item_name,
                 crate::exact_param(order.planned_qty), crate::exact_param(order.completed_qty),
                 order.status.code(),
-                order.work_center, order.prepared_by, order.memo,
+                order.work_center, order.so_id, order.prepared_by, order.memo,
                 order.order_kind, order.supplier_code, order.supplier_name,
                 order.plan_start, order.plan_end,
                 now
@@ -1554,7 +2039,7 @@ pub fn prod_release(db: &Db, id: i64) -> DbResult<()> {
 pub fn prod_get(db: &Db, id: i64) -> DbResult<Option<ProductionOrder>> {
     let mut stmt = db.conn().prepare(
         "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-         status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+         status, work_center, so_id, prepared_by, memo, order_kind, supplier_code, supplier_name,
          plan_start, plan_end
          FROM production_order WHERE id=?1",
     )?;
@@ -1573,13 +2058,14 @@ pub fn prod_get(db: &Db, id: i64) -> DbResult<Option<ProductionOrder>> {
         completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
         status: prod_status_from(&r.get::<_, String>(8)?),
         work_center: r.get(9)?,
-        prepared_by: r.get(10)?,
-        memo: r.get(11)?,
-        order_kind: r.get(12)?,
-        supplier_code: r.get(13)?,
-        supplier_name: r.get(14)?,
-        plan_start: r.get(15)?,
-        plan_end: r.get(16)?,
+        so_id: r.get(10)?,
+        prepared_by: r.get(11)?,
+        memo: r.get(12)?,
+        order_kind: r.get(13)?,
+        supplier_code: r.get(14)?,
+        supplier_name: r.get(15)?,
+        plan_start: r.get(16)?,
+        plan_end: r.get(17)?,
     }))
 }
 
@@ -1587,14 +2073,14 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
     let sql = if let Some(_s) = status {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+             status, work_center, so_id, prepared_by, memo, order_kind, supplier_code, supplier_name,
              plan_start, plan_end
              FROM production_order WHERE period=? AND status=? ORDER BY date DESC, id DESC"
         )
     } else {
         format!(
             "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
-             status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+             status, work_center, so_id, prepared_by, memo, order_kind, supplier_code, supplier_name,
              plan_start, plan_end
              FROM production_order WHERE period=? ORDER BY date DESC, id DESC"
         )
@@ -1609,9 +2095,9 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 status: prod_status_from(&r.get::<_, String>(8)?),
-                work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
-                order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
-                plan_start: r.get(15)?, plan_end: r.get(16)?,
+                work_center: r.get(9)?, so_id: r.get(10)?, prepared_by: r.get(11)?, memo: r.get(12)?,
+                order_kind: r.get(13)?, supplier_code: r.get(14)?, supplier_name: r.get(15)?,
+                plan_start: r.get(16)?, plan_end: r.get(17)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     } else {
@@ -1622,9 +2108,9 @@ pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResul
                 planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
                 completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
                 status: prod_status_from(&r.get::<_, String>(8)?),
-                work_center: r.get(9)?, prepared_by: r.get(10)?, memo: r.get(11)?,
-                order_kind: r.get(12)?, supplier_code: r.get(13)?, supplier_name: r.get(14)?,
-                plan_start: r.get(15)?, plan_end: r.get(16)?,
+                work_center: r.get(9)?, so_id: r.get(10)?, prepared_by: r.get(11)?, memo: r.get(12)?,
+                order_kind: r.get(13)?, supplier_code: r.get(14)?, supplier_name: r.get(15)?,
+                plan_start: r.get(16)?, plan_end: r.get(17)?,
             })
         })?.collect::<Result<Vec<_>, _>>()?
     };
@@ -1661,7 +2147,7 @@ mod prod_tests {
             date: NaiveDate::from_ymd(2026, 1, 5),
             item_code: "1001".to_string(), item_name: "成品A".to_string(),
             planned_qty: Money::parse("100").unwrap(), completed_qty: Money::ZERO,
-            status: ProdStatus::Draft, work_center: "WC01".to_string(),
+            status: ProdStatus::Draft, work_center: "WC01".to_string(), so_id: 0,
             prepared_by: "u1".to_string(), memo: String::new(),
             order_kind: "inhouse".to_string(),
             supplier_code: String::new(),

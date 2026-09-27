@@ -7261,6 +7261,210 @@ async fn over_shipment_is_capped_in_stock_too() {
     );
 }
 
+/// 销售订单下推生产订单：产销两单在数据上连起来，且下推量封顶
+///
+/// 回归背景：`production_order` 以前**没有 so_id**，产出的货与谁要它没有任何
+/// 记录对应，「这批货是哪张订单要的」只能靠人肉记忆，缺货时更无法反查
+/// 「哪些订单正等着这批料」。
+#[tokio::test]
+async fn sales_order_pushes_to_production_order() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "status": "Confirmed",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "lines": [{
+                    "item_code": "140501", "item_name": "成品甲",
+                    "qty_ordered": "100", "unit_price": "100", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "建销售订单应成功：{b}");
+    let so_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 下推前 ATP：无现货、无在途、已占用 100 → 负数（承诺不了）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140501", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let a: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+    assert_eq!(num(&a["committed"]), 100.0, "已确认订单应占用 100");
+    assert_eq!(num(&a["atp"]), -100.0, "没现货没在途时承诺不了 100 件");
+
+    // 下推生产订单（不填 qty = 认领全部余量）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/from-so",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "date": "2026-01-06" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "下推生产订单应成功：{b}");
+    let pushed: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(pushed["so_id"], serde_json::json!(so_id), "必须记住来源销售订单");
+    assert_eq!(num(&pushed["planned_qty"]), 100.0);
+    // 返回里带上 ATP：在途 +100 正好抵掉占用
+    assert_eq!(num(&pushed["atp"]["atp"]), 0.0, "在途抵掉占用后才够承诺");
+
+    // 生产订单列表里能看到来源单号
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/prod?period=2026-01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let list: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let row = list["orders"]
+        .as_array()
+        .expect("产单列表应返回数组")
+        .iter()
+        .find(|x| x["so_id"] == so_id)
+        .expect("列表里应能看到这张下推来的产单");
+    assert!(
+        !row["so_no"].as_str().unwrap_or("").is_empty(),
+        "应回显来源销售订单号，否则产销还是对不上：{row}"
+    );
+
+    // 全部认领后再推必须被拒（否则产销对不上）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/from-so",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "date": "2026-01-07" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert!(
+        st.is_client_error(),
+        "已全部下推后不该还能再推（拿到 {st}：{b}）"
+    );
+}
+
+/// 草稿销售订单不能下推生产
+#[tokio::test]
+async fn draft_sales_order_cannot_push_production() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "status": "Draft",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "lines": [{
+                    "item_code": "140501", "item_name": "成品甲",
+                    "qty_ordered": "10", "unit_price": "100", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod/from-so",
+            &sid,
+            serde_json::json!({ "so_id": so_id }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert!(st.is_client_error(), "草稿订单不该能下推生产（拿到 {st}：{b}）");
+}
+
+/// ATP 端点：待检库存不算可用，草稿订单不占用
+///
+/// 这两条是「宁可少承诺也不能虚承诺」的底线：待检货领不走，草稿还不是承诺。
+#[tokio::test]
+async fn atp_endpoint_excludes_qc_pending_and_draft() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 造待检入库 80 件
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("80").unwrap();
+        let p = fincore::Money::parse("5").unwrap();
+        let id = findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140301".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        db.conn()
+            .execute("UPDATE stock_move SET qc_status='pending' WHERE id=?1", [id])
+            .unwrap();
+    }
+    // 一张草稿订单要 30 件（不占用）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "status": "Draft",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "lines": [{
+                    "item_code": "140301", "item_name": "材料甲",
+                    "qty_ordered": "30", "unit_price": "5", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/atp?item=140301", &sid))
+        .await
+        .unwrap();
+    let a: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+    assert_eq!(num(&a["on_hand"]), 0.0, "待检库存不可领用，不能算进可承诺量：{a}");
+    assert_eq!(num(&a["committed"]), 0.0, "草稿订单还不是承诺：{a}");
+    assert_eq!(num(&a["atp"]), 0.0);
+    assert!(
+        a["formula"].as_str().unwrap_or("").contains("在途"),
+        "响应要带上公式，否则数字没法核对：{a}"
+    );
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {

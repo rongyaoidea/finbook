@@ -357,6 +357,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/routing/:item", get(get_routing).post(post_routing))
         .route("/api/routing/:item/delete", post(delete_routing))
         .route("/api/prod", get(list_prod_orders).post(create_prod_ep))
+        // 销售订单下推生产订单：产销在数据上连起来
+        .route("/api/prod/from-so", post(prod_from_so_ep))
+        // 可承诺量（ATP）：现货 + 在途 − 已占用
+        .route("/api/atp", get(get_atp))
         .route("/api/prod/:id", put(update_prod_ep))
         .route("/api/prod/:id/cancel", post(cancel_prod_ep))
         .route("/api/prod/:id/changes", get(list_prod_changes))
@@ -1226,6 +1230,85 @@ async fn cost_wip_ep(
     Ok(Json(json!({
         "period": period_to_str(period),
         "rows": findb::manufacturing::wip_cost(&db, period)?,
+    })))
+}
+
+/// 可承诺量（ATP）
+///
+/// 读权限与库存报表同级：ATP 由现货、在途、已占用三项算出，实质是库存视图。
+/// 三个分量一并返回而不是只给结果——只看到一个 ATP 数字，被算错了也不知道错在哪。
+async fn get_atp(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let item = q.get("item").map(|s| s.trim()).unwrap_or("");
+    if item.is_empty() {
+        return Err(AppError::bad_request("缺少存货编码 item"));
+    }
+    let a = findb::scm::atp(&db, item)?;
+    Ok(Json(json!({
+        "item": a.item,
+        "on_hand": a.on_hand,
+        "incoming": a.incoming,
+        "committed": a.committed,
+        "atp": a.atp,
+        "formula": "ATP = 现有可用库存 + 在途（未完工生产计划） − 已占用（已确认订单未发货）",
+        "note": "待检（来料检验未转正）库存不计入可用；草稿/作废订单不占用；在途含已下推的草稿产单（草稿也是已认领的产能）",
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct ProdFromSoReq {
+    so_id: i64,
+    /// 计划数量；留空 = 下推该订单尚未认领的全部余量
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    date: String,
+}
+
+/// 销售订单下推生产订单
+///
+/// 下推数量封顶在引擎里（`scm::prod_from_so`），前端再封一次只会变成两处口径。
+async fn prod_from_so_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<ProdFromSoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = current_period(&state, &user);
+    let date = if req.date.trim().is_empty() {
+        period.first_day()
+    } else {
+        NaiveDate::parse_from_str(req.date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("日期格式应为 YYYY-MM-DD"))?
+    };
+    let want = if req.qty.trim().is_empty() {
+        None
+    } else {
+        let q = parse_money_checked(&req.qty)?;
+        if !q.is_positive() {
+            return Err(AppError::bad_request("下推数量必须大于 0"));
+        }
+        Some(q)
+    };
+    let id = findb::scm::prod_from_so(&db, req.so_id, period, date, want, user.username())?;
+    let o = findb::scm::prod_get(&db, id)?
+        .ok_or_else(|| AppError::not_found("生产订单不存在"))?;
+    let atp = findb::scm::atp(&db, &o.item_code)?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "no": o.no,
+        "item_code": o.item_code,
+        "item_name": o.item_name,
+        "planned_qty": o.planned_qty,
+        "so_id": o.so_id,
+        "atp": atp,
     })))
 }
 
@@ -7525,6 +7608,16 @@ async fn list_prod_orders(
                 "completed_qty": o.completed_qty.fmt_qty(),
                 "status": format!("{:?}", o.status),
                 "order_kind": o.order_kind,
+                "so_id": o.so_id,
+                "so_no": if o.so_id > 0 {
+                    findb::scm::so_get(&db, o.so_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.no)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 "supplier_name": o.supplier_name,
                 "plan_start": o.plan_start,
                 "plan_end": o.plan_end,
@@ -8102,6 +8195,7 @@ async fn create_prod_ep(
         completed_qty: Money::ZERO,
         status: findb::scm::ProdStatus::Released,
         work_center: req.work_center.trim().to_string(),
+        so_id: 0, // 独立建单；来自销售订单的走 /api/prod/from-so
         prepared_by: user.username().to_string(),
         memo: String::new(),
         order_kind: if req.kind.trim() == "outsourcing" {

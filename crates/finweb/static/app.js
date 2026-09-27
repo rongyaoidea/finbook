@@ -5632,6 +5632,76 @@ async function viewPoReconcile(main) {
 // ===========================================================================
 // 销售对账
 // ===========================================================================
+// ---------------- 销售订单下推生产订单 ----------------
+//
+// 产销在数据上必须连着：以前 production_order 没有 so_id，「这批货是哪张订单要的」
+// 只能靠人肉记忆，缺货时更无法反查「哪些订单正等着这批料」。
+//
+// 弹窗第一件事是**先算 ATP**（现货 + 在途 − 已占用）并把三个分量都摆出来。
+// 只给一个 ATP 数字，被算错了也不知道错在哪一项；而且下���前就该看到
+// 「现货不够、但下推生产之后够不够」，而不是只能事后看库存。
+async function openPushProd(soId, after) {
+  const id = Number(soId);
+  let so, a;
+  try {
+    so = (await api(`/sales/so?period=${state.current}`)).rows.find((x) => x.id === id);
+    if (!so) throw new Error("订单不存在");
+    a = await api(`/atp?item=${encodeURIComponent(((so.lines || [])[0] || {}).item_code || "")}`);
+  } catch (e) {
+    toast(e.message, "err");
+    return;
+  }
+  const line = (so.lines || [])[0] || {};
+  const num = (v) => Number(v) || 0;
+  const remain = num(line.qty_ordered) - num(line.qty_shipped);
+  const sign = (v) => (num(v) < 0 ? "var(--err)" : num(v) > 0 ? "var(--ok)" : "inherit");
+  const mask = modal(`
+    <h3>下推生产订单 · ${esc(so.no)}</h3>
+    <div class="muted" style="margin-bottom:8px;line-height:1.7">
+      存货 <b>${esc(line.item_name || line.item_code || "")}</b>（${esc(line.item_code || "")}）·
+      订购 ${esc(line.qty_ordered || 0)} / 已发 ${esc(line.qty_shipped || 0)}，
+      <b>未发货 ${esc(remain)}</b>。下推数量按「订购 − 已发 − 已下推」封顶。
+    </div>
+    <div class="cards" style="margin-bottom:10px">
+      <div class="card"><div class="k">现有可用库存</div><div class="v">${esc(a.on_hand)}</div></div>
+      <div class="card"><div class="k">在途（未完工产单）</div><div class="v">${esc(a.incoming)}</div></div>
+      <div class="card"><div class="k">已占用（已确认订单）</div><div class="v">${esc(a.committed)}</div></div>
+      <div class="card"><div class="k">可承诺量 ATP</div><div class="v" style="color:${sign(a.atp)}">${esc(a.atp)}</div></div>
+    </div>
+    <div class="field"><label>下推数量 <span class="muted" style="font-weight:400">（留空 = 认领全部 ${esc(remain)}）</span></label>
+      <input id="pp-qty" placeholder="${esc(remain)}" /></div>
+    <p class="muted" style="font-size:12px;line-height:1.7">
+      ATP = ${esc(a.formula || "")}。<br>
+      ${esc(a.note || "")}。待检库存不计入可用——来料检验未转正的货领不走，算进去就是对客户虚承诺交期。
+    </p>
+    <div id="pp-err" style="display:none;margin-top:8px;color:var(--err);font-size:12px;line-height:1.6"></div>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn" id="pp-cancel">取消</button>
+      <button class="btn primary" id="pp-ok">确认下推</button>
+    </div>`);
+  $("#pp-cancel", mask).onclick = () => closeModal();
+  $("#pp-ok", mask).onclick = async () => {
+    const errBox = $("#pp-err", mask);
+    errBox.style.display = "none";
+    try {
+      const r = await postJson("/prod/from-so", {
+        so_id: id,
+        qty: $("#pp-qty", mask).value.trim(),
+      });
+      toast(`已下推生产订单 ${r.no}（${r.planned_qty}）`, "ok");
+      closeModal();
+      if (after) after();
+    } catch (e) {
+      // 错误**留在弹窗里**而不只弹 toast：弹窗不关闭，toast 却会自动消失。
+      // 「已全部认领、无可再下推」这类拒绝如果没留在原地，用户只会看到
+      // 按钮点了没反应，然后以为系统坏了。
+      toast(e.message, "err");
+      errBox.textContent = e.message;
+      errBox.style.display = "";
+    }
+  };
+}
+
 async function viewSoReconcile(main) {
     main.innerHTML = `<h2>销售对账</h2>
     <div class="toolbar"><button class="btn ghost sm" id="sr-result-print">打印预览</button></div>
@@ -6563,7 +6633,7 @@ async function viewSoDoc(main) {
       const s = await api(`/sales/so?period=${period}`);
       const orows = s.rows || [];
       $("#so-list").innerHTML = orows.length
-        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-so-inv="${o.id}">票</button>` : ""}${o.status !== "Draft" && o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-notice="${o.id}">通知</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
+        ? `<table class="grid"><thead><tr><th style="width:26px"><input type="checkbox" id="so-chkall" title="全选" /></th><th>单号</th><th>客户</th><th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th></tr></thead><tbody>${orows.map((o) => `<tr><td><input type="checkbox" class="so-chk" value="${o.id}" /></td><td>${esc(o.no)}</td><td>${esc(o.customer_name)}</td><td class="num">${fmt(o.total_amount)}</td><td class="num">${fmt(o.total_tax)}</td><td class="num"><b>${fmt((Number(o.total_amount) || 0) + (Number(o.total_tax) || 0))}</b></td><td><span class="tag ${o.status === "Cancelled" ? "warn" : o.status === "Draft" ? "" : "ok"}">${esc(ORDER_STATUS_LABEL[o.status] || o.status)}</span></td><td class="row-actions"><button class="btn ghost sm" data-so-edit="${o.id}">编辑</button>${o.status === "Draft" ? `<button class="btn ghost sm" data-so-confirm="${o.id}">确认</button><button class="btn ghost sm" data-so-del="${o.id}">删除</button>` : ""}${o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-cancel="${o.id}">作废</button>` : ""}<button class="btn ghost sm" data-so-chain="${o.id}">链</button>${can("voucher_new") && can("order_ops") ? `<button class="btn ghost sm" data-so-inv="${o.id}">票</button>` : ""}${o.status !== "Draft" && o.status !== "Cancelled" ? `<button class="btn ghost sm" data-so-notice="${o.id}">通知</button><button class="btn ghost sm" data-so-prod="${o.id}">下推生产</button>` : ""}<button class="btn ghost sm" data-so-exec="${o.id}">执行</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无销售订单，点右上「新建销售订单」</div>`;
       $all("[data-so-edit]").forEach((b) => b.onclick = () => openOrderEditor("so", main, parseInt(b.dataset.soEdit, 10)));
       $all("[data-so-confirm]").forEach((b) => b.onclick = () => soTransition(b.dataset.soConfirm, "Confirmed"));
@@ -6582,6 +6652,7 @@ async function viewSoDoc(main) {
         );
         openNoticeEditor(b.dataset.soNotice, un, load);
       });
+      $all("[data-so-prod]").forEach((b) => b.onclick = () => openPushProd(b.dataset.soProd, load));
       $all("[data-so-exec]").forEach((b) => b.onclick = () => { $("#sd-soid").value = b.dataset.soExec; toast(`已填入订单ID ${b.dataset.soExec}，可执行发货/收款`, "ok"); });
       $all("[data-so-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog("删除该销售订单？", true))) return; try { await api(`/sales/so/${b.dataset.soDel}/delete`, { method: "POST" }); toast("已删除", "ok"); load(); } catch (e) { toast(e.message, "err"); } });
       if ($("#so-chkall")) $("#so-chkall").onclick = (e) => { $all(".so-chk").forEach((c) => { c.checked = e.target.checked; }); };

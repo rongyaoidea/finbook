@@ -37,7 +37,8 @@ test("税务申报：进项只认已认证，应纳税额与附加税费算对",
   //   销项含「待认证」（开票了销项义务就发生）
   //   进项**排除**「待认证」（未认证不得抵扣）
   await page.click('.nav-item[data-view="tax-decl"]');
-  await expect(page.locator("h2")).toContainText("税务申报", { timeout: 15_000 });
+  // 同样等「数据到了」的信号（#tx-export），不等 h2 外壳
+  await expect(page.locator("#tx-export")).toBeVisible({ timeout: 15_000 });
   // 用 #tx-warn 而不是 .banner.unset —— 页面上还有别的 .banner.unset
   // （期间未初始化/首登改密），类选择器会命中它们，断言就成了「某个横幅非空」。
   await expect(page.locator("#tx-warn")).toContainText("尚未认证", { timeout: 15_000 });
@@ -57,7 +58,12 @@ test("税务申报：进项只认已认证，应纳税额与附加税费算对",
   await expect(page.locator("#inv-list")).toContainText("已认证", { timeout: 10_000 });
 
   await page.click('.nav-item[data-view="tax-decl"]');
-  await expect(page.locator("h2")).toContainText("税务申报", { timeout: 15_000 });
+  // 等 `#tx-export`（导出按钮）而不是 h2：viewTaxDecl 会**先**渲染一个
+  // 「<h2>税务申报…加载中…</h2>」的外壳，取到数之后再整体替换。
+  // 所以 h2 含「税务申报」只证明视图画出来了，不证明数据到了——紧接着读
+  // textContent 会读到加载态，于是 `toContain("130.00")` 偶发失败。
+  // 这个 flake 之前被 retry 盖住了，看起来像偶发，实际是断言选错了信号。
+  await expect(page.locator("#tx-export")).toBeVisible({ timeout: 15_000 });
   text = await page.locator("#main").textContent();
   expect(text).toContain("130.00"); // 销项 130
   expect(text).toContain("65.00"); // 进项 65（已认证）

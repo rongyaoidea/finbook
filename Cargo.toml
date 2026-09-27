@@ -27,6 +27,10 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["fs", "trace", "catch-panic"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
+# 开放 API 密钥哈希：快哈希（sha2）而非 argon2。
+# 密钥是 32 字节随机熵，没有低熵口令可「猜」；慢哈希的存在意义是拖慢暴力破解，
+# 用在这里只会让**每个 API 请求**都付 ~100ms，与外部系统对接的吞吐直接冲突。
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 2

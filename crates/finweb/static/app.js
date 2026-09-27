@@ -3219,6 +3219,40 @@ async function viewPlatformBooks(main) {
     <div id="po-meta" class="cards"></div>
     <div id="po-domains"></div>
     <div id="po-books"></div>
+    <h3 style="margin:18px 0 8px">开放 API 密钥</h3>
+    <div class="muted" style="margin-bottom:8px;line-height:1.6">
+      给 WMS / MES / 电商 / 银行 / 税务等外部系统签发调用凭据。
+      <b>明文只在创建时显示一次</b>，库里只存哈希，找不回来——丢了就重新签一把。
+      v1 为<b>只读接口</b>：空权限 = 只读基础档案，填 <code>fin_report</code> 才能读试算平衡与明细账。
+      密钥绑定的账套就是它能读到的账套；平台级密钥（不绑账套）能读所有账套。
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <button class="btn primary sm" id="ak-new">签发密钥</button>
+      <button class="btn ghost sm" id="ak-reload">刷新</button>
+      <a class="btn ghost sm" href="/api/v1/openapi.json" target="_blank" rel="noopener">接口文档（OpenAPI）</a>
+    </div>
+    <div id="ak-new-wrap" style="display:none;margin-bottom:10px">
+      <div class="panel" style="box-shadow:none;border:1px solid var(--warn,#c47f00);padding:10px">
+        <div style="font-weight:600;margin-bottom:6px">签发新密钥</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+          <label>名称</label><input id="ak-name" placeholder="如：仓库 WMS 对接" style="width:180px" />
+          <label>绑定账套</label>
+          <select id="ak-book" style="width:220px"><option value="">（平台级 · 可读所有账套）</option></select>
+          <label>权限</label>
+          <select id="ak-scopes" style="width:200px">
+            <option value="">只读（基础档案）</option>
+            <option value="fin_report">只读 + 财务报表</option>
+          </select>
+          <label>到期</label><input id="ak-expires" placeholder="留空 = 永不过期" style="width:180px" />
+          <button class="btn primary sm" id="ak-do">确认签发</button>
+        </div>
+        <div id="ak-plain" style="display:none">
+          <div style="font-weight:600;color:var(--err);margin-bottom:4px">⚠ 这是密钥明文，只显示这一次。关掉就再也看不到了。</div>
+          <code id="ak-plain-val" style="display:block;padding:8px;background:var(--bg);border-radius:4px;word-break:break-all;user-select:all"></code>
+        </div>
+      </div>
+    </div>
+    <div id="ak-list" class="muted">加载中…</div>
     <h3 style="margin:18px 0 8px">账套管理</h3>
     <div id="pb-list" class="muted">加载中…</div>`;
 
@@ -3366,7 +3400,93 @@ async function viewPlatformBooks(main) {
     const del = e.target.closest("button[data-del]");
     if (del) deleteBook(del.dataset.del, del.dataset.name);
   });
+
+  // ------------------------------------------------------------ 开放 API 密钥
+  const akFmtTime = (s) => (s && s !== "0000-00-00 00:00:00" ? String(s).slice(0, 16) : "—");
+
+  async function loadKeys() {
+    $("#ak-list").innerHTML = `<div class="muted">加载中…</div>`;
+    try {
+      const keys = await api("/api-keys");
+      const list = keys.keys || [];
+      $("#ak-list").innerHTML = list.length ? `<table class="grid"><thead><tr>
+        <th>名称</th><th>密钥前缀</th><th>绑定账套</th><th>权限</th><th>最近调用</th><th>到期</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody>${list.map((k) => `<tr>
+          <td>${esc(k.name)}</td>
+          <td><code>${esc(k.prefix)}…</code></td>
+          <td>${k.book_key ? esc(k.book_key) : `<span class="muted">平台级（全部账套）</span>`}</td>
+          <td>${k.scopes ? esc(k.scopes) : `<span class="muted">只读</span>`}</td>
+          <td>${esc(akFmtTime(k.last_used_at))}</td>
+          <td>${esc(akFmtTime(k.expires_at))}</td>
+          <td>${k.disabled ? `<span style="color:var(--err)">已停用</span>` : `<span style="color:var(--ok)">启用中</span>`}</td>
+          <td>
+            <button class="btn sm" data-ak-toggle="${k.id}" data-dis="${k.disabled ? "0" : "1"}">${k.disabled ? "启用" : "停用"}</button>
+            <button class="btn sm ghost" data-ak-del="${k.id}" data-name="${esc(k.name)}">删除</button>
+          </td></tr>`).join("")}</tbody></table>`
+        : `<div class="muted">还没有签发任何密钥。外部系统要对接时点上方「签发密钥」。</div>`;
+    } catch (e) { $("#ak-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
+  }
+
+  async function fillBookSelect() {
+    try {
+      const data = await loadMyBooks();
+      const opts = (data.books || []).map((b) => `<option value="${esc(b.key)}">${esc(b.company || b.key)}（${esc(b.key)}）</option>`).join("");
+      $("#ak-book").innerHTML = `<option value="">（平台级 · 可读所有账套）</option>${opts}`;
+    } catch (e) { /* 账套列表拿不到时只留平台级选项，不阻断密钥管理 */ }
+  }
+
+  $("#ak-new").addEventListener("click", async () => {
+    const w = $("#ak-new-wrap");
+    w.style.display = w.style.display === "none" ? "" : "none";
+    $("#ak-plain").style.display = "none";
+    if (w.style.display === "") await fillBookSelect();
+  });
+  $("#ak-reload").addEventListener("click", loadKeys);
+  $("#ak-do").addEventListener("click", async () => {
+    const name = $("#ak-name").value.trim();
+    if (!name) { toast("请填密钥名称（便于日后辨认是哪套系统在用）", "err"); return; }
+    try {
+      const r = await api("/api-keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          book_key: $("#ak-book").value,
+          scopes: $("#ak-scopes").value,
+          expires_at: $("#ak-expires").value.trim(),
+        }),
+      });
+      $("#ak-plain-val").textContent = r.secret;
+      $("#ak-plain").style.display = "";
+      $("#ak-name").value = "";
+      await loadKeys();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  $("#ak-list").addEventListener("click", async (e) => {
+    const tog = e.target.closest("button[data-ak-toggle]");
+    if (tog) {
+      try {
+        await api(`/api-keys/${tog.dataset.akToggle}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ disabled: tog.dataset.dis === "1" }),
+        });
+        await loadKeys();
+      } catch (err) { toast(err.message, "err"); }
+      return;
+    }
+    const del = e.target.closest("button[data-ak-del]");
+    if (del && confirm(`确定删除密钥「${del.dataset.name}」？\n删掉后正在使用它的外部系统会立刻全部 401。`)) {
+      try {
+        await api(`/api-keys/${del.dataset.akDel}`, { method: "DELETE" });
+        await loadKeys();
+      } catch (err) { toast(err.message, "err"); }
+    }
+  });
+
   await load();
+  await loadKeys();
 }
 
 function openChangePwd(forced, onDone) {

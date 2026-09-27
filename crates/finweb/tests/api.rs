@@ -202,6 +202,26 @@ fn authed_post(uri: &str, sid: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+/// 带 Bearer 密钥的 GET 请求（开放 API 用；secret 传空串表示不带 Authorization）
+fn bearer_get(uri: &str, secret: &str) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri(uri);
+    if !secret.is_empty() {
+        b = b.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// 平台级密钥 + X-Book-Key 头
+fn bearer_get_for_book(uri: &str, secret: &str, book_key: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .header("x-book-key", book_key)
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// 带 sid 的 PUT JSON 请求
 fn authed_put(uri: &str, sid: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
@@ -5516,6 +5536,672 @@ async fn audit_gate_blocks_post_until_audited() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "审核后应能记账");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 开放 API（/api/v1/*）
+// ═══════════════════════════════════════════════════════════════
+
+/// 签一把绑 b1 账套的只读密钥，返回明文
+async fn issue_ro_key(state: &Arc<WebState>, book_key: &str) -> String {
+    let (_, secret) = state
+        .realm
+        .api_key_create("测试只读", book_key, "", "", "boss")
+        .expect("签发密钥失败");
+    secret
+}
+
+async fn v1_get(state: &Arc<WebState>, uri: &str, secret: &str) -> (StatusCode, String) {
+    let r = handlers::router(state.clone())
+        .oneshot(bearer_get(uri, secret))
+        .await
+        .unwrap();
+    (r.status(), body_string(r).await)
+}
+
+/// 无密钥 / 错密钥 / 已停用一律 401，且提示要带 Authorization
+#[tokio::test]
+async fn v1_requires_bearer_key() {
+    let (state, _bd, _dir) = test_state();
+
+    let (st, body) = v1_get(&state, "/api/v1/accounts", "").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "不带密钥应 401：{body}");
+    assert!(
+        body.contains("Authorization"),
+        "401 应说清缺什么，而不是只说未授权：{body}"
+    );
+
+    let (st, _) = v1_get(&state, "/api/v1/accounts", "fbk_0000000000000000").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "错密钥应 401");
+
+    // 格式对但库里没有的 32 字节密钥
+    let ghost = format!("fbk_{}", "0".repeat(64));
+    let (st, _) = v1_get(&state, "/api/v1/accounts", &ghost).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "不存在的密钥应 401");
+
+    // 停用后立即失效——「停用」若不立刻生效，泄露事故的处置窗口就不存在了
+    let key = issue_ro_key(&state, "b1").await;
+    let (st, _) = v1_get(&state, "/api/v1/accounts", &key).await;
+    assert_eq!(st, StatusCode::OK, "刚签发的密钥应可用");
+
+    let id = state
+        .realm
+        .api_key_list()
+        .expect("列密钥失败")
+        .into_iter()
+        .find(|k| k.book_key == "b1")
+        .expect("应能找到刚签的密钥")
+        .id;
+    state
+        .realm
+        .api_key_set_disabled(id, true)
+        .expect("停用失败");
+    let (st, body) = v1_get(&state, "/api/v1/accounts", &key).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "停用后应立即 401：{body}");
+}
+
+/// 过期密钥不能过——expire_at 不是装饰字段
+#[tokio::test]
+async fn v1_expired_key_rejected() {
+    let (state, _bd, _dir) = test_state();
+    let past = (chrono::Local::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let (_, key) = state
+        .realm
+        .api_key_create("已过期", "b1", "", &past, "boss")
+        .expect("签发失败");
+    let (st, body) = v1_get(&state, "/api/v1/accounts", &key).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "过期密钥应 401：{body}");
+}
+
+/// 库只存哈希：库里任何地方都不该出现明文密钥
+#[tokio::test]
+async fn v1_key_stored_as_hash_only() {
+    let (state, _bd, _dir) = test_state();
+    let key = issue_ro_key(&state, "b1").await;
+    assert!(key.starts_with("fbk_"), "密钥应有可辨识前缀：{key}");
+
+    let listed = state.realm.api_key_list().expect("列密钥失败");
+    let row = listed.first().expect("应有一把密钥");
+    // 列表接口只回前缀，不回任何可用于鉴权的完整凭据
+    assert!(
+        !row.prefix.contains(&key) || row.prefix.len() < key.len(),
+        "列表不应暴露完整密钥：{:?}",
+        row.prefix
+    );
+    // 直接查库：哈希不等于明文
+    let dump = {
+        let conn = state.realm.debug_dump_api_keys();
+        conn
+    };
+    assert!(
+        !dump.contains(&key),
+        "库中出现了明文密钥（只该存哈希）：{dump}"
+    );
+}
+
+/// 绑账套的密钥只能读自己那个账套；平台级密钥必须显式给 X-Book-Key
+#[tokio::test]
+async fn v1_key_is_scoped_to_its_book() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let (st, body) = create_book(&state, &admin_sid, "第二账套").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let other = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 绑 b1 的密钥请求另一个账套不存在——v1 路径里没有账套参数，
+    // 目标账套只由密钥绑定决定，所以这里验证的是「换个密钥才能换账套」
+    let key_b1 = issue_ro_key(&state, "b1").await;
+    let (st, body) = v1_get(&state, "/api/v1/accounts", &key_b1).await;
+    assert_eq!(st, StatusCode::OK);
+    let company = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert!(company.is_object(), "科目表应返回对象：{body}");
+
+    // 平台级密钥（book_key 空）：不带 X-Book-Key → 400；带了就正常
+    let (_, plat) = state
+        .realm
+        .api_key_create("平台级", "", "", "", "boss")
+        .expect("签发失败");
+    let r = handlers::router(state.clone())
+        .oneshot(bearer_get("/api/v1/accounts", &plat))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "平台级密钥不给账套应 400，而不是默默挑一个"
+    );
+    let msg = body_string(r).await;
+    assert!(msg.contains("X-Book-Key"), "应指明用哪个头：{msg}");
+
+    for k in [&other, "b1"] {
+        let r = handlers::router(state.clone())
+            .oneshot(bearer_get_for_book("/api/v1/accounts", &plat, k))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "X-Book-Key={k} 应可用");
+    }
+}
+
+/// 只读密钥能读基础档案，但碰不到需要 fin_report 的报表
+#[tokio::test]
+async fn v1_readonly_scope_blocks_reports() {
+    let (state, _bd, _dir) = test_state();
+    let key = issue_ro_key(&state, "b1").await;
+
+    for uri in [
+        "/api/v1/accounts",
+        "/api/v1/items",
+        "/api/v1/me",
+        "/api/v1/vouchers",
+        "/api/v1/statements",
+    ] {
+        let (st, body) = v1_get(&state, uri, &key).await;
+        assert_eq!(st, StatusCode::OK, "只读密钥应能读 {uri}：{body}");
+    }
+
+    for uri in ["/api/v1/trial-balance", "/api/v1/ledger?code=1001"] {
+        let (st, body) = v1_get(&state, uri, &key).await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "只读密钥不应能读 {uri}：{body}"
+        );
+        assert!(
+            body.contains("只读"),
+            "403 应说清当前是只读范围，而不是只说权限不足：{body}"
+        );
+    }
+}
+
+/// 给了 fin_report 就能读报表
+#[tokio::test]
+async fn v1_fin_report_scope_allows_reports() {
+    let (state, _bd, _dir) = test_state();
+    let (_, key) = state
+        .realm
+        .api_key_create("报表只读", "b1", "fin_report", "", "boss")
+        .expect("签发失败");
+
+    let (st, body) = v1_get(&state, "/api/v1/trial-balance", &key).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert!(v["totals"]["begin_debit"].is_string(), "应含合计：{body}");
+
+    let (st, body) = v1_get(&state, "/api/v1/ledger?code=1001", &key).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    // 缺必填参数要给 400 并说明缺哪个，不能 500
+    let (st, body) = v1_get(&state, "/api/v1/ledger", &key).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("code"), "应指明缺 code：{body}");
+}
+
+/// 非法输入返回 400 而不是 500：开放 API 的调用方是程序，报错要能自纠
+#[tokio::test]
+async fn v1_bad_input_is_400_not_500() {
+    let (state, _bd, _dir) = test_state();
+    let (_, key) = state
+        .realm
+        .api_key_create("报表", "b1", "fin_report", "", "boss")
+        .expect("签发失败");
+
+    for uri in [
+        "/api/v1/vouchers?status=bogus",
+        "/api/v1/vouchers?from=not-a-period",
+        "/api/v1/vouchers?page=abc",
+    ] {
+        let (st, body) = v1_get(&state, uri, &key).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{uri} 应 400：{body}");
+    }
+
+    // 账套不存在 → 404（不是 401：密钥本身是有效的，是目标不存在）
+    let (_, ghost_key) = state
+        .realm
+        .api_key_create("孤儿", "no_such_book", "", "", "boss")
+        .expect("签发失败");
+    let (st, body) = v1_get(&state, "/api/v1/accounts", &ghost_key).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// 凭证列表分页不重不漏，且不泄露 v1 之外的数据
+#[tokio::test]
+async fn v1_vouchers_pagination() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    assert_eq!(select_book(&state, &admin_sid, "b1").await, StatusCode::OK);
+
+    // 录 7 张草稿。用「银行存款 → 库存现金」这类不需要辅助核算的科目对：
+    // 分页用例的主题是分页，不该被辅助核算档案的初始化状态左右。
+    for i in 1..=7 {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/vouchers",
+                &admin_sid,
+                serde_json::json!({
+                    "id": 0, "period": 202601, "date": format!("2026-01-{:02}", i),
+                    "word": "记", "no": i, "attachments": 0, "memo": format!("分页用例{i}"),
+                    "entries": [
+                        { "line": 1, "account_code": "100201", "summary": "转存", "debit": "100", "credit": "0" },
+                        { "line": 2, "account_code": "1001", "summary": "收现", "debit": "0", "credit": "100" }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        let st = r.status();
+        let body = body_string(r).await;
+        assert_eq!(st, StatusCode::OK, "第 {i} 张应录入成功：{body}");
+    }
+
+    let key = issue_ro_key(&state, "b1").await;
+    let mut seen: Vec<i64> = Vec::new();
+    for page in 1..=3 {
+        let (st, body) =
+            v1_get(&state, &format!("/api/v1/vouchers?page={page}&page_size=3"), &key).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let v = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let items = v["items"].as_array().expect("items 应是数组");
+        for it in items {
+            seen.push(it["id"].as_i64().expect("凭证应有 id"));
+        }
+        if page < 3 {
+            assert_eq!(items.len(), 3, "第 {page} 页应满页：{body}");
+            assert_eq!(v["has_more"], serde_json::json!(true), "{body}");
+        }
+    }
+    let uniq: std::collections::HashSet<_> = seen.iter().collect();
+    assert_eq!(seen.len(), 7, "三页共应 7 条，实际 {}", seen.len());
+    assert_eq!(uniq.len(), 7, "分页结果不应重复：{seen:?}");
+
+    // page_size 上限：page_size=99999 不该真的返回 99999 行
+    let (st, body) = v1_get(&state, "/api/v1/vouchers?page_size=99999", &key).await;
+    assert_eq!(st, StatusCode::OK);
+    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert_eq!(v["page_size"], serde_json::json!(500), "page_size 应被夹到 500");
+
+    // 单张取回含分录；不存在 → 404
+    // 这条同时是**参数段路由**的回归守卫：axum 0.7 的 matchit 只认 `:id`，
+    // 写 `{id}` 会被当字面量，`/api/v1/vouchers/1` 匹配不上 → 掉进
+    // spa_fallback → 未登录态下返回 401「未登录或会话已失效」。
+    // 症状是「单张凭证查不到」，根因却在一个字符，且没有编译错、没有警告。
+    let (st, body) = v1_get(&state, &format!("/api/v1/vouchers/{}", seen[0]), &key).await;
+    assert_eq!(st, StatusCode::OK, "单张凭证应查得到（参数段路由是否接上？）：{body}");
+    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert_eq!(v["entries"].as_array().map(|a| a.len()), Some(2), "{body}");
+
+    let (st, body) = v1_get(&state, "/api/v1/vouchers/999999", &key).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "不存在的凭证应 404 而不是别的：{body}");
+}
+
+/// v1 不含写操作：任何 /api/v1/* 的 POST 都必须被拒
+///
+/// 这是 v1 最要紧的一条边界。开放接口一旦有写入口，「谁能改账」就由接口设计决定，
+/// 而外部系统数量不可控——第一版只承诺「读得到」，不承诺「写得进」。
+#[tokio::test]
+async fn v1_has_no_write_endpoints() {
+    let (state, _bd, _dir) = test_state();
+    let key = issue_ro_key(&state, "b1").await;
+
+    for uri in [
+        "/api/v1/vouchers",
+        "/api/v1/accounts",
+        "/api/v1/items",
+    ] {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let r = handlers::router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // 405（方法不允许）或 404（无此路由）都算「没有写入口」，
+            // 但绝不能是 2xx
+            assert!(
+                !r.status().is_success(),
+                "{method} {uri} 不应成功，实际 {} —— v1 承诺只读",
+                r.status()
+            );
+        }
+    }
+}
+
+/// v1 绕开会话门禁但**不**绕开鉴权：没有密钥的 /api/v1 一律 401
+///
+/// 单独盯这一条：api_auth_gate 里给 /api/v1/ 加了前缀豁免（密钥没有 cookie，
+/// 套 session_of 会把合法外部调用全 401）。豁免不能变成「不鉴权」。
+#[tokio::test]
+async fn v1_session_gate_exemption_does_not_mean_open() {
+    let (state, _bd, _dir) = test_state();
+    // 即便带着一个真实有效的浏览器会话，v1 也要密钥——两条鉴权是物理隔离的
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/accounts")
+                .header(header::COOKIE, admin_sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "只有 cookie 没有密钥，v1 应 401 —— 会话不能顶替密钥"
+    );
+}
+
+/// 只有 health 与 openapi.json 是免鉴权的，其余都要密钥
+#[tokio::test]
+async fn v1_public_endpoints_limited_to_health_and_spec() {
+    let (state, _bd, _dir) = test_state();
+    for uri in ["/api/v1/health", "/api/v1/openapi.json"] {
+        let (st, body) = v1_get(&state, uri, "").await;
+        assert_eq!(st, StatusCode::OK, "{uri} 应免鉴权：{body}");
+    }
+    let v = serde_json::from_str::<serde_json::Value>(&v1_get(&state, "/api/v1/openapi.json", "").await.1).unwrap();
+    assert_eq!(v["openapi"], serde_json::json!("3.0.3"));
+    let paths = v["paths"].as_object().expect("paths 应是对象");
+    assert!(paths.contains_key("/api/v1/health"));
+
+    let key = issue_ro_key(&state, "b1").await;
+    for (p, spec) in paths {
+        assert!(p.starts_with("/api/v1/"), "文档路径应在 v1 下：{p}");
+        // OpenAPI 规范里参数段写作 {id}，实现（axum 0.7/matchit 0.7）要写 :id。
+        // 这里把 {x} 换成真值，既符合规范也顺便验证参数段路由真的接上了。
+        let method = p.replace("{id}", "1");
+        let public = spec["get"]["security"].as_array().is_some(); // "security": [] = 显式免鉴权
+        // 判据用「带真密钥也该通」而不是「不带密钥该 401」——
+        // 后者有个陷阱：路径拼错（如把 :id 写成 {id}）会掉进 spa_fallback，
+        // 未登录时**也**返回 401，于是「缺密钥→401」这个检查照样通过，
+        // 路由其实是死的。带密钥再打一次才能区分「鉴权生效」和「路由不存在」。
+        let (st, body) = v1_get(&state, &method, &key).await;
+        // 判「路由没接上」不能只看状态码：handler 自己的 404（凭证不存在）
+        // 与 spa_fallback 的 404（路由不存在）状态码完全一样，只有消息不同。
+        assert!(
+            !(st == StatusCode::UNAUTHORIZED || body.contains("接口不存在")),
+            "文档里的 {p} 带合法密钥返回 {st}「{body}」—— 路由没接上"
+        );
+        // 不带密钥：免鉴权的两条照常通，其余必须 401
+        let (st2, body2) = v1_get(&state, &method, "").await;
+        if public {
+            assert_eq!(st2, StatusCode::OK, "{p} 声明免鉴权却 {st2}：{body2}");
+        } else {
+            assert_eq!(st2, StatusCode::UNAUTHORIZED, "{p} 无密钥应 401：{body2}");
+        }
+    }
+}
+
+/// 浏览器那套端点没有被 v1 的豁免顺带放开
+#[tokio::test]
+async fn v1_exemption_does_not_loosen_browser_api() {
+    let (state, _bd, _dir) = test_state();
+    // 未登录访问普通 /api/* 仍应是 401
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/accounts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "加 /api/v1/ 豁免不应放宽 /api/accounts"
+    );
+}
+
+/// 密钥签发/停用/删除：只有平台管理员能做，且签发响应才带明文
+#[tokio::test]
+async fn api_key_endpoints_require_platform_admin() {
+    let (state, _bd, _dir) = test_state();
+
+    // 未登录
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/api-keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // 已登录的普通会计（非管理员）。账号治理是二元的：先在**平台**开通账号，
+    // 再在账套内邀请（/api/users 建的是账套内成员，平台没有同名账号会被拒）。
+    let boss_sid0 = login(&state, "boss", "Admin!2026").await.1;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid0,
+            serde_json::json!({ "username": "clerk", "display_name": "小会", "password": "Clerk2026a" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "开通平台账号应成功：{}", body_string(r).await);
+    let (st, body) = create_book(&state, &boss_sid0, "权限用例").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let bkey = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &boss_sid0, &bkey).await, StatusCode::OK);
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss_sid0,
+            serde_json::json!({
+                "username": "clerk", "display_name": "小会",
+                "password": "Clerk2026a", "role": "accountant", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "邀请成员应成功：{}", body_string(r).await);
+    let (st, clerk_sid) = login(&state, "clerk", "Clerk2026a").await;
+    assert_eq!(st, StatusCode::OK, "普通会计应能登录");
+    // 平台新开的账号强制首登改密（账套里的 must_change_pwd=false 管不到这一层），
+    // 不改的话后续请求全被 401 挡掉，用例测的就不是权限而是改密流程了。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &clerk_sid,
+            serde_json::json!({ "old": "Clerk2026a", "new": "Clerk2026b" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "首登改密应成功：{}", body_string(r).await);
+    let (st, clerk_sid) = login(&state, "clerk", "Clerk2026b").await;
+    assert_eq!(st, StatusCode::OK, "改密后应能重新登录");
+
+    // 确认它确实不是管理员（否则这条用例测的是别的东西）。
+    // 用 /api/platform/users 而不是 /api/me：后者要 CurrentUser（需先选中账套），
+    // 而 platform/users 只认 RealmUser，正好隔离出「平台管理员」这一层。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/platform/users", &clerk_sid))
+        .await
+        .unwrap();
+    let st = r.status();
+    let me = body_string(r).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "clerk 不该能列出平台账号 —— 它必须确实是非管理员，本用例才测到「普通会计越权」：{me}"
+    );
+
+    for (method, uri) in [("GET", "/api/api-keys"), ("POST", "/api/api-keys")] {
+        let r = handlers::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::COOKIE, clerk_sid.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"偷钥匙"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "普通会计不该能 {method} {uri} —— 否则任何会计都能给外部系统开后门"
+        );
+    }
+
+    // 管理员可以
+    let boss_sid = login(&state, "boss", "Admin!2026").await.1;
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/api-keys")
+                .header(header::COOKIE, boss_sid.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap();
+    assert_eq!(v["keys"].as_array().map(|a| a.len()), Some(0), "初始应为空");
+}
+
+/// 签发响应带明文，列表响应不带；停用后立刻 401；删除后彻底不见
+#[tokio::test]
+async fn api_key_lifecycle_over_http() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = login(&state, "boss", "Admin!2026").await.1;
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/api-keys",
+            &boss_sid,
+            serde_json::json!({ "name": "仓库对接", "book_key": "b1", "scopes": "", "expires_at": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap();
+    let secret = v["secret"].as_str().expect("签发响应应带明文").to_string();
+    let id = v["id"].as_i64().expect("应带 id");
+    assert!(secret.starts_with("fbk_"), "{secret}");
+
+    // 列表里绝不能有明文
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/api-keys", &boss_sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let list_body = body_string(r).await;
+    assert!(
+        !list_body.contains(&secret),
+        "列表泄露了明文密钥：{list_body}"
+    );
+
+    // 停用 → 立刻 401
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/api-keys/{id}"),
+            &boss_sid,
+            serde_json::json!({ "disabled": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let (st, _) = v1_get(&state, "/api/v1/accounts", &secret).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "停用应立即生效");
+
+    // 重新启用 → 恢复
+    let _ = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/api-keys/{id}"),
+            &boss_sid,
+            serde_json::json!({ "disabled": false }),
+        ))
+        .await
+        .unwrap();
+    let (st, _) = v1_get(&state, "/api/v1/accounts", &secret).await;
+    assert_eq!(st, StatusCode::OK, "启用后应恢复");
+
+    // 删除 → 彻底不可用
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&format!("/api/api-keys/{id}"))
+                .header(header::COOKIE, boss_sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let (st, _) = v1_get(&state, "/api/v1/accounts", &secret).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "删除后应不可用");
+}
+
+/// 签发参数校验：不给名字、给不存在的账套、给未知 scope、给坏日期都要 400
+#[tokio::test]
+async fn api_key_create_validates_input() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = login(&state, "boss", "Admin!2026").await.1;
+
+    // 每条带上期望状态码：账套不存在是 404（对象不存在），其余是 400（参数不合法）
+    for (body, want, why) in [
+        (serde_json::json!({ "book_key": "b1" }), StatusCode::BAD_REQUEST, "空名称"),
+        (
+            serde_json::json!({ "name": "x", "book_key": "no_such" }),
+            StatusCode::NOT_FOUND,
+            "账套不存在",
+        ),
+        (
+            serde_json::json!({ "name": "x", "book_key": "b1", "scopes": "drop_table" }),
+            StatusCode::BAD_REQUEST,
+            "未知 scope",
+        ),
+        (
+            serde_json::json!({ "name": "x", "book_key": "b1", "expires_at": "明年某天" }),
+            StatusCode::BAD_REQUEST,
+            "坏日期",
+        ),
+    ] {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_post("/api/api-keys", &boss_sid, body))
+            .await
+            .unwrap();
+        let st = r.status();
+        let got = body_string(r).await;
+        assert_eq!(st, want, "{why}：{got}");
+    }
+
+    // 合法 scope 能签发
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/api-keys",
+            &boss_sid,
+            serde_json::json!({ "name": "报表对接", "book_key": "b1", "scopes": "fin_report" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "{:?}", body_string(r).await);
 }
 
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖

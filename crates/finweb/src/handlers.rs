@@ -45,7 +45,13 @@ async fn api_auth_gate(
     next: axum::middleware::Next,
 ) -> Result<Response, AppError> {
     let path = req.uri().path();
+    // 开放 API（/api/v1/*）不走这条会话门禁：它的鉴权是 Bearer 密钥，
+    // 由各 v1 handler 里的 ApiCaller 自己完成——且**必须在**自己手里完成，
+    // 因为 API 密钥没有 cookie 也没有 CSRF 语义，套 session_of 只会把所有
+    // 合法的外部调用一律 401。豁免前缀而非逐个路径：将来加 v1 端点时
+    // 忘记在这里登记的概率，远大于新增路径被漏审的风险。
     if path.starts_with("/api/")
+        && !path.starts_with("/api/v1/")
         && path != "/api/health"
         && path != "/api/login"
         && path != "/api/logout"
@@ -84,12 +90,27 @@ async fn spa_fallback(
 /// 组装路由
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
+        // 开放 API（/api/v1/*）：Bearer 密钥鉴权，与浏览器那套 session+CSRF 完全隔离。
+        // merge 在同一层而非 nest：这些路径要绕开 api_auth_gate 的 session 门禁
+        // （见 api_auth_gate 里的前缀豁免），也绕开 csrf_guard（Bearer 不会由浏览器
+        // 自动携带，跨站表单也拿不到它，CSRF 对这种凭据不适用）。
+        .merge(crate::openapi::routes())
         .route("/api/setup/status", get(get_setup_status))
         // 平台账套目录：列表（按归属过滤）+ 自建账套 + 选择当前账套
         .route("/api/books", get(list_books).post(create_book))
         .route("/api/consolidate/preview", get(consolidate_preview))
         // 平台经营总览：跨账套 × 各业务域可视化（对标金蝶星空云「多组织集团管控视图」）
         .route("/api/platform/overview", get(platform_overview))
+        // 开放 API 密钥管理（仅平台管理员）。密钥本身属于**平台**资源而非账套资源，
+        // 所以放在账号库（realm）而不是某个账套的 SQLite 里——跨账套的统一管控。
+        .route(
+            "/api/api-keys",
+            get(crate::openapi::list_api_keys).post(crate::openapi::create_api_key),
+        )
+        .route(
+            "/api/api-keys/:id",
+            post(crate::openapi::toggle_api_key).delete(crate::openapi::delete_api_key),
+        )
         .route("/api/books/:key/select", post(select_book))
         .route("/api/books/:key", delete(delete_book))
         .route("/api/login", post(post_login))

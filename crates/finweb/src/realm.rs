@@ -74,6 +74,28 @@ CREATE TABLE IF NOT EXISTS realm_book (
     company         TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT ''
 );
+-- 开放 API 密钥（v1）：让 WMS / MES / 电商 / 银行 / 税务等外部系统能接进来。
+--
+-- 存哈希不存明文：数据库被读走也不能直接冒用密钥（与 password_hash 同理）。
+-- 只存哈希意味着**明文只在创建那一刻返回一次**，之后无法找回——这是刻意的，
+-- 宁可让用户重发一次，也不要留一个能被数据库 dump 带走的明文凭据。
+CREATE TABLE IF NOT EXISTS realm_api_key (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    -- 密钥前缀（形如 fbk_ab12cd），仅供界面辨认与定位，不参与鉴权
+    prefix       TEXT NOT NULL,
+    key_hash     TEXT NOT NULL,
+    -- 绑定的账套；空 = 平台级（可访问所有账套，只给平台管理员签发）
+    book_key     TEXT NOT NULL DEFAULT '',
+    -- 逗号分隔的权限码；空 = 只读
+    scopes       TEXT NOT NULL DEFAULT '',
+    disabled     INTEGER NOT NULL DEFAULT 0,
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    last_used_at TEXT NOT NULL DEFAULT '',
+    expires_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_realm_api_key_prefix ON realm_api_key(prefix);
 "#;
 
 /// 账号库（单进程内以 Mutex<Connection> 持有，WAL 模式下并发安全）
@@ -84,6 +106,59 @@ pub struct RealmDb {
 
 fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 开放 API 密钥的存储哈希（sha2-256，hex）
+///
+/// 用快哈希而不是 argon2：密钥是 32 字节 CSPRNG 随机值，熵高到无从「猜」，
+/// 慢哈希的防暴力破解意义在这里不存在；而鉴权在**每个请求**上都要跑一次，
+/// argon2 的 ~100ms 会让外部系统对接的吞吐直接崩掉。
+/// 真正防住「密钥泄露」的是存哈希不存明文——数据库被 dump 走也拿不到可用密钥。
+fn hash_api_secret(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(secret.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 密钥列表项（**不含哈希**，也不含明文——明文只在创建时返回一次）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ApiKeyInfo {
+    pub id: i64,
+    pub name: String,
+    pub prefix: String,
+    pub book_key: String,
+    pub scopes: String,
+    pub disabled: bool,
+    pub created_by: String,
+    pub created_at: String,
+    pub last_used_at: String,
+    pub expires_at: String,
+}
+
+/// 密钥鉴权通过后的身份
+#[derive(Clone, Debug)]
+pub struct ApiKeyAuth {
+    pub id: i64,
+    /// 密钥前缀：写审计时用来标识「是哪把密钥调的」，不泄露密钥本身
+    pub prefix: String,
+    /// 绑定的账套；空 = 平台级
+    pub book_key: String,
+    /// 逗号分隔的权限码；空 = 只读
+    pub scopes: String,
+}
+
+impl ApiKeyAuth {
+    /// 是否被授予某权限。空 scopes = 只读（只允许 Report 类只读端点）。
+    pub fn allows(&self, perm: &str) -> bool {
+        self.scopes
+            .split(',')
+            .map(|s| s.trim())
+            .any(|s| !s.is_empty() && s == perm)
+    }
+    pub fn is_readonly(&self) -> bool {
+        self.scopes.trim().is_empty()
+    }
 }
 
 impl RealmDb {
@@ -708,6 +783,177 @@ impl RealmDb {
             rusqlite::params![username],
             |r| r.get(0),
         )?)
+    }
+
+    // ---- 开放 API 密钥 ----
+
+    /// 签发一把密钥。**明文只在返回值里出现一次**，库里只留哈希。
+    ///
+    /// 明文为什么用 32 字节随机而不是可读的 token：密钥要能被外部系统长期持有
+    /// 在配置文件/环境变量里，不可读反而减少「被人瞄一眼」的机会；定位问题靠
+    /// `prefix` 字段，不是靠密钥本身。
+    pub fn api_key_create(
+        &self,
+        name: &str,
+        book_key: &str,
+        scopes: &str,
+        expires_at: &str,
+        who: &str,
+    ) -> DbResult<(i64, String)> {
+        let mut raw = [0u8; 32];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut raw);
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let secret = format!("fbk_{hex}");
+        // 存哈希：不能用 sha256 明文比（key 长度固定，直接哈希即可），也不存明文
+        let hash = hash_api_secret(&secret);
+        let prefix: String = secret.chars().take(12).collect();
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "INSERT INTO realm_api_key(name,prefix,key_hash,book_key,scopes,created_by,created_at,expires_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                name.trim(),
+                prefix,
+                hash,
+                book_key.trim(),
+                scopes.trim(),
+                who,
+                now(),
+                expires_at.trim()
+            ],
+        )?;
+        Ok((conn.last_insert_rowid(), secret))
+    }
+
+    pub fn api_key_list(&self) -> DbResult<Vec<ApiKeyInfo>> {
+        let conn = self.inner.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT id,name,prefix,book_key,scopes,disabled,created_by,created_at,last_used_at,expires_at
+             FROM realm_api_key ORDER BY id DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(ApiKeyInfo {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                prefix: r.get(2)?,
+                book_key: r.get(3)?,
+                scopes: r.get(4)?,
+                disabled: r.get::<_, i64>(5)? != 0,
+                created_by: r.get(6)?,
+                created_at: r.get(7)?,
+                last_used_at: r.get(8)?,
+                expires_at: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 把密钥表整表拼成文本，用���断言「库里没有明文」。
+    ///
+    /// 为什么用 dump 而不去查具体字段：`api_key_list` 已经在结构上排除了
+    /// 明文，用它来证明「没存明文」是循环论证。真正要验的是**表里那一列
+    /// 的实际内容**，所以直接把整行列出来——包括将来可能新增的列。
+    ///
+    /// 公开可见：集成测试（tests/api.rs）是独立 crate，拿不到 `#[cfg(test)]`
+    /// 的内部项，而「库里有没有明文」恰恰是最该被集成测试盯住的一条。
+    pub fn debug_dump_api_keys(&self) -> String {
+        let conn = self.inner.lock().unwrap();
+        let mut st = conn
+            .prepare("SELECT * FROM realm_api_key")
+            .expect("准备 dump 失败");
+        let cols: Vec<String> = st
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut out = cols.join("|");
+        out.push('\n');
+        let mut rows = st.query([]).expect("查询密钥表失败");
+        while let Some(row) = rows.next().expect("迭代密钥行失败") {
+            for (i, c) in cols.iter().enumerate() {
+                if i > 0 {
+                    out.push('|');
+                }
+                out.push_str(&format!("{c}={:?}", row.get::<_, rusqlite::types::Value>(i)));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 停用 / 启用（不物理删除：审计需要知道「曾经有过」）
+    pub fn api_key_set_disabled(&self, id: i64, disabled: bool) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE realm_api_key SET disabled=?2 WHERE id=?1",
+            rusqlite::params![id, disabled as i64],
+        )?;
+        if n == 0 {
+            return Err(fincore::FinError::not_found("密钥不存在").into());
+        }
+        Ok(())
+    }
+
+    pub fn api_key_delete(&self, id: i64) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute("DELETE FROM realm_api_key WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// 校验一把密钥，返回其身份。**每次调用都重新算哈希**——
+    /// 密钥用哈希存，鉴权就只能靠比对哈希，没法像 session 那样查表比对明文。
+    ///
+    /// 顺带更新 `last_used_at`：排查「到底是谁在调」时唯一的线索。
+    pub fn api_key_verify(&self, secret: &str) -> DbResult<Option<ApiKeyAuth>> {
+        if !secret.starts_with("fbk_") || secret.len() < 20 {
+            return Ok(None);
+        }
+        let hash = hash_api_secret(secret);
+        let conn = self.inner.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id,prefix,book_key,scopes,disabled,expires_at FROM realm_api_key WHERE key_hash=?1",
+                rusqlite::params![hash],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, prefix, book_key, scopes, disabled, expires)) = row else {
+            return Ok(None);
+        };
+        if disabled != 0 {
+            return Ok(None);
+        }
+        // 过期判断：expires_at 非空且已过 → 失效。空 = 永不过期。
+        if !expires.trim().is_empty() {
+            if let Ok(exp) = chrono::NaiveDateTime::parse_from_str(expires.trim(), "%Y-%m-%d %H:%M:%S") {
+                if exp < chrono::Local::now().naive_local() {
+                    return Ok(None);
+                }
+            }
+        }
+        let _ = conn.execute(
+            "UPDATE realm_api_key SET last_used_at=?2 WHERE id=?1",
+            rusqlite::params![id, now()],
+        );
+        Ok(Some(ApiKeyAuth {
+            id,
+            prefix,
+            book_key,
+            scopes,
+        }))
     }
 
     /// 统计该用户名当前出现在多少个账套的用户表中（含自建账套）。

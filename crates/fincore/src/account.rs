@@ -665,8 +665,18 @@ pub struct BookOptions {
     pub enable_qty: bool,
     /// 启用外币核算
     pub enable_foreign: bool,
-    /// 启用审核环节（未记账 → 已审核 → 已记账）。默认关闭：录入核对后直接记账。
-    /// 旧账套没有该字段时按关闭处理。
+    /// 启用审核环节（未记账 → 已审核 → 已记账）。
+    ///
+    /// 默认**开启**（对标金蝶云·星空默认流程 + 会计内控底线）：制单、审核、记账
+    /// 三权分离是账务系统最基本的一道内控，默认关等于「谁录的单谁就能记」，账一
+    /// 旦记错只能靠事后反结转补救。
+    ///
+    /// 代价是制单→记账从 2 步变 3 步，小微/单账套用户会觉得多一步摩擦，可以在
+    /// 账套参数里关掉——但**新建账套不再默认关**，要关得显式选，是一次有意识的
+    /// 决定而不是继承来的默认值。
+    ///
+    /// 旧账套没有该字段时按关闭处理（`#[serde(default)]`），不追溯改存量账套的
+    /// 工作流——那等于单方面改变他们已经习惯的操作顺序，且在途单据会卡住。
     #[serde(default)]
     pub enable_audit: bool,
     /// 出纳签字前置（可选，默认关闭）：开启后**涉及现金/银行科目**的凭证须出纳签字才能记账。
@@ -730,7 +740,8 @@ impl Default for BookOptions {
             tax_no: String::new(),
             enable_qty: false,
             enable_foreign: false,
-            enable_audit: false,
+            // 审核环节默认开（三权分离）；要关得在账套参数里显式关，是一次有意识的决定
+            enable_audit: true,
             require_cashier: false,
             require_audit: true,
             biz_accounts: BizAccounts::default(),

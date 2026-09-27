@@ -4,6 +4,16 @@ const { newBook } = require("../helpers");
 test("数据导入：缺失科目映射后导入凭证", async ({ page }) => {
   await newBook(page, `E2E导入${Date.now()}`);
   await page.click('.nav-item[data-view="imports"]');
+  // 视图是异步渲染的：必须等控件真的在 DOM 里再操作。
+  // 少了这个等待，selectOption/fill 会在控件出现前执行，事件监听器尚未绑定，
+  // 点「预检」无人应答，#imp-result 停在空串——看起来像产品 bug，其实是时序。
+  await expect(page.locator("#imp-kind")).toBeVisible({ timeout: 15_000 });
+  // 等 viewImports 的监听器真正绑好。
+  // viewImports 是 async：先 innerHTML，再 `await api("/accounts")`，**之后**才 addEventListener。
+  // 所以「#imp-kind 可见」不等于「按钮能点」——此刻点「预检」可能无人应答，#imp-result 停在空串。
+  // 等待信号用 #imp-text 的 placeholder：syncKind() 绑定后立刻写入列头说明，
+  // 而 innerHTML 模板里 textarea 是没有 placeholder 的。
+  await expect(page.locator("#imp-text")).toHaveAttribute("placeholder", /./, { timeout: 15_000 });
   await page.selectOption("#imp-kind", "voucher");
   await page.selectOption("#imp-template", "generic");
   await page.fill(

@@ -1,5 +1,5 @@
 const { test, expect } = require("@playwright/test");
-const { newBook, postVoucher } = require("../helpers");
+const { newBook, postVoucher, auditAllDrafts } = require("../helpers");
 
 test("往来核销：两笔应收/收款自动核销→账龄→核销记录", async ({ page }) => {
   await newBook(page, `E2E核销${Date.now()}`);
@@ -47,7 +47,13 @@ test("期末处理：结转损益→记账→结账，期间状态推进", async
       { code: "1001", summary: "办公费", credit: "100" },
     ],
   });
+  // 结转损益生成的凭证同样要走审核 → 记账（新建账套的审核环节默认开）
   await page.locator("#v-table tbody [data-edit]").first().click();
+  await expect(page.locator("#v-audit")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-audit");
+  await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
+  await page.locator("#v-table tbody [data-edit]").first().click();
+  await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 10_000 });
 
@@ -58,7 +64,12 @@ test("期末处理：结转损益→记账→结账，期间状态推进", async
   // 结转凭证已生成但未记账 → 预检查应提示存在未记账凭证
   await expect(page.locator("#pe-issues")).toContainText("未记账", { timeout: 10_000 });
 
-  // 结转生成的凭证未记账：批量记账后才能结账
+  // 结转生成的凭证未记账：审核 + 批量记账后才能结账。
+  //
+  // 批量记账（/vouchers/batch-post）与单张 post 共用同一道审核闸门，所以必须先把
+  // 结转凭证审核掉。之前这里直接点「批量记账」，结果第一张（已审核过）记上了、
+  // 结转那张（未审核）被拒，页面上仍留一条「未记账」——看起来像结账流程坏了。
+  await auditAllDrafts(page, "202601");
   await page.click('.nav-item[data-view="vouchers"]');
   await page.check("#v-all");
   await page.click("#v-batch");

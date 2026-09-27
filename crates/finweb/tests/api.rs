@@ -32,6 +32,13 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     std::fs::create_dir_all(&books_dir).expect("建账套目录失败");
     let opts = BookOptions {
         start_period: fincore::Period::new(2026, 1).unwrap(),
+        // 测试夹具显式关掉审核环节：绝大多数用例的主题是银行对账 / 核销 / 账龄 /
+        // 报表，不是审核闸门，给它们统一加上「审核 + 记账」两步只会淹没真正的主题。
+        //
+        // 生产默认值是**开**（三权分离，见 fincore::account::BookOptions 文档），
+        // 由 `audit_default_on_for_new_books` / `audit_gate_blocks_post_until_audited`
+        // 两个用例专门盯住默认行为与闸门语义——夹具关掉不等于默认关掉。
+        enable_audit: false,
         ..Default::default()
     };
     let book_path = books_dir.join("b1.fbk");
@@ -3704,6 +3711,16 @@ async fn consolidate_books() {
     let vid2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
         .as_i64()
         .unwrap();
+    // b2 走生产建账路径 → 审核环节默认开，记账前必须先审核（与 b1 夹具不同）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid2}/audit"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "b2 审核");
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             &format!("/api/vouchers/{vid2}/post"),
@@ -5389,6 +5406,116 @@ async fn workflow_template_apply_and_reject_mismatch() {
         list["rows"].as_array().unwrap().iter().any(|x| x["biz_type"] == "claim"),
         "模板落地的流程应出现在列表里"
     );
+}
+
+/// 审核环节默认开（对标金蝶星空 + 会计内控底线：制单/审核/记账三权分离）。
+///
+/// 锁两件事：① 通过生产建账接口创建的账套，审核环节默认是**开**的
+///         ② 默认配置下「草稿直接记账」被拒，必须先审核
+///
+/// 这两个用例是 api.rs 夹具显式 `enable_audit: false` 的正当性来源——夹具关掉
+/// 是为了让别的用例专注自己的主题，默认值本身由这里盯住。
+#[tokio::test]
+async fn audit_default_on_for_new_books() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+
+    // 生产路径：POST /api/books 建的新账套
+    let (status, body) = create_book(&state, &admin_sid, "默认审核").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &admin_sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let o: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        o["enable_audit"], true,
+        "新建账套的审核环节必须默认开启（制单/审核/记账三权分离）"
+    );
+    // 出纳签字仍默认关：它是资金域节点，不是全行业默认（见 settle.rs 口径说明）
+    assert_eq!(
+        o["require_cashier"], false,
+        "出纳签字不设全行业默认，需要时在账套参数显式开"
+    );
+}
+
+/// 默认配置下审核是硬闸门：未审核不能记账；审核后可以；且错误信息要说清下一步。
+#[tokio::test]
+async fn audit_gate_blocks_post_until_audited() {
+    let (state, _bd, _dir) = test_state();
+    let (_, admin_sid) = login(&state, "boss", "Admin!2026").await;
+    let (status, body) = create_book(&state, &admin_sid, "审核闸门").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let key = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(select_book(&state, &admin_sid, &key).await, StatusCode::OK);
+
+    // 录一张草稿凭证（对方科目用 1001 库存现金，无需辅助核算）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &admin_sid,
+            serde_json::json!({
+                "id": 0, "period": 202601, "date": "2026-01-10", "word": "记", "no": 1,
+                "attachments": 0, "memo": "审核闸门用例",
+                "entries": [
+                    { "line": 1, "account_code": "112201", "summary": "应收", "debit": "1000", "credit": "0",
+                      "aux": { "customer": "C01" } },
+                    { "line": 2, "account_code": "1001", "summary": "收现", "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let vid: i64 = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 草稿直接记账 → 400，且提示要先审核
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &admin_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "未审核不应能记账");
+    let msg = body_string(r).await;
+    assert!(
+        msg.contains("审核"),
+        "错误信息应指向「先审核」这个下一步动作，而不是只说失败：{msg}"
+    );
+
+    // 审核通过后再记账 → 200
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/audit"),
+            &admin_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "审核应成功");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &admin_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "审核后应能记账");
 }
 
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖

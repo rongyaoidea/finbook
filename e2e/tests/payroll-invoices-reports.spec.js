@@ -64,7 +64,9 @@ test("自定义报表：建表保存→按期间生成取数", async ({ page }) 
   });
   // H-3：自定义报表 QM/LFS 按已记账取数，先记账
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`)).status()).toBe(200);
+  // 默认账套开着审核环节：先审核再记账
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/audit`, { data: {} })).status()).toBe(200);
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`, { data: {} })).status()).toBe(200);
 
   await page.click('.nav-item[data-view="custom-reports"]');
   await page.click("#cr-new");
@@ -88,7 +90,13 @@ test("期末对账：试算平衡通过", async ({ page }) => {
       { code: "2001", summary: "对账", credit: "100" },
     ],
   });
+  // 试算平衡只看已记账，凭证要走审核 → 记账（新建账套的审核环节默认开）
   await page.locator("#v-table tbody [data-edit]").first().click();
+  await expect(page.locator("#v-audit")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-audit");
+  await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
+  await page.locator("#v-table tbody [data-edit]").first().click();
+  await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 10_000 });
 

@@ -35,10 +35,20 @@ test("会计月度闭环：建账→录凭证→记账→结账→报表", async
   // 摘要/日期校验失败时弹窗不会关闭：先确认保存成功
   await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
 
-  // 打开刚保存的凭证并记账
+  // 打开刚保存的凭证，走完整流程：审核 → 记账
+  //
+  // 新建账套的审核环节**默认开**（三权分离），所以「记账」按钮只对已审核凭证显示
+  // （见 app.js openVoucher 的 canPost）。这里刻意点两次而不是直接调 API：
+  // 这样才真的验到「未审核不给记账按钮、审核后才给」这条 UI 行为。
   const openBtn = page.locator("#v-table tbody [data-edit]").first();
   await expect(openBtn).toBeVisible({ timeout: 10_000 });
   await openBtn.click();
+  await expect(page.locator("#v-audit")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-audit");
+  await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
+
+  await page.locator("#v-table tbody [data-edit]").first().click();
+  await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });
 

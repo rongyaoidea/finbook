@@ -18,6 +18,11 @@ async function seed(page) {
     ],
   });
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
+  // 审核环节默认开：先审核，再走批量记账（batch-post 与 post 共用同一道闸门）
+  for (const v of list) {
+    const a = await page.request.post(`/api/vouchers/${v.id}/audit`, { data: {} });
+    expect(a.ok(), `审核凭证 ${v.id} 应成功`).toBeTruthy();
+  }
   const resp = await page.request.post("/api/vouchers/batch-post", {
     data: { ids: list.map((v) => v.id) },
   });

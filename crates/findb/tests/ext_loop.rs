@@ -31,6 +31,9 @@ fn d(y: i32, mo: u32, day: u32) -> NaiveDate {
 fn db() -> Db {
     let opts = BookOptions {
         start_period: Period::new(2026, 1).unwrap(),
+        // 集成测试在 crate 外，拿不到 findb::tests::test_opts()（pub(crate)）。
+        // 审核默认「开」由 findb 内的 audit_default_blocks_direct_post 盯住。
+        enable_audit: false,
         ..BookOptions::default()
     };
     Db::in_memory(&opts).unwrap()

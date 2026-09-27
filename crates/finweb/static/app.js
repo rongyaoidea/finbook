@@ -373,6 +373,7 @@ async function enterBook(key, name) {
   try {
     await api(`/books/${encodeURIComponent(key)}/select`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     state.bookKey = key;
+    state.bookOptions = null; // 换账套必须重新拉，不能沿用上一套的审核/出纳开关
     const me = await api("/me");
     session.user = me;
     shellBuilt = false; // 身份从平台层切换为账套层，顶栏与侧边栏需重建
@@ -439,6 +440,14 @@ async function afterLogin() {
     state.periods = p.list || [];
     state.current = p.current;
   } catch (e) {}
+  // 账套参数：凭证弹窗的「记账」按钮要按 enable_audit 决定给不给（见 openVoucher）。
+  // 拿不到就退回 null，前端按「未开审核」处理——顶多按钮亮着被后端拒，
+  // 不会把按钮错误地藏掉。
+  try {
+    state.bookOptions = await api("/options");
+  } catch (e) {
+    state.bookOptions = null;
+  }
   state.view = "dashboard";
   render();
   // 未建账（尚未设置公司名）→ 弹出建账向导
@@ -1796,7 +1805,12 @@ async function openVoucherEditor(id, seedEntries) {
   }
   // 可编辑状态与后端 can_edit() 对齐：未记账（含历史"已审核"）可改；已记账需先反记账
   const editable = (id === 0) || status === "draft" || status === "audited";
-  const canPost = status === "draft" || status === "audited";
+  // 「记账」按钮必须与后端闸门口径一致：**账套开着审核环节时，草稿不能记账**
+  // （voucher_post 会返回 400「请先审核凭证再记账」）。早先这里只看 status，
+  // 审核环节默认开启后仍给未审核的草稿显示「记账」，用户一点就被拒——按钮亮着
+  // 却用不了，是最容易被当成 bug 的一种 UX。
+  const auditOn = !!(state.bookOptions && state.bookOptions.enable_audit);
+  const canPost = auditOn ? status === "audited" : (status === "draft" || status === "audited");
   const mask = modal(`
     <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}${v.cashier ? `　出纳:${esc(v.cashier)}` : ""}</span></h3>
     <div class="toolbar">
@@ -2258,6 +2272,12 @@ async function viewImports(main) {
   // 加载科目列表供映射下拉
   let accounts = [];
   try { accounts = await api("/accounts"); } catch (e) {}
+  // 异步竞态守卫：本次 await 期间用户可能已切走（renderMain 会换掉整个 #main 节点）。
+  // 此时本次调用若继续往下绑监听器，`$("#imp-xxx")` 走的是 document 全局查询，会绑到
+  // **新视图的同名元素**上；而新视图自己也会绑一遍。轻则事件触发两次，重则两边都绑到
+  // 已卸载的游离节点、页面按钮彻底失灵（点「预检」毫无反应）。
+  // 判据：本次视图的 #main 仍在文档里，才说明我们仍是当前视图。
+  if (!main.isConnected) return;
   const acctOpts = (sel) => accounts.map((a) => `<option value="${esc(a.code)}" ${sel === a.code ? "selected" : ""}>${esc(a.code)} ${esc(a.name)}</option>`).join("");
 
   // Excel 文件 → base64

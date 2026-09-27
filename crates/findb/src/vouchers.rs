@@ -1085,6 +1085,47 @@ mod tests {
     use super::*;
     use crate::tests::mem;
 
+    /// 审核环节默认**开**（对标金蝶云·星空 + 会计内控底线：制单/审核/记账三权分离）。
+    ///
+    /// 这个用例是 `crate::tests::mem()` 显式 `enable_audit = false` 的正当性来源：
+    /// 夹具为了让别的用例专注各自主题而关掉审核，默认值本身必须有人盯住，否则
+    /// 「默认关」和「测试方便」就永远分不清了。
+    ///
+    /// 三段都要验：
+    /// ① `BookOptions::default()` 就是开的
+    /// ② 默认账套下草稿直接记账被拒，且错误信息指向「先审核」这个下一步
+    /// ③ 审核通过后可以记账（闸门不是死路）
+    #[test]
+    fn audit_default_blocks_direct_post() {
+        // ① 默认值
+        let d = fincore::BookOptions::default();
+        assert!(
+            d.enable_audit,
+            "审核环节必须默认开启：默认关等于「谁录的单谁就能记」，三权分离形同虚设"
+        );
+        assert!(
+            !d.require_cashier,
+            "出纳签字不是全行业默认（只对资金类有意义），应保持关闭待显式开启"
+        );
+
+        // ② 默认账套：草稿直接记账被拒
+        let o = fincore::BookOptions {
+            start_period: Period::new(2026, 1).unwrap(),
+            ..Default::default()
+        };
+        let db = crate::Db::in_memory(&o).unwrap();
+        // sample() 已是借贷平衡的完整凭证（借 1001 库存现金 / 贷 100201 银行存款）
+        let mut v = sample(Period::new(2026, 1).unwrap(), 10, 1);
+        let id = save(&db, &mut v).unwrap();
+        let err = post(&db, id, "u").unwrap_err().to_string();
+        assert!(err.contains("审核"), "错误信息应指向「先审核」：{err}");
+
+        // ③ 审核后可记（闸门不是死路）
+        audit(&db, id, "auditor").unwrap();
+        post(&db, id, "u").unwrap();
+        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Posted);
+    }
+
     fn sample(period: Period, day: u32, no: i32) -> Voucher {
         let d = NaiveDate::from_ymd_opt(period.year(), period.month(), day).unwrap();
         let mut v = Voucher::new(period, d, "记", no);

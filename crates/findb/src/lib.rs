@@ -591,18 +591,37 @@ pub fn escape_like(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 测试用账套：固定启用期间为 2026 年 1 月，避免依赖当前系统时间
+    /// 测试用账套参数（所有测试夹具的唯一来源）
+    ///
+    /// 为什么要有这个函数：审核环节的生产默认值是**开**（`BookOptions::enable_audit`，
+    /// 三权分离），但 findb 下有 8 处各自为政的本地夹具（`mem()`、以及
+    /// advanced/automation/bank/funds/mgmt/settle 里的 `tmpdb()`），它们都直接用
+    /// `BookOptions::default()`。默认值一翻，这 8 处会各自炸一遍，还得逐个加
+    /// `enable_audit = false` —— 8 份重复代码，以后必然漂移。
+    ///
+    /// 统一到这里，并在此处写清**为什么测试要关、生产默认要开**：
+    /// - 生产开：默认关等于「谁录的单谁就能记」，制单/审核/记账三权分离形同虚设。
+    /// - 测试关：这些用例的主题是结转、调汇、报表、核销、口径断言，不是审核
+    ///   闸门。给每个补一步「审核」只会淹没真正要测的东西，还会让失败报错离病因
+    ///   十万八千里。
+    /// - 默认值本身由 `vouchers::tests::audit_default_blocks_direct_post` 盯住，
+    ///   finweb 侧由 `audit_default_on_new_books` 盯住。**夹具关掉不等于默认关掉。**
+    pub(crate) fn test_opts() -> BookOptions {
+        BookOptions {
+            start_period: fincore::Period::new(2026, 1).unwrap(),
+            enable_audit: false,
+            ..Default::default()
+        }
+    }
+
+    /// 测试用账套：内存库
     pub(crate) fn mem() -> Db {
-        let mut o = BookOptions::default();
-        o.start_period = fincore::Period::new(2026, 1).unwrap();
-        Db::in_memory(&o).unwrap()
+        Db::in_memory(&test_opts()).unwrap()
     }
 
     /// 测试用账套：不内置管理员，用于「首次登录即管理员」流程测试
     pub(crate) fn mem_no_admin() -> Db {
-        let mut o = BookOptions::default();
-        o.start_period = fincore::Period::new(2026, 1).unwrap();
-        Db::in_memory_no_admin(&o).unwrap()
+        Db::in_memory_no_admin(&test_opts()).unwrap()
     }
 
     #[test]

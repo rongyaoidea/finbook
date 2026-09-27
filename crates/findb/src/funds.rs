@@ -1763,7 +1763,7 @@ mod tests {
     fn tmpdb(name: &str) -> Db {
         let p = std::env::temp_dir().join(format!("finbook_fund_{name}.fbk"));
         let _ = std::fs::remove_file(&p);
-        Db::create(&p, &fincore::BookOptions::default()).unwrap()
+        Db::create(&p, &crate::tests::test_opts()).unwrap()
     }
     fn d(y: i32, mo: u32, dd: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, mo, dd).unwrap()

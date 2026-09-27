@@ -1116,7 +1116,7 @@ mod tests {
     fn tmpdb(name: &str) -> Db {
         let p = std::env::temp_dir().join(format!("finbook_settle_{name}.fbk"));
         let _ = std::fs::remove_file(&p);
-        Db::create(&p, &fincore::BookOptions::default()).unwrap()
+        Db::create(&p, &crate::tests::test_opts()).unwrap()
     }
 
     /// 建一张已记账的往来凭证

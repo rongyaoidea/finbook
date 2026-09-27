@@ -49,7 +49,9 @@ test("辅助/数量凭证、附件上传与数量金额账", async ({ page }) =>
 
   // H-3：数量金额账只统计已记账，先记账再查报表
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`)).status()).toBe(200);
+  // 默认账套开着审核环节：先审核再记账
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/audit`, { data: {} })).status()).toBe(200);
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`, { data: {} })).status()).toBe(200);
 
   // 数量金额账能出数
   await page.click('.nav-item[data-view="reports"]');

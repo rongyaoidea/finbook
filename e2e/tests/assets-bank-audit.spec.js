@@ -30,7 +30,9 @@ test("银行对账：导入对账单→自动勾对→余额调节表一致", as
   });
   // H-3：余额与报表只统计已记账，先记账再对账
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`)).status()).toBe(200);
+  // 默认账套开着审核环节：先审核再记账
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/audit`, { data: {} })).status()).toBe(200);
+  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`, { data: {} })).status()).toBe(200);
 
   await page.click('.nav-item[data-view="bank"]');
   await page.fill("#bk-acct", "100201");

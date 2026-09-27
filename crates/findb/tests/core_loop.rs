@@ -73,6 +73,10 @@ fn t01_book_seeded() {
     let opts = BookOptions {
         company: "示例科技有限公司".to_string(),
         start_period: p1(),
+        // 集成测试在 crate 外，拿不到 findb::tests::test_opts()（pub(crate)）。
+        // 本文件用例的主题是建账/凭证/账簿/结账主链路，不是审核闸门；
+        // 审核默认「开」由 findb 内的 audit_default_blocks_direct_post 盯住。
+        enable_audit: false,
         ..BookOptions::default()
     };
     let db = Db::in_memory(&opts).unwrap();
@@ -105,7 +109,7 @@ fn t01_book_seeded() {
 
 #[test]
 fn t02_account_rules() {
-    let db = Db::in_memory(&BookOptions::default()).unwrap();
+    let db = Db::in_memory(&BookOptions { enable_audit: false, ..Default::default() }).unwrap();
     let chart = accounts::chart(&db).unwrap();
 
     // 非末级科目不能记账
@@ -168,6 +172,8 @@ fn book() -> (Db, Chart) {
         company: "示例科技有限公司".to_string(),
         start_period: p1(),
         require_audit: true,
+        // 同上：集成测试显式关审核，专注主链路
+        enable_audit: false,
         ..BookOptions::default()
     };
     let db = Db::in_memory(&opts).unwrap();

@@ -57,6 +57,27 @@ pub fn link_add(
     Ok(())
 }
 
+/// [`link_add`] 的事务内版本：写入调用方的事务，**不自行 commit**。
+///
+/// 供「改状态 + 建勾稽边」这类必须原子的场景用（如到岸成本过账）：
+/// 边建在事务外的话，提交后建边失败就留下一张「已过账但查不到来源单据」的单。
+pub fn link_add_in(
+    conn: &rusqlite::Connection,
+    src_type: &str,
+    src_id: i64,
+    dst_type: &str,
+    dst_id: i64,
+    memo: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO doc_link(src_type,src_id,dst_type,dst_id,memo,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(src_type,src_id,dst_type,dst_id) DO NOTHING",
+        rusqlite::params![src_type, src_id, dst_type, dst_id, memo, now()],
+    )?;
+    Ok(())
+}
+
 /// 是否已存在某类下游边（下推幂等检查：同源单同目标类型只允许一条）
 pub fn has_link(db: &Db, src_type: &str, src_id: i64, dst_type: &str) -> DbResult<bool> {
     let n: i64 = db.conn().query_row(

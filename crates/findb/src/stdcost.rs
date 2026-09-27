@@ -53,6 +53,13 @@ pub struct ItemVariance {
     /// 入库数量 / 金额（金额为正）
     pub in_qty: Money,
     pub in_amount: Money,
+    /// 本期到岸成本（运费/关税等，已计入 in_amount）
+    ///
+    /// 单独返回是为了**能解释差异**：只看到一个「采购价格差异 -5000」，
+    /// 用户无从判断是货价便宜了还是运费忘了算。
+    pub landed_cost: Money,
+    /// 其他成本调整（盘点差异、成本结转调整等，已计入 in_amount）
+    pub other_adjust: Money,
     /// 实际入库加权单价
     pub actual_unit: Money,
     /// 入库价格差异 = (实际单价 − 标准单价) × 入库数量。正=买贵，负=买便宜
@@ -122,6 +129,9 @@ pub fn variance_report(db: &Db, period: fincore::Period) -> DbResult<VarianceRep
 
         let (mut in_qty, mut in_amount) = (Money::ZERO, Money::ZERO);
         let (mut out_qty, mut out_amount) = (Money::ZERO, Money::ZERO);
+        // 成本调整（qty=0、只有金额）：到岸成本、盘点差异、成本结转调整都走这里。
+        // 它们**不加数量、但确实加成本**，所以必须并入成本口径。
+        let (mut landed_amount, mut other_adjust) = (Money::ZERO, Money::ZERO);
         let mut move_ids: Vec<i64> = Vec::new();
         for m in list {
             if m.qty.is_positive() {
@@ -130,11 +140,23 @@ pub fn variance_report(db: &Db, period: fincore::Period) -> DbResult<VarianceRep
             } else if m.qty.is_negative() {
                 out_qty += -m.qty;
                 out_amount += m.amount; // 出库流水金额记的是负数成本
+            } else if m.kind == crate::business::StockKind::Adjust {
+                // 区分开是为了能说清差异里有多少是到岸成本、多少是其他调整 ——
+                // 混成一个数，用户看到「超支 3 万」也不知道钱花在哪。
+                if m.memo.contains("到岸成本") {
+                    landed_amount += m.amount;
+                } else {
+                    other_adjust += m.amount;
+                }
             }
             if !m.amount.is_zero() {
                 move_ids.push(m.id);
             }
         }
+        // 到岸成本计入成本口径：**不加它，差异表算出来的「节约」是假的** ——
+        // 货价便宜 5%、运费贵 20% 时，不含运费的差异表会显示节约，
+        // 实际成本反而更高，而表面上数字完全正常。
+        in_amount += landed_amount + other_adjust;
 
         // 出库实际成本：出库流水回写的 amount 就是该存货按其**自身**计价方法
         // 算出的成本（stock_summary 已按配置方法回写），直接取用。
@@ -174,6 +196,8 @@ pub fn variance_report(db: &Db, period: fincore::Period) -> DbResult<VarianceRep
             ref_cost,
             in_qty,
             in_amount,
+            landed_cost: landed_amount,
+            other_adjust,
             actual_unit,
             price_variance,
             out_qty,
@@ -285,6 +309,29 @@ mod tests {
 
     fn set_std(db: &Db, item: &str, std: &str) {
         crate::business::item_cost_method_set(db, item, Some("standard"), m(std)).unwrap();
+    }
+
+    /// 造一条成本调整流水（qty=0、只有金额）——到岸成本就走这条路径
+    fn mv_adjust(db: &Db, item: &str, amount: &str, memo: &str) {
+        static SEQ: AtomicI64 = AtomicI64::new(1);
+        stock_insert(
+            db,
+            &StockMove {
+                id: 0,
+                period: Period::new(2026, 1).unwrap(),
+                biz_date: d(2026, 1, 6 + (SEQ.fetch_add(1, Ordering::SeqCst) as u32) % 10),
+                kind: StockKind::Adjust,
+                item: item.into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: Money::ZERO,
+                price: Money::ZERO,
+                amount: m(amount),
+                voucher_id: None,
+                memo: memo.into(),
+            },
+        )
+        .unwrap();
     }
 
     /// 标准成本必须真的生效：设 7 元标准价，引擎出 5 件必须是 35，而不是移动加权价
@@ -488,6 +535,79 @@ mod tests {
             "没配逐存货方式的应跟随全局方法：{}",
             s2.out_amount
         );
+    }
+
+    /// 到岸成本必须计入采购价格差异的成本口径
+    ///
+    /// 回归背景：这一条是到岸成本模块存在的**全部理由**。到岸成本以
+    /// `kind=adjust`（qty=0、只有金额）落库，而差异表原来只把 `qty > 0` 的
+    /// 入库行算进 `in_amount` —— 于是运费/关税被完全排除在成本之外。
+    ///
+    /// 后果极其隐蔽：货价便宜 5%、运费贵 20% 时，差异表显示**节约**，
+    /// 实际成本反而更高；而且数字完整、有正有负、能排序、合计能加，
+    /// 只有跟总账对运费时才会发现。所以这里用「货价便宜 + 运费贵」的组合
+    /// 来钉：结论必须从「节约」翻转成「超支」。
+    #[test]
+    fn landed_cost_flips_purchase_variance_from_saving_to_overspend() {
+        let db = mem();
+        let p = fincore::Period::new(2026, 1).unwrap();
+        // 货价便宜：实际入库价 6 < 标准 7 → 不含运费时是「节约」1 × 100 = 100
+        mv(&db, StockKind::Purchase, "M001", "100", "6");
+        set_std(&db, "M001", "7");
+        // 到岸成本 500（运费/关税），以 adjust 行落库
+        mv_adjust(&db, "M001", "500", "到岸成本 LC2026010001 分摊");
+        crate::business::stock_summary(&db, p, CostMethod::Standard).unwrap();
+
+        let r = variance_report(&db, p).unwrap();
+        let row = r.rows.iter().find(|x| x.item == "M001").unwrap();
+
+        assert_eq!(row.in_amount, m("1100"), "600 货款 + 500 运费 = 1100 成本");
+        assert_eq!(row.landed_cost, m("500"), "到岸成本要单列出来供解释差异");
+        assert_eq!(row.actual_unit, m("11"), "实际单价 1100 / 100 = 11");
+        assert_eq!(
+            row.price_variance,
+            m("400"),
+            "含运费后是超支 4 元 × 100 = 400 —— 不含运费时会误报成「节约 100」"
+        );
+        assert_eq!(r.total_price, m("400"));
+    }
+
+    /// 反向守卫：不含到岸成本时确实会算成「节约」——证明上面那条断言有鉴别力
+    #[test]
+    fn without_landed_cost_the_same_case_looks_like_a_saving() {
+        let db = mem();
+        let p = fincore::Period::new(2026, 1).unwrap();
+        mv(&db, StockKind::Purchase, "M001", "100", "6");
+        set_std(&db, "M001", "7");
+        crate::business::stock_summary(&db, p, CostMethod::Standard).unwrap();
+
+        let r = variance_report(&db, p).unwrap();
+        let row = r.rows.iter().find(|x| x.item == "M001").unwrap();
+        assert!(
+            row.price_variance.is_negative(),
+            "不含运费时是「节约」——这正是上一条用例要修的错误结论：{}",
+            row.price_variance
+        );
+        assert_eq!(row.price_variance, m("-100"), "货价便宜 1 元 × 100");
+    }
+
+    /// 非到岸成本的调整（盘点差异）也要计入，但要和到岸成本分开报
+    #[test]
+    fn non_landed_adjustments_are_included_but_separated() {
+        let db = mem();
+        let p = fincore::Period::new(2026, 1).unwrap();
+        mv(&db, StockKind::Purchase, "M001", "100", "7"); // 正好等于标准
+        set_std(&db, "M001", "7");
+        mv_adjust(&db, "M001", "300", "到岸成本 LC2026010001 分摊");
+        mv_adjust(&db, "M001", "-50", "盘点差异调整");
+        crate::business::stock_summary(&db, p, CostMethod::Standard).unwrap();
+
+        let r = variance_report(&db, p).unwrap();
+        let row = r.rows.iter().find(|x| x.item == "M001").unwrap();
+        assert_eq!(row.landed_cost, m("300"), "到岸成本单列");
+        assert_eq!(row.other_adjust, m("-50"), "其他调整单列，方向保留");
+        assert_eq!(row.in_amount, m("950"), "700 + 300 − 50 = 950");
+        assert_eq!(row.price_variance, m("250"), "(9.5 − 7) × 100");
     }
 
     /// 仓库里有**两个互不相干的"标准成本"**，不一致必须报出来

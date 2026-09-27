@@ -46,7 +46,7 @@ test("成本核算：配置计价方式→期末结价试算", async ({ page }) 
   await newBook(page, `E2E成本${Date.now()}`);
   // 造一笔入库流水，期末结价才有数据
   const resp = await page.request.post("/api/inventory/adjust", {
-    data: { period: 202601, date: "2026-01-10", item: "140301", delta: "5", memo: "E2E" },
+    data: { period: 202601, date: "2026-01-10", item: "140301", qty: "5", delta: "40", memo: "E2E" },
   });
   expect(resp.ok(), "入库调整应成功").toBeTruthy();
 

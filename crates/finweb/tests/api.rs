@@ -7465,6 +7465,337 @@ async fn atp_endpoint_excludes_qc_pending_and_draft() {
     );
 }
 
+/// 到岸成本全链：建采购单→入库→录入运费→过账→存货金额被抬高、凭证出
+///
+/// 这是到岸成本模块存在的理由：不摊运费，存货估值偏低、销售成本低估，
+/// **而且「采购价格差异」会算歪** —— 货价便宜、运费贵，差异表却显示「节约」。
+#[tokio::test]
+async fn landed_cost_end_to_end() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+
+    // 存货 100 件 × 8 元 → 结存价值 800
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("100").unwrap();
+        let p = fincore::Money::parse("8").unwrap();
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140301".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+    }
+    // 造一张已收货的采购订单
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-03", "status": "Confirmed",
+                "supplier_code": "S001", "supplier_name": "供应商甲",
+                "lines": [{
+                    "item_code": "140301", "item_name": "材料甲",
+                    "qty_ordered": "100", "unit_price": "8", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "建采购订单应成功：{b}");
+    let po_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .expect("应返回采购订单 id");
+    // 记一笔到货（让 fetch_lines_from_po 有已收货行）
+    {
+        let db = state.db_for("b1").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id, period, date, qty, memo) VALUES(?1,202601,'2026-01-05',100,'')",
+                [po_id],
+            )
+            .unwrap();
+    }
+
+    // 从采购订单取行：只列已收货的
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/landed-cost/from-po?po_id={po_id}"),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let from_po: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let rows = from_po["rows"].as_array().expect("rows 应是数组");
+    assert_eq!(rows.len(), 1, "已收货 100 件应能取到 1 行：{from_po}");
+    assert_eq!(rows[0]["item_code"], serde_json::json!("140301"));
+    assert_eq!(num(&rows[0]["qty"]), 100.0, "取到的是已收货量");
+
+    // 保存草稿
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/landed-cost",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-08",
+                "supplier_code": "S001", "supplier_name": "供应商甲",
+                "basis": "qty", "freight": "100",
+                "dr_account": "140301", "cr_account": "220201",
+                "lines": [{
+                    "po_id": po_id, "item_code": "140301", "item_name": "材料甲",
+                    "qty": "100", "amount": "800", "manual_amount": "0"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "保存到岸成本单应成功：{b}");
+    let lcv_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        num(&serde_json::from_str::<serde_json::Value>(&b).unwrap()["row"]["total_charges"]),
+        100.0
+    );
+
+    // 过账前存货金额没变
+    {
+        let db = state.db_for("b1").unwrap();
+        let st_ = findb::business::stock_state(
+            &db,
+            "140301",
+            fincore::Period::new(2026, 1).unwrap(),
+            fincore::engine::costing::CostMethod::MovingAverage,
+        )
+        .unwrap();
+        assert_eq!(st_.amount, fincore::Money::parse("800").unwrap(), "过账前不该变");
+    }
+
+    // 过账
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/landed-cost/{lcv_id}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "过账应成功：{b}");
+    let posted: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(num(&posted["total_to_stock"]), 100.0);
+    assert_eq!(num(&posted["total_to_expense"]), 0.0, "货还在，全部进存货");
+    assert!(posted["voucher_id"].as_i64().unwrap_or(0) > 0, "应生成凭证");
+
+    // 存货金额被抬高
+    {
+        let db = state.db_for("b1").unwrap();
+        let st_ = findb::business::stock_state(
+            &db,
+            "140301",
+            fincore::Period::new(2026, 1).unwrap(),
+            fincore::engine::costing::CostMethod::MovingAverage,
+        )
+        .unwrap();
+        assert_eq!(
+            st_.amount,
+            fincore::Money::parse("900").unwrap(),
+            "结存金额 800 + 运费 100 = 900"
+        );
+        assert_eq!(st_.qty, fincore::Money::parse("100").unwrap(), "不该动数量");
+    }
+
+    // 重复过账被拒
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/landed-cost/{lcv_id}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "重复过账必须被拒");
+}
+
+/// 到岸成本要计入采购价格差异，否则「节约」是假的
+///
+/// 回归背景：到岸成本以 `kind=adjust`（qty=0、只有金额）落库，而差异表原来只把
+/// `qty > 0` 的入库行算进成本口径 —— 运费被完全排除。货价便宜 5%、运费贵 20% 时
+/// 差异表显示「节约」，实际成本反而更高，且数字看着完全正常。
+#[tokio::test]
+async fn landed_cost_shows_up_in_purchase_variance() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+
+    // 标准成本 7；货价 6（便宜 1 元）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "standard", "standard_cost": "7" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("100").unwrap();
+        let p = fincore::Money::parse("6").unwrap();
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140301".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        // 500 到岸成本，memo 必须带「到岸成本」才能被差异表识别
+        findb::business::stock_adjust(
+            &db,
+            fincore::Period::new(2026, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(),
+            "140301",
+            "",
+            fincore::Money::parse("500").unwrap(),
+            "到岸成本 LC2026010001 分摊",
+        )
+        .unwrap();
+    }
+    findb::business::stock_summary(
+        &state.db_for("b1").unwrap(),
+        fincore::Period::new(2026, 1).unwrap(),
+        fincore::engine::costing::CostMethod::Standard,
+    )
+    .unwrap();
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/cost/material-variance?period=2026-01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let row = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item"] == "140301")
+        .expect("应有 140301 差异行");
+    assert_eq!(num(&row["landed_cost"]), 500.0, "到岸成本要单列出来");
+    assert_eq!(num(&row["in_amount"]), 1100.0, "600 货款 + 500 运费");
+    assert_eq!(
+        num(&row["price_variance"]),
+        400.0,
+        "含运费后是超支 4 元 × 100 = 400；不含运费会误报成「节约 100」"
+    );
+}
+
+/// 货已出清时过账：整笔转费用，存货里一分钱都不能留
+#[tokio::test]
+async fn landed_cost_on_sold_goods_goes_to_expense() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+    let p = fincore::Period::new(2026, 1).unwrap();
+    let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+    let db = state.db_for("b1").unwrap();
+    let q = fincore::Money::parse("10").unwrap();
+    let pr = fincore::Money::parse("8").unwrap();
+    for (kind, qty, price, amount) in [
+        (findb::business::StockKind::Purchase, q, pr, (q * pr).round2()),
+        (findb::business::StockKind::Sale, q.negated(), fincore::Money::ZERO, fincore::Money::ZERO),
+    ] {
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0, period: p, biz_date: d, kind,
+                item: "140301".into(), warehouse: String::new(), batch_no: String::new(),
+                qty, price, amount, voucher_id: None, memo: String::new(),
+            },
+        )
+        .unwrap();
+    }
+    // 到岸成本 60，货已卖光 → 必须整笔转费用
+    let mut lc = findb::landedcost::LandedCost {
+        period: p.ymm(),
+        date: "2026-01-08".to_string(),
+        supplier_code: "S001".to_string(),
+        basis: "qty".to_string(),
+        freight: fincore::Money::parse("60").unwrap(),
+        dr_account: "140301".to_string(),
+        cr_account: "220201".to_string(),
+        expense_account: "660201".to_string(),
+        ..Default::default()
+    };
+    let lines = vec![findb::landedcost::LcLine {
+        po_id: 1,
+        item_code: "140301".into(),
+        item_name: "材料甲".into(),
+        qty: fincore::Money::parse("10").unwrap(),
+        amount: fincore::Money::parse("80").unwrap(),
+        ..Default::default()
+    }];
+    let id = findb::landedcost::save(&db, &mut lc, &lines, "boss").unwrap();
+    let vid = findb::landedcost::post(&db, id, "boss").unwrap();
+    let after = findb::landedcost::get(&db, id).unwrap().unwrap();
+    assert_eq!(after.total_to_stock(), fincore::Money::ZERO, "货已出清不得入存货");
+    assert_eq!(after.total_to_expense(), fincore::Money::parse("60").unwrap());
+    // 凭证：借费用 / 贷应付，没有借存货那条
+    let v = findb::vouchers::get(&db, vid).unwrap().unwrap();
+    assert!(v.balanced());
+    assert_eq!(v.entries[0].account_code, "660201", "借方应是费用科目");
+    // 结存必须是 0 / 0（幽灵存货检查）
+    let st = findb::business::stock_state(
+        &db,
+        "140301",
+        p,
+        fincore::engine::costing::CostMethod::MovingAverage,
+    )
+    .unwrap();
+    assert!(
+        st.qty.is_zero() && st.amount.is_zero(),
+        "不得留下幽灵存货：数量 {} 金额 {}",
+        st.qty,
+        st.amount
+    );
+    let _ = (sid, num);
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {

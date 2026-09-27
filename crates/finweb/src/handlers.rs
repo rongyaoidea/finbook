@@ -461,6 +461,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/budget/analysis", get(get_budget_analysis))
         // 成本：计价配置 + 期末结价
         .route("/api/cost/configs", get(list_cost_configs).post(save_cost_method))
+        // 到岸成本：把运费/关税摊进存货成本
+        .route(
+            "/api/landed-cost",
+            get(list_landed_cost).post(save_landed_cost),
+        )
+        .route("/api/landed-cost/:id/post", post(post_landed_cost))
+        .route("/api/landed-cost/from-po", get(landed_cost_from_po))
         .route("/api/cost/configs/:item/delete", post(clear_cost_method))
         .route("/api/cost/gl-reconcile", get(gl_reconcile_ep))
         .route("/api/cost/sales-cost", post(sales_cost_ep))
@@ -1309,6 +1316,268 @@ async fn prod_from_so_ep(
         "planned_qty": o.planned_qty,
         "so_id": o.so_id,
         "atp": atp,
+    })))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 到岸成本（Landed Cost）
+//
+// 权限口径：写 = 采购订单操作权（与采购入库同级），因为它直接改变存货成本；
+// 读 = 报表权。**刻意不给「总账」权限就能改存货成本** —— 那是绕过职责分离。
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct LcLineReq {
+    po_id: i64,
+    #[serde(default)]
+    item_code: String,
+    #[serde(default)]
+    item_name: String,
+    #[serde(default)]
+    qty: String,
+    #[serde(default)]
+    weight: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    manual_amount: String,
+    #[serde(default)]
+    memo: String,
+}
+
+#[derive(serde::Deserialize)]
+struct LcSaveReq {
+    #[serde(default)]
+    id: i64,
+    period: i32,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    supplier_code: String,
+    #[serde(default)]
+    supplier_name: String,
+    #[serde(default)]
+    basis: String,
+    #[serde(default)]
+    freight: String,
+    #[serde(default)]
+    duty: String,
+    #[serde(default)]
+    insurance: String,
+    #[serde(default)]
+    clearing: String,
+    #[serde(default)]
+    other: String,
+    #[serde(default)]
+    dr_account: String,
+    #[serde(default)]
+    cr_account: String,
+    /// 付款账户（贷方核算银行账户时必填）
+    #[serde(default)]
+    bank_account: String,
+    #[serde(default)]
+    expense_account: String,
+    #[serde(default)]
+    memo: String,
+    #[serde(default)]
+    lines: Vec<LcLineReq>,
+}
+
+fn lc_line_json(l: &findb::landedcost::LcLine) -> serde_json::Value {
+    json!({
+        "id": l.id,
+        "po_id": l.po_id,
+        "po_no": l.po_no,
+        "item_code": l.item_code,
+        "item_name": l.item_name,
+        "qty": l.qty.fmt_qty(),
+        "weight": l.weight.fmt_qty(),
+        "amount": l.amount.fmt_money(),
+        "manual_amount": l.manual_amount.fmt_money(),
+        "allocated": l.allocated.fmt_money(),
+        "to_stock": l.to_stock.fmt_money(),
+        "to_expense": l.to_expense.fmt_money(),
+        "on_hand_qty": l.on_hand_qty.fmt_qty(),
+        "memo": l.memo,
+    })
+}
+
+fn lc_json(lc: &findb::landedcost::LandedCost) -> serde_json::Value {
+    // 刻意把明细拆到独立函数：这个 json! 宏展开到 25 个字段时已经撞上
+    // `recursion limit reached while expanding json_internal!`，加字段就会编译失败。
+    // 明细单独一个宏，宏的规模才可控。
+    json!({
+        "id": lc.id,
+        "no": lc.no,
+        "period": lc.period,
+        "date": lc.date,
+        "supplier_code": lc.supplier_code,
+        "supplier_name": lc.supplier_name,
+        "basis": lc.basis,
+        "basis_label": findb::landedcost::AllocBasis::parse(&lc.basis).label(),
+        "freight": lc.freight.fmt_money(),
+        "duty": lc.duty.fmt_money(),
+        "insurance": lc.insurance.fmt_money(),
+        "clearing": lc.clearing.fmt_money(),
+        "other": lc.other.fmt_money(),
+        "total_charges": lc.total_charges().fmt_money(),
+        "dr_account": lc.dr_account,
+        "cr_account": lc.cr_account,
+        "bank_account": lc.bank_account,
+        "expense_account": lc.expense_account,
+        "status": lc.status,
+        "status_label": findb::landedcost::status_label(&lc.status),
+        "voucher_id": lc.voucher_id,
+        "memo": lc.memo,
+        "prepared_by": lc.prepared_by,
+        "total_allocated": lc.total_allocated().fmt_money(),
+        "total_to_stock": lc.total_to_stock().fmt_money(),
+        "total_to_expense": lc.total_to_expense().fmt_money(),
+        "lines": lc.lines.iter().map(lc_line_json).collect::<Vec<_>>(),
+    })
+}
+
+async fn list_landed_cost(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let rows = findb::landedcost::list(&db, period)?;
+    Ok(Json(json!({
+        "period": period_to_str(period),
+        "rows": rows.iter().map(lc_json).collect::<Vec<_>>(),
+        "total_charges": rows.iter().map(|r| r.total_charges()).sum::<fincore::Money>().fmt_money(),
+        "total_to_stock": rows.iter().map(|r| r.total_to_stock()).sum::<fincore::Money>().fmt_money(),
+        "total_to_expense": rows.iter().map(|r| r.total_to_expense()).sum::<fincore::Money>().fmt_money(),
+    })))
+}
+
+async fn save_landed_cost(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<LcSaveReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = if req.period > 0 {
+        period_checked(req.period)?
+    } else {
+        current_period(&state, &user)
+    };
+    let date = if req.date.trim().is_empty() {
+        period.first_day().format("%Y-%m-%d").to_string()
+    } else {
+        req.date.trim().to_string()
+    };
+    let mut lines = Vec::new();
+    for l in &req.lines {
+        lines.push(findb::landedcost::LcLine {
+            po_id: l.po_id,
+            item_code: l.item_code.trim().to_string(),
+            item_name: l.item_name.trim().to_string(),
+            qty: parse_money_checked(&l.qty)?,
+            weight: parse_money_checked(&l.weight)?,
+            amount: parse_money_checked(&l.amount)?,
+            manual_amount: parse_money_checked(&l.manual_amount)?,
+            memo: l.memo.clone(),
+            ..Default::default()
+        });
+    }
+    // 借方/贷方科目：留空则退到账套的存货科目与资金账户
+    let biz = db.options().biz_accounts.clone();
+    let mut lc = findb::landedcost::LandedCost {
+        id: req.id,
+        no: String::new(),
+        period: period.ymm(),
+        date: date.clone(),
+        supplier_code: req.supplier_code.trim().to_string(),
+        supplier_name: req.supplier_name.trim().to_string(),
+        basis: if req.basis.trim().is_empty() {
+            "amount".to_string()
+        } else {
+            req.basis.trim().to_string()
+        },
+        freight: parse_money_checked(&req.freight)?,
+        duty: parse_money_checked(&req.duty)?,
+        insurance: parse_money_checked(&req.insurance)?,
+        clearing: parse_money_checked(&req.clearing)?,
+        other: parse_money_checked(&req.other)?,
+        dr_account: if req.dr_account.trim().is_empty() {
+            biz.material.clone()
+        } else {
+            req.dr_account.trim().to_string()
+        },
+        cr_account: if req.cr_account.trim().is_empty() {
+            biz.fund.clone()
+        } else {
+            req.cr_account.trim().to_string()
+        },
+        expense_account: req.expense_account.trim().to_string(),
+        bank_account: req.bank_account.trim().to_string(),
+        status: "draft".to_string(),
+        voucher_id: None,
+        memo: req.memo.clone(),
+        prepared_by: user.username().to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        lines: Vec::new(),
+    };
+    let id = findb::landedcost::save(&db, &mut lc, &lines, user.username())?;
+    let after = findb::landedcost::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("到岸成本单不存在"))?;
+    Ok(Json(json!({ "ok": true, "id": id, "row": lc_json(&after) })))
+}
+
+async fn post_landed_cost(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let db = state.db_for(&user.book_key)?;
+    let vid = findb::landedcost::post(&db, id, user.username())?;
+    let after = findb::landedcost::get(&db, id)?
+        .ok_or_else(|| AppError::not_found("到岸成本单不存在"))?;
+    Ok(Json(json!({
+        "ok": true,
+        "voucher_id": vid,
+        "total_to_stock": after.total_to_stock().fmt_money(),
+        "total_to_expense": after.total_to_expense().fmt_money(),
+        "row": lc_json(&after),
+    })))
+}
+
+/// 从采购订单取可分摊的存货行
+///
+/// 刻意只返回**已收到货**的行：没收到的货没有附加成本可摊，摊上去就是给一份
+/// 不存在的存货加成本。运费到了货还没到是常事，所以这个限制必须在取数层就做。
+async fn landed_cost_from_po(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let po_id = q
+        .get("po_id")
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .ok_or_else(|| AppError::bad_request("缺少采购订单 po_id"))?;
+    let lines = findb::landedcost::fetch_lines_from_po(&db, po_id)?;
+    Ok(Json(json!({
+        "po_id": po_id,
+        "rows": lines.iter().map(|l| json!({
+            "po_id": l.po_id,
+            "po_no": l.po_no,
+            "item_code": l.item_code,
+            "item_name": l.item_name,
+            "qty": l.qty.fmt_qty(),
+            "weight": l.weight.fmt_qty(),
+            "amount": l.amount.fmt_money(),
+        })).collect::<Vec<_>>(),
+        "note": "只列出已收货的存货行 —— 未收到的货没有附加成本可摊",
     })))
 }
 
@@ -5574,6 +5843,10 @@ struct StockAdjustReq {
     pub item: String,
     #[serde(default)]
     pub warehouse: String,
+    /// 调整数量（正=盘盈/调增，负=盘亏/调减）。**建账与盘盈必填**：
+    /// 只给金额不给数量会造出「数量 0、金额 > 0」的幽灵存货。
+    #[serde(default)]
+    pub qty: String,
     /// 调整金额（正=调增，负=调减），十进制字符串
     pub delta: String,
     #[serde(default)]
@@ -5601,8 +5874,18 @@ async fn stock_adjust_endpoint(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::business::stock_adjust(&db, period, date, &req.item, &req.warehouse, delta, &req.memo)?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    let qty = parse_money_checked(&req.qty)?;
+    let id = findb::business::stock_adjust_full(
+        &db,
+        period,
+        date,
+        &req.item,
+        &req.warehouse,
+        qty,
+        delta,
+        &req.memo,
+    )?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "qty": qty, "delta": delta })))
 }
 
 // ---- 库存深度：序列号 / 多单位 / 账龄 / ABC / 组装拆卸 / 分仓库 ----

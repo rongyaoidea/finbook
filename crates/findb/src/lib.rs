@@ -50,6 +50,7 @@ pub mod users;
 pub mod vouchers;
 pub mod warehouse;
 pub mod exports;
+pub mod landedcost;
 
 use std::path::{Path, PathBuf};
 

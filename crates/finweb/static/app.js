@@ -776,6 +776,7 @@ const NAV_ITEMS = [
   { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
   { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
   { id: "cost-variance", label: "存货成本差异", perm: "report", group: "库存" },
+  { id: "landed-cost", label: "到岸成本", perm: "order_ops", group: "库存" },
   { id: "inv-serial", label: "序列号", perm: "warehouse", group: "库存" },
   { id: "inv-unit", label: "多单位换算", perm: "warehouse", group: "库存" },
   { id: "warehouses", label: "仓库档案", perm: "warehouse", group: "库存" },
@@ -832,6 +833,7 @@ const VIEWS = {
   "inv-aging": viewInvAging,
   "inv-abc": viewInvAbc,
   "cost-variance": viewCostVariance,
+  "landed-cost": viewLandedCost,
   "inv-serial": viewInvSerial,
   "inv-unit": viewInvUnit,
   "inv-assemble": viewInvAssemble,
@@ -2420,6 +2422,231 @@ function openTaxOptions(o) {
   };
 }
 
+// ---------------- 到岸成本（Landed Cost） ----------------
+//
+// 界面必须说清三件事，否则用户会把它当成「多录一笔费用」：
+//  1. **不改原入库单** —— 追加成本调整流水，原单据与已开票数据一个字节都不动
+//  2. **入存货 vs 转费用** 是过账时按**当时的结存**算的，草稿阶段算不出来
+//  3. 货已全部出清时，运费是**当期费用**而不是存货 —— 挂在存货上是幽灵资产
+async function viewLandedCost(main) {
+  const period = state.current;
+  main.innerHTML = `<h2>到岸成本</h2><div class="muted">加载中…</div>`;
+  let d;
+  try {
+    d = await api(`/landed-cost?period=${encodeURIComponent(period)}`);
+  } catch (e) {
+    main.innerHTML = `<h2>到岸成本</h2><div style="color:var(--err)">${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = d.rows || [];
+  main.innerHTML = `
+    <h2>到岸成本 · ${esc(period)}</h2>
+    <div class="muted" style="margin-bottom:10px;line-height:1.7">
+      把运费、关税、保险、清关费摊进存货成本。<b>不改原采购入库单</b>（改了就得连带重算税额与
+      已对账金额），而是追加成本调整流水。<br>
+      <b>入存货 / 转费用是过账时按当时的结存算的</b>：货已经卖掉的部分摊不进去，会自动转当期费用
+      —— 挂在已清空的存货上是幽灵资产，资产负债表凭空多一笔且不报错。
+    </div>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="k">附加成本合计</div><div class="v">${esc(d.total_charges)}</div></div>
+      <div class="card"><div class="k">摊入存货</div><div class="v">${esc(d.total_to_stock)}</div></div>
+      <div class="card"><div class="k">转当期费用</div><div class="v" style="color:var(--err)">${esc(d.total_to_expense)}</div></div>
+      <div class="card"><div class="k">单据数</div><div class="v">${rows.length}</div></div>
+    </div>
+    <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0 0 12px">
+      <button class="btn primary sm" id="lc-new">新增到岸成本单</button>
+    </div>
+    <div class="panel" style="padding:0;overflow:hidden">
+      ${rows.length ? `<table class="grid"><thead><tr>
+        <th>单号</th><th>日期</th><th>供应商</th><th>基准</th>
+        <th class="num">附加成本</th><th class="num">摊入存货</th><th class="num">转费用</th>
+        <th>状态</th><th></th>
+      </tr></thead><tbody>
+      ${rows.map((r) => `<tr>
+        <td>${esc(r.no)}</td><td>${esc(r.date)}</td><td>${esc(r.supplier_name || r.supplier_code)}</td>
+        <td>${esc(r.basis_label)}</td>
+        <td class="num"><b>${esc(r.total_charges)}</b></td>
+        <td class="num">${esc(r.total_to_stock)}</td>
+        <td class="num" style="color:${Number(r.total_to_expense) > 0 ? "var(--err)" : "inherit"}">${esc(r.total_to_expense)}</td>
+        <td><span class="tag ${r.status === "posted" ? "ok" : ""}">${esc(r.status_label)}</span></td>
+        <td class="row-actions">${r.status === "draft" ? `<button class="btn ghost sm" data-lc-post="${r.id}">过账</button>` : ""}${
+          r.voucher_id ? `<a class="btn ghost sm" href="#" data-voucher="${r.voucher_id}">凭证</a>` : ""
+        }<button class="btn ghost sm" data-lc-view="${r.id}">明细</button></td>
+      </tr>`).join("")}
+      </tbody></table>` : `<div class="muted" style="padding:14px;text-align:center">
+        本期没有到岸成本单。一批货从下单到入库，运费/关税常常是货款的百分之几到几十 ——
+        不摊进存货成本，存货估值偏低、销售成本低估、**采购价格差异也会算歪**。
+      </div>`}
+    </div>
+    <div id="lc-detail" class="panel" style="display:none"></div>`;
+
+  $("#lc-new").onclick = () => openLcEditor(period, loadLc);
+  $all("[data-lc-post]").forEach((b) => b.onclick = async () => {
+    if (!(await confirmDialog("过账后将追加存货成本并生成凭证，且不可撤销。确认？", true))) return;
+    try {
+      const r = await postJson(`/landed-cost/${b.dataset.lcPost}/post`, {});
+      const warn = Number(String(r.total_to_expense).replace(/,/g, "")) > 0
+        ? `，其中 ${r.total_to_expense} 因货已出清转入当期费用`
+        : "";
+      toast(`已过账，凭证 #${r.voucher_id}，摊入存货 ${r.total_to_stock}${warn}`, "ok");
+      loadLc();
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  });
+  $all("[data-lc-view]").forEach((b) => b.onclick = async () => {
+    const box = $("#lc-detail");
+    box.style.display = "";
+    box.innerHTML = `<h3>明细</h3><div class="muted">加载中…</div>`;
+    try {
+      const r = await api(`/landed-cost?period=${encodeURIComponent(period)}`);
+      const lc = (r.rows || []).find((x) => String(x.id) === b.dataset.lcView);
+      if (!lc) throw new Error("找不到该单");
+      box.innerHTML = `<h3>${esc(lc.no)} 明细</h3>
+        <p class="muted" style="font-size:12px;line-height:1.7;margin:0 0 8px">
+          运费 ${esc(lc.freight)} · 关税 ${esc(lc.duty)} · 保险 ${esc(lc.insurance)} ·
+          清关 ${esc(lc.clearing)} · 其他 ${esc(lc.other)}
+        </p>
+        <table class="grid"><thead><tr>
+          <th>存货</th><th>名称</th><th>来源采购单</th>
+          <th class="num">收货量</th><th class="num">货值</th>
+          <th class="num">分摊额</th><th class="num">入存货</th><th class="num">转费用</th><th class="num">当前结存</th>
+        </tr></thead><tbody>
+        ${(lc.lines || []).map((l) => `<tr>
+          <td>${esc(l.item_code)}</td><td>${esc(l.item_name)}</td><td>${esc(l.po_no || l.po_id)}</td>
+          <td class="num">${esc(l.qty)}</td><td class="num">${esc(l.amount)}</td>
+          <td class="num"><b>${esc(l.allocated)}</b></td>
+          <td class="num">${esc(l.to_stock)}</td>
+          <td class="num" style="color:${Number(String(l.to_expense).replace(/,/g, "")) > 0 ? "var(--err)" : "inherit"}">${esc(l.to_expense)}</td>
+          <td class="num muted">${esc(l.on_hand_qty)}</td>
+        </tr>`).join("")}
+        </tbody></table>`;
+    } catch (e) {
+      box.innerHTML = `<h3>明细</h3><div style="color:var(--err)">${esc(e.message)}</div>`;
+    }
+  });
+
+  function loadLc() {
+    viewLandedCost(main);
+  }
+}
+
+/// 新增/编辑到岸成本单。取行必须走「按采购订单取」：只列**已收货**的存货行，
+/// 没收到的货没有附加成本可摊（运费到了货还没到是常事）。
+async function openLcEditor(period, after) {
+  const mask = modal(`
+    <h3>新增到岸成本单</h3>
+    <div class="field"><label>来源采购订单 *</label>
+      <input id="le-po" placeholder="采购订单 ID（发货/收货页可见）" /></div>
+    <div class="toolbar" style="box-shadow:none;border:none;padding:6px 0">
+      <button class="btn sm" id="le-load">取已收货存货行</button>
+      <span class="muted" id="le-hint" style="font-size:12px"></span>
+    </div>
+    <div id="le-lines" class="panel" style="padding:0;overflow:auto;max-height:34vh"></div>
+    <div class="field"><label>分摊基准</label>
+      <select id="le-basis">
+        <option value="amount">按货值金额（最常用）</option>
+        <option value="qty">按数量</option>
+        <option value="weight">按重量</option>
+        <option value="manual">手工指定（各行自行填写）</option>
+      </select></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <div><label>运费</label><input id="le-freight" value="0" style="width:110px" /></div>
+      <div><label>关税</label><input id="le-duty" value="0" style="width:110px" /></div>
+      <div><label>保险</label><input id="le-insurance" value="0" style="width:110px" /></div>
+      <div><label>清关/杂费</label><input id="le-clearing" value="0" style="width:110px" /></div>
+      <div><label>其他</label><input id="le-other" value="0" style="width:110px" /></div>
+    </div>
+    <div class="field"><label>付款账户 <span class="muted" style="font-weight:400">（贷方是银行存款时必填）</span></label>
+      <input id="le-bank" placeholder="如：100201 工商银行基本户" /></div>
+    <div id="le-err" style="display:none;margin-top:8px;color:var(--err);font-size:12px"></div>
+    <p class="muted" style="font-size:12px;line-height:1.7;margin-top:8px">
+      借贷科目留空则取账套配置（借：存货科目；贷：资金账户）。<b>贷方默认是银行存款，
+      而银行存款核算银行账户，付款账户必填</b> —— 运费是付给货代的，从哪个账户付是必填信息。
+      <b>入存货 / 转费用要到过账时才算</b> —— 那时才知道货还剩多少。
+    </p>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn" id="le-cancel">取消</button>
+      <button class="btn primary" id="le-save">保存草稿</button>
+    </div>`);
+  const errBox = $("#le-err", mask);
+  let lines = [];
+
+  $("#le-load", mask).onclick = async () => {
+    const poId = $("#le-po", mask).value.trim();
+    if (!/^\d+$/.test(poId)) {
+      errBox.textContent = "请填采购订单 ID（纯数字）";
+      errBox.style.display = "";
+      return;
+    }
+    try {
+      const r = await api(`/landed-cost/from-po?po_id=${poId}`);
+      lines = r.rows || [];
+      $("#le-hint", mask).textContent = `取到 ${lines.length} 行`;
+      if (!lines.length) {
+        $("#le-lines", mask).innerHTML = `<div class="muted" style="padding:12px">${
+          r.note || "该采购订单还没有已收货的存货行 —— 未收到的货没有附加成本可摊"
+        }</div>`;
+        return;
+      }
+      $("#le-lines", mask).innerHTML = `<table class="grid"><thead><tr>
+        <th>存货</th><th>名称</th><th class="num">收货量</th><th class="num">货值</th><th class="num">手工分摊额</th>
+      </tr></thead><tbody>
+      ${lines.map((l, i) => `<tr>
+        <td>${esc(l.item_code)}</td><td>${esc(l.item_name)}</td>
+        <td class="num">${esc(l.qty)}</td><td class="num">${esc(l.amount)}</td>
+        <td class="num"><input data-lc-m="${i}" value="0" style="width:100px;text-align:right" /></td>
+      </tr>`).join("")}
+      </tbody></table>`;
+      errBox.style.display = "none";
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.style.display = "";
+    }
+  };
+  $("#le-cancel", mask).onclick = () => closeModal();
+  $("#le-save", mask).onclick = async () => {
+    errBox.style.display = "none";
+    if (!lines.length) {
+      errBox.textContent = "请先「取已收货存货行」";
+      errBox.style.display = "";
+      return;
+    }
+    const poId = Number($("#le-po", mask).value.trim());
+    try {
+      await postJson("/landed-cost", {
+        period: Number(String(period).replace(/-/g, "")),
+        date: period + "-15",
+        basis: $("#le-basis", mask).value,
+        bank_account: $("#le-bank", mask).value.trim(),
+        freight: $("#le-freight", mask).value.trim() || "0",
+        duty: $("#le-duty", mask).value.trim() || "0",
+        insurance: $("#le-insurance", mask).value.trim() || "0",
+        clearing: $("#le-clearing", mask).value.trim() || "0",
+        other: $("#le-other", mask).value.trim() || "0",
+        lines: lines.map((l, i) => {
+          const mi = $(`[data-lc-m="${i}"]`, mask);
+          return {
+            po_id: poId,
+            item_code: l.item_code,
+            item_name: l.item_name,
+            qty: l.qty,
+            weight: l.weight,
+            amount: l.amount,
+            manual_amount: mi ? mi.value.trim() || "0" : "0",
+          };
+        }),
+      });
+      toast("已保存草稿，运费等已登记；过账后才会摊入存货", "ok");
+      closeModal();
+      if (after) after();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.style.display = "";
+    }
+  };
+}
+
 // ---------------- 存货成本差异（标准成本） ----------------
 //
 // 与「生产 → 成本差异」（实际 vs BOM，订单级）是**两个不同口径**，数字本就不该相等：
@@ -2444,7 +2671,8 @@ async function viewCostVariance(main) {
       口径：<b>存货级</b>——按收发存流水算「买贵了 / 耗用超标准」。<br>
       与「生产 → 成本差异」（实际 vs BOM，订单级）是<b>两个不同口径</b>，数字本就不该相等。
       只统计<b>已设标准成本单价</b>的存货；逐存货配置的计价方式优先于全局方法。
-      正差异=超支，负差异=节约。
+      实际单价已含<b>到岸成本</b>（运费/关税等）—— 不含的话，「货价便宜」会被
+      运费吃掉，而差异表照样显示「节约」。正差异=超支，负差异=节约。
     </div>
     ${(d.warnings || []).length ? `<div class="banner unset" id="cv-warn" style="margin-bottom:10px">
       <b>需先补数据</b>
@@ -2459,7 +2687,7 @@ async function viewCostVariance(main) {
       <h3 style="margin:0 0 10px">差异明细 <span class="muted" style="font-weight:400;font-size:12px">（按价格差异绝对值排序，点行看构成流水）</span></h3>
       ${rows.length ? `<table class="grid"><thead><tr>
         <th>存货</th><th>名称</th><th class="num">标准成本</th><th class="num">参考成本</th>
-        <th class="num">实际入库单价</th><th class="num">入库数量</th><th class="num">价格差异</th>
+        <th class="num">实际入库单价</th><th class="num">入库数量</th><th class="num">到岸成本</th><th class="num">价格差异</th>
         <th class="num">出库数量</th><th class="num">出库标准金额</th><th class="num">出库实际成本</th><th class="num">超支差异</th>
       </tr></thead><tbody>
       ${rows.map((r) => `<tr data-cv-item="${esc(r.item)}" style="cursor:pointer" title="点击查看构成流水">
@@ -2468,6 +2696,7 @@ async function viewCostVariance(main) {
         <td class="num muted">${esc(r.ref_cost)}</td>
         <td class="num" style="color:${r.actual_unit != r.standard_cost ? sign(Number(r.actual_unit) - Number(r.standard_cost)) : "inherit"}">${esc(r.actual_unit)}</td>
         <td class="num">${esc(r.in_qty)}</td>
+        <td class="num" title="运费/关税等，已计入实际单价">${esc(r.landed_cost)}${Number(r.other_adjust) ? `<span class="muted">+${esc(r.other_adjust)}</span>` : ""}</td>
         <td class="num" style="color:${sign(r.price_variance)}"><b>${esc(r.price_variance)}</b></td>
         <td class="num">${esc(r.out_qty)}</td>
         <td class="num">${esc(r.out_standard_amount)}</td>

@@ -34,7 +34,7 @@ test("组装拆卸：组装→拆卸", async ({ page }) => {
   await newBook(page, `E2E组装${Date.now()}`);
   // 先备子件库存，否则组装会因库存不足失败
   const resp = await page.request.post("/api/inventory/adjust", {
-    data: { period: 202601, date: "2026-01-10", item: "140301", delta: "5", memo: "E2E" },
+    data: { period: 202601, date: "2026-01-10", item: "140301", qty: "5", delta: "40", memo: "E2E" },
   });
   expect(resp.ok(), "子件入库应成功").toBeTruthy();
 
@@ -50,7 +50,7 @@ test("组装拆卸：组装→拆卸", async ({ page }) => {
 test("库存账龄/ABC/分仓库/调拨报表", async ({ page }) => {
   await newBook(page, `E2E库存表${Date.now()}`);
   await page.request.post("/api/inventory/adjust", {
-    data: { period: 202601, date: "2026-01-10", item: "140301", delta: "5", memo: "E2E" },
+    data: { period: 202601, date: "2026-01-10", item: "140301", qty: "5", delta: "40", memo: "E2E" },
   });
 
   // 注：Web 端没有采购/销售订单入口，库存数量只能来自到货/发货/组装，

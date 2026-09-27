@@ -226,8 +226,14 @@ pub fn stock_state(db: &Db, item: &str, upto: Period, method: CostMethod) -> DbR
     Ok(st)
 }
 
-/// 成本调整：数量不变，仅调结存金额。`delta` 正=调增、负=调减。
+/// 成本调整（纯金额）：数量不变，仅调结存金额。`delta` 正=调增、负=调减。
 /// 以 kind=adjust 的流水落库（qty=0），保证可追溯。
+///
+/// **结存数量为 0 时直接拒绝**，改用 [`stock_adjust_full`] 并给出数量。
+/// 理由：货已经卖掉（或从未入库）时调进来的成本是**当期费用，不是存货**。
+/// 放过去会造出「数量 0 / 结存金额 > 0」的幽灵存货 ——
+/// `StockState::adjust_amount` 无条件写 amount，收发存表上就会出现
+/// 结存数量 0、结存金额 1200，资产负债表凭空多一笔存货，而且不报任何错。
 pub fn stock_adjust(
     db: &Db,
     period: Period,
@@ -237,8 +243,69 @@ pub fn stock_adjust(
     delta: Money,
     memo: &str,
 ) -> DbResult<i64> {
-    if delta.is_zero() {
+    stock_adjust_full(db, period, date, item, warehouse, Money::ZERO, delta, memo)
+}
+
+/// 存货调整：**数量与金额一起给**。
+///
+/// 原来的接口只有金额，于是「建一笔期初/盘盈」只能传金额、产生数量为 0 的
+/// 幽灵存货 —— 守卫加上之后这些调用就全被拒了。根因不是守卫太严，是接口欠规格：
+/// 盘盈/建账本来就必须同时有数量和金额。
+///
+/// - `qty != 0`：走 `OtherIn` 流水，数量与金额一起进成本引擎（价格由金额/数量推出）
+/// - `qty == 0`：纯金额调整，此时要求**该期仍有结存数量**，否则拒绝
+pub fn stock_adjust_full(
+    db: &Db,
+    period: Period,
+    date: NaiveDate,
+    item: &str,
+    warehouse: &str,
+    qty: Money,
+    amount: Money,
+    memo: &str,
+) -> DbResult<i64> {
+    if qty.is_zero() && amount.is_zero() {
+        return Err(fincore::FinError::msg("调整数量与金额不能同时为 0").into());
+    }
+    if !qty.is_zero() {
+        if !amount.is_positive() {
+            return Err(fincore::FinError::msg(
+                "调整数量时金额必须为正：只给数量不给金额会算出负单价",
+            )
+            .into());
+        }
+        let price = amount.checked_div(qty).unwrap_or(Money::ZERO);
+        return stock_insert(
+            db,
+            &StockMove {
+                id: 0,
+                period,
+                biz_date: date,
+                kind: StockKind::OtherIn,
+                item: item.to_string(),
+                warehouse: warehouse.to_string(),
+                batch_no: String::new(),
+                qty,
+                price,
+                amount,
+                voucher_id: None,
+                memo: memo.to_string(),
+            },
+        );
+    }
+    if amount.is_zero() {
         return Err(fincore::FinError::msg("成本调整金额不能为 0").into());
+    }
+    // 计价方式与金额无关（只有数量参与校验），用存货自身配置即可
+    let method = item_cost_method_opt(db, item)?.unwrap_or(CostMethod::MovingAverage);
+    let on_hand = stock_state(db, item, period, method)?.qty;
+    if !on_hand.is_positive() {
+        return Err(fincore::FinError::state(format!(
+            "{item} 在 {period} 没有结存数量，不能只调金额。\
+             货已出清 → 这笔成本属于当期费用，请走损益凭证；\
+             若是盘盈/建账 → 请同时给数量（如 qty=5、amount=40）。"
+        ))
+        .into());
     }
     stock_insert(
         db,
@@ -252,7 +319,7 @@ pub fn stock_adjust(
             batch_no: String::new(),
             qty: Money::ZERO,
             price: Money::ZERO,
-            amount: delta,
+            amount,
             voucher_id: None,
             memo: memo.to_string(),
         },
@@ -1666,6 +1733,117 @@ mod tests {
         }
     }
 
+    /// 结存数量为 0 时**不能**调成本调整：否则造出「数量 0、金额 > 0」的幽灵存货
+    ///
+    /// 回归背景：`StockState::adjust_amount` 无条件写 `self.amount = new_amount`，
+    /// 批次分摊那段才用 `!qty.is_zero()` 挡一下 —— 于是数量 0、金额被抬高，
+    /// 收发存表上「结存数量 0 / 结存金额 1200」，资产负债表凭空多一笔存货，
+    /// **且不报任何错**。
+    ///
+    /// 真实触发路径：到岸成本（运费/关税）在一批货**已全部出清**之后才到账。
+    /// 货已经卖了，运费是当期费用，不是存货 —— 这时候它必须进损益。
+    /// 同一个洞也开在既有的 `POST /api/inventory/adjust` 上（不查结存）。
+    #[test]
+    fn stock_adjust_rejects_when_no_stock_remains() {
+        let db = tmpdb("ghost");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let mv = |kind: StockKind, qty: &str, price: &str, amount: &str| StockMove {
+            id: 0,
+            period: p,
+            biz_date: d,
+            kind,
+            item: "M9".to_string(),
+            warehouse: String::new(),
+            batch_no: String::new(),
+            qty: m(qty),
+            price: m(price),
+            amount: m(amount),
+            voucher_id: None,
+            memo: String::new(),
+        };
+        // 进 10 件 × 8 元，再全部出掉
+        stock_insert(&db, &mv(StockKind::Purchase, "10", "8", "80")).unwrap();
+        stock_insert(&db, &mv(StockKind::Sale, "-10", "0", "0")).unwrap();
+        let st = stock_state(&db, "M9", p, CostMethod::MovingAverage).unwrap();
+        assert!(st.qty.is_zero() && st.amount.is_zero(), "前置：货已出清");
+
+        let r = stock_adjust(&db, p, d, "M9", "", m("120"), "到岸成本-运费");
+        assert!(
+            r.is_err(),
+            "结存数量为 0 时不该接受成本调整：那 120 元是当期费用，不是存货"
+        );
+        // 确认没有留下半成品
+        let st2 = stock_state(&db, "M9", p, CostMethod::MovingAverage).unwrap();
+        assert!(st2.qty.is_zero() && st2.amount.is_zero(), "失败后不能留下金额");
+    }
+
+    /// 建账/盘盈必须同时给数量与金额，否则就是「数量 0、金额 > 0」的幽灵存货
+    ///
+    /// 回归背景：接口原来只有 `delta`（金额），于是「建一笔期初/盘盈」只能传
+    /// 金额 —— 而 `StockState::adjust_amount` 无条件写 amount，于是产生
+    /// 「数量 0、结存金额 5」。这不是用例写错，是**接口欠规格**：盘盈/建账本来
+    /// 就必须同时有数量和金额，只给金额的调整在会计上根本不成立。
+    ///
+    /// 所以修法是补 `qty`，而不是放宽守卫。
+    #[test]
+    fn stock_adjust_with_qty_creates_coherent_balance() {
+        let db = tmpdb("adjust-qty");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        // 只给金额 → 拒（没有结存可挂）
+        let e = stock_adjust(&db, p, d, "M1", "", m("40"), "建账").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("没有结存数量"),
+            "该说清「要么给数量、要么走损益」，实际 {:?}",
+            e
+        );
+        // 数量 + 金额 → 数量与金额同时进账
+        stock_adjust_full(&db, p, d, "M1", "", m("5"), m("40"), "盘盈 5 件").unwrap();
+        let st = stock_state(&db, "M1", p, CostMethod::MovingAverage).unwrap();
+        assert_eq!(st.qty, m("5"), "盘盈要有数量");
+        assert_eq!(st.amount, m("40"), "盘盈要有金额");
+    }
+
+    /// 给了数量但没给金额要拒：否则会算出负单价
+    #[test]
+    fn stock_adjust_qty_without_amount_is_rejected() {
+        let db = tmpdb("adjust-qty-noamt");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        assert!(stock_adjust_full(&db, p, d, "M1", "", m("5"), Money::ZERO, "x").is_err());
+    }
+
+    /// 有结存时可以调整，且结存金额确实变了
+    #[test]
+    fn stock_adjust_still_works_with_stock_on_hand() {
+        let db = tmpdb("adjust-ok");
+        let p = Period::new(2026, 1).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        stock_insert(
+            &db,
+            &StockMove {
+                id: 0,
+                period: p,
+                biz_date: d,
+                kind: StockKind::Purchase,
+                item: "M9".to_string(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: m("10"),
+                price: m("8"),
+                amount: m("80"),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        stock_adjust(&db, p, d, "M9", "", m("20"), "到岸成本-运费").unwrap();
+        let st = stock_state(&db, "M9", p, CostMethod::MovingAverage).unwrap();
+        assert_eq!(st.qty, m("10"), "调整不该动数量");
+        assert_eq!(st.amount, m("100"), "结存金额 80 + 20 = 100");
+    }
+
     #[test]
     fn stock_moving_average() {
         let db = tmpdb("stock");
@@ -1972,3 +2150,4 @@ mod tests {
         assert_eq!(rows[0].adjust, m("0"));
     }
 }
+

@@ -787,6 +787,56 @@ CREATE TABLE IF NOT EXISTS po_receipt (
 );
 CREATE INDEX IF NOT EXISTS idx_po_rcpt ON po_receipt(po_id);
 
+-- ===========================================================================
+-- 到岸成本（Landed Cost）
+--
+-- 运费/关税/保险/清关费摊进存货成本。**不改原采购入库单**（改了就得连带重算
+-- 税额与已对账金额），而是单独立单、追加一条 kind=adjust 的存货流水。
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS landed_cost (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    no              TEXT NOT NULL UNIQUE,
+    period          INTEGER NOT NULL,
+    date            TEXT NOT NULL,
+    supplier_code   TEXT NOT NULL DEFAULT '',
+    supplier_name   TEXT NOT NULL DEFAULT '',
+    basis           TEXT NOT NULL DEFAULT 'amount',   -- qty/amount/weight/manual
+    freight         TEXT NOT NULL DEFAULT '0',
+    duty            TEXT NOT NULL DEFAULT '0',
+    insurance       TEXT NOT NULL DEFAULT '0',
+    clearing        TEXT NOT NULL DEFAULT '0',
+    other           TEXT NOT NULL DEFAULT '0',
+    dr_account      TEXT NOT NULL DEFAULT '',          -- 借方（入存货部分）
+    cr_account      TEXT NOT NULL DEFAULT '',          -- 贷方（付款方）
+    bank_account    TEXT NOT NULL DEFAULT '',          -- 付款账户（贷方核算银行账户时必填）
+    expense_account TEXT NOT NULL DEFAULT '',          -- 货已出清时转费用的借方
+    status          TEXT NOT NULL DEFAULT 'draft',     -- draft/posted
+    voucher_id      INTEGER NOT NULL DEFAULT 0,
+    memo            TEXT NOT NULL DEFAULT '',
+    prepared_by     TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_lcv_period ON landed_cost(period, status);
+
+CREATE TABLE IF NOT EXISTS landed_cost_item (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    lcv_id        INTEGER NOT NULL REFERENCES landed_cost(id) ON DELETE CASCADE,
+    po_id         INTEGER NOT NULL,          -- 摊到哪张采购订单的货上
+    item_code     TEXT NOT NULL,
+    item_name     TEXT NOT NULL DEFAULT '',
+    qty           TEXT NOT NULL DEFAULT '0', -- 分摊权重：数量
+    weight        TEXT NOT NULL DEFAULT '0', -- 分摊权重：重量
+    amount        TEXT NOT NULL DEFAULT '0', -- 分摊权重：货值
+    manual_amount TEXT NOT NULL DEFAULT '0', -- 手工指定时的分摊额
+    allocated     TEXT NOT NULL DEFAULT '0', -- 算出来的分摊额
+    to_stock      TEXT NOT NULL DEFAULT '0', -- 实际入存货（受结存价值封顶）
+    to_expense    TEXT NOT NULL DEFAULT '0', -- 转费用（货已出清）
+    memo          TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_lcvi_lcv ON landed_cost_item(lcv_id);
+CREATE INDEX IF NOT EXISTS idx_lcvi_item ON landed_cost_item(item_code);
+
 -- 采购付款记录
 CREATE TABLE IF NOT EXISTS po_payment (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1432,6 +1482,43 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     ("po_line", "amount", "TEXT NOT NULL DEFAULT '0'"),
     ("po_line", "tax_amount", "TEXT NOT NULL DEFAULT '0'"),
     ("po_line", "memo", "TEXT NOT NULL DEFAULT ''"),
+    // 到岸成本表
+    ("landed_cost", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("landed_cost", "no", "TEXT NOT NULL UNIQUE"),
+    ("landed_cost", "period", "INTEGER NOT NULL"),
+    ("landed_cost", "date", "TEXT NOT NULL"),
+    ("landed_cost", "supplier_code", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "supplier_name", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "basis", "TEXT NOT NULL DEFAULT 'amount'"),
+    ("landed_cost", "freight", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost", "duty", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost", "insurance", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost", "clearing", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost", "other", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost", "dr_account", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "cr_account", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "bank_account", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "expense_account", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "status", "TEXT NOT NULL DEFAULT 'draft'"),
+    ("landed_cost", "voucher_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("landed_cost", "memo", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+    // 到岸成本明细
+    ("landed_cost_item", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("landed_cost_item", "lcv_id", "INTEGER NOT NULL"),
+    ("landed_cost_item", "po_id", "INTEGER NOT NULL"),
+    ("landed_cost_item", "item_code", "TEXT NOT NULL"),
+    ("landed_cost_item", "item_name", "TEXT NOT NULL DEFAULT ''"),
+    ("landed_cost_item", "qty", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "weight", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "manual_amount", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "allocated", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "to_stock", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "to_expense", "TEXT NOT NULL DEFAULT '0'"),
+    ("landed_cost_item", "memo", "TEXT NOT NULL DEFAULT ''"),
     // 销售订单表
     ("sales_order", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
     ("sales_order", "no", "TEXT NOT NULL UNIQUE"),

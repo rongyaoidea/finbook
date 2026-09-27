@@ -31,6 +31,13 @@ jobs:
         run: cargo test --workspace --locked
       - name: 前端工具函数测试（node:test）
         run: node --test crates/finweb/static/util.test.js
+      # 语法检查 + 「同一函数内重复 id」检测，按退出码判定。
+      # 重复 id 是合法 JS，语法检查抓不到，但后果是功能静默失效：
+      # #pv-social 同时用作科目输入框和按钮 id，$("#pv-social") 只拿到前者，
+      # 于是「生成社保缴纳凭证」按钮从未绑定 onclick——点了没反应、不报错，
+      # 而对应端点的集成测试一直是绿的。
+      - name: 前端静态检查（语法 + 重复 id）
+        run: node tools/check-js.js
 
   # ── lint（记录型：fincore/findb 收窄允许项；UI 层允许既有 f32 警告） ────
   clippy:

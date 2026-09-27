@@ -30,6 +30,44 @@ test("工资：职员档案→工资行个税→计提凭证", async ({ page }) 
   await expect(page.locator("#v-table tbody")).toContainText("计提");
 });
 
+/// 社保缴纳按钮必须真的能点出凭证
+///
+/// 回归背景：#pv-social 这个 id **同时**用在「应付社保科目输入框」和
+/// 「生成社保缴纳凭证按钮」上，两个都渲染在同一个 DOM 里。`$("#pv-social")`
+/// 只返回第一个（输入框），于是按钮的 onclick 从未绑上——**点了没反应、不报错、
+/// 没有任何控制台输出**。而 /api/payroll/social-pay 的集成测试一直是绿的
+/// （端子没问题），所以这类错只有 UI 层的 E2E 才拦得住。
+test("工资：社保缴纳按钮能点出凭证（id 不与科目输入框撞车）", async ({ page }) => {
+  await newBook(page, `E2E社保${Date.now()}`);
+  await page.click('.nav-item[data-view="aux"]');
+  await page.click('[data-kind="employee"]');
+  await page.click("#aux-new");
+  await page.fill("#au-code", "E002");
+  await page.fill("#au-name", "李四");
+  await page.click("#au-save");
+  await expect(page.locator("table.grid tbody")).toContainText("李四", { timeout: 10_000 });
+
+  await page.click('.nav-item[data-view="payroll"]');
+  await page.click("#py-new");
+  await page.selectOption("#pw-emp", "E002");
+  await page.fill("#pw-gross", "8000");
+  await page.fill("#pw-social", "800");
+  await page.click("#pw-save");
+  await expect(page.locator("#py-body")).toContainText("李四", { timeout: 10_000 });
+
+  await page.click("#py-tab-voucher");
+  await page.click("#pv-accrue");
+  await page.click("#cf-ok");
+  await expect(page.locator("#pv-result")).toContainText("已生成凭证", { timeout: 10_000 });
+
+  // 这一步以前是死的：按钮没绑事件，点下去什么都不发生
+  await page.click("#pv-social-btn");
+  await page.click("#cf-ok");
+  await expect(page.locator("#pv-result")).toContainText("已生成凭证", { timeout: 10_000 });
+  await page.click('.nav-item[data-view="vouchers"]');
+  await expect(page.locator("#v-table tbody")).toContainText("社保");
+});
+
 test("发票：新增→认证→作废", async ({ page }) => {
   await newBook(page, `E2E发票${Date.now()}`);
   await page.click('.nav-item[data-view="invoices"]');

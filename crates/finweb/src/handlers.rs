@@ -206,6 +206,16 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 发票管理
         .route("/api/invoices", get(list_invoices).post(create_invoice))
         .route("/api/invoices/summary", get(invoice_summary))
+        // 税务申报表（增值税一般纳税人）：只取数+算表+导出手工填报，不连网网报
+        .route("/api/tax/vat", get(get_tax_vat))
+        .route("/api/tax/vat/export", get(export_tax_vat))
+        .route("/api/tax/vat/detail", get(get_tax_vat_detail))
+        .route("/api/tax/options", get(get_tax_options).post(save_tax_options))
+        // 存货级成本差异（采购价格差异 / 出库超支差异）。
+        // 路径与订单级的 /api/cost/variance 刻意分开：两者口径不同（一个按存货
+        // 收发存、一个按生产订单实际成本 vs BOM），同名会让界面上出现两个
+        // "差异" 且数字对不上。
+        .route("/api/cost/material-variance", get(get_cost_variance))
         .route("/api/invoices/from-po", post(invoice_from_po))
         .route("/api/invoices/from-so", post(invoice_from_so))
         .route(
@@ -289,6 +299,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/assemble", post(assemble_endpoint))
         .route("/api/inventory/disassemble", post(disassemble_endpoint))
         .route("/api/inventory/warehouse-stock", get(get_warehouse_stock))
+        // 单条出入库流水（成本差异的「构成流水」点开明细用）
+        .route("/api/inventory/move/:id", get(get_stock_move))
         // 仓库主数据（v30）
         .route(
             "/api/warehouses",
@@ -353,6 +365,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/prod/op/report", post(report_prod_op))
         .route("/api/prod/op/finish", post(finish_prod_op))
         .route("/api/prod/:id/start", post(prod_start_ep))
+        // 下达（草稿 → 已下达）：生产订单的审批动作，审批流挂在这里
+        .route("/api/prod/:id/release", post(prod_release_ep))
         .route("/api/prod/:id/issue", post(prod_issue_ep))
         .route("/api/prod/:id/complete", post(prod_complete_ep))
         .route("/api/prod/:id/outsource-fee", post(outsource_fee_ep))
@@ -522,6 +536,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/claims/:id/voucher", post(claim_voucher))
         .route("/api/workflows", get(list_workflows).post(save_workflow))
         .route("/api/workflows/templates", get(list_wf_templates))
+        .route("/api/workflows/cond-fields", get(get_wf_cond_fields))
         .route("/api/workflows/templates/apply", post(apply_wf_template))
         .route("/api/workflows/instances", get(list_wf_instances))
         .route("/api/workflows/:id/publish", post(publish_workflow))
@@ -4857,6 +4872,276 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 税务申报表（增值税一般纳税人）
+// ═══════════════════════════════════════════════════════════════
+//
+// 边界：只取数、算表、导出可手工填报的表。**不做**发票查验、不做电子税务局网报、
+// 不碰税控设备——网报要 CA 证书与税控盘，是另一套基础设施。
+//
+// 报表结构的依据写在 findb::taxdecl 的模块注释里（数据来源、法定口径、哪些项
+// 刻意不算）。这里只做 HTTP 层：取期、拼 CSV、进 JSON。
+
+/// 申报表权限：与财务报表同级（`Perm::Report`），但导出单独要求「导出」权限
+///
+/// 分两级是有意的：看一眼本期数不落纸，导出 CSV 才是数据出系统。
+const _TAX_DOC: &str = "税务申报表";
+
+async fn get_tax_vat(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let form = findb::taxdecl::vat_main_form(&db, period)?;
+    let opts = findb::taxdecl::TaxOptions::load(&db)?;
+    let company = db.options().company;
+    let tax_no = db.options().tax_no;
+    Ok(Json(json!({
+        "form": form,
+        "options": opts,
+        "company": company,
+        "tax_no": tax_no,
+        // 「不代算」的项在 UI 上要能填回去（留痕，不参与计算）
+        "manual_fields": ["上期留抵税额", "进项税额转出额", "附加税费减免", "留抵结转下期"],
+    })))
+}
+
+/// 某一税率档的构成发票：回答「这个汇总数由哪几张票构成」
+async fn get_tax_vat_detail(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let kind = q.get("kind").map(|s| s.trim()).unwrap_or("out");
+    if kind != "out" && kind != "in" {
+        return Err(AppError::bad_request("kind 只能是 out（销项）或 in（进项）"));
+    }
+    let rate = q
+        .get("rate")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::bad_request("缺少参数 rate（税率档，如 13）"))?;
+    let rows = findb::taxdecl::bucket_detail(&db, kind, period, rate)?;
+    Ok(Json(json!({ "kind": kind, "rate": rate, "rows": rows, "count": rows.len() })))
+}
+
+async fn get_tax_options(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    let db = state.db_for(&user.book_key)?;
+    Ok(Json(json!(findb::taxdecl::TaxOptions::load(&db)?)))
+}
+
+async fn save_tax_options(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<findb::taxdecl::TaxOptions>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::SysOption)?;
+    // 附加税率上限取 10%，不是 100%：教育费附加法定 3%、地方教育附加各省不超过 2%，
+    // 10% 已经远高于任何合法情形，再高基本是「3% 误录成 30%」这类手误。
+    // 不设上限的后果很直接：附加税费算成几十倍，申报表上一眼就是错的。
+    const MAX_SURTAX_RATE: &str = "0.10";
+    for (name, v) in [
+        ("教育费附加", &req.edu_rate),
+        ("地方教育附加", &req.local_edu_rate),
+    ] {
+        let m = fincore::Money::parse(v.trim())
+            .map_err(|_| AppError::bad_request(format!("{name}税率无法解析：{v}")))?;
+        if m.is_negative() {
+            return Err(AppError::bad_request(format!("{name}税率不能为负：{v}")));
+        }
+        if m > fincore::Money::parse(MAX_SURTAX_RATE).unwrap() {
+            return Err(AppError::bad_request(format!(
+                "{name}税率应在 0（不征）到 {MAX_SURTAX_RATE}（10%）之间，收到：{v}"
+            )));
+        }
+    }
+    if !["general", "small"].contains(&req.taxpayer.as_str()) {
+        return Err(AppError::bad_request(
+            "纳税人身份只能是 general（一般纳税人）或 small（小规模纳税人）",
+        ));
+    }
+    if !["city", "county", "other"].contains(&req.city_tax_zone.as_str()) {
+        return Err(AppError::bad_request(
+            "城建税适用地区只能是 city / county / other",
+        ));
+    }
+    let db = state.db_for(&user.book_key)?;
+    req.save(&db)?;
+    db.log(user.username(), "税务", "税务参数", "更新申报表参数")?;
+    Ok(Json(json!({ "ok": true, "options": req })))
+}
+
+/// 导出申报表 CSV（带 BOM，Excel 双击直接打开不乱码）
+async fn export_tax_vat(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    user.require(Perm::Export)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let f = findb::taxdecl::vat_main_form(&db, period)?;
+    let company = db.options().company;
+
+    let mut out = String::from("\u{feff}");
+    let mut row = |cells: &[String]| {
+        out.push_str(
+            &cells
+                .iter()
+                .map(|c| csv_escape(c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push_str("\r\n");
+    };
+    let s = |v: &fincore::Money| v.fmt_money();
+
+    row(&[
+        "增值税一般纳税���申报表（主表）".into(),
+        format!("税款所属期：{}", f.period),
+        format!("纳税人名称：{company}"),
+        format!("纳税人识别号：{}", db.options().tax_no),
+    ]);
+    row(&[]);
+    row(&["一、销项税额".into(), "本期数".into()]);
+    row(&["一般计税方法计税销售额".into(), s(&f.sales_general)]);
+    row(&["简易计税方法计税销售额".into(), s(&f.sales_simple)]);
+    row(&["免征增值税销售额".into(), s(&f.sales_exempt)]);
+    row(&["销项税额".into(), s(&f.output_tax)]);
+    row(&[]);
+    row(&["二、进项税额".into(), "本期数".into()]);
+    row(&["本期认证相符的进项税额".into(), s(&f.input_tax)]);
+    row(&["上期留抵税额".into(), "（人工填报）".into()]);
+    row(&["进项税额转出额".into(), "（人工填报，见附列资料三）".into()]);
+    row(&[]);
+    row(&["三、税额计算".into(), "本期数".into()]);
+    row(&["应纳税额".into(), s(&f.payable)]);
+    row(&["未开票销售额".into(), s(&f.unbilled_sales)]);
+    row(&["未开票收入销项税额".into(), s(&f.unbilled_tax)]);
+    row(&[]);
+    row(&["四、附加税费".into(), "本期数".into()]);
+    row(&[
+        format!("城市维护建设税（{}）", f.surcharge.city_rate),
+        s(&f.surcharge.city_tax),
+    ]);
+    row(&[
+        format!("教育费附加（{}）", f.surcharge.edu_rate),
+        s(&f.surcharge.edu),
+    ]);
+    row(&[
+        format!("地方教育附加（{}）", f.surcharge.local_edu_rate),
+        s(&f.surcharge.local_edu),
+    ]);
+    row(&["附加税费合计".into(), s(&f.surcharge.total)]);
+
+    for t in [&f.details_out, &f.details_in] {
+        row(&[]);
+        row(&[t.title.clone(), "税率".into(), "张数".into(), "销售额".into(), "税额".into(), "价税合计".into()]);
+        for b in &t.buckets {
+            row(&[
+                String::new(),
+                format!("{}%", b.rate),
+                b.count.to_string(),
+                s(&b.net),
+                s(&b.tax),
+                s(&b.gross),
+            ]);
+        }
+        row(&[
+            "合计".into(),
+            String::new(),
+            t.count.to_string(),
+            s(&t.net_total),
+            s(&t.tax_total),
+            s(&t.gross_total),
+        ]);
+    }
+
+    // 提示随表导出：拿到 CSV 的人（不一定是出表的会计）也要知道哪些数没算
+    if !f.warnings.is_empty() {
+        row(&[]);
+        row(&["口径说明（以下各项系统不代算，需人工填报）".into()]);
+        for w in &f.warnings {
+            row(&[format!("· {w}")]);
+        }
+    }
+
+    // 中文文件名必须用 filename*=UTF-8'' 百分号编码，否则浏览器下下来名字乱码。
+    // 与附件下载（send_attachment）同一套写法，不引新依赖。
+    let fname = format!("增值税申报表_{}_{}.csv", company, f.period);
+    let encoded: String = fname.bytes().map(|b| format!("%{b:02X}")).collect();
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+        out,
+    )
+        .into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"vat_{}.csv\"; filename*=UTF-8''{encoded}",
+        f.period
+    )) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
+}
+
+/// 单条出入库流水（差异分析点行看构成明细）
+async fn get_stock_move(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let m = findb::business::stock_move_get(&db, id)?
+        .ok_or_else(|| AppError::not_found(format!("出入库流水不存在：{id}")))?;
+    Ok(Json(json!({
+        "id": m.id,
+        "biz_date": m.biz_date.to_string(),
+        "kind": m.kind.code(),
+        "kind_label": m.kind.label(),
+        "item": m.item,
+        "qty": m.qty.fmt_qty(),
+        "price": m.price.fmt_money(),
+        "amount": m.amount.fmt_money(),
+        "memo": m.memo,
+    })))
+}
+
+/// 标准成本差异分析
+///
+/// 读权限与报表同级：差异分析用的是收发存汇总与成本配置，看它等于看成本结构。
+async fn get_cost_variance(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let period = query_period(&state, &user, &q);
+    let r = findb::stdcost::variance_report(&db, period)?;
+    Ok(Json(json!({
+        "period": r.period,
+        "rows": r.rows,
+        "total_price": r.total_price,
+        "total_spend": r.total_spend,
+        "missing": r.missing,
+        "warnings": r.warnings,
+        // 「算了但没算的」要能在界面上说清楚，而不是让人以为差异表是完整的
+        "std_items": findb::business::cost_configs(&db)?,
+    })))
+}
+
 fn parse_voucher_status(s: &str) -> Option<fincore::VoucherStatus> {
     match s {
         "draft" => Some(fincore::VoucherStatus::Draft),
@@ -6584,6 +6869,77 @@ fn po_status_parse(s: &str) -> Result<findb::scm::PoStatus, AppError> {
     })
 }
 
+/// 工作流闸门的判定结果
+enum WfGate {
+    /// 无流程，或已到「通过」终态 → 调用方照常执行原业务动作
+    Continue,
+    /// 未到终态，已推进到某节点 → 调用方只推进流程、**不**改业务状态
+    Pending(String),
+    /// 本次动作被驳回 → 调用方不要改业务状态
+    Rejected,
+}
+
+/// 工作流闸门。收成函数是为了让「哪种单据走工作流」只有这一处实现。
+///
+/// 早先 4 个调用点各自抄一遍 `match intercept(...)? { Pending => …,
+/// Final{false} => …, _ => {} }`，新接单据时很容易只写业务动作、忘了插这一段
+/// ——结果是配了流程却永远不生效，而且**不报任何错**，比没有流程更坏。
+///
+/// `doc_label` 只进日志，让人能从审计日志看出卡在哪张单据的哪个节点。
+fn workflow_gate(
+    db: &findb::Db,
+    user: &CurrentUser,
+    biz_type: &str,
+    id: i64,
+    doc_label: &str,
+) -> Result<WfGate, AppError> {
+    use findb::workflow::Gate;
+    match findb::workflow::intercept(db, biz_type, id, &user.user, true, "")? {
+        Gate::Pending { next } => {
+            db.log(
+                user.username(),
+                "审批",
+                "工作流节点",
+                &format!("{doc_label}#{id} → {next}"),
+            )?;
+            Ok(WfGate::Pending(next))
+        }
+        Gate::Final { approved: false } => Ok(WfGate::Rejected),
+        _ => Ok(WfGate::Continue),
+    }
+}
+
+/// 某单据类型可用的条件字段（画布上配条件边时的候选清单）
+///
+/// 字段集**按单据类型不同**：生产订单没有 amount、报销单没有 planned_qty。
+/// 前端以前是写死一句「amount/qty/customer_code 等」，用户在生产订单上照着写
+/// `amount > 5000` 会一路保存成功、直到单据提交审批才报「条件字段不存在」——
+/// 流程已经建了、实例已经起了，单据卡死。所以这里给前端一份真清单。
+async fn get_wf_cond_fields(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let biz = q.get("biz_type").map(|s| s.trim()).unwrap_or_default();
+    if findb::workflow::ALL_BIZ.iter().all(|(k, _)| *k != biz) {
+        return Err(AppError::bad_request(format!(
+            "非法业务类型：{biz}；可选：{}",
+            findb::workflow::ALL_BIZ
+                .iter()
+                .map(|(k, l)| format!("{k}（{l}）"))
+                .collect::<Vec<_>>()
+                .join("、")
+        )));
+    }
+    let _ = &state;
+    Ok(Json(json!({
+        "biz_type": biz,
+        "biz_label": findb::workflow::biz_label(biz),
+        "fields": findb::workflow::cond_fields_of(biz),
+    })))
+}
+
 // 状态机本身在 findb：scm::so_transition_ok / po_transition_ok 由
 // so_set_status / po_set_status 强制，草稿 → 已完成这类跳变由 findb 拒（FinError::state
 // → 400）。这里不再复制一份流转表——两份图必然漂移，且 HTTP 层无从得知 findb 何时调整。
@@ -6777,6 +7133,22 @@ async fn transition_so(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = so_status_parse(&req.status)?;
+    // 工作流拦截：**只在「确认」这一个动作上**拦。
+    // 「确认」是订单的审批动作（签出即对外承诺）；partialShip / completed /
+    // cancelled 是确认之后的执行动作，再走一遍审批链等于让仓库收货要财务再批一次。
+    if to == findb::scm::SoStatus::Confirmed {
+        match workflow_gate(
+            &db,
+            &user,
+            findb::workflow::BIZ_SALES_ORDER,
+            id,
+            "销售订单",
+        )? {
+            WfGate::Pending(next) => return Ok(Json(json!({ "ok": true, "pending": next }))),
+            WfGate::Rejected => return Ok(Json(json!({ "ok": true, "rejected": true }))),
+            WfGate::Continue => {}
+        }
+    }
     // 状态机由 findb 的 so_set_status 把关（非法跳变 → 400）
     findb::scm::so_set_status(&db, id, to)?;
     // 状态已提交：日志失败不得把请求打成 500，否则客户端重试会重复流转
@@ -6958,6 +7330,20 @@ async fn transition_po(
     user.require(Perm::OrderOps)?;
     let db = state.db_for(&user.book_key)?;
     let to = po_status_parse(&req.status)?;
+    // 同 transition_so：只在「确认」这个审批动作上走工作流
+    if to == findb::scm::PoStatus::Confirmed {
+        match workflow_gate(
+            &db,
+            &user,
+            findb::workflow::BIZ_PURCHASE_ORDER,
+            id,
+            "采购订单",
+        )? {
+            WfGate::Pending(next) => return Ok(Json(json!({ "ok": true, "pending": next }))),
+            WfGate::Rejected => return Ok(Json(json!({ "ok": true, "rejected": true }))),
+            WfGate::Continue => {}
+        }
+    }
     // 同 transition_so：状态机由 findb 的 po_set_status 把关（非法跳变 → 400）
     findb::scm::po_set_status(&db, id, to)?;
     // 状态已提交：日志失败不得把请求打成 500，否则客户端重试会重复流转
@@ -7737,6 +8123,37 @@ async fn create_prod_ep(
         &format!("{} {} ×{}", order.no, code, qty.fmt_qty()),
     )?;
     Ok(Json(json!({ "ok": true, "id": id, "no": order.no })))
+}
+
+/// 下达生产订单：草稿 → 已下达。**这是生产订单的审批动作**。
+///
+/// 为什么要单开一个端点：原来只有 `create_prod_ep`，且创建即 `Released`——
+/// 没有一个「下达前把关」的动作点，审批流根本挂不上去（配了流程也永远不生效，
+/// 且不报任何错）。这里把「下达」显式化成一步，与金蝶星空「生产订单下达」一致。
+///
+/// 老路径不动：`create_prod_ep` 仍直接建 `Released`，避免既有调用方行为变化。
+async fn prod_release_ep(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::ProductionOps)?;
+    let db = state.db_for(&user.book_key)?;
+    // 先过工作流：未到终态时只推进流程，不改订单状态
+    match workflow_gate(
+        &db,
+        &user,
+        findb::workflow::BIZ_PRODUCTION_ORDER,
+        id,
+        "生产订单",
+    )? {
+        WfGate::Pending(next) => return Ok(Json(json!({ "ok": true, "pending": next }))),
+        WfGate::Rejected => return Ok(Json(json!({ "ok": true, "rejected": true }))),
+        WfGate::Continue => {}
+    }
+    findb::scm::prod_release(&db, id)?;
+    db.log(user.username(), "生产", "下达生产订单", &format!("#{id}"))?;
+    Ok(Json(json!({ "ok": true, "status": "已下达" })))
 }
 
 /// 开工：已下达 → 生产中（完工入库的前置状态；条件更新防并发）

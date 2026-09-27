@@ -259,7 +259,7 @@ fn first_line(po: &crate::scm::PurchaseOrder) -> Result<&crate::scm::PoLine, fin
 /// 按累计净收货刷新采购订单执行状态（到货/退货共用）：
 /// 净收货 ≥ 订购量 → Completed；>0 → PartialIn；=0 → Confirmed；
 /// 已取消的单不回退（WHERE status <> 'Cancelled'）。
-fn refresh_po_status(db: &Db, po_id: i64) -> DbResult<()> {
+pub fn refresh_po_status(db: &Db, po_id: i64) -> DbResult<()> {
     let po = crate::scm::po_get(db, po_id)?
         .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
     let ordered: Money = po.lines.iter().map(|l| l.qty_ordered).sum();

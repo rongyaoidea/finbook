@@ -19,11 +19,20 @@ pub const BIZ_QUOTATION: &str = "quotation";
 pub const BIZ_PURCHASE_REQ: &str = "purchase_req";
 pub const BIZ_CLAIM: &str = "claim";
 pub const BIZ_RECEIPT: &str = "receipt";
+pub const BIZ_PURCHASE_ORDER: &str = "purchase_order";
+pub const BIZ_SALES_ORDER: &str = "sales_order";
+pub const BIZ_PRODUCTION_ORDER: &str = "production_order";
 
 /// 业务类型 → 中文（前端下拉与实例列表展示）
+///
+/// 顺序按「单据生命周期」排：报价 → 请购 → 采购订单 → 生产订单 → 销售订单 → 报销 → 收付款。
+/// 这样前端下拉里相邻的就是上下游单据，配置流程时不容易把顺序看反。
 pub const ALL_BIZ: &[(&str, &str)] = &[
     (BIZ_QUOTATION, "报价单"),
     (BIZ_PURCHASE_REQ, "请购单"),
+    (BIZ_PURCHASE_ORDER, "采购订单"),
+    (BIZ_PRODUCTION_ORDER, "生产订单"),
+    (BIZ_SALES_ORDER, "销售订单"),
     (BIZ_CLAIM, "报销单"),
     (BIZ_RECEIPT, "收付款单"),
 ];
@@ -389,6 +398,69 @@ pub fn templates() -> Vec<WfTemplate> {
             ],
         },
         WfTemplate {
+            key: "order_standard".into(),
+            name: "订单两级（业务 → 财务）".into(),
+            desc: "制单 → 业务主管 → 财务主管。采购/销售订单专用：订单一旦签出就是对外的\
+                  商业承诺，金额风险高于报价与请购，所以固定两级而不是单级。".into(),
+            biz_types: vec![
+                BIZ_PURCHASE_ORDER.into(),
+                BIZ_SALES_ORDER.into(),
+            ],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("biz", "approve", "业务主管审批", &["supervisor"], 240.0, 140.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 420.0, 140.0),
+            ],
+            edges: vec![tedge("start", "biz"), tedge("biz", "fin")],
+        },
+        WfTemplate {
+            key: "order_tiered".into(),
+            name: "订单金额分级".into(),
+            desc: "按**价税合计**分级：≤5万 业务主管批完；>5万 加财务主管；>50万 再上总经理。\
+                  生产订单没有金额，改用数量模板（见「生产订单两段审」）。".into(),
+            biz_types: vec![BIZ_PURCHASE_ORDER.into(), BIZ_SALES_ORDER.into()],
+            requires_fields: vec!["amount".into()],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 200.0),
+                // 起点必须是数组里第一个 approve 节点（见约束②）
+                tnode("biz", "approve", "业务主管审批", &["supervisor"], 230.0, 200.0),
+                tnode("fin", "approve", "财务主管审批", &["supervisor"], 420.0, 120.0),
+                tnode("gm", "approve", "总经理审批", &["supervisor"], 610.0, 60.0),
+                tnode("done", "message", "主管批完归档", &[], 230.0, 300.0),
+            ],
+            // 三条出边 + 一条空条件兜底：兜底不可省（见约束①）
+            edges: vec![
+                tedge("start", "biz"),
+                tedge_if("biz", "gm", "amount > 500000"),
+                tedge_if("biz", "fin", "amount > 50000"),
+                tedge("biz", "done"),
+                tedge("fin", "gm"),
+            ],
+        },
+        WfTemplate {
+            key: "prod_two_stage".into(),
+            name: "生产订单两段审（计划 → 开工）".into(),
+            desc: "制单 → 生产计划员确认（核对 BOM/产能/库存）→ 生产负责人批准开工。\
+                  条件用 planned_qty 数量而非金额——生产订单本来就没有金额字段。".into(),
+            biz_types: vec![BIZ_PRODUCTION_ORDER.into()],
+            requires_fields: vec!["planned_qty".into()],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 200.0),
+                tnode("plan", "approve", "生产计划员确认", &["supervisor"], 240.0, 200.0),
+                tnode("pm", "approve", "生产负责人批准", &["supervisor"], 430.0, 200.0),
+                tnode("big", "approve", "厂长审批（大批量）", &["supervisor"], 430.0, 80.0),
+                tnode("done", "message", "排产完成", &[], 620.0, 200.0),
+            ],
+            edges: vec![
+                tedge("start", "plan"),
+                tedge_if("plan", "big", "planned_qty > 1000"),
+                tedge("plan", "pm"),
+                tedge("big", "pm"),
+                tedge("pm", "done"),
+            ],
+        },
+        WfTemplate {
             key: "amount_tiered".into(),
             name: "金额分级审批".into(),
             desc: "≤5000 主管批完归档；>5000 加财务主管；>50000 直接上总经理。阈值与节点均可在画布上改。".into(),
@@ -444,6 +516,22 @@ pub fn apply_template(db: &Db, key: &str, biz_type: &str, who: &str) -> DbResult
         ))
         .into());
     }
+    // 依赖字段必须真的是该单据类型**会提供**的字段。
+    //
+    // 这条校验挡住的是「模板落草稿时一切正常，单据提交到审批才报『条件配置
+    // 错误』把单卡死」——条件求值缺字段返回 Err，而实例已经建了，卡在第一个
+    // 审批节点既过不去也退不出。生产订单没有金额就是典型：把金额分级模板
+    // 套到生产订单上，planned_qty=5 会被拿去比 5000。
+    if let Some(missing) = missing_cond_fields(biz_type, &tpl.requires_fields) {
+        return Err(fincore::FinError::validate(format!(
+            "模板【{}】依赖字段「{}」在「{}」上不存在（该单据可用：{}）",
+            tpl.name,
+            missing.join("、"),
+            biz_label(biz_type),
+            cond_fields_of(biz_type).join("、")
+        ))
+        .into());
+    }
     let input = WfFlowInput {
         id: 0,
         name: format!("{}·{}", biz_label(biz_type), tpl.name),
@@ -484,6 +572,36 @@ pub fn flow_save(db: &Db, f: &WfFlowInput, who: &str) -> DbResult<i64> {
     for n in &f.nodes {
         if !n.reject_to.is_empty() && !ids.contains(n.reject_to.as_str()) {
             return Err(fincore::FinError::validate(format!("驳回目标节点不存在：{}", n.reject_to)).into());
+        }
+    }
+    // 条件边引用的字段必须真的是该单据类型**会提供**的字段。
+    //
+    // 与 apply_template 里的同一道校验是一对：那边拦模板，这边拦**手绘**的流程。
+    // 只做一边都不够——模板能过校验不代表管理员不会自己在画布上写一条
+    // `amount > 5000` 挂到生产订单上。
+    //
+    // 为什么必须在这里拦而不是等审批时：条件求值缺字段返回 Err，而实例**已经
+    // 建好了**，单据卡在第一个审批节点既过不去也退不出，只能手工改库。
+    // 「画布上少一个字段、月底发现一批单卡死」是比「保存时报错」差得多的结局。
+    {
+        let have = cond_fields_of(&f.biz_type);
+        let mut bad: Vec<String> = Vec::new();
+        for e in &f.edges {
+            for field in condition_fields(&e.condition) {
+                if !have.iter().any(|h| *h == field) {
+                    bad.push(format!("{field}（连线 {} → {}）", e.from_node, e.to_node));
+                }
+            }
+        }
+        bad.dedup();
+        if !bad.is_empty() {
+            return Err(fincore::FinError::validate(format!(
+                "条件字段「{}」在「{}」上不存在（该单据可用：{}）",
+                bad.join("、"),
+                biz_label(&f.biz_type),
+                have.join("、")
+            ))
+            .into());
         }
     }
     ids.clear();
@@ -679,6 +797,65 @@ fn first_approve(flow: &WfFlow) -> Option<&WfNode> {
     flow.nodes.iter().find(|n| n.node_type == "approve")
 }
 
+/// 某业务类型**会提供**哪些条件字段。
+///
+/// 与 `cond_context` 严格对应：这里多列一个字段，条件求值就会在真单据上
+/// 因缺字段报 Err；这里少列一个，用户配的条件边就静默走兜底分支。两个函数
+/// 必须一起改——`cond_fields_match_context` 那个用例就是钉住这一点的。
+pub fn cond_fields_of(biz_type: &str) -> Vec<&'static str> {
+    match biz_type {
+        BIZ_QUOTATION => vec!["qty", "amount", "customer_code", "item_code"],
+        BIZ_CLAIM => vec!["amount", "applicant", "dept"],
+        BIZ_RECEIPT => vec!["amount", "kind", "party"],
+        BIZ_PURCHASE_REQ => vec!["qty", "item_code", "requester"],
+        BIZ_PURCHASE_ORDER => vec!["amount", "net_amount", "tax", "supplier_code", "prepared_by"],
+        BIZ_SALES_ORDER => vec!["amount", "net_amount", "tax", "customer_code", "prepared_by"],
+        BIZ_PRODUCTION_ORDER => vec![
+            "planned_qty",
+            "item_code",
+            "work_center",
+            "order_kind",
+            "supplier_code",
+            "prepared_by",
+        ],
+        _ => vec![],
+    }
+}
+
+/// 从条件串里抽出引用的字段名（`amount > 5000` → `["amount"]`；空条件 → 空）
+///
+/// 只取第一段：条件文法固定为 `字段 操作 值`，值里的引号内容不会被误认成字段。
+fn condition_fields(cond: &str) -> Vec<String> {
+    let c = cond.trim();
+    if c.is_empty() {
+        return Vec::new();
+    }
+    c.split_whitespace()
+        .next()
+        .map(|f| f.trim_matches('"').to_string())
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// 返回 `need` 里该单据**不提供**的字段；全都有则返回 None
+fn missing_cond_fields(biz_type: &str, need: &[String]) -> Option<Vec<String>> {
+    if need.is_empty() {
+        return None;
+    }
+    let have = cond_fields_of(biz_type);
+    let missing: Vec<String> = need
+        .iter()
+        .filter(|f| !have.iter().any(|h| *h == f.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
 /// 条件分支上下文：按业务类型取单据属性（统一字符串；数值比较时解析）
 fn cond_context(
     db: &Db,
@@ -718,6 +895,40 @@ fn cond_context(
                 m.insert("qty".into(), money(r.qty));
                 m.insert("item_code".into(), r.item_code);
                 m.insert("requester".into(), r.requester);
+            }
+        }
+        BIZ_PURCHASE_ORDER => {
+            if let Some(o) = crate::scm::po_get(db, biz_id)? {
+                // 条件字段用「未税金额」还是「价税合计」要选清楚：
+                // 审批权限通常按合同/订单的**价税合计**授权（含税才是真实承诺），
+                // 所以 amount 取 total_amount + total_tax，税额单列 tax 备用。
+                m.insert("amount".into(), money(o.total_amount + o.total_tax));
+                m.insert("net_amount".into(), money(o.total_amount));
+                m.insert("tax".into(), money(o.total_tax));
+                m.insert("supplier_code".into(), o.supplier_code);
+                m.insert("prepared_by".into(), o.prepared_by);
+            }
+        }
+        BIZ_SALES_ORDER => {
+            if let Some(o) = crate::scm::so_get(db, biz_id)? {
+                m.insert("amount".into(), money(o.total_amount + o.total_tax));
+                m.insert("net_amount".into(), money(o.total_amount));
+                m.insert("tax".into(), money(o.total_tax));
+                m.insert("customer_code".into(), o.customer_code);
+                m.insert("prepared_by".into(), o.prepared_by);
+            }
+        }
+        BIZ_PRODUCTION_ORDER => {
+            // 生产订单没有金额字段，条件只能用数量/物料/委外标记。
+            // 刻意**不**塞 amount：塞一个「数量」冒充金额会让 amount_tiered
+            // 这类按金额分级的模板在生产订单上跑出「10 件 > 5000 元」的荒谬判断。
+            if let Some(o) = crate::scm::prod_get(db, biz_id)? {
+                m.insert("planned_qty".into(), money(o.planned_qty));
+                m.insert("item_code".into(), o.item_code);
+                m.insert("work_center".into(), o.work_center);
+                m.insert("order_kind".into(), o.order_kind.clone());
+                m.insert("supplier_code".into(), o.supplier_code.clone());
+                m.insert("prepared_by".into(), o.prepared_by.clone());
             }
         }
         _ => {}
@@ -974,6 +1185,18 @@ pub fn intercept(
         }
         for r in user.all_roles() {
             covered.insert(role_code(&r));
+        }
+        // 审核权限兜底**必须**同样参与计票，不能只管准入门禁。
+        //
+        // 不这么做的后果很具体：预置模板的节点都写了 participants=["supervisor"]
+        // 且默认 strategy="all"（会签），而平台管理员的 all_roles() 是 [Admin]
+        // 不含 supervisor。于是管理员能进门禁（audit_ok）却凑不满票，实例永远
+        // 停在第一个节点，单据卡死——「审核人/主管/管理员可兜底」这条规则在会签
+        // 节点上等于没写。
+        if audit_ok {
+            for p in &node.participants {
+                covered.insert(p.clone());
+            }
         }
         let done = node
             .participants
@@ -1317,7 +1540,453 @@ mod tests {
         }
     }
 
-    /// 模板不能套到不适用���单据上——否则金额分级模板跑到报价单上，
+    /// `cond_fields_of` 与 `cond_context` 必须严格一致。
+    ///
+    /// 两个函数是两处独立实现的关系，天然会漂移：
+    ///   · `cond_fields_of` 多列一个字段 → 用户配的条件边静默走兜底分支
+    ///     （看起来流程「通了」，实际条件从没生效）
+    ///   · `cond_fields_of` 少列一个字段 → 模板明明适用却被 apply_template 拒
+    /// 这个用例用真单据跑一遍 `cond_context`，逐个比对声明的字段集。
+    #[test]
+    fn cond_fields_match_context() {
+        use crate::business::{Claim, ClaimItem, ClaimStatus};
+        use crate::procurement::PurchaseReq;
+        use crate::sales::Quotation;
+        use crate::scm::{PoLine, SoLine};
+
+        let db = mem();
+        let p = fincore::Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        // 报价单：qty / amount / customer_code / item_code
+        let mut q = Quotation {
+            id: 0,
+            no: "QU-1".into(),
+            period: p,
+            date: d,
+            customer_code: "C01".into(),
+            customer_name: "客户甲".into(),
+            item_code: "I01".into(),
+            item_name: "料".into(),
+            qty: fincore::Money::parse("10").unwrap(),
+            unit_price: fincore::Money::parse("100").unwrap(),
+            status: "approved".into(),
+            prepared_by: "u".into(),
+            memo: String::new(),
+        };
+        let qid = crate::sales::quo_save(&db, &mut q).unwrap();
+
+        // 报销单：amount / applicant / dept
+        let money = fincore::Money::parse("880").unwrap();
+        let cid = crate::business::claim_insert(
+            &db,
+            &Claim {
+                id: 0,
+                period: p,
+                no: "CL-1".into(),
+                biz_date: d,
+                applicant: "E01".into(),
+                dept: "D01".into(),
+                reason: "差旅".into(),
+                amount: money,
+                status: ClaimStatus::Submitted,
+                items: vec![ClaimItem {
+                    expense_account: "660203".into(),
+                    amount: money,
+                    memo: "机票".into(),
+                }],
+                approver: String::new(),
+                approved_at: None,
+                payer: String::new(),
+                paid_at: None,
+                voucher_id: None,
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        // 请购单：qty / item_code / requester
+        let mut pr = PurchaseReq {
+            id: 0,
+            no: "PR-1".into(),
+            period: p,
+            date: d,
+            item_code: "I01".into(),
+            item_name: "料".into(),
+            qty: fincore::Money::parse("5").unwrap(),
+            status: "approved".into(),
+            requester: "E01".into(),
+            memo: String::new(),
+        };
+        let prid = crate::procurement::pr_save(&db, &mut pr).unwrap();
+
+        // 采购订单：amount(含税) / net_amount / tax / supplier_code / prepared_by
+        let mut po = crate::scm::PurchaseOrder::new(p, d, "S01", "供应商甲", "u");
+        po.status = crate::scm::PoStatus::Confirmed;
+        po.lines = vec![PoLine {
+            id: 0,
+            po_id: 0,
+            item_code: "I01".into(),
+            item_name: "料".into(),
+            qty_ordered: fincore::Money::parse("10").unwrap(),
+            qty_received: fincore::Money::ZERO,
+            unit_price: fincore::Money::parse("100").unwrap(),
+            tax_rate: fincore::Money::parse("0.13").unwrap(),
+            amount: fincore::Money::parse("1000").unwrap(),
+            tax_amount: fincore::Money::parse("130").unwrap(),
+            memo: String::new(),
+        }];
+        let poid = crate::scm::po_save(&db, &mut po).unwrap();
+
+        // 销售订单：amount / net_amount / tax / customer_code / prepared_by
+        let mut so = crate::scm::SalesOrder::new(p, d, "C01", "客户甲", "u");
+        so.status = crate::scm::SoStatus::Confirmed;
+        so.lines = vec![SoLine {
+            id: 0,
+            so_id: 0,
+            item_code: "I01".into(),
+            item_name: "料".into(),
+            qty_ordered: fincore::Money::parse("20").unwrap(),
+            qty_shipped: fincore::Money::ZERO,
+            unit_price: fincore::Money::parse("50").unwrap(),
+            tax_rate: fincore::Money::parse("0.13").unwrap(),
+            amount: fincore::Money::parse("1000").unwrap(),
+            tax_amount: fincore::Money::parse("130").unwrap(),
+            memo: String::new(),
+        }];
+        let soid = crate::scm::so_save(&db, &mut so).unwrap();
+
+        // 生产订单：planned_qty 等，**没有** amount
+        let mut mo = crate::scm::ProductionOrder {
+            id: 0,
+            no: "MO-1".into(),
+            period: p,
+            date: d,
+            item_code: "F01".into(),
+            item_name: "成品".into(),
+            planned_qty: fincore::Money::parse("300").unwrap(),
+            completed_qty: fincore::Money::ZERO,
+            status: crate::scm::ProdStatus::Draft,
+            work_center: "W01".into(),
+            prepared_by: "u".into(),
+            memo: String::new(),
+            order_kind: "inhouse".into(),
+            supplier_code: String::new(),
+            supplier_name: String::new(),
+            plan_start: String::new(),
+            plan_end: String::new(),
+        };
+        let moid = crate::scm::prod_save(&db, &mut mo).unwrap();
+
+        // 收付款单：amount / kind / party
+        let rid = crate::receipt::receipt_create(
+            &db,
+            "payment",
+            d,
+            "100201",
+            "S01",
+            fincore::Money::parse("500").unwrap(),
+            "付供应商款",
+            "u",
+        )
+        .unwrap();
+
+        let cases: Vec<(&str, i64, Vec<&str>)> = vec![
+            (BIZ_QUOTATION, qid, vec!["qty", "amount", "customer_code", "item_code"]),
+            (BIZ_CLAIM, cid, vec!["amount", "applicant", "dept"]),
+            (BIZ_PURCHASE_REQ, prid, vec!["qty", "item_code", "requester"]),
+            (
+                BIZ_PURCHASE_ORDER,
+                poid,
+                vec!["amount", "net_amount", "tax", "supplier_code", "prepared_by"],
+            ),
+            (
+                BIZ_SALES_ORDER,
+                soid,
+                vec!["amount", "net_amount", "tax", "customer_code", "prepared_by"],
+            ),
+            (
+                BIZ_PRODUCTION_ORDER,
+                moid,
+                vec![
+                    "planned_qty",
+                    "item_code",
+                    "work_center",
+                    "order_kind",
+                    "supplier_code",
+                    "prepared_by",
+                ],
+            ),
+            (BIZ_RECEIPT, rid, vec!["amount", "kind", "party"]),
+        ];
+
+        for (biz, id, declared) in cases {
+            let ctx = cond_context(&db, biz, id)
+                .unwrap_or_else(|e| panic!("cond_context({biz}) 失败：{e}"));
+            let mut actual: Vec<String> = ctx.keys().cloned().collect();
+            actual.sort();
+            let mut want: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(
+                actual, want,
+                "【{biz}】cond_context 实际提供的字段与 cond_fields_of 声明的不一致"
+            );
+        }
+    }
+
+    /// 持有审核权限的人在会签节点上**也能凑满票**（兜底规则要贯穿到计票）。
+    ///
+    /// 回归背景：预置模板的节点都写 `participants=["supervisor"]` + 默认
+    /// `strategy="all"`（会签），而平台管理员的 `all_roles()` 是 `[Admin]`，
+    /// 不含 supervisor。计票只看角色时，管理员能过门禁却永远凑不满票，实例
+    /// 死死停在第一个节点——「配了流程、单据却过不去」里最难自查的一种。
+    #[test]
+    fn audit_permission_counts_toward_cosign_quorum() {
+        let db = mem();
+        let f = apply_template(&db, "order_standard", BIZ_PURCHASE_ORDER, "u").unwrap();
+        flow_set_status(&db, f.id, true, "u").unwrap();
+        let lead = f
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "approve")
+            .expect("应有审批节点");
+        assert!(
+            !lead.participants.is_empty() && lead.strategy == "all",
+            "本用例的前提：节点既指定了参与人角色、又是会签（否则测不到兜底）"
+        );
+
+        let admin = User::new("boss", "管理员", Role::Admin);
+        assert!(admin.can(Perm::VoucherAudit), "管理员应持有审核权限");
+        assert!(
+            !admin.all_roles().iter().any(|r| role_code(r) == "supervisor"),
+            "管理员的角色里本不该有 supervisor —— 正是这一点让本用例有意义"
+        );
+
+        // 一票就该过（走到第二个节点），而不是停在原地等一个永远不会来的主管票
+        match intercept(&db, BIZ_PURCHASE_ORDER, 1, &admin, true, "").unwrap() {
+            Gate::Pending { next } => assert!(
+                !next.contains("业务主管"),
+                "审核权限兜底应直接满足该节点票数，不该停在原节点：{next}"
+            ),
+            other => panic!("首个节点不应终态：{other:?}"),
+        }
+    }
+
+    /// 生产订单**没有**金额字段：条件字段校验必须认出这一点。
+    ///
+    /// 挡的是「画布上少一个字段、月底发现一批单卡死」——条件求值缺字段返回 Err，
+    /// 而实例**已经建好**，单据卡在第一个审批节点既过不去也退不出，只能手工改库。
+    /// 所以要在**保存流程**那一刻就拒掉。
+    #[test]
+    fn condition_fields_validated_against_biz_type() {
+        let db = mem();
+
+        // 1) 字段表本身：生产订单有 planned_qty、没有 amount
+        let have = cond_fields_of(BIZ_PRODUCTION_ORDER);
+        assert!(have.contains(&"planned_qty"));
+        assert!(
+            !have.contains(&"amount"),
+            "生产订单不该有 amount —— 塞一个数量冒充金额会让「金额分级」跑出「10 件 > 5000 元」"
+        );
+        assert_eq!(
+            missing_cond_fields(BIZ_PRODUCTION_ORDER, &["amount".to_string()])
+                .unwrap_or_default(),
+            vec!["amount".to_string()]
+        );
+        assert!(missing_cond_fields(BIZ_PRODUCTION_ORDER, &["planned_qty".into()]).is_none());
+
+        // 2) 手绘流程：在生产订单上写 `amount > 5000` 必须在保存时被拒
+        let bad = WfFlowInput {
+            id: 0,
+            name: "手绘·生产金额分级".into(),
+            biz_type: BIZ_PRODUCTION_ORDER.into(),
+            nodes: vec![
+                WfNode {
+                    id: "start".into(),
+                    node_type: "start".into(),
+                    name: "制单".into(),
+                    participants: vec![],
+                    strategy: default_strategy(),
+                    reject_to: String::new(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                WfNode {
+                    id: "a".into(),
+                    node_type: "approve".into(),
+                    name: "主管".into(),
+                    participants: vec![],
+                    strategy: default_strategy(),
+                    reject_to: String::new(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                WfNode {
+                    id: "b".into(),
+                    node_type: "approve".into(),
+                    name: "财务".into(),
+                    participants: vec![],
+                    strategy: default_strategy(),
+                    reject_to: String::new(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+            ],
+            edges: vec![
+                tedge("start", "a"),
+                tedge_if("a", "b", "amount > 5000"),
+            ],
+        };
+        let e = flow_save(&db, &bad, "u").unwrap_err().to_string();
+        assert!(e.contains("amount"), "应点名缺失字段：{e}");
+        assert!(e.contains("生产订单"), "应说清是哪张单据：{e}");
+        assert!(
+            e.contains("planned_qty"),
+            "应列出该单据实际可用的字段，别让用户自己猜：{e}"
+        );
+
+        // 3) 同一张单据上用 planned_qty 就该放行
+        let mut ok = bad;
+        ok.name = "手绘·生产数量分级".into();
+        ok.edges[1].condition = "planned_qty > 1000".into();
+        assert!(
+            flow_save(&db, &ok, "u").is_ok(),
+            "用该单据真有的字段就应该能保存"
+        );
+
+        // 4) 报销单上写 planned_qty 同样要拒（反向也不许错）
+        let mut wrong = ok.clone();
+        wrong.biz_type = BIZ_CLAIM.into();
+        wrong.edges[1].condition = "planned_qty > 1000".into();
+        let e = flow_save(&db, &wrong, "u").unwrap_err().to_string();
+        assert!(e.contains("planned_qty"), "反向也必须拒：{e}");
+    }
+
+    /// 订单分级模板要真的按**价税合计**分流，而不是只看未税金额。
+    ///
+    /// 这里特意让税额占大头（未税 1000、13% 税 → 合计 1130），阈值卡在 1100：
+    /// 只看未税会判「小额走快速通道」，看价税合计才走加签。差一个 13% 就分错档
+    /// 的审批链，在实务里就是「该上财务主管的单没过财务主管」。
+    #[test]
+    fn order_tiered_branches_on_amount_including_tax() {
+        use crate::scm::{PoLine, PoStatus};
+        let db = mem();
+        let f = apply_template(&db, "order_tiered", BIZ_PURCHASE_ORDER, "u").unwrap();
+        flow_set_status(&db, f.id, true, "u").unwrap();
+        let sup = User::new("s", "主管", Role::Supervisor);
+        let p = fincore::Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        // 传未税与税额两个数：po_save 直接把 line.amount / line.tax_amount 分别
+        // 汇总成 total_amount / total_tax，所以「价税合计」= 两者之和。
+        let mk = |no: &str, net: &str, tax: &str| -> i64 {
+            let mut po = crate::scm::PurchaseOrder::new(p, d, "S01", "供应商甲", "u");
+            // no 有 UNIQUE 约束：不取号的话第二张就撞 "UNIQUE constraint failed"
+            po.no = crate::scm::po_next_no(&db, p).unwrap();
+            po.status = PoStatus::Confirmed;
+            po.lines = vec![PoLine {
+                id: 0,
+                po_id: 0,
+                item_code: "I01".into(),
+                item_name: "料".into(),
+                qty_ordered: fincore::Money::parse("1").unwrap(),
+                qty_received: fincore::Money::ZERO,
+                unit_price: fincore::Money::parse(net).unwrap(),
+                tax_rate: fincore::Money::parse("0.13").unwrap(),
+                amount: fincore::Money::parse(net).unwrap(),
+                tax_amount: fincore::Money::parse(tax).unwrap(),
+                memo: String::new(),
+            }];
+            crate::scm::po_save(&db, &mut po).unwrap_or_else(|e| panic!("{no} 保存失败：{e}"))
+        };
+        // 未税 100000 + 税 13000 = 113000 > 100000 阈值 → 上总经理
+        let big = mk("PO-1", "100000", "13000");
+        let small = mk("PO-2", "100", "13"); // 合计 113 → 业务主管批完
+
+        // 大额：业务主管 → 财务主管 → 总经理
+        match intercept(&db, BIZ_PURCHASE_ORDER, big, &sup, true, "").unwrap() {
+            Gate::Pending { next } => assert!(next.contains("财务"), "大额应加签财务主管：{next}"),
+            other => panic!("大额单第一审不应终态：{other:?}"),
+        }
+        match intercept(&db, BIZ_PURCHASE_ORDER, big, &sup, true, "").unwrap() {
+            Gate::Pending { next } => assert!(next.contains("总经理"), "大额应再上总经理：{next}"),
+            other => panic!("大额单第二审不应终态：{other:?}"),
+        }
+        assert!(matches!(
+            intercept(&db, BIZ_PURCHASE_ORDER, big, &sup, true, "").unwrap(),
+            Gate::Final { approved: true }
+        ));
+
+        // 小额：业务主管批完即终态
+        assert!(
+            matches!(
+                intercept(&db, BIZ_PURCHASE_ORDER, small, &sup, true, "").unwrap(),
+                Gate::Final { approved: true }
+            ),
+            "小额采购订单应在业务主管这一节点结束"
+        );
+    }
+
+    /// 生产订单两段审：大批量要加厂长，小批量不加。
+    #[test]
+    fn prod_two_stage_branches_on_planned_qty() {
+        use crate::scm::ProdStatus;
+        let db = mem();
+        let f = apply_template(&db, "prod_two_stage", BIZ_PRODUCTION_ORDER, "u").unwrap();
+        flow_set_status(&db, f.id, true, "u").unwrap();
+        let sup = User::new("s", "主管", Role::Supervisor);
+        let p = fincore::Period::new(2026, 1).unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        let mk = |no: &str, qty: &str| -> i64 {
+            let mut mo = crate::scm::ProductionOrder {
+                id: 0,
+                no: no.into(),
+                period: p,
+                date: d,
+                item_code: "F01".into(),
+                item_name: "成品".into(),
+                planned_qty: fincore::Money::parse(qty).unwrap(),
+                completed_qty: fincore::Money::ZERO,
+                status: ProdStatus::Draft,
+                work_center: "W01".into(),
+                prepared_by: "u".into(),
+                memo: String::new(),
+                order_kind: "inhouse".into(),
+                supplier_code: String::new(),
+                supplier_name: String::new(),
+                plan_start: String::new(),
+                plan_end: String::new(),
+            };
+            crate::scm::prod_save(&db, &mut mo)
+                .unwrap_or_else(|e| panic!("{no} 保存失败：{e}"))
+        };
+        let big = mk("MO-BIG", "5000"); // > 1000 → 加厂长
+        let small = mk("MO-SMALL", "10");
+
+        match intercept(&db, BIZ_PRODUCTION_ORDER, big, &sup, true, "").unwrap() {
+            Gate::Pending { next } => assert!(next.contains("厂长"), "大批量应加厂长：{next}"),
+            other => panic!("首批不应终态：{other:?}"),
+        }
+        match intercept(&db, BIZ_PRODUCTION_ORDER, big, &sup, true, "").unwrap() {
+            Gate::Pending { next } => assert!(next.contains("生产负责人"), "接着是生产负责人：{next}"),
+            other => panic!("次批不应终态：{other:?}"),
+        }
+        assert!(matches!(
+            intercept(&db, BIZ_PRODUCTION_ORDER, big, &sup, true, "").unwrap(),
+            Gate::Final { approved: true }
+        ));
+
+        match intercept(&db, BIZ_PRODUCTION_ORDER, small, &sup, true, "").unwrap() {
+            Gate::Pending { next } => {
+                assert!(next.contains("生产负责人"), "小批量不加厂长：{next}");
+                assert!(!next.contains("厂长"), "小批量不该走厂长节点：{next}");
+            }
+            other => panic!("小批量首批不应终态：{other:?}"),
+        }
+    }
+
+    /// 模板不能套到不适用的单据上——否则金额分级模板跑到报价单上，
     /// 审批时会因缺 `amount` 字段直接报「条件配置错误」，把单据卡死。
     #[test]
     fn template_rejects_inapplicable_biz_type() {
@@ -1529,18 +2198,41 @@ mod tests {
             Gate::Pending { next } => assert_eq!(next, "快速通过"),
             other => panic!("兜底路由：{other:?}"),
         }
-        // 语法错误 → 审批即报配置错误
+        // 语法错误 → 保存时字段名合法（`amount` 确实存在），但运算符非法：
+        // 这类**只能**在审批时才发现，所以审批时报配置错仍是对的行为。
         cond_flow("坏条件流", "amount >>> 5");
         assert!(
             intercept(&db, BIZ_QUOTATION, bad_cond, &u, true, "").is_err(),
             "语法错误应报配置错"
         );
-        // 未知字段 → 审批即报配置错误
-        cond_flow("未知字段流", "foo > 5");
+
+        // 未知字段 → 现在在**保存流程**时就被拒（flow_save 校验条件字段）。
+        // 比「审批时才发现」早一个数量级：早拒绝不会留下卡死的实例。
+        let nodes = vec![
+            n("s1", "start", "开始", vec![]),
+            n("a1", "approve", "审批", vec![]),
+            n("a2", "approve", "高额复核", vec![]),
+        ];
+        let mut edges = vec![e("e1", "s1", "a1", "normal"), e("e3", "a1", "a2", "normal")];
+        edges[1].condition = "foo > 5".to_string();
+        let e = flow_save(&db, &input(0, "未知字段流", nodes, edges), "u")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("foo"), "应点名不存在的字段：{e}");
         assert!(
-            intercept(&db, BIZ_QUOTATION, unknown_f, &u, true, "").is_err(),
-            "未知字段应报配置错"
+            e.contains("报价单") && e.contains("amount"),
+            "应说清是哪张单据、可用哪些字段：{e}"
         );
+
+        // 剩下的「晚发现」缺口：字段**声明上有**、但这张单据取不到值
+        // （如单据已被删除、aux 查不到）。这种保存时无法判断，只能审批时报。
+        let ghost = 9_999_999i64;
+        cond_flow("字段缺失流", "amount > 5000");
+        assert!(
+            intercept(&db, BIZ_QUOTATION, ghost, &u, true, "").is_err(),
+            "单据取不到值时审批应报错，而不是静默走兜底分支"
+        );
+        let _ = unknown_f;
     }
 
     /// 驳回后重新发起：实例重置回第一个审批节点，正常推进。

@@ -426,6 +426,10 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
         })?.collect::<Result<Vec<_>, _>>()?
     };
     
+    // 一次取回本期间所有到货流水，Rust 侧按订单分组累加（不在 SQL 里 SUM——
+    // 金额/数量列全库按 TEXT 存，SQLite 对 TEXT 的 SUM 返回 Integer/Real）
+    let recv_by_po = po_receipt_qty_map(db, period)?;
+
     let mut orders = Vec::new();
     for mut po in rows {
         let mut stmt = db.conn().prepare(
@@ -445,9 +449,56 @@ pub fn po_list(db: &Db, period: Period, status: Option<PoStatus>) -> DbResult<Ve
             memo: r.get(9)?,
         }))?.collect::<Result<Vec<_>, _>>()?;
         po.lines = lines;
+        // 执行进度（已收数量/金额）从 po_receipt 实时汇总，不读冗余列。
+        //
+        // 与销售侧同一个毛病：`purchase_order.received_amount` / `po_line.qty_received`
+        // 建表后**从未被任何代码回写**（只被读和初始化），到货只往 po_receipt 插行。
+        // 于是采购订单列表显示「已收 0」却同时显示状态「已入库完成」，自相矛盾。
+        let recv_qty = *recv_by_po.get(&po.id).unwrap_or(&Money::ZERO);
+        po.received_amount = po_received_gross(&po, recv_qty);
+        for l in po.lines.iter_mut() {
+            l.qty_received = recv_qty;
+        }
         orders.push(po);
     }
     Ok(orders)
+}
+
+/// 本期间各采购订单的累计已收数量（Rust 侧累加，不在 SQL 里 SUM）
+fn po_receipt_qty_map(
+    db: &Db,
+    period: Period,
+) -> DbResult<std::collections::HashMap<i64, Money>> {
+    let mut st = db
+        .conn()
+        .prepare("SELECT po_id, qty FROM po_receipt WHERE period=?1")?;
+    let rows = st.query_map([period.ymm()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut map: std::collections::HashMap<i64, Money> = std::collections::HashMap::new();
+    for r in rows {
+        let (po_id, qty) = r?;
+        *map.entry(po_id).or_insert(Money::ZERO) += Money::parse_or_zero(&qty);
+    }
+    Ok(map)
+}
+
+/// 按已收数量推导已收货金额（价税合计口径）
+///
+/// `po_receipt` 只记数量、没有金额列，金额按订购价税合计的**同一比例**推导：
+/// `价税合计 × (已收数量 ÷ 订购总数量)`。与销售侧 `so_shipped_gross` 口径对称。
+///
+/// 注意这里是**允许超收**的：`po_receipt_with_stock` 不封顶（超收在实务里常见），
+/// 所以已收数量可能大于订购数量，推导出的金额会大于订单金额 —— 这如实反映了
+/// 「到货金额确实超过订单金额」，不是 bug。是否要提示/拦截是另一个产品决策。
+pub fn po_received_gross(po: &PurchaseOrder, received_qty: Money) -> Money {
+    let ordered: Money = po.lines.iter().map(|l| l.qty_ordered).sum();
+    if ordered.is_zero() || !received_qty.is_positive() {
+        return Money::ZERO;
+    }
+    let gross = po.total_amount + po.total_tax;
+    match gross.checked_div(ordered) {
+        Some(unit) => (unit * received_qty).round2(),
+        None => Money::ZERO,
+    }
 }
 
 pub fn so_save(db: &Db, so: &mut SalesOrder) -> DbResult<i64> {
@@ -587,6 +638,14 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
         })?.collect::<Result<Vec<_>, _>>()?
     };
     
+    // 一次取回本期间所有发货流水，Rust 侧按订单分组累加。
+    //
+    // 刻意**不在 SQL 里 SUM 金额/数量列**：全库约定是「金额存 TEXT、不在 SQL 里
+    // SUM」（见 invoices::summary 的注释）。SQLite 对 TEXT 列的 SUM 返回
+    // Integer/Real，get::<String> 直接报 InvalidColumnType——而且这个错只在
+    // 「全整数数据」时出现，有小数时碰巧能过，属于最难自查的那类。
+    let shipped_by_so = so_shipment_qty_map(db, period)?;
+
     let mut orders = Vec::new();
     for mut so in rows {
         let mut stmt = db.conn().prepare(
@@ -606,9 +665,79 @@ pub fn so_list(db: &Db, period: Period, status: Option<SoStatus>) -> DbResult<Ve
             memo: r.get(9)?,
         }))?.collect::<Result<Vec<_>, _>>()?;
         so.lines = lines;
+        // 执行进度（已发数量/金额）从 so_shipment 实时汇总，不读冗余列。
+        //
+        // 冗余列 `sales_order.shipped_amount` / `so_line.qty_shipped` 建表后
+        // **从未被任何代码回写**——发货只往 so_shipment 插行。于是订单列表显示
+        // 「已发货 0.00」却同时显示状态「部分发货」，自相矛盾；而这恰恰是订单
+        // 驱动最核心的执行进度字段。读时汇总也顺带免掉了「多处回写、各处可能
+        // 漏一处」的漂移来源。
+        let shipped_qty = *shipped_by_so.get(&so.id).unwrap_or(&Money::ZERO);
+        so.shipped_amount = so_shipped_gross(&so, shipped_qty);
+        for l in so.lines.iter_mut() {
+            l.qty_shipped = shipped_qty;
+        }
         orders.push(so);
     }
     Ok(orders)
+}
+
+/// 某期间各销售订单的累计已发数量（Rust 侧累加，不在 SQL 里 SUM）
+fn so_shipment_qty_map(
+    db: &Db,
+    period: Period,
+) -> DbResult<std::collections::HashMap<i64, Money>> {
+    let mut st = db
+        .conn()
+        .prepare("SELECT so_id, qty FROM so_shipment WHERE period=?1")?;
+    let rows = st.query_map([period.ymm()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut map: std::collections::HashMap<i64, Money> = std::collections::HashMap::new();
+    for r in rows {
+        let (so_id, qty) = r?;
+        *map.entry(so_id).or_insert(Money::ZERO) += Money::parse_or_zero(&qty);
+    }
+    Ok(map)
+}
+
+/// 按已发数量推导已发货金额（价税合计口径）
+///
+/// `so_shipment` 只记数量、没有金额列，所以金额按与收入确认**相同的比例口径**
+/// 推导：`价税合计 × (已发数量 ÷ 订购总数量)`。这样「已发货金额」与「已确认
+/// 收入 + 应收」天然一致，不会出现两个百分比对不上。
+pub fn so_shipped_gross(so: &SalesOrder, shipped_qty: Money) -> Money {
+    let ordered: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
+    if ordered.is_zero() || !shipped_qty.is_positive() {
+        return Money::ZERO;
+    }
+    let gross = so.total_amount + so.total_tax;
+    match gross.checked_div(ordered) {
+        Some(unit) => (unit * shipped_qty).round2(),
+        None => Money::ZERO,
+    }
+}
+
+/// 某销售订单的累计已发（数量, 价税合计金额）
+///
+/// `so_shipment` **只记数量**（qty），没有金额列——发货金额按与收入确认**相同的
+/// 比例口径**推导：`价税合计 × (已发数量 ÷ 订购总数量)`。这样「已发货金额」与
+/// 「已确认收入+应收」天然一致，不会出现两个百分比对不上的情况。
+pub fn so_shipment_progress(db: &Db, so: &SalesOrder) -> DbResult<(Money, Money)> {
+    let ordered: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
+    // COALESCE 的默认值必须写 **TEXT 零** `'0'` 而不是 `0`：金额列全库按 TEXT 存，
+    // 写成整数会让整个表达式变成 Integer 类型，`get::<_, String>` 直接报
+    // InvalidColumnType —— 空表（还没发过货）时才触发，有数据时反而正常。
+    let mut st = db
+        .conn()
+        .prepare("SELECT COALESCE(SUM(qty),'0') FROM so_shipment WHERE so_id=?1")?;
+    let shipped_qty: Money =
+        Money::parse_or_zero(&st.query_row([so.id], |r| r.get::<_, String>(0))?);
+    if ordered.is_zero() || !shipped_qty.is_positive() {
+        return Ok((shipped_qty, Money::ZERO));
+    }
+    let gross = so.total_amount + so.total_tax;
+    // 不用除法直接乘：先算比例再乘，避免整数除法把金额抹成 0
+    let amount = (gross * shipped_qty).checked_div(ordered).unwrap_or(Money::ZERO);
+    Ok((shipped_qty, amount.round2()))
 }
 
 /// 按 id 取销售订单（含明细）
@@ -1000,6 +1129,103 @@ mod tests {
         Money::parse(s).unwrap()
     }
     
+    /// 采购订单的执行进度（已收数量/金额）必须从 po_receipt 汇总，不能读冗余列
+    ///
+    /// 回归背景：`purchase_order.received_amount` / `po_line.qty_received` 建表后
+    /// **从未被任何代码回写**（只被读和初始化），到货只往 po_receipt 插行。于是
+    /// 采购订单列表显示「已收 0」却同时显示状态「已入库完成」——**自相矛盾**，
+    /// 而这正是采购订单最核心的执行进度字段。
+    ///
+    /// 与销售侧 `so_list` 是同一个毛病，两边都要修。
+    #[test]
+    fn po_list_progress_comes_from_receipts() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = PurchaseOrder::new(p, NaiveDate::from_ymd(2026, 1, 5), "S001", "供应商A", "u1");
+        po.no = po_next_no(&db, p).unwrap();
+        po.lines.push(PoLine {
+            id: 0, po_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("100"), qty_received: Money::ZERO,
+            unit_price: m("10"), tax_rate: m("0.13"),
+            amount: m("1000"), tax_amount: m("130"),
+            memo: String::new(),
+        });
+        let id = po_save(&db, &mut po).unwrap();
+        po_set_status(&db, id, PoStatus::Confirmed).unwrap();
+
+        // 未到货：进度必须是 0（不是「未初始化」）
+        let got = po_list(&db, p, None).unwrap();
+        assert_eq!(got[0].received_amount, Money::ZERO, "没到货时不该有已收金额");
+        assert_eq!(got[0].lines[0].qty_received, Money::ZERO);
+
+        // 到货 40 件 → 已收 40，已收金额 = 1130 × 40% = 452
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id, period, date, qty, memo) VALUES(?1,?2,'2026-01-08',40,'')",
+                rusqlite::params![id, p.ymm()],
+            )
+            .unwrap();
+        crate::procurement::refresh_po_status(&db, id).unwrap();
+        let got = po_list(&db, p, None).unwrap();
+        assert_eq!(got[0].lines[0].qty_received, m("40"), "行级已收数量应汇总到 40");
+        assert_eq!(
+            got[0].received_amount,
+            m("452"),
+            "已收金额 = 价税合计 1130 × 40% = 452"
+        );
+        assert_eq!(got[0].status, PoStatus::PartialIn, "部分到货应是「部分入库」");
+
+        // 再到 60 → 累计 100 = 全量
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id, period, date, qty, memo) VALUES(?1,?2,'2026-01-12',60,'')",
+                rusqlite::params![id, p.ymm()],
+            )
+            .unwrap();
+        crate::procurement::refresh_po_status(&db, id).unwrap();
+        let got = po_list(&db, p, None).unwrap();
+        assert_eq!(got[0].lines[0].qty_received, m("100"));
+        assert_eq!(got[0].received_amount, m("1130"), "全量到货金额 = 订单价税合计");
+        assert_eq!(got[0].status, PoStatus::Completed);
+    }
+
+    /// 超收如实反映：到货超过订购量时，已收金额会大于订单金额
+    ///
+    /// 这**不是 bug**：`po_receipt_with_stock` 刻意不封顶（超收在实务里常见），
+    /// 库存与到货金额都按实际到货入账。锁住这个行为是为了防止有人"顺手加个封顶"
+    /// 把真实的超收挡掉——那样账实会不符。
+    #[test]
+    fn po_over_receipt_is_reflected_not_truncated() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = PurchaseOrder::new(p, NaiveDate::from_ymd(2026, 1, 5), "S001", "供应商A", "u1");
+        po.no = po_next_no(&db, p).unwrap();
+        po.lines.push(PoLine {
+            id: 0, po_id: 0,
+            item_code: "140301".to_string(), item_name: "原材料A".to_string(),
+            qty_ordered: m("100"), qty_received: Money::ZERO,
+            unit_price: m("10"), tax_rate: m("0.13"),
+            amount: m("1000"), tax_amount: m("130"),
+            memo: String::new(),
+        });
+        let id = po_save(&db, &mut po).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id, period, date, qty, memo) VALUES(?1,?2,'2026-01-08',120,'')",
+                rusqlite::params![id, p.ymm()],
+            )
+            .unwrap();
+        crate::procurement::refresh_po_status(&db, id).unwrap();
+        let got = po_list(&db, p, None).unwrap();
+        assert_eq!(got[0].lines[0].qty_received, m("120"), "超收不该被截到 100");
+        assert_eq!(
+            got[0].received_amount,
+            m("1356"),
+            "超收金额 = 1130 × 120% = 1356，应如实大于订单金额"
+        );
+    }
+
     #[test]
     fn po_crud() {
         let db = mem();
@@ -1300,6 +1526,61 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
     order.id = id;
     tx.commit()?;
     Ok(id)
+}
+
+/// 草稿 → 已下达。条件更新（`AND status='draft'`）防并发：两个���示点
+/// 同时下达，只有一个能成功，另一个拿到「不是草稿」而不是把状态覆盖掉。
+pub fn prod_release(db: &Db, id: i64) -> DbResult<()> {
+    let n = db.conn().execute(
+        "UPDATE production_order SET status='released', updated_at=?2 WHERE id=?1 AND status='draft'",
+        rusqlite::params![id, chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()],
+    )?;
+    if n == 0 {
+        // 区分「不存在」与「不是草稿」：前者 404 更好定位，后者是状态机拒绝
+        return match prod_get(db, id)? {
+            None => Err(fincore::FinError::not_found("生产订单不存在").into()),
+            Some(o) => Err(fincore::FinError::state(format!(
+                "只有草稿状态的生产订单能下达，当前是「{}」",
+                o.status.label()
+            ))
+            .into()),
+        };
+    }
+    Ok(())
+}
+
+/// 按 id 取生产订单（工作流条件字段取数用；`prod_list` 只能按期间+状态筛，
+/// 审批拦截器手上只有 biz_id，筛不出单张）
+pub fn prod_get(db: &Db, id: i64) -> DbResult<Option<ProductionOrder>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, no, period, date, item_code, item_name, planned_qty, completed_qty,
+         status, work_center, prepared_by, memo, order_kind, supplier_code, supplier_name,
+         plan_start, plan_end
+         FROM production_order WHERE id=?1",
+    )?;
+    let mut rows = stmt.query([id])?;
+    let Some(r) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(ProductionOrder {
+        id: r.get(0)?,
+        no: r.get(1)?,
+        period: Period::from_ymm(r.get(2)?),
+        date: r.get(3)?,
+        item_code: r.get(4)?,
+        item_name: r.get(5)?,
+        planned_qty: Money::parse_or_zero(&r.get::<_, String>(6)?),
+        completed_qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
+        status: prod_status_from(&r.get::<_, String>(8)?),
+        work_center: r.get(9)?,
+        prepared_by: r.get(10)?,
+        memo: r.get(11)?,
+        order_kind: r.get(12)?,
+        supplier_code: r.get(13)?,
+        supplier_name: r.get(14)?,
+        plan_start: r.get(15)?,
+        plan_end: r.get(16)?,
+    }))
 }
 
 pub fn prod_list(db: &Db, period: Period, status: Option<ProdStatus>) -> DbResult<Vec<ProductionOrder>> {

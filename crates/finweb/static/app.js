@@ -259,6 +259,208 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// ---------- 表格分组与汇总 ----------
+const GROUP_CONFIG = {};
+function setTableGroup(key, config) { GROUP_CONFIG[key] = config; }
+function clearTableGroup(key) { delete GROUP_CONFIG[key]; }
+function groupTableByKey(tbl, key) {
+  const cfg = GROUP_CONFIG[key];
+  if (!cfg || !tbl || tbl.dataset.grouped) return;
+  tbl.dataset.grouped = "1";
+  const { fieldIdx, subtotalIdx, startRow = 1 } = cfg;
+  const tb = tbl.tBodies[0];
+  if (!tb) return;
+  const rows = [...tb.rows].slice(startRow);
+  let lastKey = null, groupRows = [];
+  const flush = () => {
+    if (!groupRows.length || lastKey === null) return;
+    let html = `<tr class="subtotal"><td colspan="${tbl.rows[0]?.cells.length || 5}">小计</td>${subtotalIdx.map((si) => `<td class="num">${fmt(groupRows.reduce((s, r) => s + (parseFloat(r.cells[si]?.textContent?.replace(/[,\s¥%]/g, "")) || 0), 0))}</td>`).join("")}</tr>`;
+    groupRows[groupRows.length - 1].insertAdjacentHTML("afterend", html);
+  };
+  rows.forEach((r) => {
+    const k = r.cells[fieldIdx]?.textContent?.trim() || "";
+    if (k !== lastKey) { flush(); lastKey = k; groupRows = []; }
+    groupRows.push(r);
+  });
+  flush();
+}
+
+// ---------- 高级筛选面板 ----------
+function createFilterPanel(container, onApply) {
+  const fields = [
+    { key: "date", label: "日期", type: "date" },
+    { key: "amount", label: "金额", type: "number" },
+    { key: "status", label: "状态", type: "select", options: ["全部", "草稿", "已审核", "已记账", "作废"] },
+    { key: "keyword", label: "关键字", type: "text" },
+  ];
+  const panel = document.createElement("div");
+  panel.className = "filter-panel";
+  panel.innerHTML = `
+    <div class="fp-header"><b>${icon("filter")} 高级筛选</b></div>
+    <div class="fp-conditions">
+      <div class="fp-row">
+        <select data-fp="field">${fields.map((f) => `<option value="${f.key}">${f.label}</option>`).join("")}</select>
+        <select data-fp="op">
+          <option value="=">等于</option><option value="!=">不等于</option>
+          <option value=">">大于</option><option value="<">小于</option>
+          <option value=">=">≥</option><option value="<=">≤</option>
+          <option value="like">包含</option><option value="in">属于</option>
+        </select>
+        <input data-fp="value" type="text" placeholder="值" style="flex:1;min-width:120px" />
+      </div>
+    </div>
+    <div class="fp-actions">
+      <button class="btn primary sm" data-fp="apply">${icon("check")} 应用</button>
+      <button class="btn ghost sm" data-fp="reset">${icon("refresh")} 重置</button>
+    </div>`;
+  container.appendChild(panel);
+  $("[data-fp='apply']", panel).onclick = () => {
+    const field = $("[data-fp='field']", panel).value;
+    const op = $("[data-fp='op']", panel).value;
+    const value = $("[data-fp='value']", panel).value.trim();
+    onApply({ field, op, value });
+  };
+  $("[data-fp='reset']", panel).onclick = () => { $("[data-fp='value']", panel).value = ""; onApply(null); };
+  return panel;
+}
+
+// ---------- 分页器 ----------
+function createPagination(container, total, pageSize, onPage) {
+  const pg = document.createElement("div");
+  pg.className = "pagination";
+  let current = 1;
+  const render = () => {
+    const totalPages = Math.ceil(total / pageSize);
+    const start = (current - 1) * pageSize + 1;
+    const end = Math.min(total, current * pageSize);
+    const pageBtn = (n, label, active, disabled) => `<button class="pg-btn${active ? " active" : ""}" data-pg="${n}" ${disabled ? "disabled" : ""}>${label || n}</button>`;
+    let btns = pageBtn(1, icon("chevronLeft"), false, current === 1);
+    btns += pageBtn(current - 1, "上一页", false, current === 1);
+    const pages = [];
+    for (let i = Math.max(1, current - 2); i <= Math.min(totalPages, current + 2); i++) pages.push(i);
+    btns += pages.map((i) => pageBtn(i, null, i === current)).join("");
+    btns += pageBtn(current + 1, "下一页", false, current === totalPages);
+    btns += pageBtn(totalPages, icon("chevronRight"), false, current === totalPages);
+    pg.innerHTML = `<span class="pg-info">共 ${total} 条，显示 ${start}-${end}</span>${btns}
+      <span class="pg-size">每页 <select data-pg-size>${[10, 25, 50, 100].map((n) => `<option value="${n}"${n === pageSize ? " selected" : ""}>${n}</option>`).join("")}</select> 条</span>`;
+    $all(".pg-btn[data-pg]", pg).forEach((b) => { b.onclick = () => { if (!b.disabled) { current = parseInt(b.dataset.pg); onPage(current); render(); } }; });
+    $("[data-pg-size]", pg).onchange = (e) => { current = 1; onPage(1, parseInt(e.target.value)); };
+  };
+  render();
+  container.appendChild(pg);
+  return { reload: (t, ps) => { total = t; pageSize = ps || pageSize; current = 1; render(); } };
+}
+
+// ---------- 行内编辑 ----------
+function makeCellEditable(cell, onSave) {
+  if (cell.dataset.editable || cell.classList.contains("cell-editing")) return;
+  cell.dataset.editable = "1";
+  cell.classList.add("cell-editable");
+  cell.addEventListener("dblclick", () => {
+    if (cell.classList.contains("cell-editing")) return;
+    const oldVal = cell.textContent.trim();
+    cell.classList.add("cell-editing");
+    cell.innerHTML = `<input type="text" value="${esc(oldVal)}" />`;
+    const input = cell.querySelector("input");
+    input.focus(); input.select();
+    const save = () => { const v = input.value.trim(); cell.classList.remove("cell-editing"); cell.textContent = v || oldVal; if (v && v !== oldVal) onSave(v); };
+    input.addEventListener("blur", save);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); if (e.key === "Escape") { input.value = oldVal; input.blur(); } });
+  });
+}
+
+// ---------- 右键菜单 ----------
+let ctxMenuEl = null;
+function showContextMenu(x, y, items) {
+  hideContextMenu();
+  ctxMenuEl = document.createElement("div");
+  ctxMenuEl.className = "context-menu";
+  items.forEach((item) => {
+    if (item === "-") { ctxMenuEl.innerHTML += `<div class="cm-sep"></div>`; return; }
+    const el = document.createElement("div");
+    el.className = "cm-item" + (item.danger ? " danger" : "");
+    el.innerHTML = `${item.icon ? icon(item.icon) : ""}<span>${esc(item.label)}</span>`;
+    el.onclick = () => { item.action?.(); hideContextMenu(); };
+    ctxMenuEl.appendChild(el);
+  });
+  document.body.appendChild(ctxMenuEl);
+  const r = ctxMenuEl.getBoundingClientRect();
+  ctxMenuEl.style.left = Math.min(x, window.innerWidth - r.width - 8) + "px";
+  ctxMenuEl.style.top = Math.min(y, window.innerHeight - r.height - 8) + "px";
+}
+function hideContextMenu() { if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; } }
+document.addEventListener("click", (e) => { if (!e.target.closest(".context-menu")) hideContextMenu(); });
+document.addEventListener("contextmenu", (e) => {
+  const tbl = e.target.closest("table.grid");
+  if (!tbl) return;
+  e.preventDefault();
+  showContextMenu(e.clientX, e.clientY, [
+    { icon: "copy", label: "复制", action: () => navigator.clipboard.writeText(e.target.textContent) },
+    { icon: "edit", label: "编辑", action: () => makeCellEditable(e.target.closest("td"), () => {}) },
+    "-",
+    { icon: "sort", label: "升序", action: () => e.target.closest("th")?.click() },
+    { icon: "sortDesc", label: "降序", action: () => { const th = e.target.closest("th"); if (th) { th.click(); th.click(); } } },
+    "-",
+    { icon: "eye", label: "隐藏列", action: () => { const th = e.target.closest("th"); if (th) th.style.display = "none"; } },
+  ]);
+});
+
+// ---------- 多页签 ----------
+let openTabs = [];
+let activeTabId = null;
+function initTabs() {
+  const bar = document.createElement("div");
+  bar.className = "tab-bar"; bar.id = "tab-bar";
+  const main = document.getElementById("main");
+  main.parentNode.insertBefore(bar, main);
+  openTabs = [{ id: "dashboard", label: "工作台" }];
+  activeTabId = "dashboard";
+  renderTabs();
+}
+function renderTabs() {
+  const bar = document.getElementById("tab-bar");
+  if (!bar) return;
+  bar.innerHTML = openTabs.map((t) => `
+    <div class="tab-item${t.id === activeTabId ? " active" : ""}" data-tab="${t.id}">
+      <span>${esc(t.label)}</span>
+      ${openTabs.length > 1 ? `<span class="tab-close" data-tab-close="${t.id}">${icon("close")}</span>` : ""}
+    </div>`).join("");
+  $all(".tab-item", bar).forEach((el) => {
+    el.addEventListener("click", (e) => {
+      if (e.target.dataset.tabClose) return;
+      activeTabId = el.dataset.tab; renderTabs(); state.view = activeTabId; renderMain();
+    });
+  });
+  $all(".tab-close", bar).forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = el.dataset.tabClose;
+      openTabs = openTabs.filter((t) => t.id !== id);
+      if (activeTabId === id) { activeTabId = openTabs[openTabs.length - 1]?.id || "dashboard"; state.view = activeTabId; }
+      renderTabs(); renderMain();
+    });
+  });
+}
+function openTab(id, label) { if (!openTabs.find((t) => t.id === id)) openTabs.push({ id, label }); activeTabId = id; renderTabs(); }
+
+// ---------- 气泡提示 ----------
+let tooltipEl = null;
+function showTooltip(target, content) {
+  hideTooltip();
+  tooltipEl = document.createElement("div");
+  tooltipEl.className = "tooltip";
+  tooltipEl.innerHTML = content;
+  document.body.appendChild(tooltipEl);
+  const r = target.getBoundingClientRect();
+  const tr = tooltipEl.getBoundingClientRect();
+  let left = r.left + r.width / 2 - tr.width / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+  let top = r.top - tr.height - 6;
+  if (top < 8) top = r.bottom + 6;
+  tooltipEl.style.left = left + "px"; tooltipEl.style.top = top + "px";
+}
+function hideTooltip() { if (tooltipEl) { tooltipEl.remove(); tooltipEl = null; } }
+
 // ---------- 设备指纹 ----------
 function deviceId() {
   let id = localStorage.getItem("finbook_device_id");
@@ -533,6 +735,7 @@ const NAV_ITEMS = [
   { id: "payroll", label: "工资管理", perm: "voucher_new", group: "凭证" },
   { id: "claims", label: "费用报销", perm: "voucher_new", group: "凭证" },
   { id: "invoices", label: "发票管理", perm: "fin_report", group: "凭证" },
+  { id: "tax-decl", label: "税务申报", perm: "fin_report", group: "凭证" },
   { id: "ledger", label: "明细账", perm: "fin_report", group: "账簿报表" },
   { id: "reports", label: "报表中心", perm: "fin_report", group: "账簿报表" },
   { id: "balance-sheet", label: "资产负债表", perm: "fin_report", group: "账簿报表" },
@@ -572,6 +775,7 @@ const NAV_ITEMS = [
   { id: "inv-count", label: "存货盘点", perm: "warehouse", group: "库存" },
   { id: "inv-aging", label: "库存账龄", perm: "report", group: "库存" },
   { id: "inv-abc", label: "库存ABC", perm: "report", group: "库存" },
+  { id: "cost-variance", label: "存货成本差异", perm: "report", group: "库存" },
   { id: "inv-serial", label: "序列号", perm: "warehouse", group: "库存" },
   { id: "inv-unit", label: "多单位换算", perm: "warehouse", group: "库存" },
   { id: "warehouses", label: "仓库档案", perm: "warehouse", group: "库存" },
@@ -596,6 +800,7 @@ const VIEWS = {
   "dashboard": viewDashboard,
   "vouchers": viewVouchers,
   "invoices": viewInvoices,
+  "tax-decl": viewTaxDecl,
   "imports": viewImports,
   "ledger": viewLedger,
   "reports": viewReports,
@@ -626,6 +831,7 @@ const VIEWS = {
   "so-reconcile": viewSoReconcile,
   "inv-aging": viewInvAging,
   "inv-abc": viewInvAbc,
+  "cost-variance": viewCostVariance,
   "inv-serial": viewInvSerial,
   "inv-unit": viewInvUnit,
   "inv-assemble": viewInvAssemble,
@@ -2047,6 +2253,271 @@ async function loadInvoices(filter) {
   return data;
 }
 
+// ---------------- 税务申报（增值税一般纳税人） ----------------
+//
+// 边界写进界面里而不是只写在文档里：用户第一眼就该知道「不连网、手工申报」，
+// 以及哪些数系统算了、哪些没算。只在导出 CSV 里写口径说明是不够的——
+// 到那一步时人已经把表填完了。
+async function viewTaxDecl(main) {
+  const period = state.current;
+  main.innerHTML = `<h2>税务申报 · 增值税一般纳税人</h2><div class="muted">加载中…</div>`;
+  let d;
+  try {
+    d = await api(`/tax/vat?period=${encodeURIComponent(period)}`);
+  } catch (e) {
+    main.innerHTML = `<h2>税务申报 · 增值税一般纳税人</h2><div style="color:var(--err)">${esc(e.message)}</div>`;
+    return;
+  }
+  const f = d.form || {};
+  const sur = f.surcharge || {};
+  const sign = (v) => (Number(v) < 0 ? "var(--err)" : "inherit");
+  const bucketRows = (t) => (t.buckets || []).map((b) => `
+    <tr data-tx-kind="${t === f.details_out ? "out" : "in"}" data-tx-rate="${esc(b.rate)}" style="cursor:pointer" title="点击查看构成发票">
+      <td>${esc(b.rate)}%</td>
+      <td>${b.general_method ? "一般计税" : (b.rate === "0" ? "免税" : "简易计税")}</td>
+      <td class="num">${b.count}</td>
+      <td class="num">${esc(b.net)}</td>
+      <td class="num">${esc(b.tax)}</td>
+      <td class="num">${esc(b.gross)}</td>
+    </tr>`).join("");
+
+  main.innerHTML = `
+    <h2>税务申报 · 增值税一般纳税人</h2>
+    <div class="muted" style="margin-bottom:10px;line-height:1.7">
+      税款所属期 <b>${esc(f.period || period)}</b>${d.tax_no ? ` · 纳税人识别号 ${esc(d.tax_no)}` : ""}。
+      <b>本模块不连网</b>：不做发票查验、不做电子税务局网报、不碰税控设备。系统只负责把数算对、
+      把数给全、把来源说得清；申报表导出为 CSV，由会计手工填报。
+    </div>
+    ${(f.warnings || []).length ? `<div class="banner unset" id="tx-warn" style="margin-bottom:10px">
+      <b>口径与待办</b>
+      <ul style="margin:6px 0 0 18px;line-height:1.7">${f.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>
+    </div>` : ""}
+    <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0 0 12px">
+      <button class="btn ghost sm" id="tx-opts">申报参数</button>
+      <button class="btn primary sm" id="tx-export">导出申报表 CSV</button>
+    </div>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="k">销项税额</div><div class="v">${esc(f.output_tax)}</div></div>
+      <div class="card"><div class="k">进项税额（仅已认证）</div><div class="v">${esc(f.input_tax)}</div></div>
+      <div class="card"><div class="k">应纳税额</div><div class="v" style="color:${sign(f.payable)}">${esc(f.payable)}</div></div>
+      <div class="card"><div class="k">附加税费合计</div><div class="v">${esc(sur.total)}</div></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 10px">一、销项税额</h3>
+      <table class="grid"><tbody>
+        <tr><td>一般计税方法计税销售额</td><td class="num">${esc(f.sales_general)}</td></tr>
+        <tr><td>简易计税方法计税销售额</td><td class="num">${esc(f.sales_simple)}</td></tr>
+        <tr><td>免征增值税销售额</td><td class="num">${esc(f.sales_exempt)}</td></tr>
+        ${Number(f.sales_unknown) ? `<tr><td class="muted">税率未填/不可识别（<b>未计入上面三行</b>）</td><td class="num" style="color:var(--err)">${esc(f.sales_unknown)}</td></tr>` : ""}
+        <tr><td><b>销项税额</b></td><td class="num"><b>${esc(f.output_tax)}</b></td></tr>
+      </tbody></table>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 10px">二、进项税额</h3>
+      <table class="grid"><tbody>
+        <tr><td>本期认证相符的进项税额</td><td class="num">${esc(f.input_tax)}</td></tr>
+        <tr><td>上期留抵税额</td><td class="num muted">人工填报</td></tr>
+        <tr><td>进项税额转出额（附列资料三）</td><td class="num muted">人工填报</td></tr>
+        <tr><td>未开票销售额 / 销项税额</td><td class="num muted">人工填报（视同销售等需逐笔认定）</td></tr>
+        <tr><td><b>应纳税额</b></td><td class="num"><b>${esc(f.payable)}</b></td></tr>
+      </tbody></table>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 10px">三、附加税费</h3>
+      <table class="grid"><tbody>
+        <tr><td>城市维护建设税（${esc(sur.city_rate)}）</td><td class="num">${esc(sur.city_tax)}</td></tr>
+        <tr><td>教育费附加（${esc(sur.edu_rate)}）</td><td class="num">${esc(sur.edu)}</td></tr>
+        <tr><td>地方教育附加（${esc(sur.local_edu_rate)}）</td><td class="num">${esc(sur.local_edu)}</td></tr>
+        <tr><td><b>合计</b></td><td class="num"><b>${esc(sur.total)}</b></td></tr>
+      </tbody></table>
+    </div>
+    ${(f.details_out.buckets || []).length ? `<div class="panel">
+      <h3 style="margin:0 0 10px">附列资料一：应税货物和劳务销项明细 <span class="muted" style="font-weight:400;font-size:12px">（点行看构成发票）</span></h3>
+      <table class="grid"><thead><tr><th>税率</th><th>计税方式</th><th>张数</th><th>销售额</th><th>销项税额</th><th>价税合计</th></tr></thead>
+      <tbody>${bucketRows(f.details_out)}
+        <tr style="font-weight:600"><td>合计</td><td></td><td class="num">${f.details_out.count}</td><td class="num">${esc(f.details_out.net_total)}</td><td class="num">${esc(f.details_out.tax_total)}</td><td class="num">${esc(f.details_out.gross_total)}</td></tr>
+      </tbody></table>
+    </div>` : ""}
+    ${(f.details_in.buckets || []).length ? `<div class="panel">
+      <h3 style="margin:0 0 10px">附列资料二：进项税额明细 <span class="muted" style="font-weight:400;font-size:12px">（仅已认证，点行看构成发票）</span></h3>
+      <table class="grid"><thead><tr><th>税率</th><th>计税方式</th><th>张数</th><th>金额</th><th>进项税额</th><th>价税合计</th></tr></thead>
+      <tbody>${bucketRows(f.details_in)}
+        <tr style="font-weight:600"><td>合计</td><td></td><td class="num">${f.details_in.count}</td><td class="num">${esc(f.details_in.net_total)}</td><td class="num">${esc(f.details_in.tax_total)}</td><td class="num">${esc(f.details_in.gross_total)}</td></tr>
+      </tbody></table>
+    </div>` : ""}
+    <div class="panel">
+      <h3 style="margin:0 0 8px">系统不代算的项（须人工填报）</h3>
+      <ul style="margin:0 0 0 18px;line-height:1.8">${(d.manual_fields || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">
+        附列资料三（进项税额转出）要按每张发票的<b>实际用途</b>逐张判定（集体福利 / 个人消费 /
+        免税项目…），靠科目和摘要自动推断必然出错，而出错方向是多缴税或被追缴，所以留手工填。
+      </p>
+    </div>
+    <div id="tx-detail" class="panel" style="display:none"></div>`;
+
+  $("#tx-export").onclick = () => {
+    downloadUrl(`/api/tax/vat/export?period=${encodeURIComponent(f.period || period)}`);
+  };
+  $("#tx-opts").onclick = () => openTaxOptions(d.options || {});
+  $all("tr[data-tx-kind]", main).forEach((tr) => {
+    tr.onclick = async () => {
+      const box = $("#tx-detail");
+      box.style.display = "";
+      box.innerHTML = `<h3>构成发票（${tr.dataset.txKind === "out" ? "销项" : "进项"} · ${esc(tr.dataset.txRate)}%）</h3><div class="muted">加载中…</div>`;
+      try {
+        const r = await api(`/tax/vat/detail?period=${encodeURIComponent(f.period || period)}&kind=${tr.dataset.txKind}&rate=${encodeURIComponent(tr.dataset.txRate)}`);
+        const rows = r.rows || [];
+        box.innerHTML = `<h3>构成发票（${tr.dataset.txKind === "out" ? "销项" : "进项"} · ${esc(tr.dataset.txRate)}%，共 ${rows.length} 张）</h3>
+          <table class="grid"><thead><tr><th>开票日</th><th>发票号</th><th>${tr.dataset.txKind === "out" ? "购买方" : "销售方"}</th><th>金额</th><th>税额</th><th>价税合计</th><th>备注</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.date)}</td><td>${esc(x.number)}</td><td>${esc(x.party)}</td><td class="num">${esc(x.net)}</td><td class="num">${esc(x.tax)}</td><td class="num">${esc(x.gross)}</td><td>${esc(x.memo)}</td></tr>`).join("")}</tbody></table>`;
+      } catch (e) {
+        box.innerHTML = `<h3>构成发票</h3><div style="color:var(--err)">${esc(e.message)}</div>`;
+      }
+    };
+  });
+}
+
+function openTaxOptions(o) {
+  const mask = modal(`
+    <h3>税务申报参数</h3>
+    <div class="field"><label>纳税人身份</label>
+      <select id="to-taxpayer">
+        <option value="general" ${o.taxpayer === "general" ? "selected" : ""}>一般纳税人</option>
+        <option value="small" ${o.taxpayer === "small" ? "selected" : ""}>小规模纳税人</option>
+      </select></div>
+    <div class="field"><label>城建税适用地区</label>
+      <select id="to-zone">
+        <option value="city" ${o.city_tax_zone === "city" ? "selected" : ""}>市区（7%）</option>
+        <option value="county" ${o.city_tax_zone === "county" ? "selected" : ""}>县城、镇（5%）</option>
+        <option value="other" ${o.city_tax_zone === "other" ? "selected" : ""}>其他地区（1%）</option>
+      </select></div>
+    <div class="field"><label>教育费附加（小数，如 0.03）</label>
+      <input id="to-edu" value="${esc(o.edu_rate || "0.03")}" /></div>
+    <div class="field"><label>地方教育附加（小数，如 0.02）</label>
+      <input id="to-local" value="${esc(o.local_edu_rate || "0.02")}" /></div>
+    <p class="muted" style="font-size:12px;line-height:1.7">
+      城建税是法定税率，<b>只能按适用地区选</b>、不能自选，所以这里没有自由输入。
+      附加税率上限 10%：法定值远低于此，再高基本是「3% 误录成 30%」这类手误。
+    </p>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn" id="to-cancel">取消</button>
+      <button class="btn primary" id="to-ok">保存</button>
+    </div>`);
+  $("#to-cancel", mask).onclick = () => closeModal();
+  $("#to-ok", mask).onclick = async () => {
+    try {
+      await postJson("/tax/options", {
+        taxpayer: $("#to-taxpayer", mask).value,
+        city_tax_zone: $("#to-zone", mask).value,
+        edu_rate: $("#to-edu", mask).value.trim(),
+        local_edu_rate: $("#to-local", mask).value.trim(),
+      });
+      toast("已保存", "ok");
+      closeModal();
+      state.view = "tax-decl";
+      renderMain();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+// ---------------- 存货成本差异（标准成本） ----------------
+//
+// 与「生产 → 成本差异」（实际 vs BOM，订单级）是**两个不同口径**，数字本就不该相等：
+// 前者看物料采购与耗用，后者看单张生产订单的成本达成。差异每行带构成它的流水 id，
+// 点开能看明细 —— 「超支 3 万」不是可行动的信息，「集中在 3 个物料」才是。
+async function viewCostVariance(main) {
+  const period = state.current;
+  main.innerHTML = `<h2>存货成本差异</h2><div class="muted">加载中…</div>`;
+  let d;
+  try {
+    d = await api(`/cost/material-variance?period=${encodeURIComponent(period)}`);
+  } catch (e) {
+    main.innerHTML = `<h2>存货成本差异</h2><div style="color:var(--err)">${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = d.rows || [];
+  const sign = (v) => (Number(v) > 0 ? "var(--err)" : Number(v) < 0 ? "var(--ok)" : "inherit");
+
+  main.innerHTML = `
+    <h2>存货成本差异 · ${esc(period)}</h2>
+    <div class="muted" style="margin-bottom:10px;line-height:1.7">
+      口径：<b>存货级</b>——按收发存流水算「买贵了 / 耗用超标准」。<br>
+      与「生产 → 成本差异」（实际 vs BOM，订单级）是<b>两个不同口径</b>，数字本就不该相等。
+      只统计<b>已设标准成本单价</b>的存货；逐存货配置的计价方式优先于全局方法。
+      正差异=超支，负差异=节约。
+    </div>
+    ${(d.warnings || []).length ? `<div class="banner unset" id="cv-warn" style="margin-bottom:10px">
+      <b>需先补数据</b>
+      <ul style="margin:6px 0 0 18px;line-height:1.7">${d.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>
+    </div>` : ""}
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="k">采购价格差异合计</div><div class="v" style="color:${sign(d.total_price)}">${esc(d.total_price)}</div></div>
+      <div class="card"><div class="k">成本超支差异合计</div><div class="v" style="color:${sign(d.total_spend)}">${esc(d.total_spend)}</div></div>
+      <div class="card"><div class="k">参与统计存货</div><div class="v">${rows.length}</div></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 10px">差异明细 <span class="muted" style="font-weight:400;font-size:12px">（按价格差异绝对值排序，点行看构成流水）</span></h3>
+      ${rows.length ? `<table class="grid"><thead><tr>
+        <th>存货</th><th>名称</th><th class="num">标准成本</th><th class="num">参考成本</th>
+        <th class="num">实际入库单价</th><th class="num">入库数量</th><th class="num">价格差异</th>
+        <th class="num">出库数量</th><th class="num">出库标准金额</th><th class="num">出库实际成本</th><th class="num">超支差异</th>
+      </tr></thead><tbody>
+      ${rows.map((r) => `<tr data-cv-item="${esc(r.item)}" style="cursor:pointer" title="点击查看构成流水">
+        <td>${esc(r.item)}</td><td>${esc(r.item_name)}</td>
+        <td class="num">${esc(r.standard_cost)}</td>
+        <td class="num muted">${esc(r.ref_cost)}</td>
+        <td class="num" style="color:${r.actual_unit != r.standard_cost ? sign(Number(r.actual_unit) - Number(r.standard_cost)) : "inherit"}">${esc(r.actual_unit)}</td>
+        <td class="num">${esc(r.in_qty)}</td>
+        <td class="num" style="color:${sign(r.price_variance)}"><b>${esc(r.price_variance)}</b></td>
+        <td class="num">${esc(r.out_qty)}</td>
+        <td class="num">${esc(r.out_standard_amount)}</td>
+        <td class="num">${esc(r.out_amount)}</td>
+        <td class="num" style="color:${sign(r.spend_variance)}"><b>${esc(r.spend_variance)}</b></td>
+      </tr>`).join("")}
+      </tbody></table>` : `<div class="muted" style="padding:10px 0">
+        本期没有参与差异统计的存货。差异分析<b>只统计已设标准成本单价</b>的存货——
+        移动加权/先进先出是另一套口径，混进来没有可比性。
+      </div>`}
+    </div>
+    ${(d.missing || []).length ? `<div class="panel">
+      <h3 style="margin:0 0 8px">本表<b>不</b>包含的差异项</h3>
+      <ul style="margin:0 0 0 18px;line-height:1.8">${d.missing.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">
+        这三档的输入（标准 BOM / 标准工时与工资率 / 产能与固定费用预算）目前都没有维护入口。
+        缺输入时硬算等于编数，编出来的数比没有更危险 —— 所以这里点名说明，而不是给一个数。
+      </p>
+    </div>` : ""}
+    <div id="cv-detail" class="panel" style="display:none"></div>`;
+
+  $all("tr[data-cv-item]", main).forEach((tr) => {
+    tr.onclick = async () => {
+      const r = rows.find((x) => x.item === tr.dataset.cvItem);
+      if (!r) return;
+      const box = $("#cv-detail");
+      box.style.display = "";
+      box.innerHTML = `<h3>构成流水 · ${esc(r.item)} ${esc(r.item_name)}</h3><div class="muted">加载中…</div>`;
+      try {
+        // 用差异行自带的 move_ids 取构成流水：差异表已经把这几张单据算清楚了，
+        // 这里只列出来给人看，不重新推导一遍，避免两处口径打架。
+        const ids = r.move_ids || [];
+        if (!ids.length) {
+          box.innerHTML = `<h3>构成流水 · ${esc(r.item)}</h3><div class="muted">本期该存货没有金额发生额。</div>`;
+          return;
+        }
+        const list = (await Promise.all(ids.map((id) => api(`/inventory/move/${id}`).catch(() => null)))).filter(Boolean);
+        box.innerHTML = `<h3>构成流水 · ${esc(r.item)} ${esc(r.item_name)}（${list.length} 张）</h3>
+          <table class="grid"><thead><tr><th>日期</th><th>类型</th><th class="num">数量</th><th class="num">单价</th><th class="num">金额</th><th>备注</th></tr></thead>
+          <tbody>${list.map((m) => `<tr>
+            <td>${esc(m.biz_date)}</td><td>${esc(m.kind_label)}</td>
+            <td class="num">${esc(m.qty)}</td><td class="num">${esc(m.price)}</td>
+            <td class="num">${esc(m.amount)}</td><td>${esc(m.memo)}</td></tr>`).join("")}</tbody></table>`;
+      } catch (e) {
+        box.innerHTML = `<h3>构成流水</h3><div style="color:var(--err)">${esc(e.message)}</div>`;
+      }
+    };
+  });
+}
+
 async function viewInvoices(main) {
   main.innerHTML = `<h2>发票管理</h2><div class="muted">加载中…</div>`;
   let d;
@@ -2088,7 +2559,7 @@ function renderInvoices(main, d) {
       ${can("voucher_new") ? `<button class="btn primary" id="inv-new">新增发票</button>` : ""}
     </div>
     <div class="panel" style="padding:0;overflow:hidden">
-      <table class="grid">
+      <table class="grid" id="inv-list">
         <thead><tr>
           <th>类型</th><th>发票号码</th><th>开票日期</th><th>购买方</th><th>销售方</th>
           <th class="num">不含税</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th>
@@ -6351,6 +6822,23 @@ function openWfEditor(flow, reload) {
     { id: "n1", type: "start", name: "开始", participants: [], strategy: "all", reject_to: "", x: 40, y: 140 },
   ];
   let edges = flow && flow.edges ? JSON.parse(JSON.stringify(flow.edges)) : [];
+  // 当前单据类型可用的条件字段。**按单据类型不同**——生产订单没有 amount、
+  // 报销单没有 planned_qty。以前这里是写死一句「amount/qty/customer_code 等」，
+  // 用户在生产订单上照着写 amount > 5000 会一路保存成功，直到单据提交审批才报错。
+  let condFields = [];
+  const condFieldHint = () => {
+    const fields = condFields.length ? condFields.join(" / ") : "加载中…";
+    return `可用字段：${esc(fields)}；运算符 &gt; &gt;= &lt; &lt;= == !=；多条出线按序匹配，空条件为兜底；字符串值加引号`;
+  };
+  const loadCondFields = async () => {
+    try {
+      const r = await api(`/workflows/cond-fields?biz_type=${encodeURIComponent(biz)}`);
+      condFields = r.fields || [];
+    } catch (e) {
+      condFields = [];
+    }
+    render();
+  };
   let sel = null;           // {kind:"node"|"edge", id}
   let connFrom = null;      // 连线起点节点 id
   let tempTo = null;        // 鼠标当前位置（svg 坐标）
@@ -6368,6 +6856,9 @@ function openWfEditor(flow, reload) {
       <label>业务类型 <select id="wf-biz">
         <option value="quotation" ${biz === "quotation" ? "selected" : ""}>报价单</option>
         <option value="purchase_req" ${biz === "purchase_req" ? "selected" : ""}>请购单</option>
+        <option value="purchase_order" ${biz === "purchase_order" ? "selected" : ""}>采购订单</option>
+        <option value="production_order" ${biz === "production_order" ? "selected" : ""}>生产订单</option>
+        <option value="sales_order" ${biz === "sales_order" ? "selected" : ""}>销售订单</option>
         <option value="claim" ${biz === "claim" ? "selected" : ""}>报销单</option>
         <option value="receipt" ${biz === "receipt" ? "selected" : ""}>收付款单</option>
       </select></label>
@@ -6481,7 +6972,7 @@ function openWfEditor(flow, reload) {
           <option value="normal" ${e2.kind !== "reject" ? "selected" : ""}>普通</option>
           <option value="reject" ${e2.kind === "reject" ? "selected" : ""}>驳回</option>
         </select></div>
-        <div class="field"><label>连线条件（审批时求值）</label><input id="pr-cond" value="${esc(e2.condition || "")}" placeholder="如：amount &gt; 5000" /><p class="muted" style="font-size:11px;margin:4px 0 0">字段：amount/qty/customer_code 等；运算符 &gt; &gt;= &lt; &lt;= == !=；多条出线按序匹配，空条件为兜底；字符串值加引号</p></div>
+        <div class="field"><label>连线条件（审批时求值）</label><input id="pr-cond" value="${esc(e2.condition || "")}" placeholder="如：amount &gt; 5000" /><p class="muted" style="font-size:11px;margin:4px 0 0">${condFieldHint()}</p></div>
         <div style="margin-top:6px"><button class="btn danger sm" id="pr-del2">删除连线</button></div>`;
       $("#pr-kind", mask).onchange = (ev) => { snap(); e2.kind = ev.target.value; render(); };
       $("#pr-cond", mask).onchange = (ev) => { snap(); e2.condition = ev.target.value; render(); };
@@ -6638,8 +7129,10 @@ function openWfEditor(flow, reload) {
     try { await postJson(`/workflows/${fid}/publish`, {}); toast("已发布/切换发布状态", "ok"); document.removeEventListener("keydown", onKey); closeModal(); reload && reload(); } catch (e) { toast(e.message, "err"); }
   };
   $("#wf-close", mask).onclick = () => { document.removeEventListener("keydown", onKey); closeModal(); };
+  // 换单据类型 → 换可用条件字段清单（字段集按单据不同）
+  $("#wf-biz", mask).onchange = (ev) => { biz = ev.target.value; loadCondFields(); };
   loadRoles().then((rs) => { roles = rs; renderProps(); });
-  render();
+  loadCondFields();
 }
 
 // ---------------- 单据套打（订单/收付款单）：字段白名单 + 批量打印 ----------------
@@ -8695,7 +9188,7 @@ async function viewPayroll(main) {
         <div class="foot" style="margin-top:6px;display:flex;gap:10px">
           ${rows.length ? `
           <button class="btn primary" id="pv-accrue">生成计提凭证</button>
-          <button class="btn" id="pv-social">生成社保缴纳凭证</button>
+          <button class="btn" id="pv-social-btn">生成社保缴纳凭证</button>
           <button class="btn" id="pv-pay">生成发放凭证</button>` : `<span class="muted">本期无工资数据，先在「工资表」录入。</span>`}
         </div>
         <div id="pv-result" class="muted" style="margin-top:10px"></div>
@@ -8710,7 +9203,7 @@ async function viewPayroll(main) {
       } catch (e) { toast(e.message, "err"); }
     });
     if ($("#pv-accrue")) $("#pv-accrue").onclick = runVoucher("/payroll/accrue", { date: $("#pv-date").value, expense: $("#pv-expense").value.trim(), wage_payable: $("#pv-wage").value.trim(), social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim() }, "计提凭证");
-    if ($("#pv-social")) $("#pv-social").onclick = runVoucher("/payroll/social-pay", { date: $("#pv-date").value, social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim(), personal_payable: $("#pv-personal").value.trim(), bank_account: $("#pv-bank").value.trim() }, "社保缴纳凭证");
+    if ($("#pv-social-btn")) $("#pv-social-btn").onclick = runVoucher("/payroll/social-pay", { date: $("#pv-date").value, social_payable: $("#pv-social").value.trim(), housing_payable: $("#pv-housing").value.trim(), personal_payable: $("#pv-personal").value.trim(), bank_account: $("#pv-bank").value.trim() }, "社保缴纳凭证");
     if ($("#pv-pay")) $("#pv-pay").onclick = runVoucher("/payroll/pay", { date: $("#pv-date").value, payable_account: $("#pv-wage").value.trim(), bank_account: $("#pv-bank").value.trim(), tax_account: $("#pv-tax").value.trim(), social_account: $("#pv-personal").value.trim() }, "发放凭证");
     $all("[data-voucher]", body).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.voucher, 10)); }));
   }

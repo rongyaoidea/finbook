@@ -38,6 +38,8 @@ pub mod schema;
 pub mod summaries;
 pub mod settle;
 pub mod statement;
+pub mod stdcost;
+pub mod taxdecl;
 pub mod receipt;
 pub mod template;
 pub mod scm;

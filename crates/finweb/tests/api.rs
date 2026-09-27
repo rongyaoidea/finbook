@@ -1,4 +1,4 @@
-﻿//! finweb 关键 API 集成测试（多租户模型）
+//! finweb 关键 API 集成测试（多租户模型）
 //!
 //! 覆盖：平台身份库引导、平台登录、普通用户自建账套、归属隔离、
 //! 成员协作（邀请账套内成员）、管理员跨账套查看（不留痕迹）、
@@ -32,6 +32,10 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
     std::fs::create_dir_all(&books_dir).expect("建账套目录失败");
     let opts = BookOptions {
         start_period: fincore::Period::new(2026, 1).unwrap(),
+        // 公司名非空：下推发票会用它填「本企业」（销项发票的卖方 / 进项的买方），
+        // 以及税务申报表的表头。留空会让这类断言看着像产品 bug。
+        company: "测试公司".into(),
+        tax_no: "91110000TEST000001".into(),
         // 测试夹具显式关掉审核环节：绝大多数用例的主题是银行对账 / 核销 / 账龄 /
         // 报表，不是审核闸门，给它们统一加上「审核 + 记账」两步只会淹没真正的主题。
         //
@@ -6204,6 +6208,1059 @@ async fn api_key_create_validates_input() {
     assert_eq!(r.status(), StatusCode::OK, "{:?}", body_string(r).await);
 }
 
+/// 落一套模板并发布，返回流程
+async fn apply_tpl(
+    state: &Arc<WebState>,
+    sid: &str,
+    key: &str,
+    biz_type: &str,
+) -> serde_json::Value {
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows/templates/apply",
+            sid,
+            serde_json::json!({ "key": key, "biz_type": biz_type }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let body: serde_json::Value = serde_json::from_str(&body_string(r).await)
+        .unwrap_or_else(|e| panic!("模板【{key}】@ {biz_type} 应用失败（{st}）：{e}"));
+    // 端点包一层 {flow:{…}}，流程本身在 flow 里
+    let f = body
+        .get("flow")
+        .cloned()
+        .unwrap_or_else(|| panic!("响应里应含 flow：{body}"));
+    assert_eq!(f["status"], serde_json::json!("draft"), "模板应落草稿");
+    let id = f["id"].as_i64().expect("流程应带 id");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/workflows/{id}/publish"),
+            sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    assert_eq!(st, StatusCode::OK, "发布流程应成功（{st}）");
+    f
+}
+
+async fn po_status_of(state: &Arc<WebState>, book: &str, id: i64) -> String {
+    state
+        .db_for(book)
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT status FROM purchase_order WHERE id=?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+async fn prod_status_of(state: &Arc<WebState>, book: &str, id: i64) -> String {
+    state
+        .db_for(book)
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT status FROM production_order WHERE id=?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+/// 走真实 HTTP 入口建一张采购订单，返回 id
+async fn make_po(state: &Arc<WebState>, sid: &str) -> i64 {
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-15",
+                "supplier_code": "S01", "supplier_name": "供应商甲",
+                "status": "Draft",
+                "lines": [{
+                    "item_code": "140301", "item_name": "原材料",
+                    "qty_ordered": "10", "unit_price": "100", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value =
+        serde_json::from_str(&body_string(r).await).unwrap_or_else(|e| panic!("{st}：{e}"));
+    assert_eq!(st, StatusCode::OK, "建采购订单应成功：{v}");
+    v["id"].as_i64().expect("应返回订单 id")
+}
+
+/// 审批流覆盖到采购订单：发布流程后，「确认」不再立即改状态，而是先走节点链。
+///
+/// 这是新增单据类型最容易漏的一环——引擎支持了 `intercept`，但业务入口
+/// 没插闸门，结果配了流程却永远不生效、且不报任何错。所以这里从 HTTP 层
+/// 走一遍：建订单 → 发流程 → 首次确认返回 pending 且状态**不变** → 批到终态
+/// 才真的确认。
+#[tokio::test]
+async fn workflow_gates_purchase_order_confirm() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let po_id = make_po(&state, &sid).await;
+
+    apply_tpl(&state, &sid, "order_standard", "purchase_order").await;
+
+    // 第一次「确认」：只推进流程，不改订单状态
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["pending"].is_string(),
+        "配了流程后首次确认应返回下一节点：{v}"
+    );
+    // 关键：订单状态**不能**已经被确认
+    let s = po_status_of(&state, "b1", po_id).await;
+    assert_ne!(s, "Confirmed", "未批完就确认 = 审批流形同虚设（当前 {s}）");
+
+    // 第二次确认：走到终态，订单才真的被确认
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let body2 = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "{body2}");
+    assert_eq!(
+        po_status_of(&state, "b1", po_id).await,
+        "Confirmed",
+        "批到终态后应真的确认"
+    );
+}
+
+/// 生产订单的「下达」是审批动作：草稿必须先过流程才能下达
+#[tokio::test]
+async fn workflow_gates_production_order_release() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 建一张生产订单（老入口创建即「已下达」，改成草稿以走新路径）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/prod",
+            &sid,
+            serde_json::json!({ "item_code": "F01", "qty": "300", "work_center": "W01" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(st, StatusCode::OK, "建生产订单应成功：{v}");
+    let pid = v["id"].as_i64().expect("应返回 id");
+    state
+        .db_for("b1")
+        .unwrap()
+        .conn()
+        .execute(
+            "UPDATE production_order SET status='draft' WHERE id=?1",
+            rusqlite::params![pid],
+        )
+        .unwrap();
+
+    // 先验：草稿状态下不能直接开工（开工要求已下达）——否则审批就是个摆设
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/start"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        r.status(),
+        StatusCode::OK,
+        "草稿不该能直接开工 —— 那是绕过审批的口子"
+    );
+
+    apply_tpl(&state, &sid, "prod_two_stage", "production_order").await;
+
+    // 下达：第一次只推进流程，状态仍是草稿
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/prod/{pid}/release"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["pending"].is_string(), "应返回下一节点：{v}");
+    assert_eq!(
+        prod_status_of(&state, "b1", pid).await,
+        "draft",
+        "未批完就下达 = 审批流形同虚设"
+    );
+
+    // 批到终态才真的下达（计划员 → 厂长 → 生产负责人 三段）
+    for _ in 0..5 {
+        let _ = handlers::router(state.clone())
+            .oneshot(authed_post(
+                &format!("/api/prod/{pid}/release"),
+                &sid,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        if prod_status_of(&state, "b1", pid).await == "released" {
+            break;
+        }
+    }
+    assert_eq!(
+        prod_status_of(&state, "b1", pid).await,
+        "released",
+        "批到终态后应真的下达"
+    );
+}
+
+/// 没有已发布流程时，行为必须与从前完全一致（向后兼容）
+#[tokio::test]
+async fn no_flow_means_order_confirms_immediately() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let po_id = make_po(&state, &sid).await;
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/po/{po_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v.get("pending").is_none(),
+        "没有已发布流程时不该返回 pending：{v}"
+    );
+    assert_eq!(po_status_of(&state, "b1", po_id).await, "Confirmed");
+}
+
+/// 条件字段校验：把依赖 amount 的模板套到生产订单上要被拒（它没有金额）
+#[tokio::test]
+async fn template_requiring_amount_rejected_on_production_order() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 订单分级模板本来就不适用于生产订单（biz_types 不含它）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/workflows/templates/apply",
+            &sid,
+            serde_json::json!({ "key": "order_tiered", "biz_type": "production_order" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let body = body_string(r).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("不适用"), "应说明不适用：{body}");
+
+    // 模板清单里生产订单可用的是数量模板，且它声明的依赖字段该是 planned_qty
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/workflows/templates", &sid))
+        .await
+        .unwrap();
+    let tpls: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let prod_tpls: Vec<&serde_json::Value> = tpls["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| {
+            t["applicable"]
+                .as_array()
+                .map(|a| a.iter().any(|x| x["biz_type"] == "production_order"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(!prod_tpls.is_empty(), "至少应有一套模板适用于生产订单");
+    for t in prod_tpls {
+        let need: Vec<&str> = t["requires_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(
+            !need.contains(&"amount"),
+            "【{}】声明了 amount，但生产订单没有金额字段——配上去审批即卡死：{t}",
+            t["name"]
+        );
+    }
+}
+
+/// 条件字段清单端点：字段集按单据不同，且非法单据要被拒
+///
+/// 前端以前写死一句「amount/qty/customer_code 等」。用户在生产订单上照着写
+/// `amount > 5000` 会一路保存成功、直到单据提交审批才报「条件字段不存在」——
+/// 流程建了、实例起了，单据卡死。所以清单必须按单据取，不能写死。
+#[tokio::test]
+async fn cond_fields_endpoint_is_per_biz_type() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let get = |biz: &str| {
+        let state = state.clone();
+        let sid = sid.clone();
+        let biz = biz.to_string();
+        async move {
+            let r = handlers::router(state)
+                .oneshot(authed_get(
+                    &format!("/api/workflows/cond-fields?biz_type={biz}"),
+                    &sid,
+                ))
+                .await
+                .unwrap();
+            let st = r.status();
+            let body = body_string(r).await;
+            (st, body)
+        }
+    };
+
+    let (st, body) = get("claim").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let claim_fields: Vec<String> = v["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str().map(String::from))
+        .collect();
+    assert!(claim_fields.contains(&"amount".to_string()), "{claim_fields:?}");
+
+    let (st, body) = get("production_order").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let prod_fields: Vec<String> = v["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str().map(String::from))
+        .collect();
+    assert!(prod_fields.contains(&"planned_qty".to_string()), "{prod_fields:?}");
+    assert!(
+        !prod_fields.contains(&"amount".to_string()),
+        "生产订单没有金额，清单里不该出现 amount：{prod_fields:?}"
+    );
+    assert!(
+        claim_fields != prod_fields,
+        "两张单据的字段集不该相同，否则说明清单写死了"
+    );
+
+    // 采购/销售订单走金额口径（价税合计）
+    for biz in ["purchase_order", "sales_order"] {
+        let (st, body) = get(biz).await;
+        assert_eq!(st, StatusCode::OK, "{biz}：{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let f: Vec<String> = v["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+        assert!(f.contains(&"amount".to_string()), "{biz} 缺 amount：{f:?}");
+    }
+
+    // 非法单据类型 400 并列出可选值（别让用户面对空清单猜）
+    let (st, body) = get("nope").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("生产订单"), "应列出可选单据：{body}");
+}
+
+/// 税务申报表端点：进项只认已认证、参数校验、导出带 BOM
+#[tokio::test]
+async fn tax_vat_form_endpoints() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 造两张销项（含 pending）+ 一张已认证进项 + 一张未认证进项
+    async fn add(
+        state: &Arc<WebState>,
+        sid: &str,
+        kind: &str,
+        number: &str,
+        date: &str,
+        net: &str,
+        tax: &str,
+        status: &str,
+    ) {
+        let net = fincore::Money::parse(net).unwrap();
+        let tax = fincore::Money::parse(tax).unwrap();
+        let r = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/invoices",
+                sid,
+                serde_json::json!({
+                    "id": 0,
+                    "kind": kind, "code": "044001900111", "number": number, "date": date,
+                    "buyer": if kind == "out" { "客户甲" } else { "本企业" },
+                    "seller": if kind == "out" { "本企业" } else { "供应商甲" },
+                    "amount_tax": format!("{}", net + tax), "amount": format!("{net}"),
+                    "tax": format!("{tax}"), "tax_rate": "0.13", "status": status,
+                    "memo": ""
+                }),
+            ))
+            .await
+            .unwrap();
+        let st = r.status();
+        let b = body_string(r).await;
+        assert_eq!(st, StatusCode::OK, "建发票应成功：{b}");
+    }
+    add(&state, &sid, "out", "FP000001", "2026-01-05", "1000", "130", "pending").await;
+    add(&state, &sid, "in", "FP000002", "2026-01-06", "500", "65", "verified").await;
+    add(&state, &sid, "in", "FP000003", "2026-01-07", "300", "39", "pending").await;
+
+    // 取申报表
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/tax/vat?period=2026-01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let f = &v["form"];
+    assert_eq!(f["output_tax"], serde_json::json!("130.00"), "销项 {f}");
+    assert_eq!(
+        f["input_tax"],
+        serde_json::json!("65.00"),
+        "进项只应计已认证的 65：{f}"
+    );
+    assert_eq!(f["payable"], serde_json::json!("65.00"));
+    // 未认证进项必须在提示里说出来
+    let warns: Vec<&str> = f["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect();
+    assert!(
+        warns.iter().any(|w| w.contains("尚未认证")),
+        "未认证进项必须提示人工处理（否则会计以为数算全了）：{warns:?}"
+    );
+
+    // 构成明细：13% 销项档
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get(
+            "/api/tax/vat/detail?period=2026-01&kind=out&rate=13",
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(d["count"], serde_json::json!(1), "{d}");
+    // 缺参数 / 非法 kind 要 400
+    for uri in [
+        "/api/tax/vat/detail?period=2026-01&kind=out",
+        "/api/tax/vat/detail?period=2026-01&kind=xx&rate=13",
+    ] {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_get(uri, &sid))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{uri} 应 400");
+    }
+
+    // 导出：带 BOM（Excel 双击不乱码）+ 口径说明随表走
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/tax/vat/export?period=2026-01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(
+        r.headers().get(header::CONTENT_DISPOSITION).is_some(),
+        "导出应带 attachment 头"
+    );
+    let bytes = axum::body::to_bytes(r.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[0..3], &[0xEF, 0xBB, 0xBF], "CSV 应带 UTF-8 BOM");
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    for want in [
+        "销项税额",
+        "130.00",
+        "城市维护建设税",
+        "进项税额明细",
+        "口径说明",
+    ] {
+        assert!(text.contains(want), "导出表应含「{want}」");
+    }
+}
+
+/// 税务参数：税率越界 / 非法枚举要 400，且必须能从接口写入
+#[tokio::test]
+async fn tax_options_validation() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    for (body, why) in [
+        (serde_json::json!({ "taxpayer": "general", "city_tax_zone": "city", "edu_rate": "0.5", "local_edu_rate": "0.02" }), "教育费附加 50%"),
+        (serde_json::json!({ "taxpayer": "general", "city_tax_zone": "city", "edu_rate": "-0.03", "local_edu_rate": "0.02" }), "负税率"),
+        (serde_json::json!({ "taxpayer": "alien", "city_tax_zone": "city", "edu_rate": "0.03", "local_edu_rate": "0.02" }), "非法纳税人身份"),
+        (serde_json::json!({ "taxpayer": "general", "city_tax_zone": "mars", "edu_rate": "0.03", "local_edu_rate": "0.02" }), "非法城建区"),
+        (serde_json::json!({ "taxpayer": "general", "city_tax_zone": "city", "edu_rate": "abc", "local_edu_rate": "0.02" }), "非数字税率"),
+    ] {
+        let r = handlers::router(state.clone())
+            .oneshot(authed_post("/api/tax/options", &sid, body))
+            .await
+            .unwrap();
+        let st = r.status();
+        let b = body_string(r).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{why} 应 400：{b}");
+    }
+
+    // 合法值可写入，且**真的影响附加税费计算**
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/tax/options",
+            &sid,
+            serde_json::json!({ "taxpayer": "general", "city_tax_zone": "county", "edu_rate": "0.03", "local_edu_rate": "0.02" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/invoices",
+            &sid,
+            serde_json::json!({
+                "id": 0,
+                "kind": "out", "code": "044001900111", "number": "FP900001",
+                "date": "2026-01-05", "buyer": "客户甲", "seller": "本企业",
+                "amount_tax": "1130", "amount": "1000", "tax": "130",
+                "tax_rate": "0.13", "status": "pending", "memo": ""
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/tax/vat?period=2026-01", &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    // 县城档 5%：130 × 5% = 6.50（默认市区是 9.10，能看出参数确实生效）
+    assert_eq!(
+        v["form"]["surcharge"]["city_tax"], serde_json::json!("6.50"),
+        "改了适用地区就该改税率：{v}"
+    );
+}
+
+/// 标准成本差异端点：价格差异可正可负，且必须能追到构成流水
+#[tokio::test]
+async fn cost_variance_endpoint() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 配一个标准成本存货：入库价 9，标准 7
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "standard", "standard_cost": "7" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "配置标准成本应成功");
+
+    // 录一张采购入库 100 × 9。
+    // 出入库流水是**凭证/采购入库驱动**的（没有直接的 HTTP 库存入库端点），
+    // 所以这里用引擎造数，端点只负责读+算——这正是它要验的东西。
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("100").unwrap();
+        let p = fincore::Money::parse("9").unwrap();
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140301".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: "买贵了".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    // 出差异表：买贵 2 元 × 100 = 200
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/cost/material-variance?period=2026-01", &sid))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let row = v["rows"]
+        .as_array()
+        .expect("rows 应是数组")
+        .iter()
+        .find(|x| x["item"] == "140301")
+        .expect("应有 140301 的差异行");
+    assert_eq!(row["actual_unit"], serde_json::json!("9.00"));
+    assert_eq!(row["price_variance"], serde_json::json!("200.00"), "买贵 2×100=200");
+    assert_eq!(v["total_price"], serde_json::json!("200.00"));
+    // 差异必须能追到单据，否则「超支 200」不是可行动的信息
+    let ids = row["move_ids"].as_array().expect("应带 move_ids");
+    assert!(!ids.is_empty(), "差异行必须带构成流水 id");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get(
+            &format!("/api/inventory/move/{}", ids[0].as_i64().unwrap()),
+            &sid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let m: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(m["item"], serde_json::json!("140301"));
+    assert_eq!(m["kind_label"], serde_json::json!("采购入库"));
+
+    // 响应里必须声明「算了但没算的」差异项
+    let missing: Vec<&str> = v["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect();
+    for want in ["用量差异", "效率差异", "固定制造费用差异"] {
+        assert!(
+            missing.iter().any(|x| x.contains(want)),
+            "必须点名没算的差异：{want}；实际 {missing:?}"
+        );
+    }
+}
+
+/// 设了标准成本方法但没录单价 → 差异表点名提示，不静默给 0
+#[tokio::test]
+async fn cost_variance_flags_missing_standard_cost() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 只设方法，不给标准成本单价
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "standard", "standard_cost": "0" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/cost/configs",
+            &sid,
+            serde_json::json!({ "item": "140301", "method": "standard", "standard_cost": "0" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    {
+        let db = state.db_for("b1").unwrap();
+        let q = fincore::Money::parse("100").unwrap();
+        let p = fincore::Money::parse("9").unwrap();
+        findb::business::stock_insert(
+            &db,
+            &findb::business::StockMove {
+                id: 0,
+                period: fincore::Period::new(2026, 1).unwrap(),
+                biz_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                kind: findb::business::StockKind::Purchase,
+                item: "140301".into(),
+                warehouse: String::new(),
+                batch_no: String::new(),
+                qty: q,
+                price: p,
+                amount: (q * p).round2(),
+                voucher_id: None,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/cost/material-variance?period=2026-01", &sid))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(
+        v["rows"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "没有标准单价的存货不该进差异表"
+    );
+    let warns: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect();
+    assert!(
+        warns.iter().any(|w| w.contains("140301") && w.contains("标准成本单价")),
+        "必须点名是哪个存货：{warns:?}"
+    );
+}
+
+/// 订单驱动全链条勾稽：销售订单 → 发货 → 开票 → 收款 → 应收对账
+///
+/// 这条用例的主题不是「每个环节能不能跑」，而是**贯穿全程的数字能不能对上**。
+/// 单环节测试全绿但勾稽对不上，是 ERP 最常见也最难自查的一类错：
+///   销售订单 100 件 / 价税合计 113000
+///     → 发货 60 件应确认 60% 收入与应收
+///     → 开票应与发货金额一致
+///     → 收款应冲减应收
+///     → 期末应收余额 = 113000 − 已收，未发货部分仍是应收
+/// 任何一环口径错了，这条会红，而单环节测试不会。
+#[tokio::test]
+async fn order_driven_chain_ties_out() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 1) 销售订单：100 件 × 1000（13% 税）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "status": "Draft",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "lines": [{
+                    "item_code": "140301", "item_name": "成品甲",
+                    "qty_ordered": "100", "unit_price": "1000", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(st, StatusCode::OK, "建销售订单应成功：{v}");
+    let so_id = v["id"].as_i64().expect("应返回订单 id");
+
+    // 2) 确认订单（此时不该有任何收入/应收）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/sales/so/{so_id}/transition"),
+            &sid,
+            serde_json::json!({ "status": "Confirmed" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "确认订单应成功：{b}");
+
+    // 3) 发货 60 件 → 按比例确认收入与应收
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({
+                "so_id": so_id, "period": 202601, "date": "2026-01-10", "qty": "60"
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "发货应成功：{b}");
+
+    // 订单执行状态与执行进度应一致推进。
+    //
+    // 数值比较而不是字符串比较：之前这里写的是 `assert_ne!(shipped, "0")`，
+    // 而实际值是 "0.00" —— **字符串不等，断言通过，bug 却还在**。这类
+    // 「能通过但证明不了结论」的断言比没有断言更坏。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/sales/so", &sid))
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let so = list["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == so_id)
+        .expect("应能查到该订单")
+        .clone();
+    let shipped: f64 = so["shipped_amount"]
+        .as_str()
+        .unwrap_or("0")
+        .replace(",", "")
+        .parse()
+        .unwrap_or(-1.0);
+    assert!(
+        shipped > 0.0,
+        "发货后累计发货额不该是 0（状态已 PartialShip，两者是矛盾的）：{so}"
+    );
+    assert_eq!(
+        so["status"], serde_json::json!("PartialShip"),
+        "发 60/100 应是部分发货：{so}"
+    );
+    // 行级已发数量也要推进（订单执行进度落到行上）
+    let line_shipped: f64 = so["lines"][0]["qty_shipped"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(-1.0);
+    assert!(
+        line_shipped > 0.0,
+        "行级已发数量也不该是 0：{so}"
+    );
+
+    // 4) 开票：从销售订单下推，金额应与订单一致
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/invoices/from-so",
+            &sid,
+            serde_json::json!({ "so_id": so_id }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "从销售订单下推发票应成功：{b}");
+    let inv_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["invoice_id"]
+        .as_i64()
+        .expect("应返回发票 id");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/invoices", &sid))
+        .await
+        .unwrap();
+    let invs: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let inv = invs["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == inv_id)
+        .expect("应能查到该发票")
+        .clone();
+    assert_eq!(
+        inv["kind"], serde_json::json!("out"),
+        "从销售订单下推的必须是销项发票：{inv}"
+    );
+    assert_eq!(
+        inv["seller"], serde_json::json!("测试公司"),
+        "销项发票的卖方应是本企业（账套公司名）：{inv}"
+    );
+    // 销项税额必须与订单税额一致（税率没被算歪）。
+    // 用数值比而不是字符串比：订单列表与发票列表的千分位格式不同
+    // （"13000.00" vs "13,000.00"），字符串比会给出假失败。
+    let so_tax: f64 = so["total_tax"].as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0);
+    let inv_tax: f64 = inv["tax"].as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-2.0);
+    assert!(
+        (so_tax - inv_tax).abs() < 0.01,
+        "下推发票的税额应等于订单税额：订单 {so_tax} vs 发票 {inv_tax}"
+    );
+
+    // 5) 收款 30000 → 应收应等额减少
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/payment",
+            &sid,
+            serde_json::json!({
+                "so_id": so_id, "period": 202601, "date": "2026-01-20", "amount": "30000"
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "收款应成功：{b}");
+    let doc_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["doc_id"]
+        .as_i64()
+        .expect("收款应返回收付款单 id");
+
+    // 5b) 审核收付款单 —— 凭证在这一步才生成（设计如此：审核后生成凭证 + 自动核销）。
+    //     漏掉这一步会看到「应收没有减少」，那是流程没走完，不是链路断了。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{doc_id}/audit"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "审核收付款单应成功：{b}");
+
+    // 6) 把本链路产生的凭证全部记账。
+    //    必须记：对账单只统计**已记账**凭证。链路上生成的收入/应收凭证、以及
+    //    审核收付款单生成的收款凭证，此刻都还是草稿。
+    //    这也正是真实流程：业务单据驱动出凭证 → 财务审核 → 记账。
+    {
+        let db = state.db_for("b1").unwrap();
+        let ids: Vec<i64> = db
+            .conn()
+            .prepare("SELECT id FROM voucher WHERE period=202601 AND status='draft' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!ids.is_empty(), "订单链应至少产生收入/应收凭证");
+        for vid in ids {
+            let r = handlers::router(state.clone())
+                .oneshot(authed_post(
+                    &format!("/api/vouchers/{vid}/post"),
+                    &sid,
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap();
+            let st = r.status();
+            let b = body_string(r).await;
+            assert_eq!(st, StatusCode::OK, "凭证 {vid} 记账应成功：{b}");
+        }
+    }
+
+    // 7) 应收对账：能生成，且期末余额 = 订单价税合计 − 已收
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/settle/statements",
+            &sid,
+            serde_json::json!({
+                "kind": "ar", "account": "112201",
+                "party_code": "C01", "party_name": "客户甲",
+                "from": 202601, "to": 202601
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "生成应收对账单应成功：{b}");
+    let sm: serde_json::Value = serde_json::from_str(&b).unwrap();
+    // 字段是 end_balance（不是 end_amount）；订单价税合计 = 不含税 + 税额
+    let num = |x: &serde_json::Value| -> f64 {
+        x.as_str().unwrap_or("0").replace(",", "").parse().unwrap_or(-1.0)
+    };
+    let gross_num: f64 = num(&so["total_amount"]) + num(&so["total_tax"]);
+    let end_num: f64 = num(&sm["end_balance"]);
+    // 应收期末 = **已发货确认的应收** − 已收
+    //
+    // 关键业务规则：**按发货比例确认收入/应收**，未发货的 40% 不形成应收。
+    // 所以这里不能用订单全额算 —— 用全额断言会把「按发货确认」这个正确的行为
+    // 判成 bug，或者反过来：哪天有人改成订单全额确认应收，这条也会红。
+    // 两条都写死，才能锁住口径本身而不只是锁住数字。
+    let shipped_qty: f64 = num(&so["lines"][0]["qty_shipped"]);
+    let ordered_qty: f64 = num(&so["lines"][0]["qty_ordered"]);
+    assert!(ordered_qty > 0.0, "应能读到订购数量：{so}");
+    let shipped_ratio = shipped_qty / ordered_qty;
+    let ar_confirmed = gross_num * shipped_ratio;
+    let expect = ar_confirmed - 30000.0;
+    assert!(
+        (end_num - expect).abs() < 0.01,
+        "应收期末应为 {expect}（已发货 {}% × 价税合计 {gross_num} = {ar_confirmed} − 已收 30000），\
+         实际 {end_num} —— 订单链某处口径断了",
+        (shipped_ratio * 100.0).round()
+    );
+    // 反向守卫：未发货部分不该形成应收（若哪天改成订单全额确认，这条会红）
+    assert!(
+        end_num < gross_num - 30000.0,
+        "未发货部分形成了应收：期末 {end_num} ≥ 订单全额减已收 —— 收入确认口径变了"
+    );
+}
+
+/// 超发必须被封顶：超发不重复确认收入，但**发货流水也不能多出库存**
+///
+/// 回归背景：`so_income_voucher_in` 明确「超发不重复确认」（`delta_qty.min(remaining)`），
+/// 这只挡住了**收入**。如果发货流水按原始 qty 落库，就会出现「收入没多确认、
+/// 库存却多发了」——账实不符，而且没有任何提示。
+#[tokio::test]
+async fn over_shipment_is_capped_in_stock_too() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/so",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "status": "Confirmed",
+                "customer_code": "C01", "customer_name": "客户甲",
+                "lines": [{
+                    "item_code": "140301", "item_name": "成品甲",
+                    "qty_ordered": "10", "unit_price": "100", "tax_rate": "0.13"
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    let so_id = serde_json::from_str::<serde_json::Value>(&body_string(r).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // 发 6（合法）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": 202601, "date": "2026-01-10", "qty": "6" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // 再发 6（超发：只剩 4 未发）。接受还是拒绝都不重要，
+    // 重要的是**累计发货不能超过订购量**。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/sales/shipment",
+            &sid,
+            serde_json::json!({ "so_id": so_id, "period": 202601, "date": "2026-01-11", "qty": "6" }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    let db = state.db_for("b1").unwrap();
+    let shipped_qty: f64 = db
+        .conn()
+        .query_row(
+            "SELECT COALESCE(SUM(ABS(qty)),0) FROM stock_move WHERE item='140301' AND qty<0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        shipped_qty <= 10.0 + 1e-9,
+        "累计发货 {shipped_qty} 超过订购量 10 —— 超发只挡了收入没挡库存，账实不符（请求返回 {st}：{b}）"
+    );
+}
+
 /// 备份目录全局共享，但 list/restore 必须按账套隔离，不能跨租户读取/覆盖
 #[tokio::test]
 async fn backups_isolated_per_book() {
@@ -9653,6 +10710,27 @@ async fn sales_ship_income_voucher() {
     assert_eq!(resp.status(), StatusCode::OK);
     let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert!(r["voucher_id"].is_null(), "超发不应重复确认收入：{r}");
+    // 超发时**库存也不能多出**：账实必须一致
+    {
+        let db = state.db_for("b1").unwrap();
+        let shipped: f64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(ABS(qty)),0) FROM stock_move WHERE item='140301' AND qty<0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ordered: f64 = row["lines"][0]["qty_ordered"]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0.0);
+        assert!(
+            shipped <= ordered + 1e-9,
+            "累计出库 {shipped} 超过订购量 {ordered} —— 账实不符（超发只挡了收入没挡库存）"
+        );
+    }
 
     // 退货 4 → 冲回凭证（收入40 / 销项5.2 / 应收45.2）
     let resp = handlers::router(state.clone())

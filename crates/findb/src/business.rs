@@ -208,6 +208,15 @@ pub fn stock_state(db: &Db, item: &str, upto: Period, method: CostMethod) -> DbR
         }
     }
     let mut st = fincore::engine::costing::run(&moves, method)?.1;
+    // 标准成本必须在这里喂进状态机，否则整个 Standard 分支是死的。
+    //
+    // 引擎里 `CostMethod::Standard` 读 `self.standard_cost`，而它默认是
+    // ZERO → 引擎静默退回 `unit_cost()`（移动加权）。也就是说：即使在
+    // 「存货计价」里把方法设成标准成本、也录了标准成本单价，**出库仍按移动
+    // 加权算**，且不报任何错——只有成本差异算出来是 0 时才看得出不对。
+    if method == CostMethod::Standard {
+        st.set_standard_cost(item_standard_cost(db, item)?);
+    }
     // 成本调整按总额叠加到结存金额
     if !adjusts.is_empty() {
         let sum: Money = adjusts.iter().fold(Money::ZERO, |a, b| a + *b);
@@ -271,11 +280,21 @@ pub struct StockSummary {
 ///
 /// 收发存四栏（收入/发出的数量与金额）均为**本期**发生额；成本引擎内部仍重放
 /// 期前全部流水以保证移动加权单价正确——两者口径不同是有意为之。
+///
+/// ## 方法优先级：逐存货配置 > 传入的全局方法
+///
+/// 以前这里直接用传入的 `method` 覆盖全部存货，而 `period_end_cost`（期末计价）
+/// 走的是逐存货配置。两条路径不一致的后果很具体：把某个存货配成标准成本后，
+/// **期末结存按标准成本算、销售成本结转按移动加权算**——同一张表里结存和发出
+/// 两个口径，差额无处可去，成本永远对不平，且不报任何错。
+///
+/// 现在逐存货配置优先，没配的才用全局方法：老账套（无逐存货配置）行为完全不变。
 pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Vec<StockSummary>> {
     let mut items = stock_items(db)?;
     items.sort();
     let mut out = Vec::new();
     for item in items {
+        let method = item_cost_method_opt(db, &item)?.unwrap_or(method);
         let rows = stock_list_item(db, &item, period)?;
         // 全月一次平均：期末统一计价（期初 + 本期入库 → 一个单价）
         if method == CostMethod::MonthAverage {
@@ -348,6 +367,12 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
         }
 
         let mut st = StockState::new();
+        // 标准成本单价必须喂进状态机（与 `stock_state` 同一处理）。
+        // 这条路径自己 new 状态机、**不经过** stock_state，所以要在��里补一次；
+        // 漏了就是「期末计价按标准成本、销售成本结转按移动加权」那种口径分裂。
+        if method == CostMethod::Standard {
+            st.set_standard_cost(item_standard_cost(db, &item)?);
+        }
         let mut s = StockSummary {
             item: item.clone(),
             ..Default::default()
@@ -490,6 +515,16 @@ pub fn stock_cost_voucher(
 
 /// 读取某存货的计价方式（未配置时默认移动加权平均）
 pub fn item_cost_method(db: &Db, item: &str) -> DbResult<CostMethod> {
+    Ok(item_cost_method_opt(db, item)?.unwrap_or(CostMethod::MovingAverage))
+}
+
+/// 读取某存货的计价方式，**未配置返回 None**
+///
+/// 要区分「没配」与「配成默认」：调用方需要按「配了才用逐存货、没配才用全局」
+/// 的优先级来定方法（见 `stock_summary`）。用 `item_cost_method` 拿不到这个信息
+/// —— 没配的存货会返回 MovingAverage，与「显式配了移动加权」无法区分，
+/// 于是全局选 FIFO 就会被逐存货的默认值悄悄吃掉。
+pub fn item_cost_method_opt(db: &Db, item: &str) -> DbResult<Option<CostMethod>> {
     let m: Option<String> = db
         .conn()
         .query_row(
@@ -498,7 +533,7 @@ pub fn item_cost_method(db: &Db, item: &str) -> DbResult<CostMethod> {
             |r| r.get(0),
         )
         .optional()?;
-    Ok(CostMethod::parse(m.as_deref().unwrap_or("moving_average")))
+    Ok(m.as_deref().map(CostMethod::parse))
 }
 
 /// 存货是否启用来料检验（aux props.qc_required = "1"/true）——到货入库标记待检
@@ -545,6 +580,36 @@ pub fn item_cost_method_set(
         rusqlite::params![item, code, crate::exact_param(standard_cost)],
     )?;
     Ok(())
+}
+
+/// 按 id 取单条出入库流水（成本差异「构成流水」点开明细用）
+pub fn stock_move_get(db: &Db, id: i64) -> DbResult<Option<StockMove>> {
+    let m = db
+        .conn()
+        .query_row(
+            "SELECT id,period,biz_date,kind,item,warehouse,batch_no,qty,price,amount,voucher_id,memo
+             FROM stock_move WHERE id=?1",
+            [id],
+            |r| {
+                let d: String = r.get(2)?;
+                Ok(StockMove {
+                    id: r.get(0)?,
+                    period: Period::from_ymm(r.get(1)?),
+                    biz_date: NaiveDate::parse_from_str(&d, "%Y-%m-%d").unwrap_or_default(),
+                    kind: StockKind::parse(&r.get::<_, String>(3)?),
+                    item: r.get(4)?,
+                    warehouse: r.get(5)?,
+                    batch_no: r.get(6)?,
+                    qty: Money::parse_or_zero(&r.get::<_, String>(7)?),
+                    price: Money::parse_or_zero(&r.get::<_, String>(8)?),
+                    amount: Money::parse_or_zero(&r.get::<_, String>(9)?),
+                    voucher_id: r.get(10)?,
+                    memo: r.get(11)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(m)
 }
 
 /// 删除某存货的计价配置（恢复默认）

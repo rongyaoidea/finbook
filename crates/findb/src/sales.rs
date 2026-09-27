@@ -291,11 +291,46 @@ pub fn so_shipment_all(
         .ok_or_else(|| fincore::FinError::not_found("销售订单不存在"))?;
     let item = first_so_line(&so)?.item_code.clone();
     let tx = db.write_tx()?;
-    // 收入确认先做：它内部的「已发完不重复确认」要读净发货量，与执行行同事务才准确
+    // 有效发货量**只算一次**，收入确认 / 发货流水 / 库存出库三处共用。
+    //
+    // 回归背景：以前 `so_income_voucher_in` 内部自己封顶（`min(remaining)`），
+    // 而 `so_shipment` 插入与 `stock_sale_in` 用的是**原始 qty**。于是订购 10 件、
+    // 发 6 再发 6 时：账上只确认 10 件收入，**仓库实际出了 12 件**——账实不符，
+    // 而且接口返回 200、不报任何错。金额封顶而实物不封顶是这类链路上最难自查的错，
+    // 根治办法是让「能发多少」成为一个数，而不是三处各算一遍。
+    //
+    // 已发完时保持既有的**静默不确认**语义（返回 200、无凭证、无发货、无出库），
+    // 不改成报错：那是产品行为，不在本次修复范围内。截断与否写进审计日志，
+    // 便于事后查「为什么发出去的比申请的少」。
+    let shipped_now: Money = so_shipment_sum_on(&tx, so_id)?;
+    let total_qty: Money = so.lines.iter().map(|l| l.qty_ordered).sum();
+    let remaining = total_qty - shipped_now;
+    if !remaining.is_positive() {
+        db.log(
+            who,
+            "销售",
+            "发货截断",
+            &format!(
+                "{} 已全部发货（订购 {total_qty}，已发 {shipped_now}），本次请求 {qty} 未执行",
+                so.no
+            ),
+        )?;
+        tx.commit()?;
+        return Ok((0, None));
+    }
+    let eff = qty.min(remaining);
+    if eff < qty {
+        db.log(
+            who,
+            "销售",
+            "发货截断",
+            &format!("{} 请求 {qty}，实际发货 {eff}（剩余 {remaining}）", so.no),
+        )?;
+    }
     let ivid = if who.is_empty() {
         None
     } else {
-        so_income_voucher_in(&tx, &so, qty, date, who)?
+        so_income_voucher_in(&tx, &so, eff, date, who)?
     };
     tx.execute(
         "INSERT INTO so_shipment(so_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
@@ -303,7 +338,7 @@ pub fn so_shipment_all(
             so_id,
             period.ymm(),
             date.format("%Y-%m-%d").to_string(),
-            crate::exact_param(qty),
+            crate::exact_param(eff),
             memo
         ],
     )?;
@@ -312,7 +347,7 @@ pub fn so_shipment_all(
         &tx,
         &so.no,
         &item,
-        qty.negated(),
+        eff.negated(),
         period,
         date,
         &format!("销售出库 {}", so.no),

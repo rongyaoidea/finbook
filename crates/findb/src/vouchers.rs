@@ -602,6 +602,169 @@ fn set_status_on(conn: &rusqlite::Connection, id: i64, s: VoucherStatus) -> DbRe
 }
 
 /// 记账（未记账 → 已记账；无审核环节，核对无误后直接记账）
+/// 一张凭证的更正链信息
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AmendLink {
+    /// 本凭证更正的是哪张
+    pub amends_id: i64,
+    pub amends_no: String,
+    /// 本凭证被哪张更正了
+    pub amended_by: i64,
+    pub amended_by_no: String,
+    /// 更正原因（必填 —— 没有原因的更正等于没更正）
+    pub reason: String,
+}
+
+/// 读一张凭证的更正链（凭证不存在时返回 None）
+pub fn amend_link(db: &Db, id: i64) -> DbResult<Option<AmendLink>> {
+    let row: Option<(i64, i64, String)> = db
+        .conn()
+        .query_row(
+            "SELECT amends_id, amended_by, amend_reason FROM voucher WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((amends_id, amended_by, reason)) = row else {
+        return Ok(None);
+    };
+    // 单号做成「记-000012」这种可读形式：链上要能一眼看懂是哪张，
+    // 光给个数字 id 在对账时没用
+    let label = |vid: i64| -> String {
+        db.conn()
+            .query_row(
+                "SELECT word, no FROM voucher WHERE id=?1",
+                [vid],
+                |r| Ok(format!("{}-{:06}", r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
+            )
+            .unwrap_or_default()
+    };
+    Ok(Some(AmendLink {
+        amends_id,
+        amends_no: if amends_id > 0 { label(amends_id) } else { String::new() },
+        amended_by,
+        amended_by_no: if amended_by > 0 { label(amended_by) } else { String::new() },
+        reason,
+    }))
+}
+
+/// 单据更正链：作废原凭证 + 生成一张带链接的新凭证
+///
+/// ## 为什么要有这个
+///
+/// finbook 有反记账与取消审核，所以错凭证**能改** —— 但改完的两张凭证之间
+/// **没有任何链接**，事后审计只能靠时间和金额去猜哪张在冲哪张。
+///
+/// 「不能改」反而更安全：它会逼人走更正流程；「能改」会让人直接改，
+/// 而直接改完的两张凭证互相不认识，才是真正查不出来的状态。
+///
+/// ## 规则
+///
+/// - 只有**已记账**的凭证需要更正。草稿直接改，不必走这里。
+/// - 更正原因**必填**：没有原因的更正等于没更正。
+/// - 一张凭证**只能被更正一次**（`amended_by` 非 0 就拒绝），否则链会分叉，
+///   审计时看不出「哪条是最终版本」。
+/// - 全部动作在**一个事务**里：原凭证已作废却没有替代凭证是最坏状态 ——
+///   账实凭空少一笔，而且凭证号已经用掉了。
+/// - 新凭证落在**原凭证的期间与日期**（不是当前期间/今天）：更正属于被更正的那个
+///   会计期间，否则两张凭证分属不同期间，月度报表会出现「凭空一笔」；而凭证校验
+///   强制 `date` 必须属于 `period`，用今天的日子配 1 月的期间根本存不进去。
+pub fn amend(db: &Db, id: i64, reason: &str, who: &str) -> DbResult<i64> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(FinError::msg("更正原因不能为空：没有原因的更正等于没更正").into());
+    }
+    let tx = db.write_tx()?;
+    let old: Voucher = tx
+        .query_row(
+            &format!("SELECT {VOUCHER_COLS} FROM voucher WHERE id=?1"),
+            rusqlite::params![id],
+            map_voucher,
+        )
+        .optional()?
+        .ok_or_else(|| FinError::not_found(format!("凭证 #{id}")))?;
+
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // 「已被更正过」要**先于**状态检查说：更正过的凭证一定是「已作废」，
+    // 反过来判就会得到笼统的「只有已记账的凭证才需要更正」，
+    // 而真正的理由（别再改这张，去改新那张）被吞掉了。
+    let already: i64 = tx.query_row(
+        "SELECT amended_by FROM voucher WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if already > 0 {
+        return Err(FinError::state(format!(
+            "本凭证已被 #{already} 更正过，不能重复更正 —— 更正链分叉后审计就看不出哪条是最终版本了"
+        ))
+        .into());
+    }
+    if old.status != VoucherStatus::Posted {
+        return Err(FinError::state(format!(
+            "只有已记账的凭证才需要更正，当前是「{}」—— 草稿/未记账的直接改就行",
+            old.status.label()
+        ))
+        .into());
+    }
+    // 期间已结账的凭证不能更正（与 set_void 同口径）
+    let closed: Option<i32> =
+        tx.query_row("SELECT MAX(period) FROM period_state WHERE closed=1", [], |r| r.get(0))?;
+    if let Some(upto) = closed {
+        if old.period.ymm() <= upto {
+            return Err(FinError::state(format!(
+                "{} 及以前期间已结账，不能更正该期间的凭证",
+                Period::from_ymm(upto).label()
+            ))
+            .into());
+        }
+    }
+
+    // ① 作废原凭证：已记账的不能直接作废，先回退到审核态再作废
+    let back = if old.audited_by.is_some() { VoucherStatus::Audited } else { VoucherStatus::Draft };
+    set_status_on(&tx, id, back)?;
+    tx.execute("UPDATE voucher SET posted_by=NULL WHERE id=?1", [id])?;
+    set_status_on(&tx, id, VoucherStatus::Void)?;
+
+    // ② 复制成新凭证（草稿态，等会计审核记账）
+    let entries = entries_on(&tx, id)?;
+    if entries.is_empty() {
+        return Err(FinError::state("原凭证没有分录，无法更正".to_string()).into());
+    }
+    // 日期必须落在**原期间内**（凭证校验强制 date 属于 period）。
+    // 所以更正凭证沿用原凭证日期，而不是今天 —— 用今天会把一张 1 月的更正
+    // 记进 9 月的账，月度报表凭空多一笔。ERPNext 也是同期间更正。
+    let mut v = Voucher::new(old.period, old.date, &old.word, 0);
+    v.prepared_by = who.to_string();
+    v.source = old.source;
+    v.memo = format!("更正 {}-{:06}（{}）", old.word, old.no, reason);
+    v.attachments = old.attachments;
+    v.entries = entries;
+    v.no = next_no_of(&tx, old.period, &old.word)?;
+    let new_id = save_on(&tx, &mut v)?;
+
+    // ③ 双向建链
+    tx.execute(
+        "UPDATE voucher SET amends_id=?2, amend_reason=?3 WHERE id=?1",
+        rusqlite::params![new_id, id, reason],
+    )?;
+    tx.execute(
+        "UPDATE voucher SET amended_by=?2, amend_reason=?3, updated_at=?4 WHERE id=?1",
+        rusqlite::params![id, new_id, reason, now],
+    )?;
+    // ④ 操作日志必须**在同一个事务里**（与 post / unpost 同口径）。
+    // 放在调用方写的话：更正已提交、日志还没写就崩溃 —— 账改了却查不到谁改的，
+    // 那正是这套更正链要解决的审计洞，不能自己再捅一个。
+    crate::log_on(
+        &tx,
+        who,
+        "凭证",
+        "更正",
+        &format!("凭证 #{id} -> #{new_id}：{reason}"),
+    )?;
+    tx.commit()?;
+    Ok(new_id)
+}
+
 pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
     // 校验与状态更新必须在同一个写事务里重读：否则并发结账/作废后，
     // 本请求按事务外的旧快照仍会写入 posted。
@@ -799,6 +962,23 @@ pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
     } else {
         if v.status != VoucherStatus::Void {
             return Err(FinError::state("该凭证未处于作废状态").into());
+        }
+        // 已被更正的凭证不能取消作废。
+        //
+        // 更正链要求「原=作废、新=生效」是唯一形态。恢复作废后原凭证回到未记账，
+        // 看着「只是回到未记账」没什么，但**它可以被重新记账** —— 那时它与那张
+        // 更正凭证同时进总账，一笔钱记两遍，链上还挂着两个生效版本。
+        // 审计看到的是「原凭证已作废、已被更正」，账上却是两笔。
+        let by: i64 = tx.query_row(
+            "SELECT amended_by FROM voucher WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if by > 0 {
+            return Err(FinError::state(format!(
+                "本凭证已被 #{by} 更正过，不能恢复作废 —— 恢复后它与那张更正凭证会同时进总账。要改请改那张更正凭证"
+            ))
+            .into());
         }
         let back = if v.posted_by.is_some() {
             VoucherStatus::Posted
@@ -1084,6 +1264,230 @@ pub fn sum_by_account(
 mod tests {
     use super::*;
     use crate::tests::mem;
+
+    // ------------------------------------------------------------------
+    // 单据更正链（Cancel -> Amend）
+    // ------------------------------------------------------------------
+
+    fn am_voucher(db: &Db, amt: &str) -> i64 {
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = Voucher::new(p, chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(), "记", 0);
+        v.no = next_no(db, p, "记").unwrap();
+        v.memo = "测试凭证".to_string();
+        // 科目选型照同文件既有用例（`voucher_roundtrip` 用的是 1001 / 100201）：
+        // 1001 是无辅助的末级；100201 核算银行账户，必须带 bank 辅助。
+        // 本用例只验更正链的链接与作废语义，不关心业务含义。
+        v.push_entry(Entry {
+            debit: Money::parse(amt).unwrap(),
+            ..Entry::new(1, "1001", "借 库存现金")
+        });
+        v.push_entry(Entry {
+            credit: Money::parse(amt).unwrap(),
+            aux: AuxRef {
+                bank: Some("B01".into()),
+                ..Default::default()
+            },
+            ..Entry::new(2, "100201", "贷 银行存款")
+        });
+        save(db, &mut v).unwrap()
+    }
+
+    /// 更正链的完整效果：原凭证作废、新凭证草稿待记账、两边互相认得
+    ///
+    /// 回归背景：finbook 有反记账与取消审核，所以错凭证**能改** —— 但改完的两张
+    /// 凭证之间没有任何链接，事后审计只能靠时间和金额去猜哪张在冲哪张。
+    /// 「不能改」反而更安全：它会逼人走更正流程。
+    #[test]
+    fn amend_voids_original_and_links_both_ways() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        assert_eq!(get(&db, old).unwrap().unwrap().status, VoucherStatus::Posted);
+
+        let new_id = amend(&db, old, "金额录错，应为 1200", "boss").unwrap();
+        assert!(new_id > 0);
+
+        // 原凭证已作废（作废凭证不进总账，所以总账不会金额翻倍）
+        assert_eq!(
+            get(&db, old).unwrap().unwrap().status,
+            VoucherStatus::Void,
+            "原凭证必须作废，否则新旧两张都会进总账"
+        );
+        // 新凭证是草稿，等会计审核
+        let new_v = get(&db, new_id).unwrap().unwrap();
+        assert_eq!(new_v.status, VoucherStatus::Draft);
+        assert!(
+            new_v.memo.contains("更正") && new_v.memo.contains("金额录错"),
+            "摘要要说清是更正哪张、为什么：{}",
+            new_v.memo
+        );
+        // 分录原样复制
+        let old_ents = entries_of(&db, old).unwrap();
+        assert_eq!(new_v.entries.len(), old_ents.len());
+        assert_eq!(
+            new_v.entries[0].debit, old_ents[0].debit,
+            "分录必须原样复制，否则「更正」就变成了别的业务"
+        );
+        assert_eq!(new_v.entries[1].credit, old_ents[1].credit);
+
+        // 双向建链
+        let a_old = amend_link(&db, old).unwrap().unwrap();
+        assert_eq!(a_old.amended_by, new_id, "原凭证要标注「被谁更正」");
+        assert!(
+            a_old.amended_by_no.starts_with("记-"),
+            "要可读单号：{}",
+            a_old.amended_by_no
+        );
+        assert_eq!(a_old.reason, "金额录错，应为 1200");
+        let a_new = amend_link(&db, new_id).unwrap().unwrap();
+        assert_eq!(a_new.amends_id, old, "新凭证要标注「更正自谁」");
+        assert!(!a_new.amends_no.is_empty());
+
+        // 记账后总账只认新凭证那一笔
+        post(&db, new_id, "boss").unwrap();
+        let on_hand: f64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) FROM voucher_entry e
+                 JOIN voucher v ON v.id=e.voucher_id
+                 WHERE e.account_code='1001' AND v.status='posted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 借方总额仍应只有一笔（新凭证的），作废的那张不进总账
+        assert!(
+            (on_hand - 1000.0).abs() < 0.01,
+            "总账只应有一笔 1000（作废的那张不进总账），实际 {on_hand}"
+        );
+    }
+
+    /// 操作日志必须与更正**同在一条记录里**：日志写在事务外的话，
+    /// 更正已提交、日志还没写就崩溃 —— 账改了却查不到谁改的，
+    /// 那正是这套更正链要解决的审计洞。
+    #[test]
+    fn amend_writes_audit_log_with_the_reason() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        amend(&db, old, "金额录错，应为 1200", "张三").unwrap();
+        let (who, action, detail): (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT user, action, detail FROM audit_log
+                 WHERE module='凭证' AND action='更正' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(who, "张三", "日志要记是谁改的");
+        assert_eq!(action, "更正");
+        assert!(
+            detail.contains("金额录错") && detail.contains(&format!("#{old}")),
+            "日志要带原凭证 id 和更正原因（只记动作不记理由等于没记）：{detail}"
+        );
+    }
+
+    /// 已被更正的凭证不能「恢复作废」。
+    ///
+    /// 这是本次改动引入的漏洞：更正把原凭证置为作废，而 UI 上「恢复作废」的
+    /// 显隐条件正是 `status === 'void'`。恢复后原凭证回到未记账 —— 看着无害，
+    /// 但**它可以被重新记账**，届时它与更正凭证同时进总账，一笔钱记两遍，
+    /// 而链上仍显示「原凭证已作废、已被更正」。审计与账实直接矛盾。
+    #[test]
+    fn amended_voucher_cannot_be_restored_from_void() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        let new_id = amend(&db, old, "金额录错", "boss").unwrap();
+        post(&db, new_id, "boss").unwrap();
+
+        let e = set_void(&db, old, false, "boss").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("更正过"),
+            "错误信息要指向「已被更正过」，实际：{e:?}"
+        );
+        // 被拒后原凭证必须仍是作废 —— 不能被半途恢复
+        assert_eq!(
+            get(&db, old).unwrap().unwrap().status,
+            VoucherStatus::Void,
+            "守卫失败不该动凭证状态"
+        );
+
+        // 终态核对：总账里 1001 只有一笔，不是两笔
+        let on_hand: f64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) FROM voucher_entry e
+                 JOIN voucher v ON v.id=e.voucher_id
+                 WHERE e.account_code='1001' AND v.status='posted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (on_hand - 1000.0).abs() < 0.01,
+            "一笔钱只能记一次，实际总账 {on_hand}"
+        );
+    }
+
+    /// 未被更正的普通作废凭证仍可恢复（守卫不能误伤既有流程）
+    #[test]
+    fn void_restore_still_works_without_amend() {
+        let db = mem();
+        let id = am_voucher(&db, "1000");
+        set_void(&db, id, true, "boss").unwrap();
+        assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Void);
+        set_void(&db, id, false, "boss").unwrap();
+        assert_eq!(
+            get(&db, id).unwrap().unwrap().status,
+            VoucherStatus::Draft,
+            "没被更正过的凭证要能正常恢复，否则守卫误伤了作废/恢复这条老路"
+        );
+    }
+
+    /// 更正原因必填：没有原因的更正等于没更正
+    #[test]
+    fn amend_requires_a_reason() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        let e = amend(&db, old, "   ", "boss").unwrap_err();
+        assert!(format!("{e:?}").contains("更正原因"), "实际 {:?}", e);
+        // 被拒时原凭证必须还是已记账，不能被半途作废
+        assert_eq!(
+            get(&db, old).unwrap().unwrap().status,
+            VoucherStatus::Posted,
+            "校验失败不该动原凭证"
+        );
+    }
+
+    /// 一张凭证只能被更正一次：链分叉后审计就看不出哪条是最终版本
+    #[test]
+    fn amend_refuses_to_branch_the_chain() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        let new_id = amend(&db, old, "第一次更正", "boss").unwrap();
+        let e = amend(&db, old, "再改一次", "boss").unwrap_err();
+        assert!(format!("{e:?}").contains("重复更正"), "实际 {:?}", e);
+        // 新凭证自己是草稿，所以更正它会被状态拦下
+        let e2 = amend(&db, new_id, "改新凭证", "boss").unwrap_err();
+        assert!(
+            format!("{e2:?}").contains("已记账"),
+            "草稿凭证不需要走更正流程：{:?}",
+            e2
+        );
+    }
+
+    /// 草稿凭证不能走更正：它直接改就行，更正只会凭空多一张单
+    #[test]
+    fn amend_rejects_draft_voucher() {
+        let db = mem();
+        let id = am_voucher(&db, "1000");
+        let e = amend(&db, id, "草稿也要更正", "boss").unwrap_err();
+        assert!(format!("{e:?}").contains("已记账"), "实际 {:?}", e);
+    }
 
     /// 审核环节默认**开**（对标金蝶云·星空 + 会计内控底线：制单/审核/记账三权分离）。
     ///

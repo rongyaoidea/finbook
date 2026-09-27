@@ -16662,6 +16662,143 @@ async fn delete_loan_writes_audit_log() {
     );
 }
 
+/// 凭证更正链（Cancel -> Amend）的端到端行为。
+///
+/// 回归背景：finbook 有反记账 + 取消审核，所以错凭证**能改** —— 但改完的两张凭证
+/// 之间没有任何链接，事后审计只能靠时间和金额去猜哪张在冲哪张。
+/// 「不能改」反而更安全：它逼人走更正流程；「能改」让人直接改，而直接改完的两张
+/// 凭证互相不认识，才是真正查不出来的状态。
+#[tokio::test]
+async fn voucher_amend_links_old_and_new() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/dashboard", &sid))
+        .await
+        .unwrap();
+    let dash: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let cur_ymm: i32 = dash["current_period"]
+        .as_str()
+        .unwrap()
+        .replace('-', "")
+        .parse()
+        .unwrap();
+    let d15 = format!("{}-15", dash["current_period"].as_str().unwrap());
+
+    // 建一张已记账的凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/vouchers",
+            &sid,
+            serde_json::json!({
+                "id": 0, "period": cur_ymm, "date": d15, "word": "记", "no": 91,
+                "attachments": 0, "memo": "更正链测试", "entries": [
+                    { "line": 1, "account_code": "1001", "summary": "更正测试", "debit": "1000", "credit": "0" },
+                    { "line": 2, "account_code": "2001", "summary": "更正测试", "debit": "0", "credit": "1000" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let vid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "记账：{}", resp.status());
+
+    // ① 原因必填 —— 没有原因的更正等于没更正
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/amend"),
+            &sid,
+            serde_json::json!({ "reason": "  " }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "空原因应被拒");
+    // 被拒时原凭证必须还是已记账
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        r["status"], "posted",
+        "校验失败不该动原凭证：{r}"
+    );
+
+    // ② 正常更正
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/amend"),
+            &sid,
+            serde_json::json!({ "reason": "金额录错，应为 1200" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "更正失败");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let new_id = r["new_id"].as_i64().expect("应返回新凭证 id");
+    assert!(new_id > 0 && new_id != vid);
+
+    // ③ 原凭证：已作废 + 标注「被谁更正」
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["status"], "void", "原凭证应作废（否则新旧都进总账）：{r}");
+    assert_eq!(
+        r["amend"]["amended_by"], new_id,
+        "原凭证要标注被谁更正：{r}"
+    );
+    assert_eq!(r["amend"]["reason"], "金额录错，应为 1200");
+
+    // ④ 新凭证：草稿 + 标注「更正自谁」+ 分录原样复制
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{new_id}"), &sid))
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["status"], "draft", "新凭证应是草稿等会计审核：{r}");
+    assert_eq!(r["amend"]["amends_id"], vid, "新凭证要标注更正自谁：{r}");
+    assert_eq!(r["entries"].as_array().unwrap().len(), 2, "分录要原样复制");
+
+    // ⑤ 重复更正被拒，且错误信息要指向「已被更正过」而不是笼统的状态
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/amend"),
+            &sid,
+            serde_json::json!({ "reason": "再改一次" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "重复更正应被拒");
+    let msg = body_string(resp).await;
+    assert!(
+        msg.contains("更正过"),
+        "错误信息应说「已被更正过」，实际：{msg}"
+    );
+
+    // ⑥ 新凭证记账后，总账里 1001 只有一笔 1000（作废那张不进总账）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{new_id}/post"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "新凭证记账");
+}
+
 /// 发票列表必须限量返回（原先 limit=None，一次把全库发票读进内存并整包序列化）。
 #[tokio::test]
 async fn invoice_list_is_bounded() {

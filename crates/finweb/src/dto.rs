@@ -168,6 +168,8 @@ impl VoucherDetail {
             voucher: v,
             voucher_no,
             period_label,
+            // from_voucher 拿不到 db（纯函数），更正链由 get_voucher 单独补
+            amend: None,
         }
     }
 }
@@ -416,6 +418,12 @@ pub struct VoucherDetail {
     pub voucher_no: String,
     /// 期间 "YYYY-MM"
     pub period_label: String,
+    /// 更正链：更正自谁 / 被谁更正 / 更正原因
+    ///
+    /// `skip_serializing_if = "Option::is_none"`：绝大多数凭证既没被更正、
+    /// 也不是更正凭证，前端拿到 null 就当普通凭证渲染，不必多写分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amend: Option<findb::vouchers::AmendLink>,
 }
 
 /// 导入预检请求

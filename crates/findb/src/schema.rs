@@ -24,7 +24,15 @@ use crate::DbError;
 /// v7：多栏账 / 工艺路线 / MRP / 预算多版本 / 审批流 / 报表附注 / 电子档案
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
-pub const SCHEMA_VERSION: i64 = 33;
+/// v34：凭证更正链（voucher.amends_id / amended_by / amend_reason）
+///
+/// v34 之所以必须抬版本号、而不能只加迁移条目：`init` 的早退条件是
+/// `version >= SCHEMA_VERSION && tables_complete`，而 `tables_complete`
+/// **只核对表名、不核对列**。给老表（voucher 是 v1 就有的表）加列时，
+/// `CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，唯一出路就是让
+/// `init` 走进迁移分支。漏了这一步的话：全新账套一切正常（DDL 里已含新列），
+/// 只有**升级上来的旧账套**会在第一次点「更正」时报 no such column。
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -104,6 +112,15 @@ CREATE TABLE IF NOT EXISTS voucher (
     cashier     TEXT,
     source      TEXT NOT NULL DEFAULT 'manual',
     memo        TEXT NOT NULL DEFAULT '',
+    -- 单据更正链（对标 ERPNext 的 Cancel → Amend）：已记账凭证不能改，
+    -- 要改就作废原凭证 + 生成一张带链接的新凭证。原凭证标注「被谁更正」，
+    -- 新凭证标注「更正自谁」+ 更正原因。
+    --
+    -- 刻意**不**放进 fincore 的 `Voucher` 结构：那是关联元数据、不是会计内容，
+    -- 塞进去会波及全仓每一个 Voucher 构造点。
+    amends_id      INTEGER NOT NULL DEFAULT 0,  -- 本凭证更正的是哪张（0=非更正凭证）
+    amended_by     INTEGER NOT NULL DEFAULT 0,  -- 本凭证被哪张更正了（0=尚未被更正）
+    amend_reason   TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT '',
     updated_at  TEXT NOT NULL DEFAULT '',
     UNIQUE(period, word, no)
@@ -1505,6 +1522,12 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     ("landed_cost", "prepared_by", "TEXT NOT NULL DEFAULT ''"),
     ("landed_cost", "created_at", "TEXT NOT NULL DEFAULT ''"),
     ("landed_cost", "updated_at", "TEXT NOT NULL DEFAULT ''"),
+    // 凭证更正链：voucher 是 v1 老表，不在迁移清单里，所以这里要显式补。
+    // 不补的话旧账套上 `amend` 会直接报「no such column: amends_id」——
+    // 而 CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+    ("voucher", "amends_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("voucher", "amended_by", "INTEGER NOT NULL DEFAULT 0"),
+    ("voucher", "amend_reason", "TEXT NOT NULL DEFAULT ''"),
     // 到岸成本明细
     ("landed_cost_item", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
     ("landed_cost_item", "lcv_id", "INTEGER NOT NULL"),
@@ -1838,6 +1861,24 @@ fn tables_complete(conn: &Connection) -> Result<bool, DbError> {
     Ok(ddl_tables().iter().all(|t| have.contains(t)))
 }
 
+/// 连接级 PRAGMA：每次打开连接都要设，与 schema 迁移无关。
+///
+/// 抽出成独立函数，是为了让「已确认迁移过的账套」重开连接时也能设到这些设置
+/// （busy_timeout / foreign_keys / synchronous 是每连接生效的）。
+///
+/// busy_timeout 必须排在 journal_mode 之前：切 WAL 要拿排他锁，此时若
+/// busy_timeout 仍是默认 0，并发的 Db::open 会直接失败而不是等锁。
+/// 注意：PRAGMA 不能在事务内执行，必须在开启事务之前单独完成。
+pub fn apply_pragmas(conn: &Connection) -> Result<(), DbError> {
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )?;
+    Ok(())
+}
+
 /// 初始化 schema（幂等）
 ///
 /// 快速路径：版本已是最新、且 DDL 声明的表都在，就不开任何写事务直接返回。
@@ -1846,15 +1887,7 @@ fn tables_complete(conn: &Connection) -> Result<bool, DbError> {
 pub fn init(conn: &Connection) -> Result<(), DbError> {
     // WAL 让服务器上多个进程/多个用户可以同时打开同一个账套文件；
     // busy_timeout 让并发写入时等待而不是立刻报 database is locked。
-    // 注意：PRAGMA 不能在事务内执行，必须先单独完成。
-    // busy_timeout 必须排在 journal_mode 之前：切 WAL 要拿排他锁，此时若
-    // busy_timeout 仍是默认 0，并发的 Db::open 会直接失败而不是等锁。
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;",
-    )?;
+    apply_pragmas(conn)?;
     if version(conn) >= SCHEMA_VERSION && tables_complete(conn)? {
         return Ok(());
     }
@@ -1992,5 +2025,59 @@ mod tests {
         // 幂等：再跑一次不报错
         init(&conn).unwrap();
         assert!(column_exists(&conn, "prod_op", "worker").unwrap());
+    }
+
+    /// 旧账套（v33）升级后必须拿到凭证更正链三列。
+    ///
+    /// 回归背景：`voucher` 是 v1 就有的老表，给它加列时
+    /// `CREATE TABLE IF NOT EXISTS` 不生效（表已存在），唯一出路是 `init` 走进
+    /// 迁移分支。而 `init` 的早退条件是
+    /// `version >= SCHEMA_VERSION && tables_complete`，且 `tables_complete`
+    /// **只核对表名、不核对列** —— 于是漏抬 `SCHEMA_VERSION` 时：
+    /// 全新账套一切正常（DDL 里已含新列），只有升级上来的旧账套会在第一次
+    /// 点「更正」时炸 `no such column: amends_id`。
+    ///
+    /// 这条路径**只有本测试能覆盖**：集成测试与 E2E 全都建全新账套。
+    #[test]
+    fn old_book_upgrade_adds_voucher_amend_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        // 造出「v33、voucher 无更正三列」的存量账套
+        conn.execute_batch(
+            "ALTER TABLE voucher DROP COLUMN amends_id;
+             ALTER TABLE voucher DROP COLUMN amended_by;
+             ALTER TABLE voucher DROP COLUMN amend_reason;
+             INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','33');",
+        )
+        .unwrap();
+        for c in ["amends_id", "amended_by", "amend_reason"] {
+            assert!(
+                !column_exists(&conn, "voucher", c).unwrap(),
+                "前置条件：{c} 应当已从 voucher 上删掉"
+            );
+        }
+
+        init(&conn).unwrap();
+
+        for c in ["amends_id", "amended_by", "amend_reason"] {
+            assert!(
+                column_exists(&conn, "voucher", c).unwrap(),
+                "旧账套升级后必须补上 voucher.{c}（回归前 init 早退、列永远加不上）"
+            );
+        }
+        // 版本号要真的推进，否则下次打开还会再走一遍迁移
+        let v: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION.to_string(), "版本号没推进 = 下次打开白跑一遍迁移");
+        // 幂等：再跑一次不报错
+        init(&conn).unwrap();
+        for c in ["amends_id", "amended_by", "amend_reason"] {
+            assert!(column_exists(&conn, "voucher", c).unwrap());
+        }
     }
 }

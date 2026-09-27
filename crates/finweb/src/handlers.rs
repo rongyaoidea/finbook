@@ -188,6 +188,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/vouchers/:id/post", post(voucher_post))
         .route("/api/vouchers/:id/unpost", post(voucher_unpost))
         .route("/api/vouchers/:id/void", post(voucher_void))
+        .route("/api/vouchers/:id/amend", post(voucher_amend))
         .route("/api/vouchers/:id/audit", post(voucher_audit))
         .route("/api/vouchers/:id/unaudit", post(voucher_unaudit))
         .route("/api/vouchers/:id/sign", post(voucher_sign))
@@ -3239,7 +3240,11 @@ async fn get_voucher(
     if !user.user.can_see_voucher(&v) {
         return Err(AppError::forbidden("无权查看该凭证"));
     }
-    Ok(Json(VoucherDetail::from_voucher(v)))
+    let mut detail = VoucherDetail::from_voucher(v);
+    // 更正链不是凭证本身的内容（`Voucher` 结构里没有这三个字段），
+    // 所以查凭证接口顺带补上，前端一次请求就能画出链。
+    detail.amend = vouchers::amend_link(&db, id)?;
+    Ok(Json(detail))
 }
 
 /// 解析银行科目：支持尾号简写。
@@ -3483,6 +3488,12 @@ fn default_true() -> bool {
 }
 
 #[derive(Deserialize)]
+struct AmendReq {
+    /// 更正原因（必填）。没有原因的更正等于没更正。
+    reason: String,
+}
+
+#[derive(Deserialize)]
 struct VoidReq {
     /// 缺省 = true（作废）；恢复请显式传 false
     #[serde(default = "default_true")]
@@ -3511,6 +3522,32 @@ async fn voucher_void(
         &format!("凭证 #{id}"),
     )?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 凭证更正：作废原凭证 + 生成一张带链接的新凭证（对标 ERPNext 的 Cancel -> Amend）
+///
+/// 权限沿用 `VoucherDelete`（作废凭证的权限）：更正是比作废更重的动作 ——
+/// 作废只是把一张凭证移出账外，更正还会**生成**一张进入流程的新凭证。
+/// 单独的权限点会让「谁能改历史账」变成配置问题，先复用既有口径。
+async fn voucher_amend(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<AmendReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherDelete)?;
+    let db = state.db_for(&user.book_key)?;
+    // 权限校验必须在 amend 之前：数据权限不只管「看」，也管「改」
+    let v = vouchers::get(&db, id)?
+        .ok_or_else(|| AppError::NotFound("凭证不存在".to_string()))?;
+    if !user.user.can_see_voucher(&v) {
+        return Err(AppError::forbidden("无权更正该凭证"));
+    }
+    let new_id = vouchers::amend(&db, id, &req.reason, user.username())?;
+    // 操作日志由引擎在**同一事务内**写入（amend 里 log_on）：
+    // 更正已提交、日志还没写就崩溃的话，账改了却查不到谁改的 ——
+    // 那正是这套更正链要解决的审计洞，不能自己再捅一个。这里再写一条会重复。
+    Ok(Json(json!({ "ok": true, "new_id": new_id })))
 }
 
 async fn voucher_post(

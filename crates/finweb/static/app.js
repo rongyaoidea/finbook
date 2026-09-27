@@ -188,6 +188,61 @@ function confirmDialog(message, danger) {
     (danger ? $("#cf-cancel", mask) : $("#cf-ok", mask)).focus();
   });
 }
+
+/// 填原因对话框：返回填写的字符串；取消返回 null。
+///
+/// 存在的理由：有些动作**必须**留下理由才能被审计（凭证更正、作废原因、
+/// 折扣审批驳回…）。用 `confirmDialog` 只能拿到 yes/no，理由就得塞进
+/// `prompt()` —— 那会绕开 modalStack，Esc 关闭和 Ctrl+Enter 提交都失效。
+function reasonDialog(title, hint, placeholder) {
+  return new Promise((resolve) => {
+    const root = document.getElementById("modal-root");
+    const mask = document.createElement("div");
+    mask.className = "modal-mask";
+    mask.setAttribute("role", "dialog");
+    mask.setAttribute("aria-modal", "true");
+    mask.setAttribute("aria-label", title);
+    mask.innerHTML = `<div class="modal">
+      <h3>${esc(title)}</h3>
+      <p class="muted" style="margin:0 0 12px;line-height:1.6">${esc(hint)}</p>
+      <textarea id="rd-text" rows="3" style="width:100%" placeholder="${esc(placeholder || "")}"></textarea>
+      <div class="foot">
+        <button class="btn ghost" id="rd-cancel">取消</button>
+        <button class="btn primary" id="rd-ok">确定</button>
+      </div>
+    </div>`;
+    root.appendChild(mask);
+    modalStack.push(mask);
+    const ta = $("#rd-text", mask);
+    const done = (val) => {
+      document.removeEventListener("keydown", onKey, true);
+      const i = modalStack.indexOf(mask);
+      if (i >= 0) modalStack.splice(i, 1);
+      mask.remove();
+      resolve(val);
+    };
+    // 空原因按「取消」处理：让必填在前端也拦一道，而不是发一次注定 400 的请求。
+    // 但**不静默吞掉** —— 用户点了确定却什么都没发生会以为按钮坏了，
+    // 所以给校验反馈。
+    const submit = () => {
+      const val = ta.value.trim();
+      if (!val) { toast("请填写原因：没有原因的记录事后查不出来", "err"); ta.focus(); return; }
+      done(val);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); done(null); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    mask.addEventListener("click", (e) => { if (e.target === mask) done(null); });
+    $("#rd-ok", mask).onclick = submit;
+    $("#rd-cancel", mask).onclick = () => done(null);
+    // Ctrl+Enter 提交（与全局快捷键一致）
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
+    });
+    ta.focus();
+  });
+}
 // Esc 关闭最近弹窗
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && modalStack.length) closeModal();
@@ -2019,8 +2074,19 @@ async function openVoucherEditor(id, seedEntries) {
   // 却用不了，是最容易被当成 bug 的一种 UX。
   const auditOn = !!(state.bookOptions && state.bookOptions.enable_audit);
   const canPost = auditOn ? status === "audited" : (status === "draft" || status === "audited");
+  // 更正链提示：两张凭证互相认得，才查得出「哪张在冲哪张」。
+  // 没有它，已作废的原凭证和新凭证只能靠时间金额去猜。
+  const am = v.amend || null;
+  const amendBanner = am && (am.amends_id || am.amended_by)
+    ? `<div class="muted" style="margin:0 0 12px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;line-height:1.7">
+        ${am.amends_id ? `本凭证是 <b>更正凭证</b>，更正自 <b>${esc(am.amends_no || am.amends_id)}</b>。<br/>` : ""}
+        ${am.amended_by ? `本凭证已被 <b>${esc(am.amended_by_no || am.amended_by)}</b> 更正（作废，不参与账簿汇总）。<br/>` : ""}
+        ${am.reason ? `更正原因：${esc(am.reason)}` : ""}
+       </div>`
+    : "";
   const mask = modal(`
     <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}${v.cashier ? `　出纳:${esc(v.cashier)}` : ""}</span></h3>
+    ${amendBanner}
     <div class="toolbar">
       <label>日期 <input id="v-date" type="date" value="${esc(v.date)}" ${editable ? "" : "disabled"} />${editable ? `<button class="btn ghost sm" id="v-today">今天</button>` : ""}</label>
       <span id="v-date-hint" class="muted" style="font-size:12px"></span>
@@ -2046,7 +2112,8 @@ async function openVoucherEditor(id, seedEntries) {
       ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
       ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
       ${can("voucher_delete") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-void">作废</button>` : ""}
-      ${can("voucher_delete") && id > 0 && status === "void" ? `<button class="btn ghost" id="v-void-back">恢复作废</button>` : ""}
+      ${can("voucher_delete") && id > 0 && status === "void" && !(am && am.amended_by) ? `<button class="btn ghost" id="v-void-back">恢复作废</button>` : ""}
+      ${can("voucher_delete") && id > 0 && status === "posted" && !(am && am.amended_by) ? `<button class="btn ghost" id="v-amend">更正</button>` : ""}
       ${can("voucher_delete") && (status === "draft" || status === "audited") ? `<button class="btn danger" id="v-del">删除</button>` : ""}
       <button class="btn ghost" id="v-close">关闭</button>
     </div>
@@ -2197,6 +2264,23 @@ async function openVoucherEditor(id, seedEntries) {
   };
   if ($("#v-void-back", mask)) $("#v-void-back", mask).onclick = async () => {
     try { await api(`/vouchers/${v.id}/void`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ void: false }) }); toast("已恢复作废凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#v-amend", mask)) $("#v-amend", mask).onclick = async () => {
+    const reason = await reasonDialog(
+      "更正凭证",
+      "将作废本凭证，并生成一张内容相同、带更正关系的新凭证（原期间、原日期）。请写明更正原因 —— 原因会同时记入凭证摘要、操作日志与操作人日志，事后审计只查得到这些。",
+      "例：金额录错，应为 1200"
+    );
+    if (!reason) return;
+    try {
+      const r = await api(`/vouchers/${v.id}/amend`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) });
+      toast("已更正，原凭证已作废；新凭证待记账", "ok");
+      closeModal();
+      loadVouchers();
+      // 直接打开新凭证：更正后的下一步就是审核/记账，跳过去少一次点击，
+      // 也免得用户在列表里找「哪张是新的」。
+      if (r && r.new_id) openVoucherEditor(r.new_id);
+    } catch (e) { toast(e.message, "err"); }
   };
   if ($("#v-unaudit", mask)) $("#v-unaudit", mask).onclick = async () => { try { await api(`/vouchers/${v.id}/unaudit`, { method: "POST" }); toast("已反审核，凭证可修改", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };
   if ($("#v-reverse", mask)) $("#v-reverse", mask).onclick = async () => { if (!(await confirmDialog("生成该凭证的红字冲销凭证（借贷互换、摘要加「冲销」前缀），原凭证保留不动？", true))) return; try { await api(`/vouchers/${v.id}/reverse`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period: ymm(state.current || ""), date: "" }) }); toast("已生成冲销凭证", "ok"); closeModal(); loadVouchers(); } catch (e) { toast(e.message, "err"); } };

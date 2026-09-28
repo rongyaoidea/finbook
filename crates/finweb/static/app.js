@@ -3208,8 +3208,8 @@ async function viewLedger(main) {
     <div class="toolbar">
       <label>科目 <input id="l-code" list="acct-list" placeholder="科目编码，如 1002" style="width:160px" /></label>
       <datalist id="acct-list">${(state.accounts || []).map((a) => `<option value="${esc(a.code)}">${esc(a.name)}</option>`).join("")}</datalist>
-      <label>从 <input id="l-from" value="${esc(state.current || "")}" style="width:90px" /></label>
-      <label>至 <input id="l-to" value="${esc(state.current || "")}" style="width:90px" /></label>
+      <label>从 <input id="l-from" type="month" value="${esc(state.current || "")}" style="width:90px" /></label>
+      <label>至 <input id="l-to" type="month" value="${esc(state.current || "")}" style="width:90px" /></label>
       <label><input type="checkbox" id="l-children" checked /> 含下级</label>
       <label><input type="checkbox" id="l-posted" checked /> 仅已记账</label>
       <button class="btn sm" id="l-go">查询</button>
@@ -3284,8 +3284,8 @@ async function viewReports(main) {
   main.innerHTML = `
     <h2>报表中心</h2>
     <div class="toolbar">
-      <label>从 <input id="r-from" value="${esc(state.current || "")}" style="width:90px" /></label>
-      <label>至 <input id="r-to" value="${esc(state.current || "")}" style="width:90px" /></label>
+      <label>从 <input id="r-from" type="month" value="${esc(state.current || "")}" style="width:90px" /></label>
+      <label>至 <input id="r-to" type="month" value="${esc(state.current || "")}" style="width:90px" /></label>
       <button class="btn sm" id="r-go">生成科目余额表</button>
       <button class="btn ghost sm" id="r-aux">辅助账</button>
       <label>维度 <select id="r-auxkind">
@@ -3444,8 +3444,8 @@ function statementTableHtml(t) {
 async function viewBalanceSheet(main) {
   main.innerHTML = `<h2>资产负债表</h2>
     <div class="toolbar">
-      <label>从 <input id="bs-from" value="${esc(state.current)}" style="width:90px" /></label>
-      <label>至 <input id="bs-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>从 <input id="bs-from" type="month" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="bs-to" type="month" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="bs-run">查询</button>
       <button class="btn ghost sm" id="bs-print">打印预览</button>
     </div>
@@ -3465,8 +3465,8 @@ async function viewBalanceSheet(main) {
 async function viewIncomeStatement(main) {
   main.innerHTML = `<h2>利润表</h2>
     <div class="toolbar">
-      <label>从 <input id="is-from" value="${esc(state.current)}" style="width:90px" /></label>
-      <label>至 <input id="is-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>从 <input id="is-from" type="month" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="is-to" type="month" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="is-run">查询</button>
       <button class="btn ghost sm" id="is-print">打印预览</button>
     </div>
@@ -3486,8 +3486,8 @@ async function viewIncomeStatement(main) {
 async function viewCashFlow(main) {
   main.innerHTML = `<h2>现金流量表</h2>
     <div class="toolbar">
-      <label>从 <input id="cf-from" value="${esc(state.current)}" style="width:90px" /></label>
-      <label>至 <input id="cf-to" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>从 <input id="cf-from" type="month" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>至 <input id="cf-to" type="month" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="cf-run">查询</button>
       <button class="btn ghost sm" id="cf-print">打印预览</button>
     </div>
@@ -5021,7 +5021,7 @@ async function viewWorkReport(main) {
 // ===========================================================================
 async function viewEquity(main) {
   main.innerHTML = `<h2>所有者权益变动表</h2>
-    <div class="toolbar"><label>期间 <input id="eq-period" value="${esc(state.current)}" style="width:90px" /></label>
+    <div class="toolbar"><label>期间 <input id="eq-period" type="month" value="${esc(state.current)}" style="width:90px" /></label>
     <button class="btn primary" id="eq-run">查询</button>
       <button class="btn ghost sm" id="eq-run-print">打印预览</button></div>
     <div id="eq-result" class="muted">填写期间后点击查询</div>`;
@@ -5085,7 +5085,7 @@ async function viewDaily(main) {
   main.innerHTML = `<h2>科目日报表</h2>
     <div class="toolbar">
       <label>科目 <input id="dl-code" placeholder="1001" style="width:90px" /></label>
-      <label>期间 <input id="dl-from" value="${esc(state.current)}" style="width:90px" /></label>
+      <label>期间 <input id="dl-from" type="month" value="${esc(state.current)}" style="width:90px" /></label>
       <button class="btn primary" id="dl-run">查询</button>
       <button class="btn ghost sm" id="dl-run-print">打印预览</button></div>
     <div id="dl-result" class="muted">填写科目与期间后点击查询</div>`;

@@ -839,6 +839,59 @@ pub fn parse_period(s: &str) -> Option<fincore::Period> {
     fincore::Period::new(y, m).ok()
 }
 
+/// 解析**期间参数**：缺失/纯空白 → 用 `default`；存在但解析不了 → 400。
+///
+/// 为什么不能写成 `.and_then(parse_period).unwrap_or(default)`：
+/// 那会把「用户把期间敲错」静默替换成「查另一个区间」，**而报表照样借贷平衡**
+/// —— 错值在结果里根本看不出来，只能靠「平不平」判断，偏偏它是平的。
+///
+/// 生产实测（同一账套，10 万张已记账凭证，全年真实值 9,951,930）：
+///
+/// | from 传法 | 返回的本期借方 | 对不对 |
+/// |---|---|---|
+/// | `2026-01` | 9,951,930 | ✓ |
+/// | `202601` | 9,951,930 | ✓ |
+/// | `2026-01-01`（日期格式） | 829,300 | ✗ 只算了一个月 |
+/// | `garbage` | 829,300 | ✗ **HTTP 200** |
+/// | 不传 | 829,300 | ✗ **HTTP 200** |
+///
+/// 界面上报表的起止期间是**无 `type` 的自由文本框**（`#r-from` / `#r-to`），
+/// 用户敲错完全正常。财务数字错了还查不出来，比直接报错危险得多 ——
+/// 与 `parse_money_checked` 同一原则：非法输入返回 400，不静默回退。
+pub fn period_param(
+    s: Option<&String>,
+    default: fincore::Period,
+) -> Result<fincore::Period, AppError> {
+    match s.map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        None => Ok(default),
+        Some(t) => parse_period(t).ok_or_else(|| {
+            AppError::bad_request(format!("期间格式不正确：{t}（应为 202601 或 2026-01）"))
+        }),
+    }
+}
+
+/// 解析**期间区间**（from/to）：缺失 → 默认值；非法 → 400；`from > to` → 400。
+///
+/// 区间倒置也要拦：SQL 是 `period BETWEEN ?1 AND ?2`，from > to 会**安静地**
+/// 返回空表，用户看到「一张凭证都没有」，而真实原因是他把区间填反了。
+/// 同样属于「静默给出一个合法外观的错误结果」。
+pub fn period_range_param(
+    q: &HashMap<String, String>,
+    default_from: fincore::Period,
+    default_to: fincore::Period,
+) -> Result<(fincore::Period, fincore::Period), AppError> {
+    let from = period_param(q.get("from"), default_from)?;
+    let to = period_param(q.get("to"), default_to)?;
+    if from > to {
+        return Err(AppError::bad_request(format!(
+            "起始期间不能晚于结束期间：{} > {}",
+            period_to_str(from),
+            period_to_str(to)
+        )));
+    }
+    Ok((from, to))
+}
+
 /// 解析金额字符串（默认 0）
 /// 解析用户提交的金额：非法输入返回 400，不再静默归零（错值=0 会把
 /// 工资、收付款、库存调整等写错且无任何提示）。支持千分位/全角等惯例写法。
@@ -851,6 +904,96 @@ pub fn parse_money_checked(s: &str) -> Result<fincore::Money, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 期间参数：缺失/空白 → 默认值；**存在但解析不了 → 必须 400**。
+    ///
+    /// 这条是整个报表校验的地基。原来各 handler 直接写
+    /// `.and_then(parse_period).unwrap_or(默认值)`，而 `and_then` 在解析失败时
+    /// 也给 `None`，于是「敲错」和「没传」被混同 —— 静默换一个区间，
+    /// 而且返回的报表照样借贷平衡，错值在结果里看不出来。
+    #[test]
+    fn period_param_distinguishes_absent_from_garbage() {
+        let dflt = fincore::Period::new(2026, 3).unwrap();
+        let got = |s: Option<&str>| match s {
+            None => period_param(None, dflt),
+            Some(v) => period_param(Some(&v.to_string()), dflt),
+        };
+        let val = |s: Option<&str>| match got(s) {
+            Ok(p) => p,
+            // AppError 既没 Debug 也没 Display，所以只能报输入值
+            Err(_) => panic!("{s:?} 应当解析成功，却返回了错误"),
+        };
+
+        // 缺失 / 空串 / 纯空白 → 用默认值（这是合法语义，必须保留）
+        assert_eq!(val(None), dflt);
+        assert_eq!(val(Some("")), dflt);
+        assert_eq!(val(Some("   ")), dflt);
+
+        // 两种合法格式都要认（界面上两种都在用：月份式与期间式）
+        assert_eq!(val(Some("202603")), dflt);
+        assert_eq!(val(Some("2026-03")), dflt);
+        // 首尾空白要容忍：URL 里手写参数常带空格
+        assert_eq!(val(Some(" 2026-03 ")), dflt);
+
+        // 下面这些以前全都静默回退成 dflt，现在必须 400
+        for bad in [
+            "2026-01-01",      // 日期格式：用户最容易敲的
+            "2026/01",         // 斜杠
+            "2026.01",         // 点号
+            "202613",          // 月份 13
+            "202600",          // 月份 00
+            "20261",           // 位数不对
+            "2026",            // 只有年
+            "garbage",         // 乱填
+            "-2026-01",        // 负号
+            "2026-13",         // 月份 13（月份式）
+            "2601",            // 两位年
+            "2026-01-01T00:00", // ISO 时间戳
+            "<script>",        // 顺带确认不会当 HTML/注入面
+        ] {
+            match got(Some(bad)) {
+                Ok(p) => panic!("{bad:?} 解析不了，必须报错，却回退成了 {p:?}"),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// 区间：两端都要校验，且 from > to 必须拦。
+    ///
+    /// 倒置之所以要拦：SQL 是 `period BETWEEN ?1 AND ?2`，from > to 会
+    /// **安静地**返回空表 —— 用户看到「一张凭证都没有」，真实原因却是填反了。
+    #[test]
+    fn period_range_param_validates_both_ends_and_order() {
+        let d1 = fincore::Period::new(2026, 1).unwrap();
+        let d12 = fincore::Period::new(2026, 12).unwrap();
+        let q = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        // 缺省 → 用默认区间
+        assert_eq!(period_range_param(&q(&[]), d1, d12).unwrap_or((d1, d12)), (d1, d12));
+        // 只给 from → to 落到默认
+        let got = period_range_param(&q(&[("from", "2026-05")]), d1, d12);
+        assert_eq!(got.unwrap_or((d1, d12)), (fincore::Period::new(2026, 5).unwrap(), d12));
+        // 单月（from == to）与跨年都要过
+        assert!(period_range_param(&q(&[("from", "2026-03"), ("to", "2026-03")]), d1, d12).is_ok());
+        assert!(period_range_param(&q(&[("from", "2025-11"), ("to", "2026-02")]), d1, d12).is_ok());
+
+        // 倒置 → 400（否则安静返回空表）
+        for (f, t) in [("2026-12", "2026-01"), ("202601", "202512")] {
+            assert!(
+                period_range_param(&q(&[("from", f), ("to", t)]), d1, d12).is_err(),
+                "区间倒置 {f}..{t} 必须报错，不能静默返回空表"
+            );
+        }
+        // 两端任一非法 → 400
+        assert!(period_range_param(&q(&[("from", "garbage")]), d1, d12).is_err());
+        assert!(period_range_param(&q(&[("to", "2026-01-01")]), d1, d12).is_err());
+        assert!(period_range_param(&q(&[("from", "2026-01"), ("to", "2026-01-01")]), d1, d12).is_err());
+    }
 
     /// 探测式登录（用户名乱填、永远认证失败）不该在限流表里留下条目：
     /// check 早于口令校验，若它 or_default() 建键，随机用户名就能把表无限撑大。

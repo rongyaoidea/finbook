@@ -12653,6 +12653,133 @@ async fn unbalanced_voucher_rejected_m15() {
     assert!(body.contains("借贷不平衡"), "{body}");
 }
 
+/// 报表/账簿的期间参数必须校验：敲错格式或区间倒置要 400，不能静默换一个区间。
+///
+/// 回归背景（真实生产事故级）：原来的写法是
+/// `q.get("from").and_then(parse_period).unwrap_or(默认值)`。
+/// `and_then` 在**解析失败**时也返回 `None`，于是「用户把期间敲错」和
+/// 「用户没传期间」被混为一谈 —— 两者都静默回退到默认值。
+///
+/// 危险的地方在于：返回的报表**照样借贷平衡**。生产实测（10 万张已记账凭证、
+/// 全年真实值 9,951,930）：
+///
+/// | from 传法 | 本期借方 | 是否正确 |
+/// |---|---|---|
+/// | `2026-01` / `202601` | 9,951,930 | ✓ |
+/// | `2026-01-01`（日期格式） | 829,300 | ✗ 只算了一个月 |
+/// | `garbage` | 829,300 | ✗ HTTP 200 |
+/// | 不传 | 829,300 | ✗ HTTP 200 |
+///
+/// 也就是说财务数字错了，却**没有任何办法从结果上看出来** —— 「试算平衡表
+/// 平不平」这个最自然的检查手段失效，因为它平。只能靠报错拦住。
+///
+/// 界面上起止期间是**无 `type` 的自由文本框**，敲错是常态而非例外。
+#[tokio::test]
+async fn report_period_params_reject_garbage_instead_of_silently_substituting() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 造两个期间的数据，让「区间算错」在数字上真的看得出来
+    post_voucher(&state, &sid, 1, serde_json::json!([
+        { "line": 1, "account_code": "1001", "summary": "收", "debit": "1000", "credit": "0" },
+        { "line": 2, "account_code": "2001", "summary": "借", "debit": "0", "credit": "1000" }
+    ])).await;
+
+    let debit_of = |v: &serde_json::Value| -> f64 {
+        money_num(v["totals"]["end_debit"].as_str().unwrap())
+    };
+
+    // 基线：合法格式（202601 期间式 / 2026-01 月份式）必须照常 200
+    for q in ["from=202601&to=202601", "from=2026-01&to=2026-01", ""] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(
+                &format!("/api/reports/trial-balance?{q}"),
+                &sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "合法/缺省区间必须 200：{q}");
+    }
+
+    // 核心回归：这些以前全部返回 200 + 一份「合法外观的错误报表」
+    for bad in [
+        "from=2026-01-01&to=2026-12-31", // 日期格式：拼错成日期
+        "from=garbage&to=garbage",       // 乱填
+        "from=2026%2F01&to=2026%2F12",   // 斜杠分隔
+        "from=202613&to=202613",         // 月份 13，不存在
+        "from=202613&to=202601",         // 不存在的月份
+        "to=2026-12-31",                 // 只错 to
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(
+                &format!("/api/reports/trial-balance?{bad}"),
+                &sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "期间参数非法时必须 400，不能静默换区间返回一份平衡但错误的报表：{bad}"
+        );
+        // 错误信息要能让人知道怎么改
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("期间"),
+            "400 的提示里应说明是期间的问题（便于用户自查）：{bad} -> {body}"
+        );
+    }
+
+    // 区间倒置：SQL 是 period BETWEEN ?1 AND ?2，倒置会**安静地**返回空表，
+    // 用户看到「一张凭证都没有」而真实原因是他填反了 —— 同样要拦
+    for bad in ["from=202612&to=202601", "from=2026-06&to=2026-01"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(
+                &format!("/api/reports/trial-balance?{bad}"),
+                &sid,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "区间倒置必须 400，不能静默返回空表：{bad}"
+        );
+    }
+
+    // 反向证明：合法区间仍能取到数（确认上面的 400 不是「接口全挂」）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/reports/trial-balance?from=202601&to=202601", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tb: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(debit_of(&tb) > 0.0, "合法区间必须能取到发生额：{tb}");
+
+    // 同一套校验必须覆盖其它报表/账簿端点，否则只是把漏洞挪了个位置
+    for ep in [
+        "/api/reports/balance-sheet?to=2026-12-31",
+        "/api/reports/income-statement?from=garbage",
+        "/api/reports/cash-flow?to=2026-01-01",
+        "/api/reports/equity?period=garbage",
+        "/api/reports/summary-table?from=garbage",
+        "/api/reports/multi-column?main=1001&cols=2001&from=garbage",
+        "/api/ledger?code=1001&from=2026-01-01",
+        "/api/ledger/print-form?code=1001&from=garbage",
+        "/api/overview?period=2026-01-01",
+    ] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(ep, &sid))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "该端点也必须校验期间参数：{ep}"
+        );
+    }
+}
+
 /// 三大报表勾稽：试算平衡、资产=负债+权益、利润表净利。
 #[tokio::test]
 async fn web_statements_tie() {

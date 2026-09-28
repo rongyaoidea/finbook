@@ -27,8 +27,8 @@ use serde_json::json;
 use crate::dto::*;
 use crate::realm::{RealmBook, RealmDb};
 use crate::state::{
-    period_to_str, parse_money_checked, parse_period, clear_cookie_header, AppError, CurrentUser, RealmUser,
-    WebState,
+    period_param, period_range_param, period_to_str, parse_money_checked, parse_period, clear_cookie_header,
+    AppError, CurrentUser, RealmUser, WebState,
 };
 
 const SESSION_SECS: i64 = 60 * 60 * 24 * 7;
@@ -2942,10 +2942,7 @@ async fn get_overview(
         return Err(AppError::forbidden("该入口仅限系统管理员使用"));
     }
     let db = state.db_for(&user.book_key)?;
-    let period = q
-        .get("period")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = period_param(q.get("period"), current_period(&state, &user))?;
     let o = findb::reports::overview(&db, period)?;
     let recent: Vec<VoucherListItem> = o.recent.iter().map(to_item).collect();
     let a = findb::advanced::financial_analysis(&db, period, Some(&user.user))?;
@@ -4621,14 +4618,15 @@ fn ledger_query_from(
     if code.is_empty() {
         return Err(AppError::bad_request("缺少科目编码参数 code"));
     }
-    let from = q
-        .get("from")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(state, user));
-    let to = q
-        .get("to")
-        .and_then(|s| parse_period(s))
-        .unwrap_or(from);
+    let from = period_param(q.get("from"), current_period(state, user))?;
+    let to = period_param(q.get("to"), from)?;
+    if from > to {
+        return Err(AppError::bad_request(format!(
+            "起始期间不能晚于结束期间：{} > {}",
+            period_to_str(from),
+            period_to_str(to)
+        )));
+    }
     let include_children = q
         .get("include_children")
         .map(|s| s == "1" || s == "true")
@@ -4707,14 +4705,15 @@ async fn print_voucher_form(
 
     let mut query = VoucherQuery::default().with_data_scope(&user.user);
     query.asc = true;
-    let from = q
-        .get("from")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
-    let to = q
-        .get("to")
-        .and_then(|s| parse_period(s))
-        .unwrap_or(from);
+    let from = period_param(q.get("from"), current_period(&state, &user))?;
+    let to = period_param(q.get("to"), from)?;
+    if from > to {
+        return Err(AppError::bad_request(format!(
+            "起始期间不能晚于结束期间：{} > {}",
+            period_to_str(from),
+            period_to_str(to)
+        )));
+    }
     query.from = Some(from);
     query.to = Some(to);
     query.limit = q
@@ -4776,14 +4775,15 @@ async fn print_ledger_form(
     let db = state.db_for(&user.book_key)?;
     let company = user.company.clone();
     let chart = accounts::chart(&db)?;
-    let from = q
-        .get("from")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
-    let to = q
-        .get("to")
-        .and_then(|s| parse_period(s))
-        .unwrap_or(from);
+    let from = period_param(q.get("from"), current_period(&state, &user))?;
+    let to = period_param(q.get("to"), from)?;
+    if from > to {
+        return Err(AppError::bad_request(format!(
+            "起始期间不能晚于结束期间：{} > {}",
+            period_to_str(from),
+            period_to_str(to)
+        )));
+    }
     let ktype = q.get("type").map(String::as_str).unwrap_or("detail");
     let include_children = q
         .get("include_children")
@@ -4903,14 +4903,9 @@ fn trial_balance_data(
 ) -> Result<(Vec<fincore::balance::BalanceRow>, fincore::balance::TrialBalance), AppError> {
     let db = state.db_for(&user.book_key)?;
     let start = db.options().start_period;
-    let from = q
-        .get("from")
-        .and_then(|s| parse_period(s))
-        .unwrap_or(start);
-    let to = q
-        .get("to")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(state, user));
+    // 与其它报表同一套校验：区间敲错 / 倒置都返回 400，不静默换一个区间
+    // （理由与实测数据见 `state::period_param`）
+    let (from, to) = period_range_param(q, start, current_period(state, user))?;
     let bq = BalanceQuery::range(from, to).with_user_scope(&user.user);
     let snap = BalanceSnapshot::load(&db, &bq)?;
     let chart = accounts::chart(&db)?;
@@ -4947,7 +4942,7 @@ async fn account_detail_ep(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let account = q
         .get("account")
         .map(String::as_str)
@@ -5191,10 +5186,7 @@ async fn export_payroll(
 ) -> Result<Response, AppError> {
     user.require(Perm::Export)?;
     let db = state.db_for(&user.book_key)?;
-    let period = q
-        .get("period")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = period_param(q.get("period"), current_period(&state, &user))?;
     let list = business::payroll_list(&db, period)?;
     let list = scope_payroll(&user, &list);
     let mut rows = vec![[
@@ -5234,10 +5226,7 @@ async fn export_claims(
 ) -> Result<Response, AppError> {
     user.require(Perm::Export)?;
     let db = state.db_for(&user.book_key)?;
-    let period = q
-        .get("period")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = period_param(q.get("period"), current_period(&state, &user))?;
     // 空串 = 全部状态：UI 下拉默认值为空，直接 parse 会落到 Draft 只显示草稿
     let status = q
         .get("status")
@@ -5693,8 +5682,7 @@ async fn get_multi_column(
     if cols.is_empty() {
         return Err(AppError::bad_request("缺少栏目科目 cols（逗号分隔）"));
     }
-    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
-    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
+    let (from, to) = period_range_param(&q, current_period(&state, &user), current_period(&state, &user))?;
     let db = state.db_for(&user.book_key)?;
     // 数据范围：主科目与各栏目科目均须在可见范围内
     if !user.user.can_see_account(&main) || cols.iter().any(|c| !user.user.can_see_account(c)) {
@@ -5710,8 +5698,7 @@ async fn get_summary_table(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
-    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
-    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(from);
+    let (from, to) = period_range_param(&q, current_period(&state, &user), current_period(&state, &user))?;
     let db = state.db_for(&user.book_key)?;
     let rows = advanced::summary_table(&db, from, to, Some(&user.user))?;
     Ok(Json(serde_json::json!({ "from": period_to_str(from), "to": period_to_str(to), "rows": rows })))
@@ -5741,10 +5728,17 @@ async fn get_equity_statement(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
-    let period = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
-    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
-        fincore::Period::new(period.year(), 1).unwrap_or(period)
-    });
+    let period = period_param(q.get("period"), current_period(&state, &user))?;
+    // 原本只有 from 是区间参数、to 固定等于 period，这里保持不变（不凭空加 to 参数）
+    let year_start = fincore::Period::new(period.year(), 1).unwrap_or(period);
+    let from = period_param(q.get("from"), year_start)?;
+    if from > period {
+        return Err(AppError::bad_request(format!(
+            "起始期间不能晚于结束期间：{} > {}",
+            period_to_str(from),
+            period_to_str(period)
+        )));
+    }
     let db = state.db_for(&user.book_key)?;
     let stmt = findb::reports::equity_statement(&db, from, period, Some(&user.user))?;
     Ok(Json(serde_json::json!({
@@ -5761,8 +5755,8 @@ async fn get_report_compare(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let key = q.get("key").cloned().unwrap_or_else(|| "balance_sheet".to_string());
-    let cur = q.get("period").and_then(|s| parse_period(s)).unwrap_or_else(|| current_period(&state, &user));
-    let prev = q.get("prev").and_then(|s| parse_period(s)).unwrap_or(cur.prev());
+    let cur = period_param(q.get("period"), current_period(&state, &user))?;
+    let prev = period_param(q.get("prev"), cur.prev())?;
     let yearly = q.get("yearly").map(|s| s == "1" || s == "true").unwrap_or(true);
     // 默认按年累计：当前期 1 月→当前期；上期 1 月→上期
     let (cur_from, prev_from) = if yearly {
@@ -5832,7 +5826,7 @@ async fn get_aux_balance(
     if kind == fincore::AuxKind::CashFlow {
         return Err(AppError::bad_request("现金流量项目不是余额维度"));
     }
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let db = state.db_for(&user.book_key)?;
     let rows = balances::aux_balance(&db, kind, from, to, Some(&user.user))?;
     Ok(Json(json!({
@@ -5851,7 +5845,7 @@ async fn get_qty_balance(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let db = state.db_for(&user.book_key)?;
     let rows = balances::qty_balance_sheet(&db, from, to, Some(&user.user))?;
     Ok(Json(json!({
@@ -5922,10 +5916,7 @@ async fn get_custom_report(
     let db = state.db_for(&user.book_key)?;
     let r = findb::mgmt::custom_get(&db, &key)?
         .ok_or_else(|| AppError::not_found("自定义报表不存在"))?;
-    let period = q
-        .get("period")
-        .and_then(|s| parse_period(s))
-        .unwrap_or_else(|| current_period(&state, &user));
+    let period = period_param(q.get("period"), current_period(&state, &user))?;
     // 用 detailed 版本：公式写错/取数失败（数据库忙、脏数据）时该单元格按 0 占位，
     // 但**必须把原因回传**。旧的 `custom_report_values` 直接丢弃 warnings，
     // 报表会打印出一片像样的 0 而用户完全看不出哪里错了——财务报表最坏的失败模式。
@@ -12264,13 +12255,19 @@ async fn dunning_status_ep(
 // ---------------------------------------------------------------------------
 
 /// 从 query 解析 起/止期间（默认当前期间）
-fn report_range(state: &WebState, user: &CurrentUser, q: &HashMap<String, String>) -> (Period, Period) {
+/// 报表/账簿的期间区间。
+///
+/// 非法输入（敲错的格式、或者 from 晚于 to）现在返回 400，不再静默回退成
+/// 另一个区间 —— 理由与实测数据见 `state::period_param`。这一处是资产负债表、
+/// 利润表、现金流量表等 11 个报表/账簿端点的共同入口。
+fn report_range(
+    state: &WebState,
+    user: &CurrentUser,
+    q: &HashMap<String, String>,
+) -> Result<(Period, Period), AppError> {
     let cur = current_period(state, user);
-    let from = q.get("from").and_then(|s| parse_period(s)).unwrap_or_else(|| {
-        fincore::Period::new(cur.year(), 1).unwrap_or(cur)
-    });
-    let to = q.get("to").and_then(|s| parse_period(s)).unwrap_or(cur);
-    (from, to)
+    let year_start = fincore::Period::new(cur.year(), 1).unwrap_or(cur);
+    period_range_param(q, year_start, cur)
 }
 
 /// 加载报表定义（优先账套内自定义，否则内置模板）
@@ -12340,7 +12337,7 @@ async fn get_balance_sheet(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let t = statement_table(
         &db,
         &user,
@@ -12362,7 +12359,7 @@ async fn print_balance_sheet(
 ) -> Result<Response, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let t = statement_table(
         &db,
         &user,
@@ -12393,7 +12390,7 @@ async fn get_income_statement(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let t = statement_table(
         &db,
         &user,
@@ -12412,7 +12409,7 @@ async fn print_income_statement(
 ) -> Result<Response, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let t = statement_table(
         &db,
         &user,
@@ -12432,7 +12429,7 @@ async fn get_cash_flow(
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
     let line = |l: &fincore::report::cashflow::CashFlowLine| {
         json!({ "code": l.code, "name": l.name, "inflow": l.inflow.fmt_money(), "outflow": l.outflow.fmt_money(), "net": l.net.fmt_money() })
@@ -12460,7 +12457,7 @@ async fn print_cash_flow(
 ) -> Result<Response, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let cf = findb::reports::cash_flow_statement(&db, from, to, Some(&user.user))?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
     let html = crate::report_html::cash_flow_html(&cf, &user.company, &subtitle);
@@ -12474,7 +12471,7 @@ async fn print_equity_statement(
 ) -> Result<Response, AppError> {
     user.require(Perm::FinReport)?;
     let db = state.db_for(&user.book_key)?;
-    let (from, to) = report_range(&state, &user, &q);
+    let (from, to) = report_range(&state, &user, &q)?;
     let stmt = findb::reports::equity_statement(&db, from, to, Some(&user.user))?;
     let subtitle = format!("{} 至 {}", from.label(), to.label());
     let html = crate::report_html::equity_html(&stmt, &user.company, &subtitle);

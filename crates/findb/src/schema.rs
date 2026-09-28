@@ -1490,6 +1490,40 @@ const MIGRATE_V5: &[(&str, &str, &str)] = &[
     ("user", "device_name", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// **v35 新增的列**（`SCHEMA_VERSION` = 35 这一版引入的）。
+///
+/// 为什么单独成一张表，而不是继续塞进 `MIGRATE_V6`：
+/// 那张清单是**累积**的（v6 时代到 v34 的列都在里面），机器没法从中区分
+/// 「这一版新增的列」和「早就存在的列」—— 而这两者的风险完全不同。
+///
+/// 风险规则（已两次在生产咬人，务必读）：
+///
+/// > `CREATE TABLE IF NOT EXISTS` 对**已存在**的表不生效。所以老账套上
+/// > `po_receipt` 保持旧结构（没有 `item_code`），而 DDL 里紧跟着的
+/// > `CREATE INDEX ... (po_id, item_code)` 引用了一个不存在的列
+/// > → DDL 报错 → 整个 `init` 事务回滚 → **迁移静默不生效**、版本号停在旧值
+/// > → 账套随后被新代码按新结构查询，首个收货请求报 `no such column: item_code`。
+///
+/// 全新账套不会暴露（表由 DDL 新建、自带新列），所以全量测试与 E2E 全绿也照样漏
+/// —— **只有升级上来的旧账套会炸**。
+///
+/// 因此本清单有两个配套约束，由测试强制（见 `mod tests`）：
+/// 1. **DDL 里不得有索引引用本清单里的列** —— 索引必须建在 `migrate_generic` 之后
+/// 2. 老结构账套跑 `init` 必须成功补齐本清单的列与索引
+///
+/// 每次抬 `SCHEMA_VERSION` 时，把新列加到这里。
+const MIGRATE_V35: &[(&str, &str, &str)] = &[
+    // 收货分行。旧数据 item_code='' 表示「整单收货」，金额仍按订购量占比
+    // 折算（与升级前完全一致），新数据可精确到行。
+    //
+    // 代价：同一张 PO 内物料编码必须唯一 —— `po_save` 会强制校验。
+    // 用物料编码而**不是** po_line.id：`po_save` 会 DELETE FROM po_line 再重插，
+    // 行 id 每次编辑都会变，引用它会让历史收货在订单被编辑后指向别的行。
+    ("po_receipt", "item_code", "TEXT NOT NULL DEFAULT ''"),
+    // 收进哪个仓库（ERPNext / Odoo 的 Purchase Receipt 都是行级带仓库）
+    ("po_receipt", "warehouse", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// v5 → v6：供应链深化（采购订单 / 销售订单 / BOM / 生产订单）
 const MIGRATE_V6: &[(&str, &str, &str)] = &[
     // 采购订单表
@@ -1543,13 +1577,10 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     // 凭证更正链：voucher 是 v1 老表，不在迁移清单里，所以这里要显式补。
     // 不补的话旧账套上 `amend` 会直接报「no such column: amends_id」——
     // 而 CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+    // （注：v34 加的列，见 SCHEMA_VERSION 的历史；v35 的列在 MIGRATE_V35）
     ("voucher", "amends_id", "INTEGER NOT NULL DEFAULT 0"),
     ("voucher", "amended_by", "INTEGER NOT NULL DEFAULT 0"),
     ("voucher", "amend_reason", "TEXT NOT NULL DEFAULT ''"),
-    // v35：收货分行。旧数据 item_code='' 表示「整单收货」，金额仍按订购量占比
-    // 折算（与升级前完全一致），新数据可精确到行。
-    ("po_receipt", "item_code", "TEXT NOT NULL DEFAULT ''"),
-    ("po_receipt", "warehouse", "TEXT NOT NULL DEFAULT ''"),
     // 到岸成本明细
     ("landed_cost_item", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
     ("landed_cost_item", "lcv_id", "INTEGER NOT NULL"),
@@ -1944,8 +1975,10 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V25)?;
             migrate_generic(conn, MIGRATE_V26)?;
             migrate_generic(conn, MIGRATE_V31)?;
-            // v35：`po_receipt` 分行收货的索引。**必须放在加列之后**（即 MIGRATE_V6 之后 ——
-            // 那两条 `po_receipt` 列在 MIGRATE_V6 清单里，不在 MIGRATE_V5）。
+            // v35 的列。放在所有老清单**之后**，这样「本次新增的列」只有这一处来源，
+            // 配套测试才能机器校验（见 MIGRATE_V35 的文档注释）。
+            migrate_generic(conn, MIGRATE_V35)?;
+            // ↓↓↓ 引用 MIGRATE_V35 新增列的索引一律放这里 ↓↓↓
             //
             // 两条教训，都是生产事故级的：
             //
@@ -1962,10 +1995,12 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             //
             // 通用规则：**引用迁移新增列的索引一律建在 `migrate_generic` 之后**，
             // 且要确认那几列确实属于它后面那个清单。
+            // 有测试 `no_ddl_index_may_reference_a_current_migration_column` 强制这条。
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_po_rcpt_item ON po_receipt(po_id, item_code)",
                 [],
             )?;
+            // ↑↑↑ 新增索引放这里 ↑↑↑
             // v30：仓库主数据种默认仓（建表在 DDL；老账套升级即得，幂等）
             conn.execute(
                 "INSERT OR IGNORE INTO warehouse(code,name,is_default,disabled,memo)
@@ -2083,6 +2118,176 @@ mod tests {
     ///
     /// ⚠ 这条用例只覆盖「列」。**索引**是另一种翻车方式，见下一条。
     ///
+    /// 取出某张表上的所有索引名。
+    fn indexes_of(conn: &Connection, table: &str) -> Vec<String> {
+        let mut st = conn
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .unwrap();
+        st.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    /// 取出某个索引覆盖的列。
+    fn index_columns(conn: &Connection, idx: &str) -> Vec<String> {
+        let mut st = conn.prepare(&format!("PRAGMA index_info({idx})")).unwrap();
+        st.query_map([], |r| r.get::<_, String>(2))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    /// **规则 1（静态）**：DDL 里不得有索引引用 `MIGRATE_V35` 的列。
+    ///
+    /// 这条规则来自一次生产事故：`idx_po_rcpt_item ON po_receipt(po_id, item_code)`
+    /// 曾写在 DDL 里，而 `item_code` 是同一次升级才加的列。
+    /// `CREATE TABLE IF NOT EXISTS` 对**已存在**的旧表不生效 → 旧账套上
+    /// `po_receipt` 没有 `item_code` → 紧跟的 `CREATE INDEX` 引用不存在的列 →
+    /// DDL 报错 → 整个 `init` 事务回滚 → 迁移静默不生效、版本号停在旧值 →
+    /// 账套随后被新代码按新结构查询，首个收货请求报 `no such column: item_code`。
+    ///
+    /// 全新账套不会暴露（表由 DDL 新建、自带新列），所以全量测试与 E2E 全绿
+    /// 也照样漏 —— **只有升级上来的旧账套会炸**。所以把规则交给机器查，
+    /// 而不是靠人记住。
+    ///
+    /// 以后抬 `SCHEMA_VERSION` 时：把新列加进 `MIGRATE_V35`，
+    /// 引用它们的索引建在 `init` 里（本测试会拦住写进 DDL 的做法）。
+    #[test]
+    fn no_ddl_index_may_reference_a_current_migration_column() {
+        let mut checked = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+
+        // DDL 里按 `;` 切语句；含 `INDEX` 且前面有 `CREATE` 的就是建索引语句。
+        for stmt in DDL.split(';') {
+            let s = stmt.trim();
+            let up = s.to_ascii_uppercase();
+            let Some(p) = up.find("INDEX") else { continue };
+            if !up[..p].contains("CREATE") {
+                continue;
+            }
+            // 形如 `CREATE [UNIQUE] INDEX ... ON <table>(<cols>)`
+            let Some(lo) = s.find('(') else { continue };
+            let Some(hi) = s[lo..].find(')').map(|k| lo + k) else { continue };
+            let table = s[..lo]
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if table.is_empty() {
+                continue;
+            }
+            checked += 1;
+            for c in s[lo + 1..hi].split(',') {
+                let col = c
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                for (t, cc, _) in MIGRATE_V35 {
+                    if *t == table && cc.eq_ignore_ascii_case(&col) {
+                        violations.push(format!("{table}.{col}"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked > 10,
+            "解析到的索引只有 {checked} 条，说明 DDL 解析器失效了（测试会变成空跑）"
+        );
+        assert!(
+            violations.is_empty(),
+            "DDL 里有索引引用了本次迁移新增的列：{violations:?}。\n\
+             这些列在升级上来的旧账套上还不存在，CREATE INDEX 会失败 → \
+             整个 init 事务回滚 → 迁移静默不生效。\n\
+             正确做法：把索引建在 init 里、migrate_generic(MIGRATE_V35) 之后。"
+        );
+    }
+
+    /// **规则 2（动态）**：缺了 `MIGRATE_V35` 全部列的存量账套，跑 `init` 必须
+    /// 成功补齐列、索引和版本号。
+    ///
+    /// 与 `old_book_with_legacy_po_receipt_upgrades_cleanly` 的区别：那条是
+    /// 手工为 `po_receipt` 造旧结构，这条**由 `MIGRATE_V35` 驱动** ——
+    /// 以后往清单里加列，这条自动覆盖新列，不用再手写夹具。
+    /// 手写夹具正是第一次漏掉这个 bug 的原因（新列没有对应测试）。
+    #[test]
+    fn a_legacy_book_missing_every_current_migration_column_upgrades_cleanly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+
+        // 记录「全新账套」应有的索引，后面要确认 init 全部重建了
+        let all_indexes: Vec<String> = {
+            let mut st = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+
+        // 造出「缺了 MIGRATE_V35 全部列」的存量账套
+        for (table, col, _) in MIGRATE_V35 {
+            // DROP COLUMN 不允许还有索引指着该列，先摘掉相关索引
+            for idx in indexes_of(&conn, table) {
+                if index_columns(&conn, &idx)
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(col))
+                {
+                    conn.execute(&format!("DROP INDEX IF EXISTS {idx}"), [])
+                        .unwrap();
+                }
+            }
+            conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {col}"), [])
+                .unwrap_or_else(|e| panic!("造旧结构失败：{table}.{col} —— {e:?}"));
+            assert!(
+                !column_exists(&conn, table, col).unwrap(),
+                "前置条件：{table}.{col} 应当已被删掉"
+            );
+        }
+        // 版本号退回本次升级之前
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','34')",
+            [],
+        )
+        .unwrap();
+
+        init(&conn).expect("缺列的旧账套升级必须成功");
+
+        for (table, col, _) in MIGRATE_V35 {
+            assert!(
+                column_exists(&conn, table, col).unwrap(),
+                "升级后必须补齐 {table}.{col}"
+            );
+        }
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            v,
+            SCHEMA_VERSION.to_string(),
+            "版本号没推进 = 迁移整体回滚了（这是最容易被忽略的失败形态）"
+        );
+        // 每一个原本存在的索引都要回来（含 DDL 里的和 init 里补建的）
+        for idx in &all_indexes {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "索引 {idx} 在 init 之后不见了");
+        }
+        // 幂等
+        init(&conn).expect("再跑一次 init 必须幂等");
+    }
+
     /// 旧账套（v34 的**旧结构** `po_receipt`）升级后必须拿到 item_code / warehouse。
     ///
     /// 回归背景（生产事故级）：`idx_po_rcpt_item(po_id, item_code)` 曾写在 DDL 里。

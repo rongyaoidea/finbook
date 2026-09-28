@@ -184,6 +184,40 @@ async fn health_ready(
         json!({ "ok": writable, "path": state.books_dir.display().to_string() }),
     );
 
+    // ⑤ schema 迁移：升级后所有账套是否都已迁到当前版本。
+    //
+    // 这一项是为了消灭「探针报绿、账套还没升级」这种状态。迁移原本是懒执行
+    // 的（账套第一次被打开时才跑），于是部署完成、readiness 全绿，而用户第一次
+    // 点某个功能才报 `no such column: xxx` —— 生产上真实发生过。
+    //
+    // 判定：
+    // - 仍在进行 → 未就绪（503）：实例还没真正可用
+    // - 有账套迁不动 → 未就绪（503），并**指名道姓**报出是哪个、报什么。
+    //   财务系统里一个账套打不开不是「可以先用着」，必须让人看见。
+    let mig = state.books.migration_status();
+    // 权威判据是「有没有账套还没迁过」，而不是「批量任务跑过没有」——
+    // 前者能抓到运行期新增/恢复的账套，后者只看启动那一刻的快照。
+    let pending = state.books.unmigrated_books();
+    if !mig.done() || mig.has_failures() || !pending.is_empty() {
+        ok = false;
+    }
+    checks.insert(
+        "migration".into(),
+        json!({
+            "ok": mig.done() && !mig.has_failures() && pending.is_empty(),
+            "done": mig.done(),
+            "running": mig.running,
+            "total": mig.total,
+            "migrated": mig.ok,
+            "pending": pending,
+            "failed": mig.failed
+                .iter()
+                .map(|(k, e)| json!({ "book": k, "error": e }))
+                .collect::<Vec<_>>(),
+            "schema_version": findb::schema::SCHEMA_VERSION,
+        }),
+    );
+
     let body = json!({ "ok": ok, "checks": checks });
     // 有依赖不可用时返回 503：编排器据此把实例摘出负载均衡，
     // 但**不**触发重启（那是 liveness 的职责）。返回 200 会让负载均衡

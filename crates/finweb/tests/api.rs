@@ -17122,6 +17122,149 @@ async fn voucher_amend_links_old_and_new() {
 
 /// 探针必须**能抓到故障** —— 否则它是虚假的安全感。
 ///
+/// 启动时必须把所有账套迁到当前版本，并让 readiness 如实汇报。
+///
+/// 回归背景（生产真实发生）：迁移原本是**懒执行**的 —— 账套第一次被打开时
+/// 才跑 `schema::init`。于是升级后：部署完成、readiness 全绿，而用户第一次
+/// 点「收货」才报 `no such column: item_code`。故障点与原因隔了几小时，
+/// 部署的人不会联想到 schema 版本。
+///
+/// 现在改成启动时后台批量迁移，并且 readiness 汇报三件事：
+/// 迁完了没、有没有账套迁不动、还有没有账套根本没迁过。
+#[tokio::test]
+async fn startup_migrates_every_book_and_readiness_reports_it() {
+    let (state, bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 造一个「已注册但从未打开」的账套。
+    //
+    // 不能直接用刚建好的 b1：创建账套时已经打开过它，迁移早跑完了，pending 当然是空的。
+    // `unregister` + `register` 正是**恢复账套**走的那条路（覆盖文件后重新注册），
+    // 所以这里构造的就是恢复后「文件是旧版本、还没迁」的真实状态。
+    let fbk = std::fs::read_dir(&bd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "fbk").unwrap_or(false))
+        .expect("应有一个账套文件");
+    let key = fbk.file_stem().unwrap().to_string_lossy().to_string();
+    state.books.unregister(&key);
+    state.books.register(&fbk, 16);
+    assert_eq!(
+        state.books.unmigrated_books(),
+        vec![key.clone()],
+        "前置条件：重新注册后该账套应处于未迁移状态"
+    );
+
+    // ① 未迁移的账套必须被 readiness 点名（而不是报绿）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "还有账套没迁过，readiness 不能报就绪"
+    );
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let mig = &r["checks"]["migration"];
+    assert_eq!(mig["ok"], false, "migration.ok 应为 false：{mig}");
+    let pending = mig["pending"].as_array().expect("应报出 pending 列表");
+    assert!(
+        !pending.is_empty(),
+        "必须指名道姓报出哪些账套没迁过，否则运维无从下手：{mig}"
+    );
+    // 顺带确认报的是当前 schema 版本，便于一眼看出「落后几个版本」
+    assert!(mig["schema_version"].is_i64(), "应报出 schema_version：{mig}");
+
+    // ② 跑批量迁移后应全部成功、pending 清空、readiness 转绿
+    let st = state.books.migrate_all();
+    assert!(st.done(), "migrate_all 返回时不该还在进行中");
+    assert!(
+        st.failed.is_empty(),
+        "批量迁移不该有失败（全新账套都是当前版本）：{:?}",
+        st.failed
+    );
+    assert_eq!(st.ok, st.total, "所有账套都应迁移成功");
+    assert!(st.total > 0, "夹具里应至少有一个账套，实际 {}", st.total);
+    assert!(
+        state.books.unmigrated_books().is_empty(),
+        "迁移后不应还有未迁移账套：{:?}",
+        state.books.unmigrated_books()
+    );
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "迁移完成后 readiness 应 200");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["checks"]["migration"]["ok"], true);
+    assert_eq!(r["checks"]["migration"]["pending"].as_array().unwrap().len(), 0);
+    assert_eq!(r["ok"], true, "全部检查应通过：{r}");
+
+    // ③ 幂等：再跑一次不报错、结果不变
+    let again = state.books.migrate_all();
+    assert!(again.failed.is_empty() && again.ok == again.total);
+
+    // ④ liveness 全程 200 —— 迁移是后台做的，绝不能拖垮 liveness
+    //    （liveness 一旦碰重活，编排器会判 unhealthy 并重启，放大抖动）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// 账套迁不动时，readiness 必须报 503 并指名道姓，而不是继续报绿。
+///
+/// 与上一条互补：那条测「还没迁」，这条测「迁了但失败」。
+/// 财务系统里一个账套打不开不是「可以先用着」，必须让人看见。
+#[tokio::test]
+async fn readiness_reports_503_when_a_book_cannot_be_migrated() {
+    let (state, bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 把账套文件写坏，让 schema::init 失败
+    let fbk = std::fs::read_dir(&bd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "fbk").unwrap_or(false))
+        .expect("应有一个账套文件");
+    let key = fbk.file_stem().unwrap().to_string_lossy().to_string();
+    std::fs::write(&fbk, b"not a sqlite database at all").unwrap();
+    // 换一个干净连接重开（写坏前的连接可能还有缓存）
+    state.books.unregister(&key);
+    state.books.register(&fbk, 16);
+
+    let st = state.books.migrate_all();
+    assert!(st.done());
+    assert!(
+        st.has_failures(),
+        "坏掉的账套必须被记为迁移失败，而不是悄悄跳过：{st:?}"
+    );
+    assert_eq!(st.ok, 0, "唯一那个账套应该失败：{st:?}");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "有账套迁不动，readiness 必须是 503"
+    );
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let failed = r["checks"]["migration"]["failed"].as_array().expect("应报 failed 列表");
+    assert_eq!(failed.len(), 1, "应指名报出那个账套：{r}");
+    assert_eq!(failed[0]["book"].as_str().unwrap(), key.as_str());
+    assert!(
+        !failed[0]["error"].as_str().unwrap_or("").is_empty(),
+        "必须带上错误原因，否则运维无从判断：{r}"
+    );
+}
+
 /// 回归背景：原 `/api/health` 返回常量 `ok`（不碰任何依赖），于是磁盘写满、
 /// 账套文件损坏、账号库打不开这些「系统已不可用」的状态，它一律报健康。
 /// 监控拿着这样的答案会一直显示「一切正常」，人就不去查别的地方了。

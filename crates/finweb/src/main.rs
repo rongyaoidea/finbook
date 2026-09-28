@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use finweb::handlers;
 use finweb::realm::RealmDb;
 use finweb::state::{BookRegistry, SessionStore, WebState};
-use tracing::error;
+use tracing::{error, info};
 
 /// 初始化日志：默认 info 级（含 HTTP 访问日志），可用 RUST_LOG 调级
 fn init_tracing() {
@@ -108,6 +108,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 账套归属迁移（账号模型二元化，幂等）：普通账号名下的存量账套 → 管理员名下
     let _ = state.migrate_book_owners_to_admin();
+
+    // 启动时把**所有**账套的 schema 迁到当前版本。
+    //
+    // 原本迁移是懒执行的（账套第一次被打开时才跑 `schema::init`），后果是：
+    // 部署完成、readiness 探针全绿，而用户第一次点「收货」才报
+    // `no such column: item_code` —— 故障点与原因隔了几小时，部署的人
+    // 不会联想到 schema 版本。生产上真实踩到过。
+    //
+    // 分两步，顺序不能反：
+    //   ① `arm_migration` 同步把状态标成「迁移中」—— 否则从开始监听到后台
+    //     任务拉起之间有个窗口，readiness 会看到「默认 = 没在迁移」而**误报就绪**，
+    //     正好是要消灭的那种假绿。
+    //   ② 真正的迁移放 `spawn_blocking`：迁移是文件 I/O + 写事务，耗时随账套数
+    //     线性增长。放进 liveness（`/api/health`）的路径会让迁移期间探针不响应，
+    //     编排器据此判 unhealthy 并重启 —— **放大抖动**。
+    //     readiness 会如实汇报进度与失败原因。
+    state.books.arm_migration();
+    {
+        let st = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let total = st.books.list().len();
+            if total > 0 {
+                info!(books = total, "开始批量迁移账套 schema");
+            }
+            let r = st.books.migrate_all();
+            if r.has_failures() {
+                for (k, e) in &r.failed {
+                    error!(book = %k, error = %e, "账套 schema 迁移失败");
+                }
+                error!(migrated = r.ok, total = r.total, "有账套未能迁移到当前版本");
+            } else if r.total > 0 {
+                info!(migrated = r.ok, total = r.total, "账套 schema 迁移完成");
+            }
+        });
+    }
 
     // 导出计划任务：每 60s 轮询（到期即写 books_dir/exports/，同日去重）
     {

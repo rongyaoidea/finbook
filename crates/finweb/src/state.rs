@@ -174,6 +174,50 @@ pub struct BookRegistry {
     /// 账套文件被换掉时标记同步清除（恢复账套会 `unregister` + `register`），
     /// 下次打开重新走完整迁移检查。
     migrated: Mutex<HashSet<String>>,
+    /// 启动时批量迁移的进度与结果（供 readiness 探针汇报）。
+    migration: Mutex<MigrationStatus>,
+}
+
+/// 启动批量迁移的状态。
+///
+/// 为什么要专门记一份：迁移原本是**懒执行**的 —— 账套第一次被打开时才跑
+/// `schema::init`。这带来两个真实问题：
+///
+/// 1. 升级后探针**报绿**，但账套 schema 还停在旧版本。生产上就是这样踩到的：
+///    部署完成、readiness 全绿，而用户第一次点「收货」才报
+///    `no such column: item_code`。
+/// 2. 故障点和原因隔得很远 —— 部署的人不会想到问题在部署几小时后才出现，
+///    更不会联想到「schema 版本」。
+///
+/// 所以改成**启动时后台把全部账套迁一遍**，并把结果如实汇报出去：
+/// 迁完 = 就绪；没迁完 = 未就绪；某个账套迁不动 = 明确报出来是哪个、报什么。
+#[derive(Clone, Debug, Default)]
+pub struct MigrationStatus {
+    /// 是否仍在进行中
+    pub running: bool,
+    /// 已注册账套总数
+    pub total: usize,
+    /// 迁移成功的账套数
+    pub ok: usize,
+    /// 迁移失败的账套：key + 错误信息
+    pub failed: Vec<(String, String)>,
+}
+
+impl MigrationStatus {
+    /// 未开始时（启动到后台任务拉起之间）视为「迁移已开始但未完成」，
+    /// 这样 readiness 在这个窗口内是 503，而不是假装就绪。
+    fn pending(total: usize) -> Self {
+        Self { running: true, total, ok: 0, failed: Vec::new() }
+    }
+
+    pub fn done(&self) -> bool {
+        !self.running
+    }
+
+    /// 是否有账套没能迁移
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
 }
 
 impl BookRegistry {
@@ -181,6 +225,7 @@ impl BookRegistry {
         Self {
             inner: Mutex::new(Vec::new()),
             migrated: Mutex::new(HashSet::new()),
+            migration: Mutex::new(MigrationStatus::default()),
         }
     }
 
@@ -232,6 +277,69 @@ impl BookRegistry {
         let db = Db::open(&path)?;
         lock(&self.migrated).insert(key.to_string());
         Ok(db)
+    }
+
+    /// 迁移状态（readiness 探针用）
+    pub fn migration_status(&self) -> MigrationStatus {
+        lock(&self.migration).clone()
+    }
+
+    /// 已注册但**尚未**完成 schema 初始化的账套（readiness 用）。
+    ///
+    /// 比「启动时批量迁移跑过没有」更可靠：批量任务只覆盖启动那一刻的账套快照，
+    /// 而运行期新增/恢复的账套不在其中。这里直接比对「已注册」与「已迁移」两个集合，
+    /// 任何来源的漏网账套都会被抓到。
+    pub fn unmigrated_books(&self) -> Vec<String> {
+        let done = lock(&self.migrated);
+        self.list()
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| !done.contains(k))
+            .collect()
+    }
+
+    /// 启动时先把状态标成「迁移进行中」，再由后台任务跑 [`Self::migrate_all`]。
+    ///
+    /// 为什么要单独一步：服务开始监听到后台任务真正跑起来之间有个窗口。
+    /// 不先 arm 的话，readiness 在这个窗口里会看到「默认状态 = 没在迁移」
+    /// 而**误报就绪** —— 正好是这次要消灭的那种「探针说好了、其实没好」。
+    ///
+    /// 幂等：只在状态还是初始值时生效，重复调用不会抹掉已有结果。
+    pub fn arm_migration(&self) {
+        let mut st = lock(&self.migration);
+        if !st.running && st.total == 0 && st.failed.is_empty() {
+            *st = MigrationStatus::pending(self.list().len());
+        }
+    }
+
+    /// 把所有已注册账套的 schema 迁移跑一遍（幂等）。
+    ///
+    /// 为什么在后台线程而不是启动流程里同步做：
+    /// 迁移是**文件 I/O + 写事务**，耗时随账套数线性增长。同步做会让
+    /// `/api/health`（liveness）在迁移期间不响应 —— 而 liveness 一旦碰
+    /// 重活，编排器就会把容器判 unhealthy 并重启，**放大抖动**。
+    /// 所以：先开始监听，再在后台迁移，readiness 负责如实汇报进度。
+    ///
+    /// 单个账套失败不阻断其它账套 —— 失败信息记录下来由 readiness 报出，
+    /// 而不是让整个服务起不来（那样会掩盖问题，且重启也修不好）。
+    pub fn migrate_all(&self) -> MigrationStatus {
+        let books = self.list();
+        {
+            let mut st = lock(&self.migration);
+            *st = MigrationStatus::pending(books.len());
+        }
+        let mut st = MigrationStatus { running: true, total: books.len(), ok: 0, failed: Vec::new() };
+        for (key, _path) in &books {
+            // 走 open 而不是直接 Db::open：已迁移过的账套会命中 migrated 标记跳过，
+            // 避免重复的全表存在性检查。
+            match self.open(key) {
+                Ok(_) => st.ok += 1,
+                Err(e) => st.failed.push((key.clone(), e.to_string())),
+            }
+        }
+        st.running = false;
+        *lock(&self.migration) = st.clone();
+        st
     }
 }
 

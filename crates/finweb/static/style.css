@@ -566,6 +566,9 @@ table.grid tbody tr:last-child td { border-bottom: none; }
 .toast.err  { background: #b91c1c; }
 .toast.ok   { background: #0d7a3f; }
 .toast.warn { background: #92400e; }
+/* 错误常驻：不自动消失，但停在原地不遮挡后续提示（max-width 让它不铺满） */
+.toast.sticky { max-width: 460px; box-shadow: 0 10px 30px rgba(185, 28, 28, .3); }
+.toast.sticky .toast-x { opacity: .9; }
 
 /* ── 科目选择器：搜索过滤 + 原生下拉（最近使用置顶在 JS 排序）──── */
 .acct-pick { display: inline-flex; align-items: center; gap: 4px; width: 100%; min-width: 0; }
@@ -1116,4 +1119,394 @@ td.cell-editing input {
   padding-left: 20px;
   border-left: 1px solid var(--z-200);
   margin-left: 8px;
+}
+
+/* ===========================================================================
+   前端优化 2026-09：可发现性 / 持久态 / 数字排版 / 溢出收纳
+   ---------------------------------------------------------------------------
+   这一段是**新增**的，不改动上面任何既有规则（改动既有规则会让 69 个视图
+   一起变脸，无法归因是哪一条引起的回归）。新组件一律独立成块，便于回滚。
+   =========================================================================== */
+
+/* ── 1. 顶栏：当前视图名（面包屑）─────────────────────────────────────────
+   改造前视图名只出现在 <main> 里的 <h2>。后果：截图给同事时看不出在哪、
+   顶栏挤了 6 个文字按钮却不知道自己在哪个模块、浏览器标签页只有「FinBook」。 */
+.topbar .crumb {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topbar .crumb .crumb-sep { color: var(--z-500); font-size: 12px; }
+.topbar .crumb .crumb-cur {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topbar .crumb .crumb-book {
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 顶栏按钮组：把 6 个文字按钮收成「图标 + 悬停标题」，窄屏不再挤爆 */
+.topbar .tb-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.topbar .tb-actions .btn.icon-only {
+  width: 30px;
+  min-width: 30px;
+  padding: 0;
+  justify-content: center;
+  font-size: 14px;
+}
+.topbar .tb-actions .btn.icon-only .tb-label { display: none; }
+
+/* ── 2. 侧栏：搜索 / 收藏 / 最近 ─────────────────────────────────────────
+   改造前 69 个功能平铺在 16 个分组里，Ctrl+K 只搜数据不搜功能。会计每天真正
+   用的只有 4-5 个页面，却每次都要在长列表里翻。这里加「搜功能 + 收藏 + 最近」，
+   三者都是 localStorage，不改任何后端权限判定。 */
+.side-search {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding: 0 12px 10px;
+  background: var(--sidebar-bg);
+}
+.side-search input {
+  width: 100%;
+  height: 30px;
+  padding: 0 9px 0 26px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, .06);
+  color: #e5e7eb;
+  font-size: 12.5px;
+}
+.side-search input::placeholder { color: var(--z-500); }
+.side-search input:focus {
+  outline: none;
+  border-color: var(--primary);
+  background: rgba(255, 255, 255, .1);
+}
+.side-search .ss-wrap { position: relative; }
+.side-search .ss-icon {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 13px;
+  height: 13px;
+  color: var(--z-500);
+  pointer-events: none;
+}
+.side-search .ss-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: none;
+  color: var(--z-500);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  line-height: 1;
+}
+.side-search .ss-clear:hover { color: #e5e7eb; }
+.side-search .ss-count {
+  font-size: 11px;
+  color: var(--z-500);
+  padding: 2px 2px 0;
+}
+/* 收藏 / 最近分组：可折叠，折叠状态本身也持久化 */
+.sidebar .nav-fav-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+}
+.sidebar .nav-fav-row .nav-item { flex: 1; min-width: 0; }
+.sidebar .nav-star {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: none;
+  color: var(--z-500);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: var(--r-sm);
+  opacity: 0;
+  transition: opacity var(--dur-fast), color var(--dur-fast);
+}
+.sidebar .nav-item:hover ~ .nav-star,
+.sidebar .nav-star:hover,
+.sidebar .nav-star.on { opacity: 1; }
+.sidebar .nav-star.on { color: #f5b544; }
+.sidebar .nav-sec {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--z-500);
+  padding: 12px 14px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.sidebar .nav-sec:hover { color: var(--z-400); }
+.sidebar .nav-sec .caret {
+  font-size: 9px;
+  transition: transform var(--dur-fast);
+  display: inline-block;
+}
+.sidebar .nav-sec.collapsed .caret { transform: rotate(-90deg); }
+.sidebar .nav-sec.collapsed + .nav-body { display: none; }
+.sidebar .nav-body { padding-bottom: 2px; }
+.sidebar .nav-hit { color: var(--primary); }
+.sidebar .nav-none {
+  padding: 4px 14px 8px;
+  font-size: 12px;
+  color: var(--z-600);
+}
+
+/* ── 3. 数字排版：负数红字 / 零值淡化 / 合计行 ─────────────────────────────
+   改造前 .num 只有 text-align:right + tabular-nums。财务界面靠「负红正黑」
+   一眼分辨方向，缺了这条要逐个读符号。 */
+.num.neg, td.num.neg, th.num.neg { color: var(--err); }
+.num.zero, td.num.zero { color: var(--subtle); }
+.num.strong, td.num.strong { font-weight: 650; }
+/* 合计行：sticky 底部，滚动长表时始终可见 */
+table.grid tfoot.totals td {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--panel);
+  border-top: 2px solid var(--z-300);
+  font-weight: 650;
+  color: var(--text);
+  box-shadow: 0 -1px 0 var(--panel-border);
+}
+table.grid tfoot.totals td .tot-label { color: var(--muted); font-weight: 500; font-size: 12px; }
+table.grid tfoot.totals tr.tot-sub td { border-top: 1px solid var(--panel-border); font-weight: 500; }
+
+/* ── 4. 空态扩展：错误态 / 无权限态 ─────────────────────────────────────
+   改造前 .empty-state 只在凭证页用了 1 次，空数据、加载失败、没权限三种情况
+   在其余 68 个视图里长得一模一样（都是「加载中…」卡住或裸表格）。 */
+.empty-state .es-icon { font-size: 22px; line-height: 1; margin-bottom: 8px; opacity: .5; }
+.empty-state.is-error .es-title { color: var(--err); }
+.empty-state.is-error .es-icon { opacity: .8; color: var(--err); }
+.empty-state.is-noperm .es-icon { color: var(--warn); }
+.empty-state .es-detail {
+  font-size: 12px;
+  color: var(--err);
+  background: var(--err-bg);
+  border: 1px solid rgba(220, 38, 38, .15);
+  border-radius: var(--r-sm);
+  padding: 6px 10px;
+  margin: 0 auto 12px;
+  max-width: 520px;
+  text-align: left;
+  word-break: break-word;
+}
+/* 表格内的空态：整行铺满，不要左右两截 */
+td > .empty-state { padding: 26px 12px; }
+
+/* ── 5. 工具栏溢出收纳（「更多」菜单）───────────────────────────────────
+   改造前采购订单工具栏 8 个按钮、销售订单 9 个，平铺一行；凭证页把
+   「重排断号」这种危险操作和「查询」并排同权重。
+   **默认不启用**：只有显式标了 data-more="N" 的工具栏才收纳前 N 个之后的部分，
+   理由见 app.js 里的说明——E2E 按 id 点按钮，收纳后按钮不可见就会超时。 */
+.tool-more {
+  position: relative;
+  flex: none;
+}
+.tool-more > .btn { min-width: 30px; }
+.tool-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  min-width: 168px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tool-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tool-menu button:hover { background: var(--z-100); color: var(--text); }
+.tool-menu button.danger { color: var(--err); }
+.tool-menu button.danger:hover { background: var(--err-bg); }
+.tool-menu hr { border: none; border-top: 1px solid var(--panel-border); margin: 3px 2px; }
+
+/* ── 6. 行内操作溢出（「⋯」菜单）─────────────────────────────────────────
+   改造前采购订单行内 8 个、销售订单 9 个按钮，占掉整张表的宽度，金额列被挤
+   到需要横向滚动。同样**默认不启用**，需显式标 data-rowmenu="N"。 */
+td .row-menu-wrap { position: relative; display: inline-block; }
+td .row-menu-wrap > .btn { min-width: 30px; }
+td .row-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  white-space: nowrap;
+}
+td .row-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+td .row-menu button:hover { background: var(--z-100); color: var(--text); }
+td .row-menu button.danger { color: var(--err); }
+td .row-menu button.danger:hover { background: var(--err-bg); }
+td .row-menu hr { border: none; border-top: 1px solid var(--panel-border); margin: 3px 2px; }
+
+/* 整行可点：列表行加 .row-link 后整行 hover 有反馈、行内空白处也能点开 */
+tr.row-link { cursor: pointer; }
+tr.row-link:hover > td { background: var(--primary-t); }
+tr.row-link > td { transition: background var(--dur-fast); }
+
+/* ── 7. 工具类（收敛内联样式用）──────────────────────────────────────
+   app.js 里有 200+ 处手写 style="..."，同样的 margin/gap 抄了几十遍。
+   后果是「顶栏 Aa 字号四档」「暗色模式」对这些硬编码无效。工具类让常用
+   几类有统一出口，逐步替换而不是一次性大改。 */
+.u-row { display: flex; align-items: center; gap: 8px; }
+.u-row.wrap { flex-wrap: wrap; }
+.u-row.tight { gap: 4px; }
+.u-row.loose { gap: 14px; }
+.u-col { display: flex; flex-direction: column; gap: 8px; }
+.u-right { justify-content: flex-end; }
+.u-center { justify-content: center; }
+.u-between { justify-content: space-between; }
+.u-grow { flex: 1; min-width: 0; }
+.u-nowrap { white-space: nowrap; }
+.u-ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.u-sec-title { margin: 14px 0 6px; font-size: 13.5px; font-weight: 600; color: var(--text-dim); }
+.u-mt6 { margin-top: 6px; }
+.u-mt10 { margin-top: 10px; }
+.u-mt14 { margin-top: 14px; }
+.u-mb6 { margin-bottom: 6px; }
+.u-mb10 { margin-bottom: 10px; }
+.u-sm { font-size: 12px; }
+.u-dim { color: var(--muted); }
+.u-num { font-variant-numeric: tabular-nums; }
+/* 区块小标题（取代各处手写的 <h4 style="margin:14px 0 6px">） */
+.sec-title { margin: 14px 0 6px; font-size: 13.5px; font-weight: 600; color: var(--text-dim); }
+
+/* 工作台「账套概况」折叠区：参考值默认收起，不跟可操作的待办抢首屏 */
+details.wb-ref { margin-top: 12px; }
+details.wb-ref > summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+details.wb-ref > summary::-webkit-details-marker { display: none; }
+details.wb-ref > summary::before {
+  content: "▸";
+  font-size: 10px;
+  transition: transform var(--dur-fast);
+  display: inline-block;
+}
+details.wb-ref[open] > summary::before { transform: rotate(90deg); }
+details.wb-ref > summary:hover { color: var(--text-dim); }
+details.wb-ref .card { padding: 8px 12px; }
+details.wb-ref .card .v { font-size: 14px; }
+
+/* ── 8. 加载态：顶栏进度条 ───────────────────────────────────────────
+   改造前没有任何「正在请求」的全局指示，视图自己写「加载中…」，慢请求时
+   用户不知道是卡住了还是本来就没数据。 */
+#top-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 2px;
+  z-index: 999;
+  background: var(--primary);
+  width: 0;
+  opacity: 0;
+  transition: width .2s linear, opacity .25s linear;
+  pointer-events: none;
+}
+#top-progress.on { opacity: 1; }
+
+/* 视图级「卡住了」提示：超过阈值未返回时给出可操作的重试，而不是无限转圈 */
+.stuck-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 22px 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.stuck-box .btn { flex: none; }
+
+/* ── 9. 暗色模式补充 ───────────────────────────────────────────────────
+   上一段的规则在暗色下是按「浅底」调的，这几处是新组件，必须单独调，
+   否则深色底上会发白（最典型的廉价感来源）。 */
+@media (prefers-color-scheme: dark) {
+  .topbar .crumb .crumb-cur { color: var(--z-200); }
+  .side-search input { border-color: rgba(255, 255, 255, .14); }
+  .tool-menu, td .row-menu { background: var(--z-800); border-color: rgba(255, 255, 255, .14); }
+  .tool-menu button:hover, td .row-menu button:hover { background: var(--z-700); }
+  .tool-menu button.danger:hover, td .row-menu button.danger:hover { background: var(--err-bg); }
+  .empty-state .es-detail { background: var(--err-bg); }
+  .sidebar .nav-none { color: var(--z-500); }
+}
+
+/* ── 10. 窄屏侧栏（不做移动端，只保证侧栏不遮挡内容）─────────────────
+   顶栏在 900px 以下把次要文字按钮收成图标，视图名保留。 */
+@media (max-width: 1100px) {
+  .topbar .crumb .crumb-book { display: none; }
+}
+@media (max-width: 900px) {
+  .topbar .who { display: none; }
 }

@@ -35,6 +35,11 @@ pub struct VoucherQuery {
     pub prepared_by: Option<String>,
     pub source: Option<VoucherSource>,
     pub limit: Option<i64>,
+    /// 数据范围下界（科目编码，含端点）。空 = 不限。
+    /// 与 `DataScope::allows_account` 的下界同义，供 `list_page` 下推 SQL。
+    pub scope_account_from: String,
+    /// 数据范围上界（科目编码，含端点及下级）。空 = 不限。
+    pub scope_account_to: String,
     /// 排序：true 为按日期+凭证号升序（默认），false 为降序
     pub asc: bool,
 }
@@ -70,6 +75,17 @@ impl VoucherQuery {
             // 这里必须按 username 过滤，否则 display_name ≠ username 的用户一张都看不到
             self.prepared_by = Some(u.username.clone());
         }
+        self.scope_account_from = scope.account_from.trim().to_string();
+        self.scope_account_to = scope.account_to.trim().to_string();
+        self
+    }
+
+    /// 只套用科目区间部分的数据范围（不依赖 `User`）。
+    /// **不含 `own_voucher_only`**：那一位需要 `username`，调用方自己设
+    /// `prepared_by`。用 `with_data_scope` 就不用操心这个。
+    pub fn with_account_scope(mut self, scope: &fincore::user::DataScope) -> Self {
+        self.scope_account_from = scope.account_from.trim().to_string();
+        self.scope_account_to = scope.account_to.trim().to_string();
         self
     }
 }
@@ -207,9 +223,74 @@ pub fn fill_entries(db: &Db, vouchers: &mut [Voucher]) -> DbResult<()> {
 
 /// 条件查询（只含表头，列表界面不需要分录）
 pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
-    let mut sql = format!(
-        "SELECT {VOUCHER_COLS} FROM voucher v WHERE 1=1"
-    );
+    let (whered, mut params) = build_where(q)?;
+    let mut sql = format!("SELECT {VOUCHER_COLS} FROM voucher v WHERE 1=1{whered}");
+
+    sql.push_str(" ORDER BY v.date ");
+    sql.push_str(if q.asc { "ASC" } else { "DESC" });
+    sql.push_str(", v.word ASC, v.no ");
+    sql.push_str(if q.asc { "ASC" } else { "DESC" });
+
+    if let Some(l) = q.limit {
+        sql.push_str(" LIMIT ?");
+        params.push(Box::new(l));
+    }
+
+    let mut stmt = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs.as_slice(), map_voucher)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 分页查询：返回 `(本页凭证, 过滤后总张数)`。
+///
+/// 为什么要单独一个函数而不是给 `list` 加 offset：分页必须知道**总张数**才能
+/// 渲染页码和合计，而总张数要跟 `VoucherQuery` 的 WHERE 完全一致——一旦两处
+/// 条件写得不齐，页码就会算错（页数少于实际能翻到的范围，末页永远打不开）。
+/// 所以这里复用同一个 `build_where`，不允许出现第二份条件。
+///
+/// **返回的凭证同样只含表头**（没有分录），要借贷合计/摘要得再调 `fill_entries`
+/// —— 与 `list` 的约定完全一致，不要以为分页版自带明细。
+///
+/// `total` 与权限过滤的一致性依赖 `with_account_scope` 把数据范围**下推到
+/// SQL**（见该方法的注释）；`own_voucher_only` 早就由 `with_data_scope` 变成
+/// `prepared_by = ?` 了。调用方仍可再 `retain` 一次做兜底，但那时若真过滤掉了
+/// 行就说明 SQL 条件写错了，应该报错而不是默默给出错误页码。
+pub fn list_page(
+    db: &Db,
+    q: &VoucherQuery,
+    offset: i64,
+    limit: i64,
+) -> DbResult<(Vec<Voucher>, i64)> {
+    let (whered, params) = build_where(q)?;
+    // 总数：只取 WHERE，COUNT 走 voucher 主表（NOT EXISTS 子查询在 COUNT 里同样生效）
+    let count_sql = format!("SELECT COUNT(*) FROM voucher v WHERE 1=1{whered}");
+    let mut stmt = db.conn().prepare(&count_sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let total: i64 = stmt.query_row(refs.as_slice(), |r| r.get(0))?;
+
+    let mut sql = format!("SELECT {VOUCHER_COLS} FROM voucher v WHERE 1=1{whered}");
+    sql.push_str(" ORDER BY v.date ");
+    sql.push_str(if q.asc { "ASC" } else { "DESC" });
+    sql.push_str(", v.word ASC, v.no ");
+    sql.push_str(if q.asc { "ASC" } else { "DESC" });
+    sql.push_str(" LIMIT ? OFFSET ?");
+    let mut p2 = params;
+    p2.push(Box::new(limit));
+    p2.push(Box::new(offset));
+    let mut stmt = db.conn().prepare(&sql)?;
+    let refs2: Vec<&dyn rusqlite::types::ToSql> = p2.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs2.as_slice(), map_voucher)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rows, total))
+}
+
+/// 构造 `list` 与 `list_page` 共用的 WHERE 片段（**唯一的一份条件**）。
+fn build_where(q: &VoucherQuery) -> DbResult<(String, Vec<Box<dyn rusqlite::types::ToSql>>)> {
+    let mut sql = String::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(f) = q.from {
@@ -260,6 +341,29 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
         );
         params.push(Box::new(format!("{}%", crate::escape_like(code))));
     }
+    // 数据范围的科目区间下推到 SQL：语义必须和 `User::can_see_voucher` 的
+    // 「全部科目都在范围内才可见」严格一致，否则分页 total 与实际能翻到的
+    // 范围对不上。逐条对照 `DataScope::allows_account`：
+    //   下界非空 → 任一分录 code < lo 即不可见 → NOT EXISTS(越下界的分录)
+    //   上界非空 → 任一分录 !(code <= hi || 前缀 hi) 即不可见
+    // 空分录时两个 NOT EXISTS 都为真（可见），与 Rust 侧 `all()` 对空迭代
+    // 返回 true 的行为一致。
+    let lo = q.scope_account_from.trim();
+    let hi = q.scope_account_to.trim();
+    if !lo.is_empty() {
+        sql.push_str(
+            " AND NOT EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id AND e.account_code < ?)",
+        );
+        params.push(Box::new(lo.to_string()));
+    }
+    if !hi.is_empty() {
+        sql.push_str(
+            " AND NOT EXISTS(SELECT 1 FROM voucher_entry e WHERE e.voucher_id=v.id
+                             AND NOT (e.account_code <= ? OR e.account_code LIKE ? ESCAPE '\\'))",
+        );
+        params.push(Box::new(hi.to_string()));
+        params.push(Box::new(format!("{}%", crate::escape_like(hi))));
+    }
     if let Some(ref aux) = q.aux {
         // 逐维度整段匹配，不能把整条 aux_key 当子串 LIKE：
         //   旧写法 `aux_key LIKE '%customer=C001%'` 会连带命中 `customer=C0011`，
@@ -288,23 +392,7 @@ pub fn list(db: &Db, q: &VoucherQuery) -> DbResult<Vec<Voucher>> {
             params.push(Box::new(k.clone()));
         }
     }
-
-    sql.push_str(" ORDER BY v.date ");
-    sql.push_str(if q.asc { "ASC" } else { "DESC" });
-    sql.push_str(", v.word ASC, v.no ");
-    sql.push_str(if q.asc { "ASC" } else { "DESC" });
-
-    if let Some(l) = q.limit {
-        sql.push_str(" LIMIT ?");
-        params.push(Box::new(l));
-    }
-
-    let mut stmt = db.conn().prepare(&sql)?;
-    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let rows = stmt
-        .query_map(refs.as_slice(), map_voucher)?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
+    Ok((sql, params))
 }
 
 /// 保存（新增或更新）。返回凭证 id。
@@ -1373,10 +1461,203 @@ pub fn sum_by_account(
         .collect())
 }
 
+/// 某筛选条件下的**全量**借贷合计（不分页）。
+///
+/// 为什么不给分页端点在 Rust 侧把本页的数字加起来：财务界面里
+/// 「本期间借方合计 = 贷方合计」是这个**期间的总账数字**，按页汇总会让人
+/// 以为账不平（翻到第 3 页突然合计变了）。所以合计必须走全量。
+///
+/// 条件复用 `build_where`，与列表/COUNT 同源，不会出现「合计和列表对不上」。
+/// 聚合同样在 Rust 侧用 `Decimal` 完成（SQLite 无十进制类型，
+/// `SUM(CAST(x AS REAL))` 会引入浮点误差）。
+///
+/// 作废凭证不计入合计（`status != 'void'`），与账簿口径一致。
+pub fn totals(db: &Db, q: &VoucherQuery) -> DbResult<(Money, Money)> {
+    let (whered, params) = build_where(q)?;
+    // 分录别名故意用 `te` 而不是 `e`：`whered` 里的辅助子查询也起名叫 `e`
+    // （EXISTS(SELECT 1 FROM voucher_entry e ...)）。同名会让内层 e 遮蔽外层 e，
+    // 虽然 SQLite 允许遮蔽、结果碰巧也对，但读代码的人会误判到底在查哪张表，
+    // 而且改 WHERE 时极易踩坏。`te` 与 `v` 都是外层唯一占用的名字。
+    let sql = format!(
+        "SELECT te.debit, te.credit FROM voucher_entry te
+         JOIN voucher v ON te.voucher_id = v.id
+         WHERE v.status != 'void' AND 1=1{whered}"
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut rows = stmt.query(refs.as_slice())?;
+    let (mut d, mut c) = (Money::ZERO, Money::ZERO);
+    while let Some(r) = rows.next()? {
+        d += read_money(r, 0)?;
+        c += read_money(r, 1)?;
+    }
+    Ok((d, c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::mem;
+
+    // ------------------------------------------------------------------
+    // 分页 + 数据范围：SQL 下推与 can_see_voucher 必须逐张一致
+    // ------------------------------------------------------------------
+    //
+    // 为什么这个测试是必需的：分页要显示「共 N 张」并据此算页码。N 来自
+    // `list_page` 的 COUNT(*)，而真正返回的行还要过一遍
+    // `User::can_see_voucher`。如果 COUNT 的条件比 can_see_voucher 宽
+    // （例如漏了科目区间），用户会看到「共 100 张」却只能翻出 60 张，
+    // 后面 40 张**通过界面完全访问不到**——分页就成了假分页。
+    // 所以这里显式造数据，让两套判定在同一批凭证上跑，把 id 集合拿来对比。
+
+    /// 造一张指定科目组合的凭证（`codes` 里第 0 个借、其余贷，金额自平衡）。
+    /// 只用默认科目表里**不需要辅助核算**的末级科目（1001/1901/2001/5xxxxx/6xxxxx），
+    /// 否则 `save` 的守卫会以「必须填写银行/客户辅助」拒掉，测的就不是范围而是守卫了。
+    fn scope_voucher(db: &Db, day: u32, codes: &[&str]) -> i64 {
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = Voucher::new(p, chrono::NaiveDate::from_ymd_opt(2026, 1, day).unwrap(), "记", 0);
+        v.no = next_no(db, p, "记").unwrap();
+        v.memo = format!("范围测试 {}", day);
+        for (i, code) in codes.iter().enumerate() {
+            let code: &str = code;
+            let mut e = Entry::new(i as i32 + 1, code, code);
+            if i == 0 {
+                e.debit = Money::parse("120.00").unwrap();
+            } else {
+                e.credit = Money::parse("120.00").unwrap();
+            }
+            v.push_entry(e);
+        }
+        save(db, &mut v).unwrap()
+    }
+
+    fn scoped_user(from: &str, to: &str) -> fincore::user::User {
+        let mut u = fincore::user::User::default();
+        u.username = "tester".into();
+        u.display_name = "测试".into();
+        u.data_scope.account_from = from.into();
+        u.data_scope.account_to = to.into();
+        u
+    }
+
+    /// 同一批凭证，SQL 下推得到的 id 集合 必须等于 can_see_voucher 过滤后的集合。
+    #[test]
+    fn list_page_scope_matches_can_see_voucher() {
+        let db = mem();
+        // 三种典型科目组合：全低（1xxx）/ 全高（6xxx）/ 一低一高（跨界的关键用例）
+        let a = scope_voucher(&db, 5, &["1001", "1901"]);
+        let b = scope_voucher(&db, 6, &["660201", "600101"]);
+        let c = scope_voucher(&db, 7, &["1001", "660201"]);
+
+        for (from, to) in [
+            ("", ""),
+            ("1001", ""),
+            ("", "1901"),
+            ("1001", "1001"),
+            ("1001", "1901"),
+            ("660201", "600101"),
+            ("500101", "600101"),
+        ] {
+            let u = scoped_user(from, to);
+            let mut q = VoucherQuery::period(Period::new(2026, 1).unwrap()).with_data_scope(&u);
+            q.limit = None;
+            let sql_ids: Vec<i64> = list(&db, &q)
+                .unwrap()
+                .iter()
+                .map(|v| v.id)
+                .collect();
+            // Rust 侧：全量取回后逐张过滤（这是改造前 handler 的做法）。
+            // **必须先 fill_entries**：`list` 只读 voucher 表头，`v.entries` 是空的，
+            // 而 `can_see_voucher` 是「全部科目都在范围内才可见」——对空分录
+            // `all()` 恒真，于是会把什么都判成可见。生产路径（handler）也是
+            // 先 fill_entries 再 retain，所以这里必须复刻同一顺序。
+            let mut base = VoucherQuery::period(Period::new(2026, 1).unwrap());
+            base.limit = None;
+            let mut all = list(&db, &base).unwrap();
+            fill_entries(&db, &mut all).unwrap();
+            let rust_ids: Vec<i64> = all
+                .iter()
+                .filter(|v| u.can_see_voucher(v))
+                .map(|v| v.id)
+                .collect();
+            assert_eq!(
+                sql_ids, rust_ids,
+                "范围 [{from}..{to}] 下 SQL 下推与 can_see_voucher 不一致（a={a} b={b} c={c}）"
+            );
+            // 分页的 COUNT 也必须等于过滤后的真实张数
+            let (_, total) = list_page(&db, &q, 0, 10).unwrap();
+            assert_eq!(
+                total as usize,
+                rust_ids.len(),
+                "范围 [{from}..{to}] 下 COUNT(*) 与 can_see_voucher 过滤后的张数不一致"
+            );
+        }
+    }
+
+    /// 分页翻完每一页，去重后的 id 集合 == 全量集合，且不重不漏。
+    /// 这是「末页能打开、第 N 页不丢行」的直接证据。
+    #[test]
+    fn list_page_walks_every_row_exactly_once() {
+        let db = mem();
+        let total = 23;
+        for d in 1..=total {
+            scope_voucher(&db, (d as u32 % 28) + 1, &["1001", "1901"]);
+        }
+        let mut q = VoucherQuery::period(Period::new(2026, 1).unwrap());
+        q.limit = None;
+        let all: Vec<i64> = list(&db, &q).unwrap().iter().map(|v| v.id).collect();
+        assert_eq!(all.len(), total, "造数本身就该是 {total} 张");
+
+        let mut seen: Vec<i64> = Vec::new();
+        for (page, page_size) in [5usize, 5, 5, 5, 5].iter().enumerate() {
+            let (rows, cnt) = list_page(&db, &q, (page * page_size) as i64, *page_size as i64)
+                .unwrap();
+            assert_eq!(cnt as usize, total, "每一页的 COUNT 都得是总张数");
+            seen.extend(rows.iter().map(|v| v.id));
+        }
+        // 越界的那一页必须为空而不是报错或回绕
+        let (rows, _) = list_page(&db, &q, 9999, 5).unwrap();
+        assert!(rows.is_empty(), "越界页应为空");
+        seen.sort();
+        assert_eq!(seen, all, "分页走完应恰好覆盖全部行且不重复");
+    }
+
+    /// 全量合计必须等于「每张凭证的借贷合计之和」，且**不受分页参数影响**。
+    /// 会计核对时看的是本期间的总数；按页汇总会让人以为账不平。
+    #[test]
+    fn totals_is_whole_set_not_page() {
+        let db = mem();
+        for d in 1..=9u32 {
+            scope_voucher(&db, d, &["1001", "1901"]); // 借 120 / 贷 120
+        }
+        let mut q = VoucherQuery::period(Period::new(2026, 1).unwrap());
+        let (d_all, c_all) = totals(&db, &q).unwrap();
+        assert_eq!(d_all, Money::parse("1080.00").unwrap());
+        assert_eq!(c_all, Money::parse("1080.00").unwrap());
+
+        // 一页只要 4 张时，合计仍是 9 张的全量（不是 4 张的）
+        // 注意 list_page 和 list 一样**只读表头**，借贷合计要靠 fill_entries 填
+        // （生产 handler 也是这个顺序）。不填的话每张的 debit_total 都是 0，
+        // 测试就会变成「0 累加等于 1080」这种假失败。
+        let (mut rows, total) = list_page(&db, &q, 0, 4).unwrap();
+        fill_entries(&db, &mut rows).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(total, 9);
+        let page_sum: Money = rows.iter().map(|v| v.debit_total()).sum();
+        assert_ne!(page_sum, d_all, "本测试要成立：本页合计 ≠ 全量合计");
+        // 各页累加 = 全量
+        let mut acc = Money::ZERO;
+        for off in [0i64, 4, 8] {
+            let (mut r, _) = list_page(&db, &q, off, 4).unwrap();
+            fill_entries(&db, &mut r).unwrap();
+            acc += r.iter().map(|v| v.debit_total()).sum::<Money>();
+        }
+        assert_eq!(acc, d_all, "各页借方合计累加应等于全量");
+        // 条件收窄后合计要跟着变（证明合计与列表同源，不是写死的）
+        q.status = Some(VoucherStatus::Void);
+        let (dv, cv) = totals(&db, &q).unwrap();
+        assert_eq!((dv, cv), (Money::ZERO, Money::ZERO), "没有作废凭证时合计应为 0");
+    }
 
     // ------------------------------------------------------------------
     // 单据更正链（Cancel -> Amend）

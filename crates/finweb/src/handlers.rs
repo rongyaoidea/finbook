@@ -323,6 +323,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/accounts/fill-defaults", post(fill_default_accounts))
         .route("/api/vouchers/next-no", get(next_voucher_no))
         .route("/api/vouchers", get(list_vouchers).post(save_voucher))
+        // 分页列表：老端点默认 limit=200 且无「共 N 张」，一个期间超 200 张后
+        // 后面的凭证在界面上完全不可见。放在 /api/vouchers/:id 之前注册，
+        // 否则 "page" 会被当成 id 解析。
+        .route("/api/vouchers/page", get(list_vouchers_page))
         .route("/api/vouchers/batch-post", post(voucher_batch_post))
         .route("/api/vouchers/:id", get(get_voucher))
         .route("/api/vouchers/:id/post", post(voucher_post))
@@ -3330,15 +3334,13 @@ fn to_item(v: &Voucher) -> VoucherListItem {
     }
 }
 
-async fn list_vouchers(
-    State(state): State<Arc<WebState>>,
-    user: CurrentUser,
-    Query(q): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<VoucherListItem>>, AppError> {
-    if !can_view_vouchers(&user) {
-        return Err(AppError::forbidden("没有查看凭证的权限"));
-    }
-    let db = state.db_for(&user.book_key)?;
+/// 从查询参数构造凭证列表条件。`list_vouchers` 与 `list_vouchers_page` **共用**
+/// 这一份：分页要显示「共 N 张」和合计，两者必须和列表看到的是同一批数据，
+/// 条件一旦各写一份就会漂移（页码算错 / 合计对不上）。
+fn voucher_query_from(
+    q: &HashMap<String, String>,
+    user: &CurrentUser,
+) -> VoucherQuery {
     // 落地数据范围：仅本人凭证或按科目区间过滤
     let mut query = VoucherQuery::default().with_data_scope(&user.user);
     query.asc = true;
@@ -3355,6 +3357,19 @@ async fn list_vouchers(
     if let Some(st) = q.get("status").and_then(|s| parse_voucher_status(s)) {
         query.status = Some(st);
     }
+    query
+}
+
+async fn list_vouchers(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<VoucherListItem>>, AppError> {
+    if !can_view_vouchers(&user) {
+        return Err(AppError::forbidden("没有查看凭证的权限"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let mut query = voucher_query_from(&q, &user);
     // 上限 1000：limit 传负数时 SQLite 视为不限制，会把全库凭证+分录读进内存
     query.limit = q
         .get("limit")
@@ -3368,6 +3383,62 @@ async fn list_vouchers(
     list.retain(|v| user.user.can_see_voucher(v));
     let list = list.iter().map(to_item).collect();
     Ok(Json(list))
+}
+
+/// 凭证列表（分页 + 全量合计）。
+///
+/// 为什么必须有这个端点：老的 `GET /api/vouchers` 默认 `limit=200`，而排序
+/// 是 `asc=true`（日期+凭证号升序）。于是一个期间超过 200 张凭证后，
+/// **后面的凭证通过界面完全看不到**，而且界面上没有任何提示说「还有更多」。
+/// 对一个月两三百张的单据，这事每天都在发生。
+///
+/// 参数非法一律 400（`page=abc` 不能静默当第 1 页——那会让调用方拿到
+/// 「看起来正常但其实是首页」的数据，漏拉很难发现）。
+async fn list_vouchers_page(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<VoucherPage>, AppError> {
+    if !can_view_vouchers(&user) {
+        return Err(AppError::forbidden("没有查看凭证的权限"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let num = |k: &str, def: i64| -> Result<i64, AppError> {
+        match q.get(k).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            None => Ok(def),
+            Some(t) => t.parse::<i64>().map_err(|_| {
+                AppError::bad_request(format!("参数 {k} 必须是整数，收到：{t}"))
+            }),
+        }
+    };
+    let page = num("page", 1)?.max(1);
+    // 单页上限 500：一次拉太多只会把浏览器和服务端一起拖垮。
+    // 要全量导出走 export 端点，不该靠调大 page_size。
+    let page_size = num("page_size", 50)?.clamp(1, 500);
+    let offset = (page - 1) * page_size;
+
+    let query = voucher_query_from(&q, &user);
+    let (mut rows, total) = vouchers::list_page(&db, &query, offset, page_size)?;
+    vouchers::fill_entries(&db, &mut rows)?;
+
+    // 兜底：科目区间已由 SQL 下推（vouchers::build_where），这里再 retain 一次。
+    // 若真的过滤掉了行，说明 SQL 条件与 can_see_voucher 不一致 —— 那时 total 就是
+    // 错的，页码会算错。与其默默给用户一个打不开的末页，不如把 9 张说成 10 张这
+    // 类错误暴露出来。所以这里显式断言一致。
+    let before = rows.len();
+    rows.retain(|v| user.user.can_see_voucher(v));
+    debug_assert_eq!(before, rows.len(), "SQL 下推的数据范围与 can_see_voucher 不一致，total 会算错页码");
+
+    // 合计走全量（不分页）：财务界面要核对的是本期间总账数字
+    let (debit_total, credit_total) = vouchers::totals(&db, &query)?;
+    Ok(Json(VoucherPage {
+        items: rows.iter().map(to_item).collect(),
+        page,
+        page_size,
+        total,
+        debit_total: debit_total.fmt_money(),
+        credit_total: credit_total.fmt_money(),
+    }))
 }
 
 async fn get_voucher(

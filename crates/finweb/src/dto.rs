@@ -358,6 +358,28 @@ pub struct VoucherListItem {
     pub prepared_by: String,
 }
 
+/// 凭证列表分页结果。
+///
+/// 为什么单独一个结构而不是给 `Vec<VoucherListItem>` 加字段：老接口
+/// `GET /api/vouchers` 返回裸数组，有别的调用方（含导出、OpenAPI 文档、
+/// 第三方脚本）依赖它。新增分页端点而不是改老接口的形状，破坏面为零。
+///
+/// `total` 是**过滤后**的真实张数（含数据范围），页码和「共 N 张」都靠它；
+/// `debit_total` / `credit_total` 是**全量合计**（不是本页合计）——
+/// 财务界面里「本期间借方合计」指的就是这个期间的总账数字，
+/// 按页算合计会让人以为对不上账。
+#[derive(Serialize)]
+pub struct VoucherPage {
+    pub items: Vec<VoucherListItem>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+    /// 全量借方合计（字符串金额，与 item 字段同格式，避免前端浮点误差）
+    pub debit_total: String,
+    /// 全量贷方合计
+    pub credit_total: String,
+}
+
 #[derive(Serialize)]
 pub struct Dashboard {
     pub company: String,

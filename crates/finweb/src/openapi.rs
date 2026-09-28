@@ -403,13 +403,17 @@ async fn v1_vouchers(
     let c = ApiCaller::from_headers(&state, &headers)?;
     let db = c.db(&state)?;
     let (page, size) = page_of(&q)?;
-    let offset = ((page - 1) * size) as usize;
+    let offset = (page - 1) * size;
 
     let mut vq = findb::vouchers::VoucherQuery {
         asc: q.get("asc").map(|s| s != "0" && s != "false").unwrap_or(false),
-        // VoucherQuery 只有 limit 没有 offset，所以一次取到「最后一页末尾 +1 条」，
-        // 再在内存里裁掉前 offset 条。多取 1 条用来判断 has_more。
-        limit: Some((offset + size as usize + 1) as i64),
+        // 走 SQL 侧的 LIMIT/OFFSET + COUNT(*)，不在内存里裁。
+        // 原来这里是「取到 offset+size+1 条再 skip(offset)」（注释说引擎层没有
+        // offset，改签名要动几十个调用点）。现在引擎层新增了 `list_page`，
+        // 老的 `list` 签名一个字没动，所以不用改任何调用点就能换成真分页：
+        //   · 第 50 页不再把 2501 张凭证读进内存
+        //   · 并且首次能给出精确 `total`（原来只有 has_more，调用方无法渲染页码）
+        limit: None,
         ..Default::default()
     };
     vq.from = parse_period_opt(q.get("from"))?;
@@ -431,18 +435,19 @@ async fn v1_vouchers(
             }
         });
     }
+    // API 密钥的数据范围：synthetic_user 明确放开 own_voucher_only、不限科目，
+    // 这里仍走 with_data_scope 让 vq 带上 scope 字段（值都是空 = 不限），
+    // 与 Web 端共用同一条 WHERE，不会出现两套条件算出不同 total 的情况。
+    let caller_user = c.synthetic_user();
+    vq = vq.with_data_scope(&caller_user);
 
-    // 分页在内存里做：VoucherQuery 只有 limit 没有 offset，改引擎层签名要动
-    // 几十个调用点。凭证列表在「一家中小企业的账」量级（单年数千张），
-    // 多取几页再裁掉的开销远低于引入 offset 的回归风险。
-    let all = findb::vouchers::list(&db, &vq)?;
-    let has_more = all.len() > offset + size as usize;
-    let items: Vec<_> = all.into_iter().skip(offset).take(size as usize).collect();
+    let (items, total) = findb::vouchers::list_page(&db, &vq, offset, size)?;
     Ok(Json(json!({
         "items": items,
         "page": page,
         "page_size": size,
-        "has_more": has_more,
+        "total": total,
+        "has_more": offset + size < total,
     })))
 }
 

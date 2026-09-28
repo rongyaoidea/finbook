@@ -10693,6 +10693,270 @@ async fn web_aux_qty_and_custom_reports() {
 }
 
 // ---------------------------------------------------------------------------
+// 凭证列表分页（GET /api/vouchers/page）
+// ---------------------------------------------------------------------------
+//
+// 这些测试针对的是一个具体缺陷：老端点 `GET /api/vouchers` 默认 limit=200、
+// 排序升序，于是**一个期间超过 200 张凭证后，后面的凭证在界面上完全看不到，
+// 而且没有任何提示**。对月均两三百张的单子，这不是边角情况。
+
+/// 灌 n 张草稿凭证（借 1001 / 贷 2001，金额 100），期间 202601。
+async fn seed_draft_vouchers(state: &Arc<WebState>, sid: &str, n: i32) {
+    for i in 1..=n {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                "/api/vouchers",
+                sid,
+                serde_json::json!({
+                    "id": 0, "period": 202601, "date": "2026-01-15", "word": "记",
+                    "no": i, "attachments": 0, "memo": format!("批量 {i}"),
+                    "entries": [
+                        { "line": 1, "account_code": "1001", "summary": "批量", "debit": "100", "credit": "0" },
+                        { "line": 2, "account_code": "2001", "summary": "批量", "debit": "0", "credit": "100" }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "第 {i} 张凭证应保存成功");
+    }
+}
+
+async fn get_voucher_page(state: &Arc<WebState>, sid: &str, qs: &str) -> serde_json::Value {
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/page?{qs}"), sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "分页端点应 200：{qs}");
+    serde_json::from_str(&body_string(resp).await).unwrap()
+}
+
+/// 回归：第 201 张及以后的凭证必须能被界面访问到。
+///
+/// 老端点 limit 默认 200，UI 用的是老端点，所以第 201 张开始就是死数据。
+/// 这里用 205 张（略微超过 200）而不是刚好 200：边界值测不出来，
+/// 差一张才说明分页真的接上了。
+#[tokio::test]
+async fn voucher_page_reaches_past_the_old_200_cap() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    seed_draft_vouchers(&state, &sid, 205).await;
+
+    // 最后一页（205 张，page_size=50 → 第 5 页）必须有内容
+    let p5 = get_voucher_page(&state, &sid, "period=202601&page=5&page_size=50").await;
+    assert_eq!(p5["total"], 205, "total 应是全量张数，不是本页数");
+    let items = p5["items"].as_array().unwrap();
+    assert_eq!(items.len(), 5, "第 5 页应有 205-200=5 张，实际 {}", items.len());
+
+    // 老端点确实只给 200（证明这个测试对应的是真实缺陷，而不是我臆想的）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/vouchers?period=202601", &sid))
+        .await
+        .unwrap();
+    let old = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap();
+    assert_eq!(old.as_array().unwrap().len(), 200, "老端点仍按 limit=200 截断");
+}
+
+/// 翻完每一页，去重后的凭证号集合 == 全部凭证号，且不重不漏。
+#[tokio::test]
+async fn voucher_page_walks_every_row_exactly_once() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    seed_draft_vouchers(&state, &sid, 23).await;
+
+    let mut seen: Vec<i64> = Vec::new();
+    for page in 1..=5 {
+        let p = get_voucher_page(&state, &sid, &format!("period=202601&page={page}&page_size=5")).await;
+        assert_eq!(p["total"], 23);
+        for it in p["items"].as_array().unwrap() {
+            seen.push(it["id"].as_i64().unwrap());
+        }
+    }
+    let unique: std::collections::HashSet<i64> = seen.iter().copied().collect();
+    assert_eq!(seen.len(), 23, "应恰好取到 23 张，实际 {}", seen.len());
+    assert_eq!(unique.len(), 23, "不应有重复：重复 {}/{}", seen.len(), unique.len());
+    // 越界页必须是空数组，而不是报错或回绕到第一页
+    let p = get_voucher_page(&state, &sid, "period=202601&page=99&page_size=5").await;
+    assert_eq!(p["items"].as_array().unwrap().len(), 0, "越界页应为空数组");
+}
+
+/// 合计必须是**全量**的，不能是本页的。
+///
+/// 会计核对时看的是「本期间借方合计 = 贷方合计」这个总账数字。
+/// 按页汇总会让人以为账不平（翻到第 3 页合计突然变了）。
+#[tokio::test]
+async fn voucher_page_totals_cover_whole_set_not_the_page() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    seed_draft_vouchers(&state, &sid, 9).await; // 每张借 100 / 贷 100
+
+    let p1 = get_voucher_page(&state, &sid, "period=202601&page=1&page_size=4").await;
+    assert_eq!(p1["items"].as_array().unwrap().len(), 4);
+    assert_eq!(p1["total"], 9);
+    assert_eq!(money_num(p1["debit_total"].as_str().unwrap()), 900.0, "第 1 页也要显示全量合计 900");
+    assert_eq!(money_num(p1["credit_total"].as_str().unwrap()), 900.0);
+
+    let p3 = get_voucher_page(&state, &sid, "period=202601&page=3&page_size=4").await;
+    assert_eq!(p3["items"].as_array().unwrap().len(), 1);
+    assert_eq!(money_num(p3["debit_total"].as_str().unwrap()), 900.0, "合计不应随页码变化");
+
+    // 过滤条件收窄时合计跟着变：证明合计与列表同源，不是写死的
+    let nohit = get_voucher_page(&state, &sid, "period=202601&q=根本不存在的摘要").await;
+    assert_eq!(nohit["total"], 0);
+    assert_eq!(money_num(nohit["debit_total"].as_str().unwrap()), 0.0);
+}
+
+/// 作废凭证不进合计（与账簿口径一致），但仍可在列表里查到。
+#[tokio::test]
+async fn voucher_page_totals_exclude_void() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    seed_draft_vouchers(&state, &sid, 3).await;
+    // 作废其中一张
+    let p = get_voucher_page(&state, &sid, "period=202601&page_size=10").await;
+    let id = p["items"].as_array().unwrap()[0]["id"].as_i64().unwrap();
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(&format!("/api/vouchers/{id}/void"), &sid, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = get_voucher_page(&state, &sid, "period=202601&page_size=10").await;
+    assert_eq!(after["total"], 3, "作废的仍在列表里（能查到）");
+    assert_eq!(
+        money_num(after["debit_total"].as_str().unwrap()),
+        200.0,
+        "作废的 100 不应计入合计"
+    );
+}
+
+/// 参数非法必须 400，不能静默当第 1 页。
+///
+/// 静默容错在浏览器端是优点，在 API 端是 bug：`page=abc` 返回首页的话，
+/// 调用方会拿到「看起来正常但其实是首页」的数据，漏拉极难发现。
+#[tokio::test]
+async fn voucher_page_rejects_bad_params() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    seed_draft_vouchers(&state, &sid, 2).await;
+
+    for qs in ["period=202601&page=abc", "period=202601&page_size=xyz", "period=202601&page=0x"] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get(&format!("/api/vouchers/page?{qs}"), &sid))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{qs} 应 400");
+    }
+    // page_size 超上限要被夹住而不是报错（缺省≠非法）
+    let big = get_voucher_page(&state, &sid, "period=202601&page_size=99999").await;
+    assert_eq!(big["page_size"], 500, "page_size 应夹到上限 500");
+    // 缺省用默认值
+    let def = get_voucher_page(&state, &sid, "period=202601").await;
+    assert_eq!(def["page"], 1);
+    assert_eq!(def["page_size"], 50);
+}
+
+/// 分页的 total 必须与数据范围一致：受限用户看到的张数更少。
+#[tokio::test]
+async fn voucher_page_total_respects_data_scope() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    // 两批各 6 张：一批借贷两侧都在 1xxx（落在范围 1001..1999 内），
+    // 一批在 6xxx（越界）。
+    // 两侧都必须在范围内才有意义 —— `can_see_voucher` 是「全部科目都在范围内
+    // 才可见」，只把借方放进范围、贷方留在 2001 的话**连范围内那批也会被
+    // 全部滤掉**（我第一版就是这么写的，测出来 total=0）。
+    for (no_base, debit, credit) in [(1, "1001", "1901"), (101, "660201", "600101")] {
+        for k in 0..6i32 {
+            let resp = handlers::router(state.clone())
+                .oneshot(authed_post(
+                    "/api/vouchers",
+                    &sid,
+                    serde_json::json!({
+                        "id": 0, "period": 202601, "date": "2026-01-15", "word": "记",
+                        "no": no_base + k, "attachments": 0,
+                        "memo": format!("范围 {debit}"),
+                        "entries": [
+                            { "line": 1, "account_code": debit, "summary": debit, "debit": "100", "credit": "0" },
+                            { "line": 2, "account_code": credit, "summary": credit, "debit": "0", "credit": "100" }
+                        ]
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{debit}/{credit} 第 {k} 张应保存成功");
+        }
+    }
+
+    // 管理员不限范围：12 张
+    let all = get_voucher_page(&state, &sid, "period=202601&page_size=100").await;
+    assert_eq!(all["total"], 12, "管理员应看到全部 12 张");
+
+    // 建一个只允许看 1xxx 的普通账号。两层账号：先在平台层开通，再由 boss
+    // 拉进 b1（直接 POST /api/users 会 400「该账号尚未开通」），最后收紧数据范围。
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &sid,
+            serde_json::json!({
+                "username": "scoped", "display_name": "受限", "password": "Scoped@123456"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号：{}", body_string(resp).await);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &sid,
+            serde_json::json!({
+                "username": "scoped", "display_name": "受限", "password": "Scoped@123456",
+                "role": "accountant", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "拉进 b1：{}", body_string(resp).await);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put(
+            "/api/users/scoped",
+            &sid,
+            serde_json::json!({ "data_scope": { "account_from": "1001", "account_to": "1999" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "收紧数据范围应成功");
+
+    // 平台层开通的账号默认 must_change_pwd，不改密就进不了账套（401）。
+    let (st, sid0) = login(&state, "scoped", "Scoped@123456").await;
+    assert_eq!(st, StatusCode::OK, "scoped 首登");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/change-password",
+            &sid0,
+            serde_json::json!({ "old": "Scoped@123456", "new": "Scoped!23456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "首登改密");
+    let (st, sid2) = login(&state, "scoped", "Scoped!23456").await;
+    assert_eq!(st, StatusCode::OK, "scoped 改密后重登");
+    assert_eq!(select_book(&state, &sid2, "b1").await, StatusCode::OK);
+    let scoped = get_voucher_page(&state, &sid2, "period=202601&page_size=100").await;
+    assert_eq!(
+        scoped["total"], 6,
+        "数据范围限定 1001..1999 时应只看到 6 张（借贷都在 1xxx 的那批）"
+    );
+    for it in scoped["items"].as_array().unwrap() {
+        // item.summary 取的是**第一条分录**的摘要（Voucher::first_summary），
+        // 所以这里用它来分辨批次：范围内 = 1001，越界那批 = 660201。
+        assert_eq!(it["summary"], "1001", "越界的那批不该出现");
+    }
+    // 合计也跟着收窄（这是 total 必须与数据范围同源的直接证据）
+    assert_eq!(money_num(scoped["debit_total"].as_str().unwrap()), 600.0);
+}
+
+// ---------------------------------------------------------------------------
 // 报表勾稽 / 凭证流转 / 导出 / 发票 / 银行手工勾对 / 核销手工 / 打印端点
 // ---------------------------------------------------------------------------
 

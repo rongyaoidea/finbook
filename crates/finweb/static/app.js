@@ -14,34 +14,154 @@ const reqSeq = { v: 0 };
 function nextReq(scope) { reqSeq[scope] = (reqSeq[scope] || 0) + 1; return reqSeq[scope]; }
 function staleReq(scope, id) { return reqSeq[scope] !== id; }
 
-async function api(path, opts = {}) {
-  const r = await fetch(API + path, Object.assign({ credentials: "same-origin" }, opts));
-  let data = null;
-  try { data = await r.json(); } catch (e) {}
-  if (r.status === 401) {
-    if (path !== "/setup/status" && path !== "/login") { session.user = null; render(); }
-    throw new Error((data && data.error) || "未登录");
+// ===========================================================================
+// 顶栏进度条：所有请求在途时显示一条 2px 进度线
+// ---------------------------------------------------------------------------
+// 改造前没有任何全局「正在请求」指示。视图自己写死「加载中…」，于是网络抖动
+// 或后端慢时，用户看到的和「本来就没数据」完全一样，只能干等或刷新。这里
+// 做成全局计数：任何时刻有请求在途就亮起，全部结束就淡出。
+let inflight = 0;
+let progressEl = null;
+function progressOn() {
+  if (!progressEl) {
+    progressEl = document.createElement("div");
+    progressEl.id = "top-progress";
+    document.body.appendChild(progressEl);
   }
-  if (!r.ok) {
-    let msg = (data && data.error) || ("请求失败 " + r.status);
-    if (r.status === 403) msg += "（权限不足，请联系管理员开通该权限或调整岗位）";
-    throw new Error(msg);
-  }
-  // 列偏好：每次数据到达后重挂（异步填充的表格也能获得列菜单与隐藏样式）
-  try { autoColPrefs(); } catch (e) {}
-  // 通用列头排序 + 列宽拖拽（同点补挂，异步表也能获得）
-  try { autoColSort(); } catch (e) {}
-  try { autoColResize(); } catch (e) {}
-  // 单元格省略号补 title（悬停可见全文）
-  try { autoCellTitles(); } catch (e) {}
-  return data;
+  inflight++;
+  progressEl.classList.add("on");
+  // 前进到 90% 然后等真实完成——匀速走到 100% 再回落，避免「假完成」
+  const pct = Math.min(90, 18 + inflight * 14);
+  progressEl.style.width = pct + "%";
 }
+function progressOff() {
+  inflight = Math.max(0, inflight - 1);
+  if (inflight > 0) return;
+  if (!progressEl) return;
+  progressEl.style.width = "100%";
+  setTimeout(() => {
+    if (inflight === 0) {
+      progressEl.classList.remove("on");
+      progressEl.style.width = "0";
+    }
+  }, 220);
+}
+
+// ===========================================================================
+// api()：统一请求入口
+// ---------------------------------------------------------------------------
+// 2026-09 加的三件事，都是为了「挂住的请求不会变成永远转圈」：
+//   1. **超时**。原来没有 AbortSignal，后端卡住时 fetch 永远 pending，界面停在
+//      「加载中…」，用户唯一出路是刷新（刷新会丢掉已填的表单）。现在默认 30s
+//      主动中止，并抛出**可识别**的错误，让视图能给出重试按钮。
+//   2. **网络错误翻译**。原来 fetch 抛的是 `TypeError: Failed to fetch`，
+//      直接 toast 出来对会计毫无意义。现在按「断网 / 请求被中止 / 超时」
+//      三种情况给中文说明。
+//   3. **GET 失败重试一次**。内网偶发丢包很常见，一次 502/网络错误就重试能挡住
+//      大部分；**只对 GET 重试**，写操作绝不重试（重试 = 可能重复提交单据）。
+// ---------------------------------------------------------------------------
+const API_TIMEOUT_MS = 30000;
+const API_RETRY_MS = 600;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 视图用来判断「要不要给重试按钮」：fetch 已经拉黑，视图可以直接重调 api()
+class TimeoutError extends Error {
+  constructor(ms, path) { super(`请求超时（超过 ${Math.round(ms / 1000)} 秒）`); this.name = "TimeoutError"; this.path = path; }
+}
+class OfflineError extends Error {
+  constructor(path) { super("连不上服务器，请检查网络后重试"); this.name = "OfflineError"; this.path = path; }
+}
+
+async function apiOnce(path, opts, timeoutMs) {
+  const ctl = ("AbortController" in window) ? new AbortController() : null;
+  let timedOut = false;
+  let timer = null;
+  if (ctl) {
+    timer = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
+  }
+  try {
+    const merged = Object.assign({ credentials: "same-origin" }, opts);
+    if (ctl) merged.signal = ctl.signal;
+    return await fetch(API + path, merged);
+  } catch (e) {
+    // AbortError 只在我们自己超时后出现；别的 AbortError 视为用户取消，不报错
+    if (timedOut) throw new TimeoutError(timeoutMs, path);
+    if (e && e.name === "AbortError") throw e;
+    // 浏览器对「连不上」一律抛 TypeError，DOM 层面无法再细分
+    throw new OfflineError(path);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function api(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  const timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : API_TIMEOUT_MS;
+  const o = Object.assign({}, opts);
+  delete o.timeout;
+  // 只对 GET 重试一次：写操作重试会造成重复单据
+  const attempts = method === "GET" && o.retry !== false ? 2 : 1;
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    progressOn();
+    let r;
+    try {
+      r = await apiOnce(path, o, timeout);
+    } catch (e) {
+      progressOff();
+      lastErr = e;
+      // 用户主动取消（切视图/关弹窗）不算失败，直接抛出
+      if (e && e.name === "AbortError") throw e;
+      // 超时不重试——已经等了 30s，再等一轮只会更让人绝望
+      if (e instanceof TimeoutError) throw e;
+      if (i + 1 < attempts) { await sleep(API_RETRY_MS); continue; }
+      throw e;
+    }
+    progressOff();
+    let data = null;
+    try { data = await r.json(); } catch (e) {}
+    if (r.status === 401) {
+      if (path !== "/setup/status" && path !== "/login") { session.user = null; render(); }
+      throw new Error((data && data.error) || "未登录");
+    }
+    if (!r.ok) {
+      let msg = (data && data.error) || ("请求失败 " + r.status);
+      if (r.status === 403) msg += "（权限不足，请联系管理员开通该权限或调整岗位）";
+      const err = new Error(msg);
+      err.status = r.status;
+      // 5xx / 429 属于服务端临时问题，GET 值得再来一次
+      if (i + 1 < attempts && (r.status >= 500 || r.status === 429)) { lastErr = err; await sleep(API_RETRY_MS); continue; }
+      throw err;
+    }
+    // 列偏好：每次数据到达后重挂（异步填充的表格也能获得列菜单与隐藏样式）
+    try { autoColPrefs(); } catch (e) {}
+    // 通用列头排序 + 列宽拖拽（同点补挂，异步表也能获得）
+    try { autoColSort(); } catch (e) {}
+    try { autoColResize(); } catch (e) {}
+    // 单元格省略号补 title（悬停可见全文）
+    try { autoCellTitles(); } catch (e) {}
+    // 通用后处理：异步填充的表也要过一遍（负数红字 / 空态 / 溢出收纳）
+    try { autoNumbers(); } catch (e) {}
+    try { autoEmptyRows(); } catch (e) {}
+    try { autoOverflowMenus(); } catch (e) {}
+    return data;
+  }
+  throw lastErr || new Error("请求失败");
+}
+
 
 const MAX_TOASTS = 5;
 function toast(msg, kind) {
   const wrap = document.getElementById("toast");
-  // 上限：挤掉最旧
-  while (wrap.children.length >= MAX_TOASTS) wrap.removeChild(wrap.firstChild);
+  // 上限：挤掉最旧。但**错误不挤错误**——错误是唯一必须被读到的信息。
+  // 原来「超过 5 个就 removeChild(firstChild)」会把最早的错误挤掉，而错误
+  // 恰恰是最需要看的那条。
+  const sticky = wrap.querySelectorAll(".toast.err");
+  while (wrap.children.length - sticky.length >= MAX_TOASTS) {
+    const victim = Array.from(wrap.children).find((c) => !c.classList.contains("err"));
+    if (!victim) break;
+    wrap.removeChild(victim);
+  }
   const t = document.createElement("div");
   t.className = "toast " + (kind || "");
   const text = document.createElement("span");
@@ -57,7 +177,14 @@ function toast(msg, kind) {
   t.appendChild(close);
   wrap.appendChild(t);
   requestAnimationFrame(() => t.classList.add("show"));
-  setTimeout(dismiss, 2600);
+  // 改造前一律 2600ms 自动消失。财务的错误信息普遍很长——比如
+  // 「期间格式不正确：2026-01-01（应为 202601 或 2026-01）」——2.6 秒读不完，
+  // 提示就没了，用户只能猜哪里错了。现在：err 常驻到手动关；warn 6s；
+  // 成功类按长度自适应（短 2.6s，长 6s），短提示仍不占屏。
+  const isErr = kind === "err";
+  const ms = isErr ? 0 : kind === "warn" ? 6000 : msg.length > 24 ? 6000 : 2600;
+  if (ms > 0) setTimeout(dismiss, ms);
+  else t.classList.add("sticky");
 }
 
 let modalStack = [];
@@ -97,7 +224,7 @@ function openQuickSearch() {
             <span><span class="tag">${KIND[x.kind] || esc(x.kind)}</span> ${esc(x.label)}</span>
             <span class="muted" style="font-size:12px;white-space:nowrap">${esc(x.sub || "")}</span></button>`).join("")
         : `<div class="muted">无匹配结果</div>`;
-      $all("[data-qs]", mask).forEach((b) => b.onclick = () => { state.view = b.dataset.view; closeModal(); renderMain(); });
+      $all("[data-qs]", mask).forEach((b) => b.onclick = () => { closeModal(); goView(b.dataset.view); });
     } catch (e) { box.innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`; }
   };
   input.oninput = () => { clearTimeout(timer); timer = setTimeout(run, 260); };
@@ -251,7 +378,9 @@ document.addEventListener("keydown", (e) => {
 // 快捷键帮助面板（顶栏「?」或按 ?）
 function openShortcuts() {
   const rows = [
-    ["Ctrl+K", "全局快速搜索（凭证 / 采购 / 销售 / 请购 / 报销）"],
+    ["/", "定位侧栏功能搜索框（搜功能名，如「明细账」）——69 个功能平铺时的主要出路"],
+    ["Ctrl+K", "全局快速搜索单据（凭证 / 采购 / 销售 / 请购 / 报销）"],
+    ["浏览器后退", "回到上一个页面（地址栏现在是 #/页面名，可直接发给同事）"],
     ["Ctrl+Enter", "提交当前弹窗主按钮（保存 / 确定）"],
     ["Ctrl+S", "保存当前录单弹窗"],
     ["Enter", "录单：最后一行金额/摘要回车 → 新增一行（自动带出上一行摘要）"],
@@ -263,7 +392,7 @@ function openShortcuts() {
   ];
   const mask = modal(`<h3>快捷键与帮助</h3>
     <table class="grid"><tbody>${rows.map(([k, v]) => `<tr><td style="white-space:nowrap"><span class="tag">${k}</span></td><td>${v}</td></tr>`).join("")}</tbody></table>
-    <div class="muted" style="font-size:12px;margin-top:8px">所有列表：点列头排序、拖列边调宽、右上「列▾」显隐列（偏好自动记忆）；顶栏「Aa」调字号。</div>
+    <div class="muted" style="font-size:12px;margin-top:8px">侧栏：点导航项右侧 ☆ 加为「常用」（置顶）；分组可折叠；顶部搜索框找功能。所有列表：点列头排序、拖列边调宽、右上「列▾」显隐列（偏好自动记忆）；列表带分页与合计行；顶栏「Aa」调字号。</div>
     <div class="foot"><button class="btn ghost" id="kb-close">关闭</button></div>`);
   $("#kb-close", mask).onclick = closeModal;
 }
@@ -277,6 +406,18 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     openShortcuts();
     return;
+  }
+  // /：定位侧栏功能搜索框。69 个功能平铺 16 组，不给一个搜索入口就得靠翻。
+  // 输入态不触发（否则录单打不出斜杠），Esc 在框里回车清空由 renderSidebar 管。
+  if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !["INPUT", "SELECT", "TEXTAREA"].includes(tag)) {
+    const q = document.getElementById("nav-q");
+    if (q) {
+      e.preventDefault();
+      q.focus();
+      q.select();
+      document.body.classList.add("menu-open"); // 窄屏下把抽屉拉出来，否则看不见框
+      return;
+    }
   }
   // F7：聚焦当前弹窗的科目搜索框
   if (e.key === "F7" && modalStack.length) {
@@ -634,7 +775,7 @@ async function enterBook(key, name) {
     const me = await api("/me");
     session.user = me;
     shellBuilt = false; // 身份从平台层切换为账套层，顶栏与侧边栏需重建
-    state.view = "dashboard";
+    resetToDashboard();
     toast(`已进入账套「${esc(name || key)}」`, "ok");
     await afterLogin();
   } catch (e) {
@@ -705,7 +846,7 @@ async function afterLogin() {
   } catch (e) {
     state.bookOptions = null;
   }
-  state.view = "dashboard";
+  resetToDashboard();
   render();
   // 未建账（尚未设置公司名）→ 弹出建账向导
   try {
@@ -760,7 +901,7 @@ async function showSetupWizard() {
       await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(merged) });
       closeModal();
       toast("账套创建成功", "ok");
-      state.view = "dashboard";
+      resetToDashboard();
       render();
     } catch (err) { toast(err.message, "err"); }
   });
@@ -928,6 +1069,303 @@ function rerenderView(id, main) {
 
 let shellBuilt = false;
 
+// ===========================================================================
+// A. 路由（hash）+ 视图状态保留 + 侧栏搜索/收藏/最近
+// ---------------------------------------------------------------------------
+// 改造前只有 `state.view` 一个变量，没有 location.hash、没有 history：
+//   · 浏览器**后退键无效**——从报表点进明细账，回不去上一张报表；
+//   · **无法把页面发给同事**（「你去处理一下期末」只能口头说进哪个菜单）；
+//   · **刷新必然丢位置**（state.view 没进 localStorage）。
+// 会计一天要在凭证/明细账/期末/报表/对账之间来回跳，这三条都是每天要付的税。
+//
+// 这里只做**加法**：state.view 仍然是唯一真相，hash 只是它的镜像。所有
+// 切视图的地方统一走 goView()，它负责「改 state → 同步 hash → 存旧视图态 →
+// 渲染 → 还原新视图态」。
+// ===========================================================================
+
+const NAV_INDEX = (() => {
+  const m = {};
+  NAV_ITEMS.forEach((n) => { m[n.id] = n; });
+  return m;
+})();
+function navLabel(id) { return (NAV_INDEX[id] && NAV_INDEX[id].label) || id; }
+function navGroup(id) { return (NAV_INDEX[id] && NAV_INDEX[id].group) || ""; }
+
+// ---- 视图状态（筛选条件 / 滚动位置）--------------------------------------
+// 为什么要「切走再切回要保留」：会计在凭证页按摘要搜出 20 张，翻两页看完去
+// 明细账对一下，再回来时搜索词、状态筛选、翻到第几页全被清空，只能重打一遍。
+// renderMain() 每次重建 #main 并重新调用视图函数，各视图的 DOM 值是全新的，
+// 所以必须在**离开时快照、进入时还原**。
+//
+// 存什么：视口里所有有 id 的 input/select/textarea 的值 + 滚动位置。
+// 不存 checkbox 的选中态（很多是「全选」这种瞬时态，存了反而怪）。
+// 局部变量驱动的视图（像凭证列表的 q/status 直接读 DOM）能自动受益。
+const viewState = Object.create(null);
+const SCROLL_KEY = "__scroll__";
+function saveViewState(id, main) {
+  if (!main || !id) return;
+  const snap = { v: 1, fields: {}, scroll: main.scrollTop || 0 };
+  $all("input[id], select[id], textarea[id]", main).forEach((el) => {
+    if (el.type === "checkbox" || el.type === "radio" || el.type === "file") return;
+    // 只存有意义的值：空值不必占地方
+    if (el.value === "") return;
+    snap.fields[el.id] = el.value;
+  });
+  viewState[id] = snap;
+}
+function restoreViewState(id, main) {
+  const snap = viewState[id];
+  if (!snap || !main) return;
+  // 视图函数是 async 的：它在 await 之后才填表，立刻还原只能还原到骨架上。
+  // 所以还原分两轮：先还原同步渲染出来的（工具栏筛选框），再在微任务 +
+  // 短延时后各来一次，覆盖 await 之后才出现的（列表区的筛选框）。
+  const apply = () => {
+    if (state.view !== id) return;
+    if (main !== document.getElementById("main")) return;
+    Object.keys(snap.fields).forEach((k) => {
+      const el = document.getElementById(k);
+      if (!el) return;
+      if (el.tagName === "SELECT" || el.tagName === "TEXTAREA" || el.type === "text" || el.type === "search" || el.type === "month" || !el.type) {
+        if (el.value !== snap.fields[k]) el.value = snap.fields[k];
+      }
+    });
+    if (snap.scroll) main.scrollTop = snap.scroll;
+  };
+  apply();
+  Promise.resolve().then(apply);
+  setTimeout(apply, 60);
+  setTimeout(apply, 260);
+  // 改了筛选值要触发视图自己的查询，否则只是把框填上了、数据没跟着变。
+  // 用 'input' 事件（change 对 text 不触发）且只在值真的变了才发，避免死循环。
+  setTimeout(() => {
+    if (state.view !== id) return;
+    Object.keys(snap.fields).forEach((k) => {
+      const el = document.getElementById(k);
+      if (!el || el.value !== snap.fields[k]) return;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }, 300);
+}
+
+// ---- hash 路由 ------------------------------------------------------------
+let suppressHash = false;
+function readHashView() {
+  const h = (location.hash || "").replace(/^#\/?/, "").trim();
+  if (!h) return null;
+  // 允许 #/view/子路径（未来用），只取第一段
+  const id = h.split("/")[0];
+  return VIEWS[id] ? id : null;
+}
+function syncHash(id) {
+  const want = "#/" + id;
+  if (location.hash === want) return;
+  suppressHash = true;
+  // replaceState 而不是直接赋值 location.hash：直接赋值会往历史里塞一条，
+  // 于是「后退」变成「后退两步」这种更难解释的行为。首屏用 replace，之后
+  // 由 goView 用 pushState。
+  history.replaceState(history.state, "", want);
+  setTimeout(() => { suppressHash = false; }, 0);
+}
+function goView(id, opts = {}) {
+  if (!id || !VIEWS[id]) return;
+  if (state.view === id && !opts.force) { renderMain(); return; }
+  // 离开旧视图：存它的筛选/滚动
+  const old = document.getElementById("main");
+  if (old) saveViewState(state.view, old);
+  state.view = id;
+  if (!opts.fromPop) {
+    // push 一条历史，后退键才有意义
+    const want = "#/" + id;
+    if (location.hash !== want) {
+      suppressHash = true;
+      history.pushState({ view: id }, "", want);
+      setTimeout(() => { suppressHash = false; }, 0);
+    }
+  }
+  touchRecent(id);
+  renderSidebar();
+  renderMain();
+  restoreViewState(id, document.getElementById("main"));
+}
+window.addEventListener("popstate", () => {
+  if (suppressHash) return;
+  const id = readHashView();
+  if (!id) return;
+  if (id === state.view) return;
+  const old = document.getElementById("main");
+  if (old) saveViewState(state.view, old);
+  state.view = id;
+  renderSidebar();
+  renderMain();
+  restoreViewState(id, document.getElementById("main"));
+});
+// 登录/切换账套后强制回工作台
+// **必须连 hash 一起重置**：否则上一个账套停在 #/vouchers 的用户，切换账套后
+// 会落在新账套的凭证页上——而他刚换账套，一条新凭证都还没有，看起来像坏了。
+let bootHashOff = false;
+function resetToDashboard() {
+  state.view = "dashboard";
+  viewState.dashboard = null;
+  bootHashOff = true;
+  syncHash("dashboard");
+}
+
+// 登录前用户可能带着上次的 hash（退出登录不清 hash），登进来要能落在那个页面
+function applyHashOnBoot() {
+  if (bootHashOff) { bootHashOff = false; return; }
+  const id = readHashView();
+  if (id && id !== "dashboard") state.view = id;
+  else syncHash(state.view);
+}
+
+// ---- 侧栏：搜索 / 收藏 / 最近 -------------------------------------------
+// 69 个功能平铺在 16 组里，Ctrl+K 只搜数据不搜功能。会计每天实际只用 4-5 个
+// 页面。三个改动都是纯前端（localStorage），不碰后端权限判定：
+//   · 搜索框：按功能名/分组名过滤。**空查询时展示全部**——这一点是硬要求，
+//     E2E 全靠 `.nav-item[data-view=...]` 点击进入页面，隐藏了就全超时。
+//   · 收藏（星标）：点导航项右侧的 ☆ 置顶成「常用」。
+//   · 最近：最近 8 个去过的页面，去重后在收藏下面。
+const LS_FAV = "nav_fav";
+const LS_REC = "nav_recent";
+const LS_SEC = "nav_sec_collapsed";
+const MAX_RECENT = 8;
+
+function lsGet(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function getFavs() { return lsGet(LS_FAV, []).filter((id) => NAV_INDEX[id]); }
+function toggleFav(id) {
+  const f = getFavs();
+  const i = f.indexOf(id);
+  if (i >= 0) f.splice(i, 1); else f.unshift(id);
+  lsSet(LS_FAV, f);
+}
+function getRecent() { return lsGet(LS_REC, []).filter((id) => NAV_INDEX[id] && !getFavs().includes(id)); }
+function touchRecent(id) {
+  if (!NAV_INDEX[id] || id === "dashboard") return;
+  let r = lsGet(LS_REC, []).filter((x) => NAV_INDEX[x]);
+  r = r.filter((x) => x !== id);
+  r.unshift(id);
+  lsSet(LS_REC, r.slice(0, MAX_RECENT));
+}
+function isNavVisible(n) {
+  const pa = !!session.platformAdmin;
+  if (n.perm && !can(n.perm)) return false;
+  if (n.admin && !(session.user && session.user.is_admin)) return false;
+  if (n.platform && !pa) return false;
+  return true;
+}
+
+// 侧栏搜索关键词（不持久化：刷新后回到全量展示，符合 E2E 与直觉）
+let navQuery = "";
+function navMatches(n, q) {
+  if (!q) return true;
+  if (n.label.indexOf(q) >= 0) return true;
+  if (n.group && n.group.indexOf(q) >= 0) return true;
+  return false;
+}
+function renderSidebar() {
+  const box = document.getElementById("sidebar");
+  if (!box) return;
+  const q = navQuery.trim();
+  const all = NAV_ITEMS.filter(isNavVisible);
+  const hit = all.filter((n) => navMatches(n, q));
+  const favs = getFavs().map((id) => NAV_INDEX[id]).filter((n) => n && navMatches(n, q));
+  const recents = getRecent().map((id) => NAV_INDEX[id]).filter((n) => n && navMatches(n, q));
+  const collapsed = lsGet(LS_SEC, {});
+
+  const itemHtml = (n, extra) => {
+    const on = n.id === state.view;
+    return `<div class="nav-fav-row">
+      <button class="nav-item${on ? " active" : ""}" data-view="${n.id}"${on ? ' aria-current="page"' : ""} title="${esc(n.label)}${n.group ? " · " + esc(n.group) : ""}">${esc(n.label)}</button>
+      <button class="nav-star${getFavs().includes(n.id) ? " on" : ""}" data-fav="${n.id}" title="${getFavs().includes(n.id) ? "取消常用" : "加为常用"}（点导航项右侧星星）" aria-label="把${esc(n.label)}加为常用">${getFavs().includes(n.id) ? "★" : "☆"}</button>
+    </div>${extra || ""}`;
+  };
+  const secHtml = (key, title, body, count) => {
+    if (!body) return "";
+    const col = !!collapsed[key];
+    return `<div class="nav-sec${col ? " collapsed" : ""}" data-sec="${key}" role="button" tabindex="0" aria-expanded="${col ? "false" : "true"}">
+        <span class="caret">▼</span><span class="u-grow">${esc(title)}</span>${count ? `<span class="ss-count">${count}</span>` : ""}
+      </div><div class="nav-body">${body}</div>`;
+  };
+
+  let html = `<div class="side-search">
+      <div class="ss-wrap">
+        <span class="ss-icon">${icon("search")}</span>
+        <input id="nav-q" type="search" placeholder="搜功能（如：明细账）" value="${esc(navQuery)}" autocomplete="off" aria-label="搜索功能" />
+        ${q ? `<button class="ss-clear" id="nav-q-clear" title="清空" aria-label="清空搜索">✕</button>` : ""}
+      </div>
+      ${q ? `<div class="ss-count">匹配 ${hit.length} / ${all.length} 个功能</div>` : ""}
+    </div>`;
+
+  if (favs.length) html += secHtml("fav", "常用", favs.map((n) => itemHtml(n)).join(""), favs.length);
+  if (recents.length) html += secHtml("recent", "最近", recents.map((n) => itemHtml(n)).join(""), recents.length);
+
+  if (q) {
+    // 搜索态：只列命中项，不再按分组铺开（否则「搜明细账」还是一大屏）
+    if (!hit.length) {
+      html += `<div class="nav-none">没有匹配「${esc(navQuery)}」的功能</div>`;
+    } else {
+      // 搜索结果里**也要给星标**：用户正是「搜出来 → 觉得常用 → 收藏」这个
+      // 路径找到功能的，只在全量列表给星标等于把这条路堵死。
+      html += `<div class="nav-body">${hit.map((n) => itemHtml(n)).join("")}</div>`;
+    }
+  } else {
+    // 全量：按分组铺开（改造前就是这个行为，E2E 依赖）
+    // 每个分组包在自己的 .nav-body 里，折叠靠 `.nav-sec.collapsed + .nav-body`
+    // 的相邻选择器生效——所以项必须在 body 内部，不能平铺在 header 后面。
+    const rest = all.filter((n) => !favs.includes(n) && !recents.includes(n));
+    const groups = [];
+    const gmap = {};
+    rest.forEach((n) => {
+      const g = n.group || "";
+      if (!gmap[g]) { gmap[g] = []; groups.push(g); }
+      gmap[g].push(n);
+    });
+    groups.forEach((g) => {
+      const col = !!collapsed["g:" + g];
+      html += `<div class="nav-sec${col ? " collapsed" : ""}" data-sec="g:${esc(g)}" role="button" tabindex="0" aria-expanded="${col ? "false" : "true"}">
+          <span class="caret">▼</span><span class="u-grow">${esc(g)}</span><span class="ss-count">${gmap[g].length}</span>
+        </div><div class="nav-body">${gmap[g].map((n) => itemHtml(n)).join("")}</div>`;
+    });
+    if (!groups.length) html += `<div class="nav-none">没有可见的功能</div>`;
+  }
+  box.innerHTML = html;
+
+  const qi = document.getElementById("nav-q");
+  if (qi) {
+    qi.addEventListener("input", () => {
+      navQuery = qi.value;
+      const pos = qi.selectionStart;
+      renderSidebar();
+      const again = document.getElementById("nav-q");
+      if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (e) {} }
+    });
+    // Ctrl+K / Ctrl+F 之外的入口：在侧栏里按 / 直接聚焦搜索
+    qi.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { navQuery = ""; renderSidebar(); }
+      if (e.key === "Enter") {
+        const first = $(".nav-item[data-view]", box);
+        if (first) { goView(first.dataset.view); const f = document.getElementById("nav-q"); if (f) f.focus(); }
+      }
+    });
+  }
+  const clr = document.getElementById("nav-q-clear");
+  if (clr) clr.onclick = () => { navQuery = ""; renderSidebar(); const f = document.getElementById("nav-q"); if (f) f.focus(); };
+  // 分组折叠 / 收藏：事件委托挂在侧栏容器上（每次重绘只绑一次）
+  $all("[data-sec]", box).forEach((el) => {
+    el.addEventListener("click", () => {
+      const key = el.dataset.sec;
+      const c = lsGet(LS_SEC, {});
+      c[key] = !c[key];
+      lsSet(LS_SEC, c);
+      renderSidebar();
+    });
+  });
+  $all("[data-fav]", box).forEach((el) => {
+    el.addEventListener("click", (e) => { e.stopPropagation(); toggleFav(el.dataset.fav); renderSidebar(); });
+  });
+}
+
 // 骨架只渲染一次；切换视图只更新 .main，不再重建 topbar/sidebar
 // ---------------- 界面字号调节（四档循环 90/100/115/130%，localStorage 持久化） ----------------
 // 字号全为 px 硬编码（rem 改造不现实）→ html.zoom 整体缩放；不支持的浏览器无害回退。
@@ -949,7 +1387,13 @@ function applyUiScale(idx) {
   try { localStorage.setItem("ui_scale", String(d.v)); } catch (e) {}
   document.documentElement.style.zoom = String(d.v);
   const el = document.getElementById("ui-scale-btn");
-  if (el) { el.textContent = `Aa ${d.label}`; el.title = `界面字号：${d.label}（点击切换）`; }
+  // 按钮现在是 icon-only（顶栏空间有限），档位文字放进 title/aria-label，
+  // 不要再写进 textContent —— 写了会把 30px 宽的按钮撑成两行。
+  if (el) {
+    el.textContent = "Aa";
+    el.title = `界面字号：${d.label}（点击切换）`;
+    el.setAttribute("aria-label", `界面字号：${d.label}`);
+  }
 }
 function cycleUiScale() {
   const next = (uiScaleIdx() + 1) % UI_SCALES.length;
@@ -1051,9 +1495,8 @@ function ntRender(r) {
   if (!html) html = `<div class="nt-empty">没有待办，也暂无动态</div>`;
   body.innerHTML = html;
   $all("[data-nt-view]", body).forEach((b) => b.onclick = () => {
-    state.view = b.dataset.ntView;
     ntCloseDrawer();
-    renderMain();
+    goView(b.dataset.ntView);
   });
 }
 async function ntMarkRead() {
@@ -1235,6 +1678,235 @@ function autoCellTitles() {
 }
 // ---------------- 列偏好 END ----------------
 
+// ===========================================================================
+// B. 通用 DOM 后处理（一次修好 69 个视图的共性问题）
+// ---------------------------------------------------------------------------
+// 逐个视图手改 69 遍既不现实也高风险（改错一处就是某个页面白屏，而且没人
+// 能说清是哪次改动引入的）。这里改成**渲染后统一扫一遍 DOM**，凡是符合
+// 约定结构的元素都自动套上。约定只有两条，且**默认全部关闭**：
+//   · <td class="num"> 里的数字 → 负数红字、零值淡化（无条件生效，纯装饰）
+//   · 空 tbody / 占位行 → 结构化空态（只替换"纯文字占位行"，绝不动带按钮的行）
+//   · data-more="N" / data-rowmenu="N" → 溢出收纳（**必须显式标注**）
+// 为什么溢出收纳不默认开：E2E 大量用 `page.click("#某个按钮")`，按钮一旦被
+// 收进折叠菜单就不可见，Playwright 会一直等到超时。默认开 = 必然打破测试。
+// ===========================================================================
+
+// ---- B1. 数字排版：负数红字 / 零值淡化 ---------------------------------
+// 改造前 .num 只有右对齐 + 等宽数字，方向要靠读负号。财务界面靠「负红正黑」
+// 一眼分方向，缺这条就得逐个数字确认。
+const NUM_RE = /-?\d[\d,]*\.?\d*/;
+function autoNumbers(root) {
+  const r = root || document.getElementById("main");
+  if (!r) return;
+  $all("td.num, th.num", r).forEach((el) => {
+    el.classList.remove("neg", "zero");
+    // 只看第一个数字：摘要/备注列里如果有「-」但不在数字前（如「科目-差额」）不算
+    const txt = (el.textContent || "").trim();
+    const m = txt.match(NUM_RE);
+    if (!m) return;
+    const raw = m[0];
+    const n = parseFloat(raw.replace(/,/g, ""));
+    if (!isFinite(n)) return;
+    // 前缀是负号（允许 ¥ $ ( 等货币符号与括号记负法在前面）
+    const before = txt.slice(0, m.index).replace(/[\s¥￥$€£,]/g, "");
+    const isNeg = raw.startsWith("-") || /\($/.test(before) || /^\(/.test(txt.replace(/[\s¥￥$€£,]/g, ""));
+    if (isNeg && n !== 0) el.classList.add("neg");
+    else if (n === 0) el.classList.add("zero");
+  });
+}
+
+// ---- B2. 空态：把裸 tbody / 占位行换成结构化空态 -------------------------
+// 改造前 .empty-state 组件只被凭证页用了 1 次，其余 68 个视图空数据时是裸表格
+// 或永远「加载中…」，用户分不清「没数据」「加载失败」「没权限」。
+//
+// 只在**确定是空**时才动，两种判定：
+//   1. tbody 完全没有子元素；
+//   2. tbody 只有一个 tr、只有一个 colspan 单元格、**里面没有按钮/输入框**，
+//      且文字是已知占位词（「加载中…」「暂无数据」…）。
+// 条件 2 里的「没有按钮」是关键：像 loadVouchers 的失败态会放一个「重试」
+// 按钮，那种行绝不能被覆盖——覆盖了就等于把重试入口删了。
+const EMPTY_PLACEHOLDERS = /^(加载中|加载中…|加载中\.\.\.|加载|暂无数据|无数据|没有数据|暂无|空空如也|—|-|)$/;
+function emptyStateHtml(table, mode, detail) {
+  const t = (table.dataset || {}) ;
+  const title = t.emptyTitle || (mode === "error" ? "加载失败" : mode === "noperm" ? "没有权限" : "暂无数据");
+  const hint = t.emptyHint || (mode === "error" ? "数据没能取回来，可能是网络问题或会话过期。" : "");
+  const iconCh = mode === "error" ? "⚠" : mode === "noperm" ? "🔒" : "◌";
+  const actions = [];
+  if (mode !== "error") {
+    // 通用建议动作：去导入 / 去新建，取决于表上有没有挂 data-empty-action
+    const act = t.emptyAction;
+    if (act) actions.push(`<button class="btn ghost sm" data-empty-go="${esc(act)}">${esc(t.emptyActionLabel || "前往")}</button>`);
+  }
+  actions.push(`<button class="btn ghost sm" data-empty-retry>重试</button>`);
+  return `<div class="empty-state${mode === "error" ? " is-error" : mode === "noperm" ? " is-noperm" : ""}">
+      <div class="es-icon">${iconCh}</div>
+      <div class="es-title">${esc(title)}</div>
+      ${hint ? `<div class="es-hint">${esc(hint)}</div>` : ""}
+      ${mode === "error" && detail ? `<div class="es-detail">${esc(detail)}</div>` : ""}
+      <div class="es-actions">${actions.join("")}</div>
+    </div>`;
+}
+function autoEmptyRows(root) {
+  const r = root || document.getElementById("main");
+  if (!r) return;
+  $all("table.grid", r).forEach((table) => {
+    if (table.dataset.noEmpty) return;
+    const tb = table.tBodies[0];
+    if (!tb) return;
+    // ① 空 tbody
+    if (tb.children.length === 0) {
+      const cols = (table.tHead && table.tHead.rows[0] ? table.tHead.rows[0].cells.length : 1) || 1;
+      tb.innerHTML = `<tr><td colspan="${cols}">${emptyStateHtml(table, "empty")}</td></tr>`;
+      return;
+    }
+    // ② 单行占位
+    if (tb.children.length !== 1) return;
+    const tr = tb.children[0];
+    if (tr.tagName !== "TR" || tr.children.length !== 1) return;
+    const td = tr.children[0];
+    if (td.tagName !== "TD") return;
+    // 有交互元素 = 是有意义的行（重试按钮、跳转链接、错误详情），不动
+    if (td.querySelector("button, a, input, select, textarea")) return;
+    const txt = (td.textContent || "").trim();
+    if (!EMPTY_PLACEHOLDERS.test(txt)) return;
+    const cols = (table.tHead && table.tHead.rows[0] ? table.tHead.rows[0].cells.length : 1) || 1;
+    const mode = /加载/.test(txt) ? "error" : "empty";
+    td.innerHTML = emptyStateHtml(table, mode);
+  });
+}
+
+// 空态里的按钮：点「重试」= 触发该视图自己的查询（点刷新按钮 / 回车搜索框）
+document.addEventListener("click", (e) => {
+  const retry = e.target.closest("[data-empty-retry]");
+  if (retry) {
+    e.preventDefault();
+    const scope = retry.closest("#main") || document;
+    const btn = $(".toolbar button[id$='-refresh'], .toolbar #v-refresh, .toolbar #r-go", scope);
+    if (btn) { btn.click(); return; }
+    // 没有显式刷新按钮就重跑当前视图
+    const main = document.getElementById("main");
+    if (main) { const fn = VIEWS[state.view]; if (fn) fn(main); }
+    return;
+  }
+  const go = e.target.closest("[data-empty-go]");
+  if (go && VIEWS[go.dataset.emptyGo]) { e.preventDefault(); goView(go.dataset.emptyGo); }
+});
+
+// ---- B3. 溢出收纳：工具栏「更多」/ 行内「⋯」----------------------------
+// 改造前采购订单工具栏 8 个按钮、销售订单 9 个，全平铺一行，把「重排断号」
+// 这类危险操作和「查询」摆在同一排同权重；行内更挤，整张表被按钮撑到要横滚。
+//
+// **必须显式标注 data-more / data-rowmenu 才会生效**，且标注时要确认：
+//   ① 收进去的按钮没有 id 被 E2E 或外部按 id 引用；
+//   ② 该按钮不是首屏唯一入口（收进菜单后要多点一次）。
+// 危险项放菜单底部并加 .danger 分隔线，视觉上和日常操作分开。
+function closeAllMenus() {
+  $all(".tool-menu, .row-menu").forEach((m) => m.remove());
+  $all(".menu-open-btn").forEach((b) => b.classList.remove("menu-open-btn"));
+}
+document.addEventListener("click", (e) => {
+  // 点外面关掉所有弹出菜单
+  if (!e.target.closest(".tool-more, .row-menu-wrap")) closeAllMenus();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAllMenus(); });
+
+function buildMenu(items, cls) {
+  const menu = document.createElement("div");
+  menu.className = cls;
+  items.forEach((el) => {
+    if (el === "---") { menu.appendChild(document.createElement("hr")); return; }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = el.dataset.mlabel || el.textContent.trim();
+    b.className = el.classList.contains("danger") ? "danger" : "";
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      closeAllMenus();
+      // 点菜单项 = 转发到原按钮的 click。事件监听器绑在元素本身，
+      // 元素被搬进隐藏容器也不受影响，所以原按钮的功能完全不变。
+      el.click();
+    });
+    menu.appendChild(b);
+  });
+  return menu;
+}
+// 危险项沉底并加分隔线（视觉上和日常操作分开）
+function menuItems(rest) {
+  const items = rest.slice();
+  const i = items.findIndex((x) => x.classList.contains("danger"));
+  if (i > 0) { const d = items.splice(i, 1); items.push("---", d[0]); }
+  return items;
+}
+function autoOverflowMenus(root) {
+  const r = root || document.getElementById("main");
+  if (!r) return;
+  // 工具栏：data-more="N" = 前 N 个保持平铺，其余收进「更多」
+  $all('.toolbar[data-more]', r).forEach((tb) => {
+    if (tb.dataset.moreDone) return;
+    const keep = parseInt(tb.dataset.more, 10);
+    if (!isFinite(keep) || keep < 0) return;
+    const kids = Array.from(tb.children).filter((c) => c.tagName === "BUTTON" && !c.classList.contains("spacer"));
+    if (kids.length <= keep + 1) return;
+    const rest = kids.slice(keep);
+    const wrap = document.createElement("div");
+    wrap.className = "tool-more menu-open-btn";
+    const btn = document.createElement("button");
+    btn.className = "btn ghost sm";
+    btn.type = "button";
+    btn.textContent = "⋯";
+    btn.title = "更多操作（" + rest.length + " 项）";
+    btn.setAttribute("aria-haspopup", "true");
+    btn.setAttribute("aria-label", "更多操作");
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (wrap.querySelector(".tool-menu")) { closeAllMenus(); return; }
+      closeAllMenus();
+      wrap.appendChild(buildMenu(menuItems(rest), "tool-menu"));
+    });
+    wrap.appendChild(btn);
+    tb.appendChild(wrap);
+    // 真正**搬走**：只 insertBefore 换个位置的话按钮还在工具栏里露着，
+    // 菜单就成了「多出一份」的重复入口。这里搬进 hidden 容器（保留在 DOM，
+    // 监听器与 id 都不丢），再用菜单里的副本转发点击。
+    const src = document.createElement("div");
+    src.hidden = true;
+    tb.appendChild(src);
+    rest.forEach((el) => src.appendChild(el));
+    tb.dataset.moreDone = "1";
+  });
+  // 行内：td[data-rowmenu="N"] = 前 N 个按钮平铺，其余进「⋯」
+  $all("td[data-rowmenu]", r).forEach((td) => {
+    if (td.dataset.rowmenuDone) return;
+    const keep = parseInt(td.dataset.rowmenu, 10);
+    if (!isFinite(keep) || keep < 0) return;
+    const btns = Array.from(td.children).filter((c) => c.tagName === "BUTTON");
+    if (btns.length <= keep + 1) return;
+    const rest = btns.slice(keep);
+    const wrap = document.createElement("span");
+    wrap.className = "row-menu-wrap menu-open-btn";
+    const btn = document.createElement("button");
+    btn.className = "btn ghost sm";
+    btn.type = "button";
+    btn.textContent = "⋯";
+    btn.title = "更多操作（" + rest.length + " 项）";
+    btn.setAttribute("aria-haspopup", "true");
+    btn.setAttribute("aria-label", "更多操作");
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (wrap.querySelector(".row-menu")) { closeAllMenus(); return; }
+      closeAllMenus();
+      wrap.appendChild(buildMenu(menuItems(rest), "row-menu"));
+    });
+    wrap.appendChild(btn);
+    td.appendChild(wrap);
+    const src = document.createElement("span");
+    src.hidden = true;
+    td.appendChild(src);
+    rest.forEach((el) => src.appendChild(el));
+    td.dataset.rowmenuDone = "1";
+  });
+}
+
 // 单据行内流程徽标：按业务类型拉取流程实例状态，填充 [data-wftag="类型:id"] 占位
 async function fillWfTags(root) {
   const els = $all("[data-wftag]", root || document);
@@ -1257,7 +1929,19 @@ async function fillWfTags(root) {
 function renderShell() {
   const u = session.user;
   const app = document.getElementById("app");
-  const nav = NAV_ITEMS.filter((n) => !n.perm || can(n.perm));  const periodOpts = state.periods.map((p) => `<option value="${p}" ${p === state.current ? "selected" : ""}>${p}</option>`).join("");
+  const periodOpts = state.periods.map((p) => `<option value="${p}" ${p === state.current ? "selected" : ""}>${p}</option>`).join("");
+  // 面包屑：改造前视图名只出现在 <main> 的 <h2> 里，顶栏看不出在哪。
+  // 现在顶栏常驻「账套 / 分组 / 当前页」，截图发人、浏览器标签页都能看出位置。
+  const crumb = (() => {
+    const g = navGroup(state.view);
+    const book = (state.bookOptions && state.bookOptions.company) || "";
+    return `<div class="crumb" id="crumb">
+        ${book ? `<span class="crumb-book" title="${esc(book)}">${esc(book)}</span>` : ""}
+        ${book && g ? `<span class="crumb-sep">/</span>` : ""}
+        ${g ? `<span>${esc(g)}</span><span class="crumb-sep">/</span>` : ""}
+        <span class="crumb-cur">${esc(navLabel(state.view))}</span>
+      </div>`;
+  })();
   app.innerHTML = `
     <div class="app">
       <div class="topbar">
@@ -1265,30 +1949,18 @@ function renderShell() {
         <span class="logo" id="logo-home" title="回到工作台">FinBook</span>
         <span class="who">${esc(u.display_name)}（${esc(u.role_label)}）</span>
         <select id="period-sel" title="会计期间">${periodOpts}</select>
+        ${crumb}
         <span class="grow"></span>
-        <button class="btn ghost sm" id="ui-scale-btn" title="界面字号（点击切换）" aria-label="界面字号">Aa 标准</button>
+        <div class="tb-actions">
+        <button class="btn ghost sm icon-only" id="ui-scale-btn" title="界面字号（点击切换）" aria-label="界面字号">Aa</button>
         <button class="btn ghost sm bell" id="bell" title="通知（待办与动态）" aria-label="通知">🔔<span class="bell-n" id="bell-n" data-zero="1">0</span></button>
-        <button class="btn ghost sm" id="help-btn" title="快捷键与帮助（按 ? 唤起）" aria-label="快捷键与帮助">?</button>
-        <button class="btn ghost sm" id="switch-book">切换账套</button>
-        <button class="btn ghost sm" id="change-pwd">修改口令</button>
-        <button class="btn ghost sm" id="logout">退出登录</button>
+        <button class="btn ghost sm icon-only" id="help-btn" title="快捷键与帮助（按 ? 唤起）" aria-label="快捷键与帮助">?</button>
+        <button class="btn ghost sm icon-only" id="switch-book" title="切换账套" aria-label="切换账套">⇄</button>
+        <button class="btn ghost sm icon-only" id="change-pwd" title="修改口令" aria-label="修改口令">⚿</button>
+        <button class="btn ghost sm icon-only" id="logout" title="退出登录" aria-label="退出登录">⏻</button>
+        </div>
       </div>
-      <div class="sidebar" id="sidebar">
-        ${(() => {
-          const pa = !!session.platformAdmin;
-          const visible = nav.filter((n) => !(n.admin && !session.user.is_admin) && !(n.platform && !pa));
-          let lastGroup = "";
-          let html = "";
-          for (const n of visible) {
-            if (n.group && n.group !== lastGroup) {
-              html += `<div class="group">${esc(n.group)}</div>`;
-              lastGroup = n.group;
-            }
-            html += `<button class="nav-item ${n.id === state.view ? "active" : ""}" data-view="${n.id}"${n.id === state.view ? ' aria-current="page"' : ""}>${n.label}</button>`;
-          }
-          return html;
-        })()}
-      </div>
+      <div class="sidebar" id="sidebar"></div>
       <div class="side-mask" id="side-mask"></div>
       <div class="nt-mask" id="nt-mask"></div>
       <aside class="nt-drawer" id="nt-drawer">
@@ -1304,23 +1976,25 @@ function renderShell() {
   function toggleMenu() { document.body.classList.toggle("menu-open"); }
 
   // 点击 logo 回到仪表盘（不再是无行为的死元素）
-  $("#logo-home").addEventListener("click", () => { state.view = "dashboard"; closeMenu(); renderMain(); });
+  $("#logo-home").addEventListener("click", () => { closeMenu(); goView("dashboard"); });
   $("#menu-btn").addEventListener("click", toggleMenu);
   $("#help-btn").addEventListener("click", openShortcuts);
   $("#side-mask").addEventListener("click", closeMenu);
-  // 事件委托：nav-item 只在 sidebar 容器上绑一次
+  // 事件委托：nav-item 只在 sidebar 容器上绑一次。
+  // 注意 star（收藏）按钮在 nav-item 外面一层，必须先排掉，否则点星星会跳页面。
   $(".sidebar").addEventListener("click", (e) => {
     const btn = e.target.closest(".nav-item");
     if (!btn) return;
-    state.view = btn.dataset.view;
-    $all(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === state.view));
+    if (e.target.closest("[data-fav]")) return;
     closeMenu();
-    renderMain();
+    goView(btn.dataset.view);
   });
   $("#period-sel").addEventListener("change", async (e) => {
     state.current = e.target.value;
     try { await api("/period", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ymm: ymm(e.target.value) }) }); } catch (err) {}
-    renderMain();
+    // 换期间 = 换数据范围，旧视图的筛选/页码不再适用：清掉快照重新起
+    viewState[state.view] = null;
+    goView(state.view, { force: true });
   });
   $("#logout").addEventListener("click", logout);
   $("#switch-book").addEventListener("click", async () => {
@@ -1338,6 +2012,8 @@ function renderShell() {
   $("#nt-allread").addEventListener("click", ntMarkRead);
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") ntCloseDrawer(); });
   ntStart();
+  // 侧栏内容交给 renderSidebar()（搜索/收藏/最近都在那里）
+  renderSidebar();
   shellBuilt = true;
 }
 
@@ -1346,7 +2022,25 @@ function render() {
   if (!session.user) { shellBuilt = false; showLogin(); return; }
   if (!session.user.perms) { shellBuilt = false; showBookPicker(); return; }
   if (!shellBuilt) renderShell();
+  // 首屏：如果 URL 带了 #/view（刷新或同事发来的链接），落在那个页面上。
+  // 放在 renderShell 之后：面包屑要用 shell 里的 DOM 节点。
+  applyHashOnBoot();
+  updateCrumb();
   renderMain();
+}
+
+// 顶栏面包屑：只改文字不重建 DOM（切视图时 shell 不重绘）
+function updateCrumb() {
+  const el = document.getElementById("crumb");
+  if (!el) return;
+  const g = navGroup(state.view);
+  const book = (state.bookOptions && state.bookOptions.company) || "";
+  el.innerHTML = `
+    ${book ? `<span class="crumb-book" title="${esc(book)}">${esc(book)}</span>` : ""}
+    ${book && g ? `<span class="crumb-sep">/</span>` : ""}
+    ${g ? `<span>${esc(g)}</span><span class="crumb-sep">/</span>` : ""}
+    <span class="crumb-cur">${esc(navLabel(state.view))}</span>`;
+  document.title = `${navLabel(state.view)} · FinBook`;
 }
 
 function renderMain() {
@@ -1361,6 +2055,7 @@ function renderMain() {
     old.parentNode.replaceChild(main, old);
   }
   closeAllModals(); // 切视图时关闭遗留弹窗（栈式关闭下不再整体清空）
+  updateCrumb();
   const fn = VIEWS[state.view] || viewDashboard;
   const r = fn(main);
   // 列偏好：同步表结构先挂一次（async 表由 api() 回调补挂）
@@ -1368,6 +2063,10 @@ function renderMain() {
   try { autoColSort(); } catch (e) {}
   try { autoColResize(); } catch (e) {}
   try { autoCellTitles(); } catch (e) {}
+  // 通用后处理：负数红字 + 空态识别 + 溢出收纳（opt-in）
+  try { autoNumbers(); } catch (e) {}
+  try { autoEmptyRows(); } catch (e) {}
+  try { autoOverflowMenus(); } catch (e) {}
   return r;
 }
 
@@ -1400,31 +2099,34 @@ async function viewDashboard(main) {
     [6, 12, 24].map((n) => `<option value="${n}" ${Number(state.wbPeriods || 12) === n ? "selected" : ""}>${n} 期</option>`).join("")
   }</select></label>`;
   const group = (arr) => { const m = {}; (arr || []).forEach((x) => { (m[x.domain] = m[x.domain] || []).push(x); }); return m; };
-  let wbHtml = "";
+  let wbHtml = { todo: "", cards: "", trend: "", nSel: "" };
   if (wb) {
     const cg = group(wb.cards);
     const tg = group(wb.trends);
     const cardsHtml = Object.keys(cg).map((dom) => `
-      <div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)}</h4>
+      <div class="wb-sec"><h4 class="sec-title">${esc(dom)}</h4>
         <div class="cards">${cg[dom].map((c) => `<div class="card"><div class="k">${esc(c.label)}</div><div class="v">${esc(c.value)}${c.unit === "元" || c.unit === "件" ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(c.unit)}</span>` : ""}</div></div>`).join("")}</div>
       </div>`).join("");
+    // 待办提到工作台最上面（原来排在两排卡片之后，要往下滚才看到）
     const todos = wb.todos || [];
     const todoHtml = todos.length ? `
-      <div class="wb-sec"><h4 style="margin:14px 0 6px">我的待办</h4>
-        <div style="display:flex;flex-wrap:wrap;gap:8px">${todos.map((t) => `
+      <div class="wb-sec"><h4 class="sec-title">我的待办</h4>
+        <div class="u-row wrap">${todos.map((t) => `
           <button class="btn ${t.count > 0 ? "primary" : "ghost"}" data-wb-go="${esc(t.view)}" ${t.count > 0 ? "" : "disabled"} style="display:inline-flex;gap:8px;align-items:center">${esc(t.label)}<b>${t.count}</b></button>`).join("")}
         </div>
       </div>` : "";
     const trendHtml = Object.keys(tg).map((dom) => `
-      <div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)}</h4>
+      <div class="wb-sec"><h4 class="sec-title">${esc(dom)}</h4>
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px">
           ${tg[dom].map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
-            <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
+            <div class="u-row"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
             ${lineChartSvg(t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 190)}
           </div>`).join("")}
         </div>
       </div>`).join("");
-    wbHtml = `<div class="toolbar" style="border:0;padding:6px 0">${nSel}</div>${cardsHtml}${todoHtml}${trendHtml}`;
+    // 分三块返回：待办（首屏）→ 账套参考值 → 业务卡与趋势。
+    // 原来是一坨 wbHtml 顺序拼接，待办被两排参考卡片压在下面。
+    wbHtml = { todo: todoHtml, cards: cardsHtml, trend: trendHtml, nSel };
   }
   const firstRun = Number(d.vouchers) === 0 ? `
     <div class="panel first-run">
@@ -1444,20 +2146,24 @@ async function viewDashboard(main) {
     <h2>我的工作台</h2>
     ${adminBanner}
     ${firstRun}
-    <div class="cards">
-      <div class="card"><div class="k">公司名称</div><div class="v" style="font-size:16px">${esc(d.company || "—")}</div></div>
-      <div class="card"><div class="k">当前会计期间</div><div class="v">${esc(d.current_period)}</div></div>
-      <div class="card"><div class="k">已结账至</div><div class="v">${esc(d.closed_upto || "未结账")}</div></div>
-    </div>
-    <div class="cards" style="margin-top:14px">
-      <div class="card"><div class="k">凭证数</div><div class="v">${esc(d.vouchers)}</div></div>
-      <div class="card"><div class="k">分录数</div><div class="v">${esc(d.entries)}</div></div>
-      <div class="card"><div class="k">科目数</div><div class="v">${esc(d.accounts)}</div></div>
-    </div>
-    ${wbHtml}`;
+    ${wbHtml.todo}
+    <details class="wb-ref" ${firstRun ? "" : "open"}>
+      <summary class="u-dim u-sm">账套概况</summary>
+      <div class="cards u-mt10">
+        <div class="card"><div class="k">当前会计期间</div><div class="v">${esc(d.current_period)}</div></div>
+        <div class="card"><div class="k">已结账至</div><div class="v">${esc(d.closed_upto || "未结账")}</div></div>
+        <div class="card"><div class="k">公司名称</div><div class="v" style="font-size:16px">${esc(d.company || "—")}</div></div>
+        <div class="card"><div class="k">凭证数</div><div class="v">${esc(d.vouchers)}</div></div>
+        <div class="card"><div class="k">分录数</div><div class="v">${esc(d.entries)}</div></div>
+        <div class="card"><div class="k">科目数</div><div class="v">${esc(d.accounts)}</div></div>
+      </div>
+    </details>
+    <div class="toolbar" style="border:0;padding:6px 0">${wbHtml.nSel}</div>
+    ${wbHtml.cards}
+    ${wbHtml.trend}`;
   if ($("#wb-n")) $("#wb-n").onchange = (e) => { state.wbPeriods = Number(e.target.value); viewDashboard(main); };
-  $all("[data-wb-go]").forEach((b) => b.onclick = () => { state.view = b.dataset.wbGo; renderMain(); });
-  $all("[data-fr-go]").forEach((b) => b.onclick = () => { state.view = b.dataset.frGo; renderMain(); });
+  $all("[data-wb-go]").forEach((b) => b.onclick = () => goView(b.dataset.wbGo));
+  $all("[data-fr-go]").forEach((b) => b.onclick = () => goView(b.dataset.frGo));
 }
 
 // ===========================================================================
@@ -1853,7 +2559,7 @@ async function loadBizOverview(main) {
 
   box.innerHTML = panels + settlePanel
     || `<div class="panel"><div class="muted">本期暂无业务数据。业务模块录单后这里会出现订单、库存、生产与往来概览。</div></div>`;
-  $all("[data-biz-go]", main).forEach((b) => b.onclick = () => { state.view = b.dataset.bizGo; renderMain(); });
+  $all("[data-biz-go]", main).forEach((b) => b.onclick = () => goView(b.dataset.bizGo));
 }
 
 // ===========================================================================
@@ -1924,10 +2630,18 @@ document.addEventListener("change", (e) => {
   } catch (err) {}
 });
 
+// 工具栏 data-more="3"：前 3 个（新增凭证 / 查询 / 批量记账）保持平铺。
+// 这三个是两岗公司的**每日**动作，「批量记账」尤其不该藏进菜单里多点一次。
+// 收进「更多」的是低频项：重排断号（标了 danger，会沉底并加分隔线）、套打、导出。
 async function viewVouchers(main) {
+  // 分页状态放在这里而不是全局：viewVouchers 每次都重建 #main，
+  // 页码得自己记住（切走再切回由 saveViewState/restoreViewState 负责筛选框，
+  // 页码属于「同一视图内部」的状态，跟着视图对象走最省事）。
+  if (!viewVouchers.page) viewVouchers.page = 1;
+  if (!viewVouchers.size) viewVouchers.size = 50;
   main.innerHTML = `
     <h2>记账凭证</h2>
-    <div class="toolbar">
+    <div class="toolbar" data-more="3">
       ${can("voucher_new") ? `<button class="btn sm" id="new-v">新增凭证</button>` : ""}
       <input id="v-q" placeholder="摘要 / 凭证号 / 科目" style="width:200px" />
       <select id="v-status">
@@ -1937,20 +2651,26 @@ async function viewVouchers(main) {
         <option value="posted">已记账</option><option value="void">已作废</option>
       </select>
       <button class="btn ghost sm" id="v-refresh">查询</button>
-      ${can("voucher_edit") ? `<button class="btn ghost sm" id="v-renumber">重排断号</button>` : ""}
       ${can("voucher_post") ? `<button class="btn ghost sm" id="v-batch">批量记账</button>` : ""}
+      ${can("voucher_edit") ? `<button class="btn ghost sm danger" id="v-renumber" title="把本期间已记账凭证的断号重排为连续">重排断号</button>` : ""}
       ${can("report") ? `<button class="btn ghost sm" id="v-printform">凭证套打</button>` : ""}
       ${can("export") ? `<button class="btn ghost sm" id="v-export">导出 CSV</button>` : ""}
       <span class="spacer"></span>
       <span class="muted">期间：${esc(state.current || "")}</span>
     </div>
-    <div class="panel"><table class="grid" id="v-table"><thead><tr>
-      ${can("voucher_post") ? `<th style="width:26px"><input type="checkbox" id="v-all" title="全选未记账" /></th>` : ""}
+    <div class="panel"><table class="grid" id="v-table"
+      data-empty-title="本期间没有凭证"
+      data-empty-hint="点「新增凭证」录第一张；已有旧账套数据可到「数据导入」迁移。"
+      data-empty-action="imports" data-empty-action-label="去导入"><thead><tr>
+      ${can("voucher_post") ? `<th style="width:26px"><input type="checkbox" id="v-all" title="全选本页未记账" /></th>` : ""}
       <th>期间</th><th>日期</th><th>凭证号</th><th>摘要</th><th class="num">借方</th><th class="num">贷方</th><th>状态</th><th>制单</th><th></th>
     </tr></thead><tbody><tr><td colspan="${can("voucher_post") ? 10 : 9}" class="muted">加载中…</td></tr></tbody></table></div>`;
   if (can("voucher_new")) $("#new-v").addEventListener("click", () => openVoucherEditor(null));
-  $("#v-refresh").addEventListener("click", () => loadVouchers());
-  $("#v-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadVouchers(); });
+  // 改筛选条件一律回到第 1 页：留着第 7 页去搜一个只有 2 条结果的关键词，
+  // 看到的就是「空列表 + 第 7/7 页」这种没法解释的界面
+  $("#v-refresh").addEventListener("click", () => { viewVouchers.page = 1; loadVouchers(); });
+  $("#v-q").addEventListener("keydown", (e) => { if (e.key === "Enter") { viewVouchers.page = 1; loadVouchers(); } });
+  $("#v-status").addEventListener("change", () => { viewVouchers.page = 1; loadVouchers(); });
   if ($("#v-all")) $("#v-all").addEventListener("change", (e) => { $all(".v-sel").forEach((c) => c.checked = e.target.checked); });
   if ($("#v-batch")) $("#v-batch").addEventListener("click", batchPost);
   if ($("#v-printform")) $("#v-printform").addEventListener("click", () => {
@@ -1971,25 +2691,55 @@ async function viewVouchers(main) {
   loadVouchers();
 }
 
+// 凭证列表：分页 + 全量合计
+//
+// 改造前走 `/vouchers`，那个接口默认 limit=200 且升序排列 —— 一个期间超过
+// 200 张后，后面的凭证在界面上**完全看不到且没有任何提示**。对月均两三百张的
+// 单子这是常态，不是边角情况。现在走 `/vouchers/page`：能翻到最后一页，
+// 并且给出全期借贷合计（会计核对时看的就是这个数，不是本页的数）。
 async function loadVouchers() {
-  const tb = $("#v-table tbody");
+  const table = $("#v-table");
+  if (!table) return;
+  const tb = table.tBodies[0];
   const q = $("#v-q").value.trim();
   const st = $("#v-status").value;
-  let url = `/vouchers?period=${encodeURIComponent(state.current || "")}`;
-  if (q) url += `&q=${encodeURIComponent(q)}`;
-  if (st) url += `&status=${st}`;
-  let rows;
-  try { rows = await api(url); } catch (e) { tb.innerHTML = `<tr><td colspan="${can("voucher_post") ? 10 : 9}" style="color:var(--err)">${esc(e.message)} <button class="btn ghost sm" id="v-retry">重试</button></td></tr>`; const rb = $("#v-retry", tb); if (rb) rb.addEventListener("click", loadVouchers); return; }
-  if (!rows.length) {
-    tb.innerHTML = `<tr><td colspan="9"><div class="empty-state">
-      <div class="es-title">还没有凭证</div>
-      <div class="es-hint">点击「新增凭证」录入第一张；已有旧账套数据可到「数据导入」迁移凭证。</div>
-      <div class="es-actions"><button class="btn primary sm" id="v-empty-new">新增凭证</button><button class="btn ghost sm" id="v-empty-import">去导入</button></div>
+  const size = viewVouchers.size || 50;
+  const qs = new URLSearchParams({
+    period: (state.current || "").replace("-", ""),
+    page: String(viewVouchers.page || 1),
+    page_size: String(size),
+  });
+  if (q) qs.set("q", q);
+  if (st) qs.set("status", st);
+  const colspan = can("voucher_post") ? 10 : 9;
+  let data;
+  try {
+    data = await api(`/vouchers/page?${qs.toString()}`);
+  } catch (e) {
+    // 失败态保留重试入口：整行被换成纯文字空态的话重试按钮就没了
+    tb.innerHTML = `<tr><td colspan="${colspan}"><div class="empty-state is-error">
+      <div class="es-icon">⚠</div>
+      <div class="es-title">凭证加载失败</div>
+      <div class="es-detail">${esc(e.message)}</div>
+      <div class="es-actions"><button class="btn ghost sm" data-empty-retry>重试</button></div>
     </div></td></tr>`;
-    const b1 = $("#v-empty-new");
-    if (b1) b1.onclick = () => openVoucherEditor(null);
-    const b2 = $("#v-empty-import");
-    if (b2) b2.onclick = () => { state.view = "imports"; renderMain(); };
+    const ft = table.tFoot;
+    if (ft) ft.remove();
+    renderVoucherPager(table, { total: 0, page: 1, page_size: size, debit_total: "0", credit_total: "0" }, 1);
+    return;
+  }
+  const rows = data.items || [];
+  const total = data.total || 0;
+  const pages = Math.max(1, Math.ceil(total / size));
+  // 请求的是第 7 页但只有 3 页（刚删完 / 换了期间）→ 退到最后一页并重取
+  if (viewVouchers.page > pages && total > 0) { viewVouchers.page = pages; return loadVouchers(); }
+  if (viewVouchers.page > 1 && total === 0) { viewVouchers.page = 1; return loadVouchers(); }
+
+  if (!rows.length) {
+    // 交回通用空态组件处理（它会读 table 上的 data-empty-* 属性）
+    tb.innerHTML = "";
+    renderVoucherPager(table, data, pages);
+    autoEmptyRows();
     return;
   }
   const stMap = { draft: ["未记账", "warn"], audited: ["已审核", "warn"], posted: ["已记账", "ok"], void: ["已作废", "err"] };
@@ -2005,6 +2755,77 @@ async function loadVouchers() {
     </tr>`;
   }).join("");
   $all("[data-edit]").forEach((b) => b.addEventListener("click", () => openVoucherEditor(parseInt(b.dataset.edit, 10))));
+  renderVoucherPager(table, data, pages);
+  try { autoNumbers(); } catch (e) {}
+}
+
+// 合计行 + 分页器
+//
+// 合计放 **tfoot**（sticky 底部，滚动长表时一直看得见），而且是**全期合计**
+// 而不是本页合计 —— 会计核对的是「本期间借方 = 贷方」，按页汇总会让人以为
+// 账不平（翻到第 3 页数字突然变了）。文案里写明「全期」，避免误解。
+function renderVoucherPager(table, data, pages) {
+  const total = data.total || 0;
+  const size = data.page_size || viewVouchers.size || 50;
+  const page = viewVouchers.page || 1;
+  const colspan = can("voucher_post") ? 10 : 9;
+  let tf = table.tFoot;
+  if (!tf) {
+    tf = document.createElement("tfoot");
+    table.appendChild(tf);
+  }
+  if (!total) { tf.innerHTML = ""; return; }
+  const d = data.debit_total || "0";
+  const c = data.credit_total || "0";
+  const balanced = fmtMoneyNum(d) === fmtMoneyNum(c);
+  tf.innerHTML = `<tr class="totals">
+      <td colspan="${can("voucher_post") ? 5 : 4}"><span class="tot-label">全期合计（${total} 张，不随翻页变化）</span></td>
+      <td class="num strong">${esc(d)}</td>
+      <td class="num strong">${esc(c)}</td>
+      <td colspan="3">${balanced
+        ? `<span class="tag ok">借贷平衡</span>`
+        : `<span class="tag err" title="全期借方合计与贷方合计不等，请检查">借贷不平</span>`}</td>
+    </tr>`;
+  // 分页条挂在表格外面（.panel 内），不进 tfoot
+  let bar = $("#v-pager");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "v-pager";
+    bar.className = "pagination";
+    table.parentNode.appendChild(bar);
+  }
+  const from = total === 0 ? 0 : (page - 1) * size + 1;
+  const to = Math.min(total, page * size);
+  const go = (p) => { viewVouchers.page = Math.min(pages, Math.max(1, p)); loadVouchers(); window.scrollTo(0, 0); };
+  const nums = [];
+  const push = (p) => nums.push(`<button class="pg-btn${p === page ? " active" : ""}" data-pg="${p}">${p}</button>`);
+  push(1);
+  if (pages > 6) {
+    const lo = Math.max(2, page - 1), hi = Math.min(pages - 1, page + 1);
+    if (lo > 2) nums.push(`<span class="pg-info" style="margin:0">…</span>`);
+    for (let p = lo; p <= hi; p++) push(p);
+    if (hi < pages - 1) nums.push(`<span class="pg-info" style="margin:0">…</span>`);
+    push(pages);
+  } else {
+    for (let p = 2; p <= pages; p++) push(p);
+  }
+  bar.innerHTML = `<span class="pg-info">第 ${from}–${to} 张 / 共 ${total} 张 · 第 ${page} / ${pages} 页</span>
+    <button class="pg-btn" data-pg="prev" ${page <= 1 ? "disabled" : ""} title="上一页">‹</button>
+    ${nums.join("")}
+    <button class="pg-btn" data-pg="next" ${page >= pages ? "disabled" : ""} title="下一页">›</button>
+    <span class="pg-size">每页
+      <select id="v-size">${[20, 50, 100, 200].map((n) => `<option value="${n}" ${n === size ? "selected" : ""}>${n}</option>`).join("")}</select>
+    </span>`;
+  $all("[data-pg]", bar).forEach((b) => b.addEventListener("click", () => {
+    const v = b.dataset.pg;
+    go(v === "prev" ? page - 1 : v === "next" ? page + 1 : parseInt(v, 10));
+  }));
+  const sz = $("#v-size", bar);
+  if (sz) sz.addEventListener("change", () => { viewVouchers.size = parseInt(sz.value, 10) || 50; viewVouchers.page = 1; loadVouchers(); });
+}
+// 金额字符串 → 数值（只为比较借贷是否相等，不参与展示）
+function fmtMoneyNum(s) {
+  return parseFloat(String(s == null ? "" : s).replace(/[^0-9.\-]/g, "")) || 0;
 }
 
 async function batchPost() {
@@ -2505,8 +3326,7 @@ function openTaxOptions(o) {
       });
       toast("已保存", "ok");
       closeModal();
-      state.view = "tax-decl";
-      renderMain();
+      goView("tax-decl", { force: true });
     } catch (e) { toast(e.message, "err"); }
   };
 }
@@ -5742,7 +6562,7 @@ async function viewSettle(main) {
   };
   loadArap();
   if ($("#arap-reload", main)) $("#arap-reload", main).onclick = loadArap;
-  if ($("#arap-goimport", main)) $("#arap-goimport", main).onclick = () => { state.view = "imports"; renderMain(); };
+  if ($("#arap-goimport", main)) $("#arap-goimport", main).onclick = () => goView("imports");
 
   // 催款单 / 对账函：按客商快照未核销 + 期初；状态流转 + 打印预览
   const loadDunnings = async () => {

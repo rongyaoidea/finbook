@@ -551,6 +551,8 @@ impl ScmDeepView {
         let p = self.period(ctx);
         match findb::procurement::po_receipt_add(ctx.db(), &findb::procurement::PoReceipt {
             id: 0, po_id, period: p, date: chrono::Local::now().date_naive(), qty, memo: self.doc_memo.clone(),
+            // TUI 只有「一张单一个数量」这一个输入位，行级收货留给 Web 端
+            item_code: String::new(), warehouse: String::new(),
         }) {
             Ok(_) => { ctx.info("已登记到货"); self.doc_amount.clear(); self.doc_memo.clear(); self.dirty = true; }
             Err(e) => self.err = e.to_string(),

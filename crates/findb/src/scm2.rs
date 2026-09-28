@@ -101,29 +101,10 @@ pub fn po_estimate_add(
     if !est_amount.is_positive() {
         return Err(fincore::FinError::msg("暂估金额必须为正数").into());
     }
-    let line = po
-        .lines
-        .iter()
-        .find(|l| l.item_code == item)
-        .ok_or_else(|| fincore::FinError::msg(format!("采购订单里没有物料 {item}")))?;
-    // 金额/数量列一律 TEXT 存储：不在 SQL 里 SUM（SQLite 对 TEXT 的 SUM 返回
-    // Real，精度和类型都不可靠），取回后在 Money 里累加。
-    let mut st = db.conn().prepare(
-        "SELECT qty FROM po_receipt WHERE po_id=?1 ORDER BY id",
-    )?;
-    let recv_qty = st
-        .query_map([po_id], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .fold(fincore::Money::ZERO, |acc, q| acc + fincore::Money::parse_or_zero(q));
-    // `po_receipt` 只记数量、不分物料（整单收货），所以到货金额按**订购数量占比**
-    // 折算到本物料：整单到货金额 × (本行订购量 ÷ 全单订购量)。
-    let gross = crate::scm::po_received_gross(&po, recv_qty);
-    let ordered_all: fincore::Money = po.lines.iter().map(|l| l.qty_ordered).sum();
-    let cap = gross
-        .checked_div(ordered_all)
-        .map(|u| u * line.qty_ordered)
-        .unwrap_or(fincore::Money::ZERO);
+    // 额度统一走 `estimate_cap_for_line` —— 守卫与界面查询共用同一份算法。
+    // 两处各写一遍必然分叉，而分叉的后果是「界面显示还能登 800，一点就被拒」。
+    let cap = estimate_cap_for_line(db, &po, item)?;
+
     let mut st2 = db.conn().prepare(
         "SELECT est_amount FROM po_estimate WHERE po_id=?1 AND item=?2 AND settled=0 ORDER BY id",
     )?;
@@ -158,6 +139,141 @@ pub fn po_estimate_add(
     let est_id = tx.last_insert_rowid();
     tx.commit()?;
     Ok((est_id, vid))
+}
+
+/// 某一行的**可暂估额度**（含税），即「该物料累计到货金额」。
+///
+/// 口径：
+/// - 有该物料的**分行**收货记录（`po_receipt.item_code = 物料`）时，用
+///   **该行含税单价 × 该行实收量** —— 精确。
+/// - 只有整单收货记录（`item_code = ''`，旧数据或调用方未指定行）时，退回
+///   `po_received_gross` × 本行订购占比的折算。
+///
+/// 折算为什么不能作主口径：两张行各 100 件、含税单价 11，实收 100 件（全是第一行），
+/// 折算会摊成 550，而实际是 1100 —— 差一半。而这个额度同时是暂估封顶的依据，
+/// 折算错就等于守卫拿错额度去拦正确的操作。
+///
+/// 守卫与界面查询**共用这一个函数**：两处各写一遍必然分叉，分叉的后果是
+/// 「界面显示还能登 800，用户一点就被拒」。
+pub fn estimate_cap_for_line(
+    db: &Db,
+    po: &crate::scm::PurchaseOrder,
+    item: &str,
+) -> DbResult<fincore::Money> {
+    let line = po
+        .lines
+        .iter()
+        .find(|l| l.item_code == item)
+        .ok_or_else(|| fincore::FinError::msg(format!("采购订单里没有物料 {item}")))?;
+    // 金额/数量列一律 TEXT 存储：不在 SQL 里 SUM（SQLite 对 TEXT 的 SUM 返回
+    // Real，精度与类型都不可靠），取回后在 Money 里累加。
+    //
+    // 实收量 = 分行收货（本物料）+ 整单收货（item_code=''，旧数据 / 未指定行）。
+    // 两者都算，否则旧账套升级后额度会突然变 0，把合法的暂估全挡掉。
+    let rows: Vec<String> = {
+        let conn = db.conn();
+        let mut st = conn.prepare(
+            "SELECT qty FROM po_receipt
+             WHERE po_id=?1 AND (item_code=?2 OR item_code='') ORDER BY id",
+        )?;
+        let v = st
+            .query_map(rusqlite::params![po.id, item], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        v
+    };
+    let recv_qty = rows
+        .iter()
+        .fold(fincore::Money::ZERO, |acc, q| acc + fincore::Money::parse_or_zero(q));
+    let has_line_receipt: bool = db.conn().query_row(
+        "SELECT COUNT(*) FROM po_receipt WHERE po_id=?1 AND item_code=?2",
+        rusqlite::params![po.id, item],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if has_line_receipt {
+        Ok(line
+            .amount
+            .checked_add(line.tax_amount)
+            .and_then(|g| g.checked_div(line.qty_ordered))
+            .map(|u| u * recv_qty)
+            .unwrap_or(fincore::Money::ZERO))
+    } else {
+        let gross = crate::scm::po_received_gross(po, recv_qty);
+        let ordered_all: fincore::Money = po.lines.iter().map(|l| l.qty_ordered).sum();
+        Ok(gross
+            .checked_div(ordered_all)
+            .map(|u| u * line.qty_ordered)
+            .unwrap_or(fincore::Money::ZERO))
+    }
+}
+
+/// 一行物料的暂估状态：可暂估额度 / 已暂估 / 未暂估 / 收货与欠收。
+///
+/// 界面用它替代「让用户手填金额再试错」：三笔数摆在面前，用户自己判断。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EstimateLine {
+    pub item_code: String,
+    pub item_name: String,
+    /// 累计到货金额（含税）= 可暂估额度上限
+    pub cap: fincore::Money,
+    /// 未结算暂估累计
+    pub estimated: fincore::Money,
+    /// 还能登的（cap − estimated，负数归零）
+    pub remaining: fincore::Money,
+    pub qty_ordered: fincore::Money,
+    /// 累计收货量（分行 + 整单折算口径，与 cap 同源）
+    pub qty_received: fincore::Money,
+    /// 欠收量 = 订购 − 收货
+    pub qty_outstanding: fincore::Money,
+}
+
+/// 逐行列出该 PO 的暂估状态（收货 → 暂估的联动界面靠它）
+pub fn estimate_status_by_line(db: &Db, po_id: i64) -> DbResult<Vec<EstimateLine>> {
+    let po = crate::scm::po_get(db, po_id)?
+        .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
+    let mut out = Vec::new();
+    for line in &po.lines {
+        let cap = estimate_cap_for_line(db, &po, &line.item_code)?;
+        let rows: Vec<String> = {
+            let conn = db.conn();
+            let mut st = conn.prepare(
+                "SELECT est_amount FROM po_estimate
+                 WHERE po_id=?1 AND item=?2 AND settled=0 ORDER BY id",
+            )?;
+            let v = st
+                .query_map(rusqlite::params![po_id, line.item_code], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            v
+        };
+        let estimated = rows
+            .iter()
+            .fold(fincore::Money::ZERO, |acc, a| acc + fincore::Money::parse_or_zero(a));
+        let recv_rows: Vec<String> = {
+            let conn = db.conn();
+            let mut st = conn.prepare(
+                "SELECT qty FROM po_receipt
+                 WHERE po_id=?1 AND (item_code=?2 OR item_code='') ORDER BY id",
+            )?;
+            let v = st
+                .query_map(rusqlite::params![po_id, line.item_code], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            v
+        };
+        let qty_received = recv_rows
+            .iter()
+            .fold(fincore::Money::ZERO, |acc, q| acc + fincore::Money::parse_or_zero(q));
+        let remaining = cap - estimated;
+        out.push(EstimateLine {
+            item_code: line.item_code.clone(),
+            item_name: line.item_name.clone(),
+            cap,
+            estimated,
+            remaining: if remaining.is_positive() { remaining } else { fincore::Money::ZERO },
+            qty_ordered: line.qty_ordered,
+            qty_received,
+            qty_outstanding: line.qty_ordered - qty_received,
+        });
+    }
+    Ok(out)
 }
 
 /// 暂估冲回：发票到票后标记 settled，并同事务生成反向冲回凭证（借 应付 / 贷 存货）。
@@ -533,6 +649,110 @@ mod tests {
             .unwrap();
         po_estimate_add(&db, po_id, p, "140301", m("1000"), "u")
             .expect("冲回后额度应释放，能重新暂估全额");
+    }
+
+    /// 收货**分行**时，额度按**该行含税单价 × 该行实收量**精确算。
+    ///
+    /// 回归背景：收货早先只有「一个总数量」，多行订单的部分收货说不清这批货是
+    /// 哪些行的，金额只能按订购量占比折算 —— 那是错的：
+    /// 两张行各 100 件、含税单价 11，实际收 100 件（全是第一行），
+    /// 折算摊成 550，而实际应付 1100 —— 差一半。
+    /// 而暂估封顶的额度取自这个折算，于是折算错 = 守卫拿错额度去拦正确操作。
+    #[test]
+    fn line_level_receipt_gives_exact_cap() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = crate::scm::PurchaseOrder::new(
+            p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "S01", "供应商A", "u");
+        po.no = crate::scm::po_next_no(&db, p).unwrap();
+        // 两行，各 100 件、单价 10、税率 10% → 含税单价 11
+        for (code, name) in [("140301", "原料A"), ("140302", "原料B")] {
+            po.lines.push(crate::scm::PoLine {
+                id: 0, po_id: 0, item_code: code.into(), item_name: name.into(),
+                qty_ordered: m("100"), qty_received: m("0"), unit_price: m("10"),
+                tax_rate: m("0.1"), amount: m("1000"), tax_amount: m("100"), memo: String::new(),
+            });
+        }
+        let po_id = crate::scm::po_save(&db, &mut po).unwrap();
+
+        // 只收第一行 100 件（走真实收货路径，不是直接 INSERT 汇总表）
+        crate::procurement::po_receipt_with_stock(
+            &db,
+            &crate::procurement::PoReceipt {
+                id: 0, po_id, period: p, date: NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(),
+                qty: m("100"), memo: "只到 A".into(),
+                item_code: "140301".into(), warehouse: "01".into(),
+            },
+            "01",
+        ).unwrap();
+
+        // 第一行额度 = 11 × 100 = 1100（精确），不是折算的 550
+        let cap_a = estimate_cap_for_line(&db, &po, "140301").unwrap();
+        assert_eq!(cap_a, m("1100"), "第一行额度应按该行含税单价精确算：{cap_a}");
+        // 第二行没收货 → 额度 0（不能被第一行的收货撑起来）
+        let cap_b = estimate_cap_for_line(&db, &po, "140302").unwrap();
+        assert_eq!(cap_b, m("0"), "没收货的行额度必须是 0");
+
+        // 暂估 1100 可以，超出一厘就被拒
+        po_estimate_add(&db, po_id, p, "140301", m("1100"), "u").unwrap();
+        let e = po_estimate_add(&db, po_id, p, "140301", m("0.01"), "u").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("超出可暂估额度"),
+            "超出一厘就该被拒（金额是精确十进制，不是浮点近似）：{e:?}"
+        );
+        // 第二行还没收货，登不了暂估
+        let e2 = po_estimate_add(&db, po_id, p, "140302", m("1"), "u").unwrap_err();
+        assert!(format!("{e2:?}").contains("超出可暂估额度"), "{e2:?}");
+    }
+
+    /// 超收要按实收如实入库，暂估额度随之放大（走真实收货路径）。
+    ///
+    /// 早先的超收用例是**直接 INSERT po_receipt**，只断言 `po_list` 的汇总字段 ——
+    /// 存货流水、凭证一个都没产生，所以「超收时存货与应付是否自洽」一直没被验证。
+    #[test]
+    fn over_receipt_flows_through_stock_and_estimate_cap() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = crate::scm::PurchaseOrder::new(
+            p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "S01", "供应商A", "u");
+        po.no = crate::scm::po_next_no(&db, p).unwrap();
+        po.lines.push(crate::scm::PoLine {
+            id: 0, po_id: 0, item_code: "140301".into(), item_name: "原料".into(),
+            qty_ordered: m("100"), qty_received: m("0"), unit_price: m("10"),
+            tax_rate: m("0"), amount: m("1000"), tax_amount: m("0"), memo: String::new(),
+        });
+        let po_id = crate::scm::po_save(&db, &mut po).unwrap();
+
+        // 超收 30%：收 130 而订 100
+        crate::procurement::po_receipt_with_stock(
+            &db,
+            &crate::procurement::PoReceipt {
+                id: 0, po_id, period: p, date: NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(),
+                qty: m("130"), memo: "超收".into(),
+                item_code: "140301".into(), warehouse: "01".into(),
+            },
+            "01",
+        ).unwrap();
+
+        // ① 存货流水按实收 130 入库，不是按订购 100 截断
+        let stock_qty: String = db
+            .conn()
+            .query_row(
+                "SELECT qty FROM stock_move WHERE kind='purchase' AND item='140301'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stock_qty.starts_with("130"),
+            "存货要按实收 130 入库，超收不能被悄悄截成 100：{stock_qty}"
+        );
+        // ② 暂估额度随之放大到 1300（守卫不该把真实超收挡掉）
+        let po2 = crate::scm::po_get(&db, po_id).unwrap().unwrap();
+        assert_eq!(estimate_cap_for_line(&db, &po2, "140301").unwrap(), m("1300"));
+        po_estimate_add(&db, po_id, p, "140301", m("1300"), "u")
+            .expect("超收后的额度应能全额暂估");
     }
 
     #[test]

@@ -2079,11 +2079,15 @@ async function openVoucherEditor(id, seedEntries) {
   const am = v.amend || null;
   const amendBanner = am && (am.amends_id || am.amended_by)
     ? `<div class="muted" style="margin:0 0 12px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;line-height:1.7">
-        ${am.amends_id ? `本凭证是 <b>更正凭证</b>，更正自 <b>${esc(am.amends_no || am.amends_id)}</b>。<br/>` : ""}
-        ${am.amended_by ? `本凭证已被 <b>${esc(am.amended_by_no || am.amended_by)}</b> 更正（作废，不参与账簿汇总）。<br/>` : ""}
+        ${am.amends_id ? `本凭证是 <b>更正链</b>产生的凭证，更正自 <b>${esc(am.amends_no || am.amends_id)}</b>。<br/>` : ""}
+        ${am.amended_by ? `本凭证已被 <b>${esc(am.amended_by_no || am.amended_by)}</b> 红冲，由 <b>${esc(am.amended_by_new_no || am.amended_by_new)}</b> 更正重做。<br/>` : ""}
         ${am.reason ? `更正原因：${esc(am.reason)}` : ""}
        </div>`
     : "";
+  // 已记账的更正链凭证（原 + 红冲 + 更正）必须成套存在：单独反记账或再红冲一次，
+  // 账上就会少一张或多一张，净额直接错。所以这几个按钮一律不给 ——
+  // 亮着却用不了是最容易被当成 bug 的一种 UX，守卫必须与按钮显隐同步。
+  const inAmendSet = status === "posted" && !!(am && (am.amended_by || am.amends_id));
   const mask = modal(`
     <h3>记账凭证 ${esc(voucher_no)} <span class="muted" style="font-size:13px">${({ draft: "未记账", audited: "已审核", posted: "已记账", void: "已作废" })[status] || esc(status)}${v.cashier ? `　出纳:${esc(v.cashier)}` : ""}</span></h3>
     ${amendBanner}
@@ -2109,8 +2113,8 @@ async function openVoucherEditor(id, seedEntries) {
       ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}
       ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") && v.cashier ? `<button class="btn ghost" id="v-unsign">取消签字</button>` : ""}
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
-      ${can("voucher_unpost") && status === "posted" ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
-      ${can("voucher_new") && id > 0 && status !== "void" ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
+      ${can("voucher_unpost") && status === "posted" && !inAmendSet ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
+      ${can("voucher_new") && id > 0 && status !== "void" && !inAmendSet ? `<button class="btn ghost" id="v-reverse">红字冲销</button>` : ""}
       ${can("voucher_delete") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-void">作废</button>` : ""}
       ${can("voucher_delete") && id > 0 && status === "void" && !(am && am.amended_by) ? `<button class="btn ghost" id="v-void-back">恢复作废</button>` : ""}
       ${can("voucher_delete") && id > 0 && status === "posted" && !(am && am.amended_by) ? `<button class="btn ghost" id="v-amend">更正</button>` : ""}
@@ -2268,8 +2272,8 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-amend", mask)) $("#v-amend", mask).onclick = async () => {
     const reason = await reasonDialog(
       "更正凭证",
-      "将作废本凭证，并生成一张内容相同、带更正关系的新凭证（原期间、原日期）。请写明更正原因 —— 原因会同时记入凭证摘要、操作日志与操作人日志，事后审计只查得到这些。\n\n" +
-      "只调整金额或时点、希望总账里留下一笔冲销记录的，请改用「红字冲销」：更正链会把原凭证作废，总账上看不出曾经记错过。",
+      "将按准则做「红字冲销 + 蓝字重做」：本凭证保持已记账，另生成一张红冲凭证抵消它、再生成一张更正凭证（原期间、原日期）。请写明更正原因 —— 原因会同时记入两张凭证的摘要与操作日志，事后审计只查得到这些。\n\n" +
+      "三张凭证会成套生效，之后不能单独反记账或作废其中一张（否则净额会错）。",
       "例：金额录错，应为 1200"
     );
     if (!reason) return;
@@ -6669,15 +6673,59 @@ async function viewPoEstimate(main) {
       <button class="btn primary" id="pe-load">查询暂估</button>
       <span class="grow"></span>
     </div>
+    <div id="pe-status" class="muted">填写订单ID后查询</div>
     <div class="toolbar">
-      <label>存货(科目) <input id="pe-item" style="width:140px" placeholder="如 140301" /></label>
-      <label>暂估金额 <input id="pe-amount" style="width:110px" /></label>
+      <label>物料 <select id="pe-item" style="width:210px"></select></label>
+      <label>暂估金额 <input id="pe-amount" style="width:120px" /></label>
+      <button class="btn ghost" id="pe-fill">带出还能登的额度</button>
       <button class="btn" id="pe-add">登记暂估</button>
     </div>
     <div id="pe-result" class="muted">填写订单ID后查询</div>`;
+  let statusRows = [];
+  // 带出该物料**还能登的**额度（cap − 已暂估），不是 cap ——
+  // 带出 cap 会让用户照抄一个必然被拒的数。
+  function fillAmount() {
+    const row = statusRows.find((x) => x.item_code === $("#pe-item").value);
+    $("#pe-amount").value = row ? String(row.remaining ?? "0") : "";
+  }
   const load = async () => {
     const poId = $("#pe-poid").value.trim();
     if (!poId) { toast("请填写采购订单ID", "err"); return; }
+    // 两个请求**各自容错**：订单不存在时 status 会报错，但暂估记录列表仍要能看。
+    // 合成一个 try 的话，订单一填错整个视图就卡在旧数据上不动了。
+    statusRows = [];
+    try {
+      // ① 逐行状态：可暂估额度 / 已暂估 / 还能登多少 —— 三笔数摆在面前，
+      //    用户自己判断，而不是「手填金额 → 试错 → 被守卫拒」。
+      const st = await api(`/procure/estimate/status?po_id=${encodeURIComponent(poId)}`);
+      statusRows = st.rows || [];
+      $("#pe-status").innerHTML = statusRows.length
+        ? `<table class="grid"><thead><tr>
+            <th>物料</th><th class="num">订购</th><th class="num">已收</th><th class="num">欠收</th>
+            <th class="num">可暂估额度</th><th class="num">已暂估</th><th class="num">还能登</th></tr></thead>
+          <tbody>${statusRows.map((x) => `<tr>
+            <td>${esc(x.item_code)} ${esc(x.item_name || "")}</td>
+            <td class="r">${fmt(x.qty_ordered)}</td>
+            <td class="r">${fmt(x.qty_received)}</td>
+            <td class="r">${fmt(x.qty_outstanding)}</td>
+            <td class="r">${fmt(x.cap)}</td>
+            <td class="r">${fmt(x.estimated)}</td>
+            <td class="r">${Number(x.remaining) > 0 ? fmt(x.remaining) : `<span class="muted">已用满</span>`}</td>
+          </tr>`).join("")}</tbody></table>`
+        : `<span class="muted">该订单没有物料行</span>`;
+    } catch (e) {
+      $("#pe-status").innerHTML = `<span style="color:#b00">读取暂估状态失败：${esc(e.message)}</span>`;
+    }
+    // ② 物料改为**从订单行里选**：自由输入能敲订单里没有的物料，
+    //    被守卫拒一次才发现，白跑一趟。
+    const sel = $("#pe-item");
+    const keep = sel.value;
+    sel.innerHTML = statusRows.map((x) =>
+      `<option value="${esc(x.item_code)}"${x.item_code === keep ? " selected" : ""}>${esc(x.item_code)} ${esc(x.item_name || "")}</option>`
+    ).join("") || `<option value="">（先查订单）</option>`;
+    fillAmount();
+
+    // ③ 已有暂估记录
     try {
       const r = await api(`/procure/estimate?po_id=${encodeURIComponent(poId)}`);
       const rows = r.rows || [];
@@ -6692,11 +6740,18 @@ async function viewPoEstimate(main) {
     } catch (e) { toast(e.message, "err"); }
   };
   $("#pe-load").addEventListener("click", load);
+  $("#pe-item").addEventListener("change", fillAmount);
+  $("#pe-fill").addEventListener("click", () => {
+    fillAmount();
+    if (!Number($("#pe-amount").value || 0)) toast("该物料的暂估额度已用满", "err");
+  });
   $("#pe-add").addEventListener("click", async () => {
     const po_id = parseInt($("#pe-poid").value.trim(), 10);
     if (!po_id) { toast("请填写采购订单ID", "err"); return; }
+    const item = $("#pe-item").value;
+    if (!item) { toast("请选择物料（先查订单）", "err"); return; }
     try {
-      const r = await postJson("/procure/estimate", { po_id, item: $("#pe-item").value.trim(), est_amount: $("#pe-amount").value.trim() });
+      const r = await postJson("/procure/estimate", { po_id, item, est_amount: $("#pe-amount").value.trim() });
       toast(r.voucher_id ? `已登记暂估，凭证 #${r.voucher_id}` : "已登记暂估", "ok");
       $("#pe-amount").value = "";
       load();
@@ -6853,6 +6908,7 @@ async function viewPoDoc(main) {
       <label>采购订单ID <input id="pd-poid" style="width:80px" /></label>
       <label>数量/金额 <input id="pd-amt" style="width:100px" /></label>
       <label>仓库 <input id="pd-wh" style="width:90px" placeholder="默认仓" /></label>
+      <label>收货行 <select id="pd-line" style="width:190px"></select></label>
       <label>备注 <input id="pd-memo2" style="width:120px" /></label>
       <button class="btn" id="pd-receipt">到货</button>
       <button class="btn" id="pd-return">退货</button>
@@ -6930,8 +6986,26 @@ async function viewPoDoc(main) {
   const poid = () => parseInt($("#pd-poid").value.trim(), 10) || 0;
   const amt = () => $("#pd-amt").value.trim();
   const memo = () => $("#pd-memo2").value.trim();
-  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const rr = await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), memo: memo() }); toast(rr && rr.qc_pending ? "已到货（待检入库，待质检转正后可用）" : "已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
-  $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
+  const lineCode = () => $("#pd-line").value || "";
+  // 收货行下拉：跟着订单ID刷新，列出该 PO 的物料行。
+  // 多行订单必须选行 —— 不选时金额只能按订购量占比折算，对部分收货是错的
+  // （两张行各 100 件、含税单价 11，实收 100 件全是第一行会折算成 550）。
+  // 复用 /procure/estimate/status：它本来就是按行给出物料与订购量，
+  // 不必为下拉单开一个只读 PO 端点。
+  const refreshLines = async () => {
+    const sel = $("#pd-line");
+    if (!poid()) { sel.innerHTML = `<option value="">（先填订单ID）</option>`; return; }
+    try {
+      const r = await api(`/procure/estimate/status?po_id=${poid()}`);
+      const rows = (r.rows || []).filter((x) => x.item_code);
+      sel.innerHTML = rows.length
+        ? rows.map((x) => `<option value="${esc(x.item_code)}">${esc(x.item_code)} ${esc(x.item_name || "")}（订 ${fmt(x.qty_ordered)}／已收 ${fmt(x.qty_received)}）</option>`).join("")
+        : `<option value="">（该单没有物料行）</option>`;
+    } catch (e) { sel.innerHTML = `<option value="">（读取订单失败）</option>`; }
+  };
+  $("#pd-poid").addEventListener("change", refreshLines);
+  $("#pd-receipt").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const rr = await postJson("/procure/receipt", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), item_code: lineCode(), memo: memo() }); toast(rr && rr.qc_pending ? "已到货（待检入库，待质检转正后可用）" : "已到货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); refreshLines(); } catch (e) { toast(e.message, "err"); } });
+  $("#pd-return").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { await postJson("/procure/return", { po_id: poid(), period: ymm(state.current || ""), date: today(), qty: amt(), warehouse: $("#pd-wh").value.trim(), item_code: lineCode(), memo: memo() }); toast("已退货", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); refreshLines(); } catch (e) { toast(e.message, "err"); } });
   $("#pd-pay").addEventListener("click", async () => { if (!poid()) { toast("请填写采购订单ID", "err"); return; } try { const r = await postJson("/procure/payment", { po_id: poid(), period: ymm(state.current || ""), date: today(), amount: amt(), memo: memo() }); toast(r && r.doc_id ? `已付款，付款单 #${r.doc_id}（待审核，审核后出凭证并自动核销）` : "已付款", "ok"); $("#pd-amt").value=""; $("#pd-memo2").value=""; load(); } catch (e) { toast(e.message, "err"); } });
   load();
 }

@@ -25,14 +25,14 @@ use crate::DbError;
 /// v16：资金（票据 / 融资）+ 存货计价配置（全月一次 / 期末结价）
 /// v17：用户权限逐项覆盖（user.deny_perms_json）
 /// v34：凭证更正链（voucher.amends_id / amended_by / amend_reason）
+/// v35：收货分行（po_receipt.item_code / warehouse）
 ///
-/// v34 之所以必须抬版本号、而不能只加迁移条目：`init` 的早退条件是
+/// 抬版本号不是形式主义：`init` 的早退条件是
 /// `version >= SCHEMA_VERSION && tables_complete`，而 `tables_complete`
-/// **只核对表名、不核对列**。给老表（voucher 是 v1 就有的表）加列时，
-/// `CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，唯一出路就是让
-/// `init` 走进迁移分支。漏了这一步的话：全新账套一切正常（DDL 里已含新列），
-/// 只有**升级上来的旧账套**会在第一次点「更正」时报 no such column。
-pub const SCHEMA_VERSION: i64 = 34;
+/// **只核对表名、不核对列**。给老表加列时 `CREATE TABLE IF NOT EXISTS` 不生效，
+/// 唯一出路就是让 `init` 走进迁移分支。漏了这一步：全新账套一切正常（DDL 里
+/// 已含新列），只有**升级上来的旧账套**会在第一次用到新列时报 no such column。
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// 建表语句
 const DDL: &str = r#"
@@ -800,9 +800,23 @@ CREATE TABLE IF NOT EXISTS po_receipt (
     period      INTEGER NOT NULL,
     date        TEXT NOT NULL,
     qty         TEXT NOT NULL DEFAULT '0',
-    memo        TEXT NOT NULL DEFAULT ''
+    memo        TEXT NOT NULL DEFAULT '',
+    -- 收货**分行**：item_code 指明这批货是哪一行；'' = 整单收货（兼容旧数据）
+    --
+    -- 早先只有一个总数量，于是部分收货时说不清「这批货是哪些行的」，
+    -- 金额只能按订购量占比折算：两张行各 100 件、单价含税 11，实际收 100 件
+    -- （全是第一行），折算摊成 550，而实际是 1100 —— 差一半。
+    -- 这个折算同时是暂估封顶的额度来源，所以折算错 = 守卫拿错额度去拦。
+    --
+    -- 用物料编码而**不是** po_line.id：`po_save` 会 DELETE FROM po_line 再重插，
+    -- 行 id 每次编辑都会变，引用它会让历史收货在订单被编辑后指向别的行。
+    -- 代价是同一张 PO 内物料编码必须唯一 —— `po_save` 会强制校验。
+    item_code   TEXT NOT NULL DEFAULT '',
+    -- 收进哪个仓库（ERPNext / Odoo 的 Purchase Receipt 都是行级带仓库）
+    warehouse   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_po_rcpt ON po_receipt(po_id);
+CREATE INDEX IF NOT EXISTS idx_po_rcpt_item ON po_receipt(po_id, item_code);
 
 -- ===========================================================================
 -- 到岸成本（Landed Cost）
@@ -1528,6 +1542,10 @@ const MIGRATE_V6: &[(&str, &str, &str)] = &[
     ("voucher", "amends_id", "INTEGER NOT NULL DEFAULT 0"),
     ("voucher", "amended_by", "INTEGER NOT NULL DEFAULT 0"),
     ("voucher", "amend_reason", "TEXT NOT NULL DEFAULT ''"),
+    // v35：收货分行。旧数据 item_code='' 表示「整单收货」，金额仍按订购量占比
+    // 折算（与升级前完全一致），新数据可精确到行。
+    ("po_receipt", "item_code", "TEXT NOT NULL DEFAULT ''"),
+    ("po_receipt", "warehouse", "TEXT NOT NULL DEFAULT ''"),
     // 到岸成本明细
     ("landed_cost_item", "id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
     ("landed_cost_item", "lcv_id", "INTEGER NOT NULL"),

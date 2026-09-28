@@ -74,7 +74,7 @@ test("更正原因必填；空原因不能提交", async ({ page }) => {
   await expect(page.locator("#rd-text")).toHaveCount(0);
 });
 
-test("更正后原凭证显示「被谁更正」，新凭证显示「更正自谁」+ 原因", async ({ page }) => {
+test("更正后原凭证被红冲，红冲与更正两张各自可追溯", async ({ page }) => {
   await newBook(page, `E2E更正链${Date.now()}`);
   const vid = await postedVoucher(page, 1000);
 
@@ -101,20 +101,55 @@ test("更正后原凭证显示「被谁更正」，新凭证显示「更正自�
   expect(banner).toMatch(/记-\d{6}/);
   // 新凭证是草稿，在等会计审核
   await expect(page.locator(".modal-mask").last()).toContainText("未记账");
-  // 已被更正过的凭证不再给「更正」按钮（链不能分叉）
-  await expect(page.locator("#v-amend")).toHaveCount(0);
 
-  // 回看原凭证：应标注「已被谁更正」
+  // 回看原凭证：仍显示已记账（靠红冲抵消，不是被删掉），并标注被谁红冲 + 谁重做
   await page.keyboard.press("Escape");
   await page.evaluate((id) => openVoucherEditor(id), vid);
-  await expect(page.locator(".modal-mask").last()).toContainText("已被", { timeout: 15_000 });
+  await expect(page.locator(".modal-mask").last()).toContainText("红冲", { timeout: 15_000 });
   const oldBanner = await page.locator(".modal-mask").last().textContent();
-  expect(oldBanner).toContain("更正");
-  expect(oldBanner).toMatch(/记-\d{6}/);
+  expect(oldBanner).toContain("金额录错，应为 1200");
+  expect(oldBanner).toMatch(/记-\d{6}/g);
+  await expect(page.locator(".modal-mask").last()).toContainText("已记账");
+  // 已被更正过的凭证不再给「更正」按钮（链不能分叉）
   await expect(page.locator("#v-amend")).toHaveCount(0);
+  // 三张成套生效，反记账 / 再红冲一次都不给（亮着却用不了最容易被当成 bug）
+  await expect(page.locator("#v-unpost")).toHaveCount(0);
+  await expect(page.locator("#v-reverse")).toHaveCount(0);
 });
 
-test("已被更正的凭证不给「恢复作废」—— 恢复后它能被重新记账，一笔钱就记两遍", async ({ page }) => {
+test("红冲凭证借贷互换且摘要带冲销标记（账上不能看着像重复录入）", async ({ page }) => {
+  await newBook(page, `E2E红冲形态${Date.now()}`);
+  const vid = await postedVoucher(page, 1000);
+
+  const r = await page.request.post(`/api/vouchers/${vid}/amend`, {
+    data: { reason: "科目录错" },
+  });
+  expect(r.ok(), `更正应成功：${await r.text()}`).toBeTruthy();
+  const new_id = (await r.json()).new_id;
+
+  // 从原凭证的链上取到红冲凭证
+  const old = await (await page.request.get(`/api/vouchers/${vid}`)).json();
+  const red_id = old.amend.amended_by;
+  expect(red_id, "原凭证要标注被谁红冲").toBeGreaterThan(0);
+  expect(old.amend.amended_by_new, "同批的更正凭证要单独列出").toBe(new_id);
+
+  const red = await (await page.request.get(`/api/vouchers/${red_id}`)).json();
+  // 原凭证：借 1001 / 贷 2001 —— 红冲必须反过来
+  // （金额列以 TEXT 存、序列化带两位小数，用 startsWith 而非精确等值）
+  expect(red.entries[0].credit, "红冲第一行应是贷方").toMatch(/^1000(\.0+)?$/);
+  expect(red.entries[1].debit, "红冲第二行应是借方").toMatch(/^1000(\.0+)?$/);
+  // 摘要要带冲销标记
+  expect(red.entries[0].summary, "红冲摘要要带「冲销」").toContain("冲销");
+  expect(red.memo).toContain("红冲");
+  expect(red.memo).toContain("科目录错");
+
+  // 更正凭证：分录原样复制
+  const nw = await (await page.request.get(`/api/vouchers/${new_id}`)).json();
+  expect(nw.entries[0].debit, "更正凭证要原样复制分录").toMatch(/^1000(\.0+)?$/);
+  expect(nw.entries[1].credit).toMatch(/^1000(\.0+)?$/);
+});
+
+test("更正链三张成套：任何一张都不能被单独反记账（撤一张净额就错）", async ({ page }) => {
   await newBook(page, `E2E更正防翻倍${Date.now()}`);
   const vid = await postedVoucher(page, 1000);
 
@@ -123,22 +158,37 @@ test("已被更正的凭证不给「恢复作废」—— 恢复后它能被重�
   });
   expect(r.ok(), `更正应成功：${await r.text()}`).toBeTruthy();
   const new_id = (await r.json()).new_id;
+  const old = await (await page.request.get(`/api/vouchers/${vid}`)).json();
+  const red_id = old.amend.amended_by;
 
-  // 后端口径：取消作废必须被拒
-  const back = await page.request.post(`/api/vouchers/${vid}/void`, {
-    data: { void: false },
-  });
-  expect(back.status(), "已被更正的凭证不能恢复作废").toBe(400);
-  expect(await back.text()).toContain("更正过");
+  // 三张都记账
+  // 注意：更正链产出的红冲与更正是**新凭证**（草稿态），账套开着审核环节时
+  // 必须先审核才能记账 —— `postedVoucher` 只替原凭证做了审核。
+  for (const [id, what] of [[vid, "原凭证"], [red_id, "红冲"], [new_id, "更正"]]) {
+    if (id !== vid) {
+      const a = await page.request.post(`/api/vouchers/${id}/audit`);
+      expect(a.ok(), `${what} 审核应成功：${await a.text()}`).toBeTruthy();
+    }
+    const p = await page.request.post(`/api/vouchers/${id}/post`);
+    expect(p.ok(), `${what} 记账应成功：${await p.text()}`).toBeTruthy();
+  }
 
-  // 界面也不能给这个按钮（亮着却用不了是最容易被当成 bug 的 UX）
-  await page.evaluate((id) => openVoucherEditor(id), vid);
-  await expect(page.locator(".modal-mask").last()).toContainText("已被", { timeout: 15_000 });
-  await expect(page.locator("#v-void-back")).toHaveCount(0);
+  // 任何一张被单独反记账都必须被拒
+  for (const [id, what] of [[vid, "原凭证"], [red_id, "红冲凭证"], [new_id, "更正凭证"]]) {
+    const u = await page.request.post(`/api/vouchers/${id}/unpost`);
+    expect(u.status(), `${what} 不能被单独反记账（三张必须成套）`).toBe(400);
+    expect(await u.text(), "错误信息要指向「成套」").toContain("成套");
+  }
+
+  // 界面同步不给这些按钮（亮着却用不了最容易被当成 bug）
+  await page.evaluate((id) => openVoucherEditor(id), red_id);
+  await expect(page.locator(".modal-mask").last()).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("#v-unpost")).toHaveCount(0);
+  await expect(page.locator("#v-reverse")).toHaveCount(0);
 
   // 未被更正的凭证仍能正常走「反记账 -> 作废 -> 恢复」，守卫不能误伤老路。
   // （已记账的凭证不能直接作废 —— 引擎既有规则 `validate_void` 拒绝 Posted，
-  //   所以对照组必须先反记账。这也顺带覆盖「恢复后回到已记账」这条更强的路径。）
+  //   所以对照组必须先反记账。）
   const plain = await postedVoucher(page, 500);
   const un = await page.request.post(`/api/vouchers/${plain}/unpost`);
   expect(un.ok(), `反记账应成功：${await un.text()}`).toBeTruthy();
@@ -150,7 +200,6 @@ test("已被更正的凭证不给「恢复作废」—— 恢复后它能被重�
   // 而 `audited_by` 还在 —— 引擎既有语义，守卫不该改它。
   const after = await page.request.get(`/api/vouchers/${plain}`);
   expect((await after.json()).status, "恢复作废后应回到已审核").toBe("audited");
-  expect(new_id).toBeGreaterThan(0);
 });
 
 test("重复更正被拒，且错误信息指向「已被更正过」而不是笼统的状态", async ({ page }) => {

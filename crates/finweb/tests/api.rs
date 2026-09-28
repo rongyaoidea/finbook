@@ -16866,30 +16866,106 @@ async fn voucher_amend_links_old_and_new() {
     let new_id = r["new_id"].as_i64().expect("应返回新凭证 id");
     assert!(new_id > 0 && new_id != vid);
 
-    // ③ 原凭证：已作废 + 标注「被谁更正」
+    // ③ 原凭证：**保持已记账** + 标注「被谁红冲 + 谁更正重做」
+    //    （准则形态：红字冲销 + 蓝字重做。作废原凭证会让总账看不出曾经记错过。）
     let resp = handlers::router(state.clone())
         .oneshot(authed_get(&format!("/api/vouchers/{vid}"), &sid))
         .await
         .unwrap();
     let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(r["status"], "void", "原凭证应作废（否则新旧都进总账）：{r}");
     assert_eq!(
-        r["amend"]["amended_by"], new_id,
-        "原凭证要标注被谁更正：{r}"
+        r["status"], "posted",
+        "原凭证必须保持已记账，由红冲凭证抵消：{r}"
+    );
+    let red_id = r["amend"]["amended_by"].as_i64().expect("应标注被谁红冲");
+    assert!(red_id > 0 && red_id != vid);
+    assert_eq!(
+        r["amend"]["amended_by_new"], new_id,
+        "同批的更正凭证要单独标出：只列一张等于账上有一张凭证没交代来路：{r}"
     );
     assert_eq!(r["amend"]["reason"], "金额录错，应为 1200");
+    assert!(
+        r["amend"]["amended_by_no"].as_str().unwrap_or("").starts_with("记-"),
+        "要可读单号：{r}"
+    );
 
-    // ④ 新凭证：草稿 + 标注「更正自谁」+ 分录原样复制
+    // ④ 红冲凭证：草稿 + 借贷互换 + 摘要带冲销标记
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get(&format!("/api/vouchers/{red_id}"), &sid))
+        .await
+        .unwrap();
+    let red: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(red["status"], "draft", "红冲凭证应是草稿等会计审核：{red}");
+    assert_eq!(red["amend"]["amends_id"], vid, "红冲凭证也要标注来自哪张：{red}");
+    let red_entries = red["entries"].as_array().unwrap();
+    assert_eq!(red_entries.len(), 2);
+    // 借贷互换：原凭证借 1001，红冲就贷 1001
+    // （金额列以 TEXT 存、序列化带两位小数，所以用正则而不是精确等值）
+    assert!(
+        red_entries[0]["credit"].as_str().unwrap_or("").starts_with("1000"),
+        "红冲第一行应为贷方 1000（原凭证是借方）：{red}"
+    );
+    assert!(
+        red_entries[1]["debit"].as_str().unwrap_or("").starts_with("1000"),
+        "红冲第二行应为借方 1000：{red}"
+    );
+    assert!(
+        red_entries[0]["summary"].as_str().unwrap_or("").contains("冲销"),
+        "红冲凭证摘要要带冲销标记，否则账上看着像重复录入：{red}"
+    );
+
+    // ⑤ 更正凭证：草稿 + 标注「更正自谁」+ 分录原样复制
     let resp = handlers::router(state.clone())
         .oneshot(authed_get(&format!("/api/vouchers/{new_id}"), &sid))
         .await
         .unwrap();
     let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(r["status"], "draft", "新凭证应是草稿等会计审核：{r}");
-    assert_eq!(r["amend"]["amends_id"], vid, "新凭证要标注更正自谁：{r}");
-    assert_eq!(r["entries"].as_array().unwrap().len(), 2, "分录要原样复制");
+    assert_eq!(r["status"], "draft", "更正凭证应是草稿等会计审核：{r}");
+    assert_eq!(r["amend"]["amends_id"], vid, "更正凭证要标注更正自谁：{r}");
+    assert!(
+        r["entries"][0]["debit"].as_str().unwrap_or("").starts_with("1000"),
+        "分录要原样复制：{r}"
+    );
 
-    // ⑤ 重复更正被拒，且错误信息要指向「已被更正过」而不是笼统的状态
+    // ⑥ 三张都记账后，任何一张都不能被单独反记账（撤掉一张净额就错）
+    //    红冲与更正凭证是**新凭证**（草稿态），账套开着审核环节时须先审核。
+    for id in [red_id, new_id] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                &format!("/api/vouchers/{id}/audit"),
+                &sid,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "红冲/更正凭证应能审核");
+    }
+    for (id, what) in [(vid, "原凭证"), (red_id, "红冲凭证"), (new_id, "更正凭证")] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_post(
+                &format!("/api/vouchers/{id}/post"),
+                &sid,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{what} 应能记账");
+    }
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{red_id}/unpost"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "红冲凭证不能被单独反记账（三张必须成套存在）"
+    );
+
+    // ⑦ 重复更正被拒，且错误信息要指向「已被更正过」而不是笼统的状态
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             &format!("/api/vouchers/{vid}/amend"),
@@ -16914,7 +16990,7 @@ async fn voucher_amend_links_old_and_new() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "新凭证记账");
+    assert_eq!(resp.status(), StatusCode::OK, "更正凭证记账");
 }
 
 /// 探针必须**能抓到故障** —— 否则它是虚假的安全感。

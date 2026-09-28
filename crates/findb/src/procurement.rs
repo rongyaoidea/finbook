@@ -130,6 +130,17 @@ pub struct PoReceipt {
     pub date: NaiveDate,
     pub qty: Money,
     pub memo: String,
+    /// 收货针对哪一行（物料编码）。**空 = 整单收货**（旧数据 / 单行订单）。
+    ///
+    /// 早先收货只有「一个总数量」，部分收货时说不清这批货是哪些行的，金额只能
+    /// 按订购量占比折算 —— 那是错的（两张行各 100 件、单价含税 11，实际收 100 件
+    /// 全是第一行，折算摊成 550 而实际是 1100）。而暂估封顶的额度又取自这个折算，
+    /// 于是折算错 = 守卫拿错额度去拦正确的操作。
+    #[serde(default)]
+    pub item_code: String,
+    /// 收进哪个仓库（行级，ERPNext / Odoo 的 Purchase Receipt 就是这样）
+    #[serde(default)]
+    pub warehouse: String,
 }
 
 pub fn po_receipt_add(db: &Db, r: &PoReceipt) -> DbResult<i64> {
@@ -146,7 +157,8 @@ pub fn po_receipt_add(db: &Db, r: &PoReceipt) -> DbResult<i64> {
 
 pub fn po_receipt_list(db: &Db, po_id: i64) -> DbResult<Vec<PoReceipt>> {
     let mut st = db.conn().prepare(
-        "SELECT id,po_id,period,date,qty,memo FROM po_receipt WHERE po_id=?1 ORDER BY id"
+        "SELECT id,po_id,period,date,qty,memo,item_code,warehouse
+         FROM po_receipt WHERE po_id=?1 ORDER BY id"
     )?;
     let rows = st
         .query_map([po_id], |r| {
@@ -158,6 +170,8 @@ pub fn po_receipt_list(db: &Db, po_id: i64) -> DbResult<Vec<PoReceipt>> {
                     .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
                 qty: m(&r.get::<_, String>(4)?),
                 memo: r.get(5)?,
+                item_code: r.get(6)?,
+                warehouse: r.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -198,15 +212,20 @@ fn receipt_row_in(
     date: NaiveDate,
     qty: Money,
     memo: &str,
+    item_code: &str,
+    warehouse: &str,
 ) -> DbResult<i64> {
     tx.execute(
-        "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO po_receipt(po_id,period,date,qty,memo,item_code,warehouse)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
         rusqlite::params![
             po_id,
             period.ymm(),
             date.format("%Y-%m-%d").to_string(),
             crate::exact_param(qty),
-            memo
+            memo,
+            item_code,
+            warehouse,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -284,7 +303,30 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt, warehouse: &str) -> DbResul
     }
     let po = crate::scm::po_get(db, r.po_id)?
         .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
-    let line = first_line(&po)?;
+    let line = if r.item_code.trim().is_empty() {
+        first_line(&po)?.clone()
+    } else {
+        // 收货针对**哪一行**：`item_code` 为空 = 整单收货（单行订单 / 旧调用方）。
+        // 早先只有「一个总数量」，多行订单的部分收货说不清是哪些行的，金额只能按
+        // 订购量占比折算 —— 那是错的（两张行各 100 件、含税单价 11，实收 100 件
+        // 全是第一行，折算摊成 550 而实际 1100）。而暂估封顶额度取自这个折算，
+        // 折算错 = 守卫拿错额度去拦正确操作。
+        let code = r.item_code.trim();
+        po.lines
+            .iter()
+            .find(|l| l.item_code.trim() == code)
+            .ok_or_else(|| {
+                fincore::FinError::msg(format!(
+                    "采购订单里没有物料 {code}（本单物料：{}）",
+                    po.lines
+                        .iter()
+                        .map(|l| l.item_code.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ))
+            })?
+            .clone()
+    };
     if line.unit_price.is_zero() {
         return Err(fincore::FinError::msg(
             "采购订单单价为 0：请先补价再入库（防 0 价污染库存成本）",
@@ -293,8 +335,19 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt, warehouse: &str) -> DbResul
     }
     let item = line.item_code.clone();
     let price = line.unit_price;
+    // 仓库优先取行上的，其次取调用方传的（接口参数，为空则由存货层兜底）
+    let wh = if r.warehouse.trim().is_empty() { warehouse } else { r.warehouse.as_str() };
     let tx = db.write_tx()?;
-    let rid = receipt_row_in(&tx, r.po_id, r.period, r.date, r.qty, &r.memo)?;
+    let rid = receipt_row_in(
+        &tx,
+        r.po_id,
+        r.period,
+        r.date,
+        r.qty,
+        &r.memo,
+        &item,
+        wh,
+    )?;
     let mid = stock_purchase_in(
         &tx,
         &po.no,
@@ -304,7 +357,7 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt, warehouse: &str) -> DbResul
         r.period,
         r.date,
         &format!("采购入库 {}", po.no),
-        warehouse,
+        wh,
     )?;
     // 来料检验（存货档案 qc_required=1）→ 入库标记待检：可用量口径排除，质检转正后方可领用
     if crate::business::item_qc_required(db, &item) {
@@ -317,6 +370,10 @@ pub fn po_receipt_with_stock(db: &Db, r: &PoReceipt, warehouse: &str) -> DbResul
 }
 
 /// 采购退货：负到货行 + 负采购入库流水同事务；**超退防呆**（本次退量 ≤ 累计净收货）
+///
+/// `item_code` 为空 = 整单退货（旧调用方）；指定则只退该行，且**超退按该行**判，
+/// 不能拿整单累计收货来判 —— 否则退 A 行时会被 B 行的收货量「垫高」额度，
+/// 退完才发现 A 已经退超了。
 pub fn po_return_with_stock(
     db: &Db,
     po_id: i64,
@@ -325,29 +382,61 @@ pub fn po_return_with_stock(
     qty: Money,
     memo: &str,
     warehouse: &str,
+    item_code: &str,
 ) -> DbResult<i64> {
     if qty.is_negative() || qty.is_zero() {
         return Err(fincore::FinError::msg("退货数量必须为正数").into());
     }
     let po = crate::scm::po_get(db, po_id)?
         .ok_or_else(|| fincore::FinError::msg("采购订单不存在"))?;
-    let line = first_line(&po)?;
+    let line = if item_code.trim().is_empty() {
+        first_line(&po)?.clone()
+    } else {
+        let code = item_code.trim();
+        po.lines
+            .iter()
+            .find(|l| l.item_code.trim() == code)
+            .ok_or_else(|| fincore::FinError::msg(format!("采购订单里没有物料 {code}")))?
+            .clone()
+    };
     if line.unit_price.is_zero() {
         return Err(fincore::FinError::msg("采购订单单价为 0：请先补价再退货").into());
     }
     let item = line.item_code.clone();
     let price = line.unit_price;
-    let received = po_receipt_sum(db, po_id)?;
+    let received = if item_code.trim().is_empty() {
+        po_receipt_sum(db, po_id)?
+    } else {
+        // 指定行时只按该行的收货量判超退（含整单收货行，那是旧数据）。
+        // 口径与本文件既有的 `po_receipt_sum` 一致（SQL 侧 CAST 求和）。
+        let v: f64 = db.conn().query_row(
+            "SELECT COALESCE(SUM(CAST(qty AS REAL)),0) FROM po_receipt
+             WHERE po_id=?1 AND (item_code=?2 OR item_code='')",
+            rusqlite::params![po_id, item_code.trim()],
+            |r| r.get(0),
+        )?;
+        Money::parse_or_zero(&format!("{v:.4}"))
+    };
     if qty > received {
         return Err(fincore::FinError::state(format!(
-            "退货数量 {} 超过累计净收货 {}",
+            "退货数量 {} 超过{}累计净收货 {}",
             qty.fmt_qty(),
+            if item_code.trim().is_empty() { String::new() } else { format!("物料 {item_code} 的") },
             received.fmt_qty()
         ))
         .into());
     }
     let tx = db.write_tx()?;
-    let rid = receipt_row_in(&tx, po_id, period, date, qty.negated(), &format!("退货 {memo}"))?;
+    let rid = receipt_row_in(
+        &tx,
+        po_id,
+        period,
+        date,
+        qty.negated(),
+        &format!("退货 {memo}"),
+        &item,
+        warehouse,
+    )?;
     stock_purchase_in(
         &tx,
         &po.no,
@@ -430,7 +519,9 @@ pub fn qc_save(
     };
 
     // 受检量与结果：待检模式以待检量为准（忽略入参检验数，逐笔检验）；否则按入参（事后质检）
+    let mut qc_wh = String::new();
     let (insp_qty, fail_qty, result) = if let Some((mid, m_qty, m_amt, m_wh)) = pending {
+        qc_wh = m_wh.clone();
         if qty_fail > m_qty {
             return Err(fincore::FinError::state(format!(
                 "不合格数 {} 超过待检量 {}",
@@ -530,6 +621,10 @@ pub fn qc_save(
                 date,
                 qty_fail.negated(),
                 &format!("质检退货 {}", memo),
+                &item,
+                // 质检退货针对的是**首笔待检入库流水**，那笔流水进的是哪个仓库就
+                // 退回哪个，所以这里从该流水取仓库（取不到则空，由存货层兜底）。
+                &qc_wh,
             )?;
             stock_purchase_in(
                 &tx,
@@ -714,7 +809,7 @@ mod tests {
         });
         let po_id = crate::scm::po_save(&db, &mut po).unwrap();
         // 到货 60
-        po_receipt_add(&db, &PoReceipt { id: 0, po_id, period: p, date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(), qty: m("60"), memo: String::new() }).unwrap();
+        po_receipt_add(&db, &PoReceipt { id: 0, po_id, period: p, date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(), qty: m("60"), memo: String::new(), item_code: String::new(), warehouse: String::new() }).unwrap();
         // 退货 10
         po_return_add(&db, po_id, p, NaiveDate::from_ymd_opt(2026, 1, 12).unwrap(), m("10"), "破损").unwrap();
         // 付款 500

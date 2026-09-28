@@ -601,16 +601,21 @@ fn set_status_on(conn: &rusqlite::Connection, id: i64, s: VoucherStatus) -> DbRe
     Ok(())
 }
 
-/// 记账（未记账 → 已记账；无审核环节，核对无误后直接记账）
 /// 一张凭证的更正链信息
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AmendLink {
     /// 本凭证更正的是哪张
     pub amends_id: i64,
     pub amends_no: String,
-    /// 本凭证被哪张更正了
+    /// 本凭证是被哪张**红冲**了（更正链的第一张后续凭证）
     pub amended_by: i64,
     pub amended_by_no: String,
+    /// 与红冲同批产生的**更正凭证**（重做后的那张）
+    ///
+    /// 单列出来是因为它与 `amended_by` 是**两张**凭证：`amended_by` 只够指一张，
+    /// 而只列一张就等于账上凭空多出一张没交代来路的凭证。
+    pub amended_by_new: i64,
+    pub amended_by_new_no: String,
     /// 更正原因（必填 —— 没有原因的更正等于没更正）
     pub reason: String,
 }
@@ -639,44 +644,60 @@ pub fn amend_link(db: &Db, id: i64) -> DbResult<Option<AmendLink>> {
             )
             .unwrap_or_default()
     };
+    // 同批产生的两张后续凭证：红冲那张记在 amended_by，更正那张要单独找出来。
+    // 两张的 `amends_id` 都指向**原凭证**（即本行 id），且带同一个更正原因 ——
+    // 所以用原凭证 id 去查，不能拿 `amended_by`（那是红冲自己的 id）去查。
+    let sibling = |orig: i64, exclude: i64| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT id FROM voucher
+                 WHERE amends_id=?1 AND id<>?2 AND amend_reason=?3 ORDER BY id LIMIT 1",
+                rusqlite::params![orig, exclude, reason],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    };
+    let sibling_id = if amended_by > 0 { sibling(id, amended_by) } else { 0 };
     Ok(Some(AmendLink {
         amends_id,
         amends_no: if amends_id > 0 { label(amends_id) } else { String::new() },
         amended_by,
         amended_by_no: if amended_by > 0 { label(amended_by) } else { String::new() },
+        amended_by_new: sibling_id,
+        amended_by_new_no: if sibling_id > 0 { label(sibling_id) } else { String::new() },
         reason,
     }))
 }
 
-/// 单据更正链：作废原凭证 + 生成一张带链接的新凭证
+/// 单据更正链：红字冲销原凭证 + 生成一张带链接的新凭证
 ///
-/// ## 为什么要有这个
+/// 一次 amend 在**一个事务**里产生两张新凭证，总账形态是：
 ///
-/// finbook 有反记账与取消审核，所以错凭证**能改** —— 但改完的两张凭证之间
-/// **没有任何链接**，事后审计只能靠时间和金额去猜哪张在冲哪张。
+/// ```text
+///   原凭证   借 存货 1000 / 贷 应付 1000     （保持已记账，不动）
+///   红冲凭证 借 应付 1000 / 贷 存货 1000     （新，抵消原凭证）
+///   更正凭证 借 存货 1000 / 贷 应付 1000     （新，草稿待记账；改成 1200 后净 +1200）
+/// ```
 ///
-/// 「不能改」反而更安全：它会逼人走更正流程；「能改」会让人直接改，
-/// 而直接改完的两张凭证互相不认识，才是真正查不出来的状态。
+/// ## 为什么是这个形态
 ///
-/// ## 与 `reverse`（红字冲销）的分工 —— 两条路径的审计特征不同
+/// 中国准则对「以前年度差错」要求**红字冲销 + 蓝字重做** —— 总账里要看得见
+/// 那一笔反向记录。ERPNext 的 Cancel 同理（官方论坛原话：
+/// "the ledger will not be deleted, but reverse entries will be added"）。
 ///
-/// finbook 现在有两条更正路径，用错会导致账簿形态不合准则：
+/// 早先的实现是把原凭证置为 `void` 再复制一张。作废凭证不进总账（balances
+/// 只取 `status='posted'`），**总账上因此「看不出曾经记错过」** —— 链信息只
+/// 留在凭证表里。是形式上留痕、账上无痕。
 ///
-/// | | 本函数（amend，更正链） | `reverse`（红字冲销）
+/// ## 与 `reverse`（红字冲销）的分工
+///
+/// | | 本函数（amend） | `reverse`
 /// |---|---|---|
-/// | 原凭证 | **作废**（`status='void'`） | **原样保留、仍已记账**
-/// | 总账痕迹 | 原凭证从总账**消失** | 一笔反向分录，**留在总账里**
-/// | 新凭证 | 草稿，落**原期间** | 草稿，落**当前期间** |
-/// | 适合 | 科目错、摘要错、分录结构错 —— 整单要重做 | 金额错、时点错 —— 只想增减一笔 |
+/// | 原凭证 | 保留已记账 | 保留已记账 |
+/// | 新凭证 | **红冲 + 蓝字重做**两张 | 只有红冲一张 |
+/// | 适合 | 整单内容错，要重做分录 | 只调整金额或时点 |
 ///
-/// **中国准则对「以前年度差错」要求红字冲销 + 蓝字重做**（即 `reverse` 形态：
-/// 总账里要看得见那一笔反向记录）。ERPNext 的 Cancel 同样是「ledger 不删除、
-/// 加反向分录」而不是作废。
-///
-/// 所以：**只做金额/时点调整 → 走红字冲销**（总账留痕、符合准则）；
-/// 整单内容错了要重做 → 走本函数（链清楚，但总账里看不到那一笔冲销）。
-/// 拿本函数处理需要红冲留痕的场景，总账上会「看不出曾经记错过」——
-/// 链信息只在凭证表里，账簿层面不体现。
+/// 只调金额/时点走红字冲销更省事；整单重做走本函数。
 ///
 /// ## 规则
 ///
@@ -739,20 +760,41 @@ pub fn amend(db: &Db, id: i64, reason: &str, who: &str) -> DbResult<i64> {
         }
     }
 
-    // ① 作废原凭证：已记账的不能直接作废，先回退到审核态再作废
-    let back = if old.audited_by.is_some() { VoucherStatus::Audited } else { VoucherStatus::Draft };
-    set_status_on(&tx, id, back)?;
-    tx.execute("UPDATE voucher SET posted_by=NULL WHERE id=?1", [id])?;
-    set_status_on(&tx, id, VoucherStatus::Void)?;
-
-    // ② 复制成新凭证（草稿态，等会计审核记账）
     let entries = entries_on(&tx, id)?;
     if entries.is_empty() {
         return Err(FinError::state("原凭证没有分录，无法更正".to_string()).into());
     }
-    // 日期必须落在**原期间内**（凭证校验强制 date 属于 period）。
-    // 所以更正凭证沿用原凭证日期，而不是今天 —— 用今天会把一张 1 月的更正
-    // 记进 9 月的账，月度报表凭空多一笔。ERPNext 也是同期间更正。
+
+    // ① 红字冲销（准则形态：先红冲，再蓝字重做）
+    //
+    // 原凭证**保持已记账**：中国准则对以前年度差错要求「红字冲销 + 蓝字重做」，
+    // 也就是总账里要看得见那一笔反向记录；ERPNext 的 Cancel 同理
+    // （"the ledger will not be deleted, but reverse entries will be added"）。
+    //
+    // 早先这里是把原凭证置为 void —— 作废凭证不进总账（balances 只取
+    // `status='posted'`），于是总账上「看不出曾经记错过」，链信息只留在凭证表。
+    // 那是形式上留痕、账上无痕。
+    // `VOUCHER_COLS` 不含分录（分录在 voucher_entry 表），`old.entries` 是空的。
+    // 直接拿它去 reverse 会得到一张零分录的凭证，保存时被校验拒掉。
+    let mut old_full = old.clone();
+    old_full.entries = entries.clone();
+    let mut red = fincore::engine::reverse_voucher(&old_full);
+    red.date = old.date;
+    red.period = old.period;
+    red.no = next_no_of(&tx, old.period, &old.word)?;
+    red.status = VoucherStatus::Draft;
+    red.prepared_by = who.to_string();
+    red.audited_by = None;
+    red.posted_by = None;
+    red.cashier = None;
+    red.source = old.source;
+    red.memo = format!("红冲 {}-{:06}（更正原因：{}）", old.word, old.no, reason);
+    let red_id = save_on(&tx, &mut red)?;
+
+    // ② 蓝字重做：复制原分录成新凭证（草稿态，等会计审核记账）
+    //
+    // 日期必须落在**原期间内**（凭证校验强制 date 属于 period）。所以沿用原凭证
+    // 日期而不是今天 —— 用今天会把一张 1 月的更正记进 9 月的账，月度报表凭空多一笔。
     let mut v = Voucher::new(old.period, old.date, &old.word, 0);
     v.prepared_by = who.to_string();
     v.source = old.source;
@@ -762,14 +804,21 @@ pub fn amend(db: &Db, id: i64, reason: &str, who: &str) -> DbResult<i64> {
     v.no = next_no_of(&tx, old.period, &old.word)?;
     let new_id = save_on(&tx, &mut v)?;
 
-    // ③ 双向建链
+    // ③ 双向建链（原凭证 ← 红冲凭证 + 更正凭证）
+    //
+    // 红冲凭证自己的 `amends_id` 也挂原凭证：账上不止一张凭证由本次更正产生，
+    // 审计时从原凭证要能看到**两张**（只挂一张就等于有一张凭空出现）。
     tx.execute(
-        "UPDATE voucher SET amends_id=?2, amend_reason=?3 WHERE id=?1",
-        rusqlite::params![new_id, id, reason],
+        "UPDATE voucher SET amends_id=?2, amend_reason=?3, updated_at=?4 WHERE id=?1",
+        rusqlite::params![red_id, id, reason, now],
+    )?;
+    tx.execute(
+        "UPDATE voucher SET amends_id=?2, amend_reason=?3, updated_at=?4 WHERE id=?1",
+        rusqlite::params![new_id, id, reason, now],
     )?;
     tx.execute(
         "UPDATE voucher SET amended_by=?2, amend_reason=?3, updated_at=?4 WHERE id=?1",
-        rusqlite::params![id, new_id, reason, now],
+        rusqlite::params![id, red_id, reason, now],
     )?;
     // ④ 操作日志必须**在同一个事务里**（与 post / unpost 同口径）。
     // 放在调用方写的话：更正已提交、日志还没写就崩溃 —— 账改了却查不到谁改的，
@@ -779,7 +828,7 @@ pub fn amend(db: &Db, id: i64, reason: &str, who: &str) -> DbResult<i64> {
         who,
         "凭证",
         "更正",
-        &format!("凭证 #{id} -> #{new_id}：{reason}"),
+        &format!("凭证 #{id} -> 红冲 #{red_id} + 更正 #{new_id}：{reason}"),
     )?;
     tx.commit()?;
     Ok(new_id)
@@ -796,6 +845,49 @@ pub fn post(db: &Db, id: i64, who: &str) -> DbResult<()> {
 }
 
 /// 反记账（已记账 → 未记账）
+/// 更正链守卫：更正产生的三张凭证（原 + 红冲 + 更正）必须**成套存在**。
+///
+/// 单独把任何一张移出总账，净额都会错：
+/// - 移出原凭证 → 只剩 红冲 + 更正，账上凭空少一笔
+/// - 移出红冲凭证 → 只剩 原 + 更正，一笔钱记两遍
+/// - 移出更正凭证 → 只剩 原 + 红冲，凭空少一笔
+///
+/// 唯一放行的是**尚未记账**的更正凭证：它还没进总账，单独作废只是「重做这
+/// 一张」，不动净额。
+///
+/// `unpost` 与 `set_void` 两个入口共用这一份守卫 —— 两处各写一份必然分叉，
+/// 而分叉的后果是「作废挡住了但反记账没挡住」，等于没守卫。
+fn guard_amend_set(
+    conn: &rusqlite::Connection,
+    id: i64,
+    status: VoucherStatus,
+    action: &str,
+) -> DbResult<()> {
+    let (by, from): (i64, i64) = conn.query_row(
+        "SELECT amended_by, amends_id FROM voucher WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    // 未记账的不在总账里，动它不改变净额
+    if status != VoucherStatus::Posted {
+        return Ok(());
+    }
+    if by > 0 {
+        return Err(FinError::state(format!(
+            "本凭证已被 #{by} 红冲更正，不能{action} —— 账上三张凭证（原 + 红冲 + 更正）必须成套存在，\
+             少任何一张净额就错。要重做请作废那张尚未记账的更正凭证后重新录入"
+        ))
+        .into());
+    }
+    if from > 0 {
+        return Err(FinError::state(format!(
+            "本凭证是 #{from} 的冲销/更正凭证，不能单独{action} —— 它与 #{from} 必须成套存在，少一张净额就错"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
     let tx = db.write_tx()?;
     let v: Voucher = tx
@@ -812,6 +904,7 @@ pub fn unpost(db: &Db, id: i64) -> DbResult<()> {
         |r| r.get(0),
     )?;
     fincore::engine::validate_unpost(&v, closed.map(Period::from_ymm)).into_result()?;
+    guard_amend_set(&tx, id, v.status, "反记账")?;
     // 反记账回到审核前的状态：有审核记录的回「已审核」，否则回「未记账」
     let back = if v.audited_by.is_some() { "audited" } else { "draft" };
     tx.execute(
@@ -976,6 +1069,7 @@ pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
         }
     }
     if void {
+        guard_amend_set(&tx, id, v.status, "作废")?;
         let iss = fincore::engine::validate_void(&v);
         iss.into_result()?;
         set_status_on(&tx, id, VoucherStatus::Void)?;
@@ -985,10 +1079,9 @@ pub fn set_void(db: &Db, id: i64, void: bool, who: &str) -> DbResult<()> {
         }
         // 已被更正的凭证不能取消作废。
         //
-        // 更正链要求「原=作废、新=生效」是唯一形态。恢复作废后原凭证回到未记账，
-        // 看着「只是回到未记账」没什么，但**它可以被重新记账** —— 那时它与那张
-        // 更正凭证同时进总账，一笔钱记两遍，链上还挂着两个生效版本。
-        // 审计看到的是「原凭证已作废、已被更正」，账上却是两笔。
+        // 恢复作废后原凭证回到未记账，看着「只是回到未记账」没什么，但**它可以
+        // 被重新记账** —— 那时它与红冲、更正凭证同时进总账，一笔钱记两遍，
+        // 而链上还挂着更正关系。审计看到「已被更正」，账上却是两笔。
         let by: i64 = tx.query_row(
             "SELECT amended_by FROM voucher WHERE id=?1",
             [id],
@@ -1312,13 +1405,18 @@ mod tests {
         save(db, &mut v).unwrap()
     }
 
-    /// 更正链的完整效果：原凭证作废、新凭证草稿待记账、两边互相认得
+    /// 更正链的完整效果：红冲 + 更正两张，原凭证保持已记账，三张互相认得。
     ///
-    /// 回归背景：finbook 有反记账与取消审核，所以错凭证**能改** —— 但改完的两张
-    /// 凭证之间没有任何链接，事后审计只能靠时间和金额去猜哪张在冲哪张。
-    /// 「不能改」反而更安全：它会逼人走更正流程。
+    /// 形态（对齐中国准则「红字冲销 + 蓝字重做」与 ERPNext 的 Cancel-then-Amend）：
+    /// ```text
+    ///   原凭证   +1000（保持 posted）
+    ///   红冲凭证 -1000（新，draft）
+    ///   更正凭证 +1000（新，draft；改成 1200 后净 +1200）
+    /// ```
+    /// 总账里**看得见**那一笔反向记录 —— 这是与「作废原凭证」的关键差别：
+    /// 作废不进总账，账上就看不出曾经记错过。
     #[test]
-    fn amend_voids_original_and_links_both_ways() {
+    fn amend_makes_reversal_plus_rewrite_and_links_all_three() {
         let db = mem();
         let old = am_voucher(&db, "1000");
         post(&db, old, "boss").unwrap();
@@ -1327,13 +1425,50 @@ mod tests {
         let new_id = amend(&db, old, "金额录错，应为 1200", "boss").unwrap();
         assert!(new_id > 0);
 
-        // 原凭证已作废（作废凭证不进总账，所以总账不会金额翻倍）
+        // 原凭证**保持已记账**（准则形态的关键：账上要留得住那一笔反向记录）
         assert_eq!(
             get(&db, old).unwrap().unwrap().status,
-            VoucherStatus::Void,
-            "原凭证必须作废，否则新旧两张都会进总账"
+            VoucherStatus::Posted,
+            "原凭证必须保持已记账，由红冲凭证抵消；作废会让总账看不出曾经记错过"
         );
-        // 新凭证是草稿，等会计审核
+
+        // 链上要拿到两张后续凭证
+        let a_old = amend_link(&db, old).unwrap().unwrap();
+        let red_id = a_old.amended_by;
+        assert!(red_id > 0, "原凭证要标注「被红冲」");
+        assert!(
+            a_old.amended_by_no.starts_with("记-"),
+            "要可读单号：{}",
+            a_old.amended_by_no
+        );
+        assert_eq!(
+            a_old.amended_by_new, new_id,
+            "同批的更正凭证要单独列出：只列一张等于账上有一张凭证没交代来路"
+        );
+        assert!(a_old.amended_by_new_no.starts_with("记-"));
+        assert_eq!(a_old.reason, "金额录错，应为 1200");
+
+        // 红冲凭证：借贷互换、摘要带「冲销」、草稿待记账
+        let red_v = get(&db, red_id).unwrap().unwrap();
+        assert_eq!(red_v.status, VoucherStatus::Draft);
+        assert!(
+            red_v.memo.contains("红冲") && red_v.memo.contains("金额录错"),
+            "红冲凭证摘要要说清冲的是哪张、为什么：{}",
+            red_v.memo
+        );
+        let old_ents = entries_of(&db, old).unwrap();
+        assert_eq!(red_v.entries.len(), old_ents.len());
+        assert_eq!(
+            red_v.entries[0].credit, old_ents[0].debit,
+            "红冲必须借贷互换，才抵得住原凭证"
+        );
+        assert!(
+            red_v.entries.iter().all(|e| e.summary.contains("冲销")),
+            "红冲凭证的每条摘要都要带冲销标记，否则账上看着像重复录入：{:?}",
+            red_v.entries.iter().map(|e| &e.summary).collect::<Vec<_>>()
+        );
+
+        // 更正凭证：分录原样复制、草稿待记账
         let new_v = get(&db, new_id).unwrap().unwrap();
         assert_eq!(new_v.status, VoucherStatus::Draft);
         assert!(
@@ -1341,45 +1476,111 @@ mod tests {
             "摘要要说清是更正哪张、为什么：{}",
             new_v.memo
         );
-        // 分录原样复制
-        let old_ents = entries_of(&db, old).unwrap();
         assert_eq!(new_v.entries.len(), old_ents.len());
         assert_eq!(
             new_v.entries[0].debit, old_ents[0].debit,
             "分录必须原样复制，否则「更正」就变成了别的业务"
         );
         assert_eq!(new_v.entries[1].credit, old_ents[1].credit);
-
-        // 双向建链
-        let a_old = amend_link(&db, old).unwrap().unwrap();
-        assert_eq!(a_old.amended_by, new_id, "原凭证要标注「被谁更正」");
-        assert!(
-            a_old.amended_by_no.starts_with("记-"),
-            "要可读单号：{}",
-            a_old.amended_by_no
-        );
-        assert_eq!(a_old.reason, "金额录错，应为 1200");
         let a_new = amend_link(&db, new_id).unwrap().unwrap();
         assert_eq!(a_new.amends_id, old, "新凭证要标注「更正自谁」");
-        assert!(!a_new.amends_no.is_empty());
 
-        // 记账后总账只认新凭证那一笔
+        // 终态：两张都记账后，1001 **净额**仍是 +1000
+        // （原 借1000，红冲 贷1000，更正 借1000）
+        post(&db, red_id, "boss").unwrap();
         post(&db, new_id, "boss").unwrap();
-        let on_hand: f64 = db
+        let (net, n): (f64, i64) = db
             .conn()
             .query_row(
-                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) FROM voucher_entry e
-                 JOIN voucher v ON v.id=e.voucher_id
+                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) - COALESCE(SUM(CAST(e.credit AS REAL)),0),
+                        COUNT(*)
+                 FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
+                 WHERE e.account_code='1001' AND v.status='posted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (net - 1000.0).abs() < 0.01,
+            "三张凭证净额应等于原始那一笔 1000，实际 {net}"
+        );
+        // 账上确实看得见三笔（留痕）—— 这正是与「作废原凭证」的关键差别
+        assert_eq!(n, 3, "总账里应看得见三笔（留痕），而不是只剩一笔");
+    }
+
+    /// 三张凭证必须成套存在：单独作废或反记账任何一张，净额都会错。
+    ///
+    /// 这是红冲形态引入的**新**风险：早先「作废原凭证 + 替换」只有两张且原凭证
+    /// 早已不在总账，动它不影响净额；改成红冲后原凭证仍在账上，任何一张被单独
+    /// 撤出都会出错，而 `unpost` 与 `set_void` 是两个入口 —— 漏掉一个等于没守卫。
+    #[test]
+    fn amend_set_cannot_pull_one_third_of_the_set_out() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        let new_id = amend(&db, old, "金额录错", "boss").unwrap();
+        let red_id = amend_link(&db, old).unwrap().unwrap().amended_by;
+        // 两张都记账，进入「成就在总账里」的状态
+        post(&db, red_id, "boss").unwrap();
+        post(&db, new_id, "boss").unwrap();
+
+        // ① 原凭证：作废 → 凭空少一笔；反记账 → 一笔钱记两遍（都做过一次更正后
+        //    再来一次才触发，因为被更正的原凭证本就不该再动）
+        for (what, r) in [
+            ("作废", set_void(&db, old, true, "boss")),
+            ("反记账", unpost(&db, old)),
+        ] {
+            let e = r.unwrap_err();
+            assert!(
+                format!("{e:?}").contains("成套存在"),
+                "{what} 必须被守卫挡住：{e:?}"
+            );
+        }
+        // ② 红冲凭证：作废 → 只剩 原+更正，一笔钱记两遍
+        let e = set_void(&db, red_id, true, "boss").unwrap_err();
+        assert!(format!("{e:?}").contains("成套存在"), "红冲凭证不能单独作废：{e:?}");
+        let e = unpost(&db, red_id).unwrap_err();
+        assert!(format!("{e:?}").contains("成套存在"), "红冲凭证不能单独反记账：{e:?}");
+        // ③ 更正凭证同样
+        let e = set_void(&db, new_id, true, "boss").unwrap_err();
+        assert!(format!("{e:?}").contains("成套存在"), "更正凭证不能单独作废：{e:?}");
+
+        // 守卫失败不该动任何状态
+        for id in [old, red_id, new_id] {
+            assert_eq!(
+                get(&db, id).unwrap().unwrap().status,
+                VoucherStatus::Posted,
+                "守卫失败不该动凭证 #{id} 的状态"
+            );
+        }
+        // 净额仍是 1000
+        let net: f64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) - COALESCE(SUM(CAST(e.credit AS REAL)),0)
+                 FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
                  WHERE e.account_code='1001' AND v.status='posted'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        // 借方总额仍应只有一笔（新凭证的），作废的那张不进总账
-        assert!(
-            (on_hand - 1000.0).abs() < 0.01,
-            "总账只应有一笔 1000（作废的那张不进总账），实际 {on_hand}"
-        );
+        assert!((net - 1000.0).abs() < 0.01, "净额应仍为 1000，实际 {net}");
+    }
+
+    /// 「重做这一张」是唯一放行的操作：更正凭证还没记账时，把它作废重来。
+    ///
+    /// 不放行的话，用户改了错的更正凭证就只能再更正一次（凭空多出三张），
+    /// 而那张错的草稿还在列表里等着被误记账。
+    #[test]
+    fn draft_rewrite_can_be_voided_and_reentered() {
+        let db = mem();
+        let old = am_voucher(&db, "1000");
+        post(&db, old, "boss").unwrap();
+        let new_id = amend(&db, old, "第一次更正", "boss").unwrap();
+        // 草稿状态（未记账）→ 不在总账里，作废它不改变净额
+        assert_eq!(get(&db, new_id).unwrap().unwrap().status, VoucherStatus::Draft);
+        set_void(&db, new_id, true, "boss").expect("未记账的更正凭证应可作废重来");
+        assert_eq!(get(&db, new_id).unwrap().unwrap().status, VoucherStatus::Void);
     }
 
     /// 操作日志必须与更正**同在一条记录里**：日志写在事务外的话，
@@ -1408,47 +1609,47 @@ mod tests {
         );
     }
 
-    /// 已被更正的凭证不能「恢复作废」。
+    /// 更正链上的原凭证不能被反记账 —— 那会让一笔钱记两遍。
     ///
-    /// 这是本次改动引入的漏洞：更正把原凭证置为作废，而 UI 上「恢复作废」的
-    /// 显隐条件正是 `status === 'void'`。恢复后原凭证回到未记账 —— 看着无害，
-    /// 但**它可以被重新记账**，届时它与更正凭证同时进总账，一笔钱记两遍，
-    /// 而链上仍显示「原凭证已作废、已被更正」。审计与账实直接矛盾。
+    /// 原凭证仍保持已记账（靠红冲抵消），所以对它反记账等于把「抵消项」撤掉：
+    /// 总账里剩下 红冲(-1000) + 更正(+1000) = 0，但原凭证那笔业务凭空消失。
+    /// 反过来若只撤更正凭证，又会变成 原(+1000) + 红冲(-1000) = 0，业务同样丢了。
+    /// 无论撤哪张，正确答案都是「三张一起撤」，所以逐张的入口必须都挡住。
     #[test]
-    fn amended_voucher_cannot_be_restored_from_void() {
+    fn amended_voucher_cannot_be_unposted() {
         let db = mem();
         let old = am_voucher(&db, "1000");
         post(&db, old, "boss").unwrap();
         let new_id = amend(&db, old, "金额录错", "boss").unwrap();
+        let red_id = amend_link(&db, old).unwrap().unwrap().amended_by;
+        post(&db, red_id, "boss").unwrap();
         post(&db, new_id, "boss").unwrap();
 
-        let e = set_void(&db, old, false, "boss").unwrap_err();
+        let e = unpost(&db, old).unwrap_err();
         assert!(
-            format!("{e:?}").contains("更正过"),
-            "错误信息要指向「已被更正过」，实际：{e:?}"
+            format!("{e:?}").contains("成套存在"),
+            "错误信息要说清是「成套」问题：{e:?}"
         );
-        // 被拒后原凭证必须仍是作废 —— 不能被半途恢复
+        // 被拒后状态不该变
         assert_eq!(
             get(&db, old).unwrap().unwrap().status,
-            VoucherStatus::Void,
+            VoucherStatus::Posted,
             "守卫失败不该动凭证状态"
         );
-
-        // 终态核对：总账里 1001 只有一笔，不是两笔
-        let on_hand: f64 = db
+        // 终态核对：总账里 1001 仍是三笔、净额 1000
+        let (n, net): (i64, f64) = db
             .conn()
             .query_row(
-                "SELECT COALESCE(SUM(CAST(e.debit AS REAL)),0) FROM voucher_entry e
-                 JOIN voucher v ON v.id=e.voucher_id
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CAST(e.debit AS REAL)),0) - COALESCE(SUM(CAST(e.credit AS REAL)),0)
+                 FROM voucher_entry e JOIN voucher v ON v.id=e.voucher_id
                  WHERE e.account_code='1001' AND v.status='posted'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert!(
-            (on_hand - 1000.0).abs() < 0.01,
-            "一笔钱只能记一次，实际总账 {on_hand}"
-        );
+        assert_eq!(n, 3, "总账里应仍是三笔（留痕）");
+        assert!((net - 1000.0).abs() < 0.01, "净额应仍为 1000，实际 {net}");
     }
 
     /// 未被更正的普通作废凭证仍可恢复（守卫不能误伤既有流程）

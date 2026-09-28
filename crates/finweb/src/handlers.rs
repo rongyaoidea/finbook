@@ -422,6 +422,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/inventory/batch-cost", get(batch_cost))
         // 采购/销售深度：暂估 / 对账 / 配额 / 订单变更
         .route("/api/procure/estimate", get(list_estimates).post(add_estimate))
+        .route("/api/procure/estimate/status", get(estimate_status))
         .route("/api/procure/estimate/:id/settle", post(settle_estimate))
         .route("/api/procure/reconcile", get(get_po_reconcile))
         .route("/api/procure/quota", get(get_quota).post(set_quota))
@@ -6345,6 +6346,26 @@ async fn add_estimate(
     Ok(Json(serde_json::json!({ "ok": true, "id": est_id, "voucher_id": vid })))
 }
 
+/// 逐行列出暂估状态：可暂估额度 / 已暂估 / 还能登多少。
+///
+/// 收货与暂估之间原本**没有任何联动** —— 收完货不会提示「该登暂估了」，
+/// 而登记暂估的金额还要用户手敲（敲错也没人拦）。这个端点把三笔数摆出来，
+/// 让界面能显示「可暂估 / 已暂估 / 未暂估」，并可一键带出金额。
+async fn estimate_status(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::OrderOps)?;
+    let po_id = q.get("po_id").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    if po_id == 0 {
+        return Err(AppError::bad_request("缺少 po_id"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let rows = findb::scm2::estimate_status_by_line(&db, po_id)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
+}
+
 async fn list_estimates(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -6538,6 +6559,13 @@ struct ReceiptReq {
     /// 仓库编码（留空 = 默认仓）
     #[serde(default)]
     pub warehouse: String,
+    /// 收货针对哪一行（物料编码）。留空 = 整单收货（单行订单 / 旧客户端）。
+    ///
+    /// 多行订单**必须**指定：否则这批货属于哪一行说不清，金额只能按订购量占比
+    /// 折算，而那个折算对部分收货是错的（两张行各 100 件、含税单价 11，实收 100 件
+    /// 全是第一行，折算摊成 550 而实际 1100），暂估封顶额度也会跟着错。
+    #[serde(default)]
+    pub item_code: String,
 }
 
 async fn add_po_receipt(
@@ -6555,6 +6583,7 @@ async fn add_po_receipt(
     };
     let id = findb::procurement::po_receipt_with_stock(&db, &findb::procurement::PoReceipt {
         id: 0, po_id: req.po_id, period, date, qty: parse_money_checked(&req.qty)?, memo: req.memo,
+        item_code: req.item_code, warehouse: req.warehouse.clone(),
     }, &req.warehouse)?;
     // 待检提示：首行存货勾选了来料检验 → 入库为待检状态（质检转正后方可领用）
     let qc_pending = findb::scm::po_get(&db, req.po_id)?
@@ -6580,7 +6609,16 @@ async fn add_po_return(
     } else {
         NaiveDate::parse_from_str(&req.date, "%Y-%m-%d").unwrap_or_else(|_| period.first_day())
     };
-    let id = findb::procurement::po_return_with_stock(&db, req.po_id, period, date, parse_money_checked(&req.qty)?, &req.memo, &req.warehouse)?;
+    let id = findb::procurement::po_return_with_stock(
+        &db,
+        req.po_id,
+        period,
+        date,
+        parse_money_checked(&req.qty)?,
+        &req.memo,
+        &req.warehouse,
+        &req.item_code,
+    )?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 

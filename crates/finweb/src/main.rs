@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 use finweb::handlers;
 use finweb::realm::RealmDb;
 use finweb::state::{BookRegistry, SessionStore, WebState};
+use tracing::error;
 
 /// 初始化日志：默认 info 级（含 HTTP 访问日志），可用 RUST_LOG 调级
 fn init_tracing() {
@@ -36,6 +37,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 用户自建账套的存放目录
     let books_dir = std::env::var("FINBOOK_BOOKS_DIR").unwrap_or_else(|_| "./data/books".to_string());
     let books_dir = PathBuf::from(&books_dir);
+    // 数据目录是否必须**事先存在**。
+    //
+    // 容器部署必须置 FINBOOK_REQUIRE_BOOKS_DIR=true（Dockerfile 已设）：
+    // `--data-volume` 挂错路径、或 bind mount 因宿主机目录不存在而没挂上时，
+    // `create_dir_all` 会在**容器可写层**里凭空造一个 books 目录。服务照常启动、
+    // 照常记账、备份脚本也照常把 .fbk 写进同一层 —— 一切看起来正常，
+    // 直到容器重建：账套、备份全没，而运维从头到尾没收到任何信号。
+    // 那是静默数据丢失，比启动失败糟得多。
+    //
+    // 本机/开发场景保留自动创建：首次跑起来不该要求人先 mkdir。
+    let require_books_dir = std::env::var("FINBOOK_REQUIRE_BOOKS_DIR")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(false);
+    if require_books_dir && !books_dir.is_dir() {
+        return Err(format!(
+            "账套目录不存在：{}\n\
+             这通常是数据卷没挂上（--volume / -v 路径写错，或宿主机目录不存在导致 bind mount 失败）。\n\
+             继续启动会在容器可写层里新建一个目录开始记账，容器一重建数据就没了。\n\
+             请先创建并挂载该目录；确认确实不需要持久化时，显式设 FINBOOK_REQUIRE_BOOKS_DIR=0。",
+            books_dir.display()
+        )
+        .into());
+    }
     std::fs::create_dir_all(&books_dir)?;
 
     // 兼容旧版单账套环境变量：若设置且目录里有账套文件，则注册为可选账套
@@ -103,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) =
                                     findb::exports::sched_run(&db, s.id, &st.books_dir.join("exports"))
                                 {
-                                    eprintln!("[export] 计划任务 #{} 执行失败：{e}", s.id);
+                                    error!(schedule = s.id, error = %e, "导出计划任务执行失败");
                                 }
                             }
                         }
@@ -130,8 +154,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  └─────────────────────────────────────────────┘\n");
     }
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// 监听 SIGTERM / SIGINT，触发优雅关闭
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("注册 Ctrl+C 处理器失败");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("注册 SIGTERM 处理器失败")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    println!("收到关闭信号，等待进行中的请求完成...");
 }
 
 /// 默认工作期间：当前月份（ymm）

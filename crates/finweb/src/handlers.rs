@@ -54,6 +54,9 @@ async fn api_auth_gate(
     if path.starts_with("/api/")
         && !path.starts_with("/api/v1/")
         && path != "/api/health"
+        // 深度探针同样免登录：它的调用方是监控/负载均衡，不是浏览器用户。
+        // 它只回「依赖是否可用」，不回任何业务数据。
+        && path != "/api/health/ready"
         && path != "/api/login"
         && path != "/api/logout"
         && path != "/api/setup/status"
@@ -86,6 +89,109 @@ async fn spa_fallback(
         // tower-http 的响应体类型映射为 axum Body
         .map(|resp| resp.map(axum::body::Body::new))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// 深度探针（readiness）：真正去碰依赖，回答「数据层还能用吗」
+///
+/// ## 与 `/api/health` 的分工
+///
+/// - `/api/health` = **liveness**：进程还在收请求吗。**不碰任何依赖**，
+///   所以数据库慢不会让它失败。
+/// - `/api/health/ready` = **readiness**：账号库 / 账套库 / 数据目录还能读写吗。
+///
+/// 这个区分是硬要求，不是洁癖：liveness 一旦碰 DB，数据库变慢就会把容器判成
+/// unhealthy，编排器随即重启应用 —— 于是「数据库一慢就重启应用，重启又让
+/// 数据库更慢」，把一次本可自愈的抖动放大成宕机。负载均衡与监控该用 readiness。
+///
+/// ## 为什么原探针不够用
+///
+/// 原 `/api/health` 返回常量 `ok`，不碰 DB。于是下面这种最常见的故障它一律
+/// 报「健康」：磁盘写满 → SQLite 写失败；账套文件损坏 → 打开即报错；
+/// 账号库被锁 → 所有登录 500。进程活着、端口通，但系统已经不能用了。
+/// healthcheck.sh 拿着这样的答案会一直显示「一切正常」—— 虚假的安全感比
+/// 没有监控更危险，因为它让人不去查别的地方。
+///
+/// ## 探针自身必须廉价且无副作用
+///
+/// - 账套用 `open_no_migrate` 打开：只设连接级 PRAGMA，**不写库**。
+///   探针绝不能触发迁移 —— 迁移是写事务，5 分钟一次的探针去抢写锁，
+///   会在业务正忙时制造额外的锁竞争。
+/// - 目录可写性用「建临时文件 → 立即删」，文件名不以 `.fbk` 结尾，
+///   不会被账套扫描当成新账套。
+async fn health_ready(
+    State(state): State<Arc<WebState>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let mut checks = serde_json::Map::new();
+    let mut ok = true;
+
+    // ① 账号库：真发一条 SQL（realm.db 损坏 / 被锁 / 权限不对都会在这里暴露）
+    match state.realm.count_users() {
+        Ok(n) => {
+            checks.insert("realm".into(), json!({ "ok": true, "users": n }));
+        }
+        Err(e) => {
+            ok = false;
+            checks.insert("realm".into(), json!({ "ok": false, "error": e.to_string() }));
+        }
+    }
+
+    // ② 账套目录：能列出来，且至少一个账套能真的读
+    let mut book_files: Vec<std::path::PathBuf> = std::fs::read_dir(&state.books_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "fbk").unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default();
+    book_files.sort();
+    checks.insert("books_count".into(), json!(book_files.len()));
+
+    // ③ 抽一个账套做只读查询 —— 文件损坏 / 权限不对 / 磁盘 I/O 错误都在这里现形
+    if let Some(p) = book_files.first() {
+        match findb::Db::open_no_migrate(p).and_then(|db| {
+            // 走一次真实查询：Connection::open 是惰性的，坏文件也要 SELECT 才报错
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM voucher", [], |r| r.get::<_, i64>(0))
+                .map_err(Into::into)
+        }) {
+            Ok(_) => {
+                checks.insert("book_sample".into(), json!({ "ok": true }));
+            }
+            Err(e) => {
+                ok = false;
+                checks.insert(
+                    "book_sample".into(),
+                    json!({
+                        "ok": false,
+                        "file": p.file_name().unwrap_or_default().to_string_lossy(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    // ④ 数据目录可写：磁盘满 / 只读挂载 / 属主不对时，服务看着健康却录不了凭证。
+    //    healthcheck.sh 只能查宿主机视角的权限，这里查进程自己的真实能力。
+    let probe = state.books_dir.join(".finbook-write-probe");
+    let writable = std::fs::write(&probe, b"ok").is_ok() && std::fs::remove_file(&probe).is_ok();
+    if !writable {
+        ok = false;
+    }
+    checks.insert(
+        "books_dir_writable".into(),
+        json!({ "ok": writable, "path": state.books_dir.display().to_string() }),
+    );
+
+    let body = json!({ "ok": ok, "checks": checks });
+    // 有依赖不可用时返回 503：编排器据此把实例摘出负载均衡，
+    // 但**不**触发重启（那是 liveness 的职责）。返回 200 会让负载均衡
+    // 继续往一个明确不能用的实例上打流量。
+    Ok((
+        if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        Json(body),
+    ))
 }
 
 /// 组装路由
@@ -405,7 +511,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/archives", get(list_archives).post(create_archive))
         .route("/api/archives/:id", get(get_archive))
         .route("/api/archives/:id/verify", get(verify_archive))
+        // 存活探针：**故意不碰任何依赖**。它只回答「进程还在收请求吗」，
+        // 所以不能加 DB 查询 —— Docker HEALTHCHECK 每 30s 调一次，
+        // 一旦让它碰 DB，数据库慢就会把容器判成 unhealthy 并被编排器重启，
+        // 变成「数据库一慢就把应用重启」的自伤式故障放大。
+        // 需要验证数据层请用 /api/health/ready（深度探针）。
         .route("/api/health", get(|| async { "ok" }))
+        .route("/api/health/ready", get(health_ready))
         // 资金：票据 / 融资 / 资金日报 / 资金预测（台账与总账联动：流转/结清自动生成凭证）
         .route("/api/funds/bills", get(list_bills).post(save_bill))
         .route("/api/funds/bills/:id/status", post(bill_transition))

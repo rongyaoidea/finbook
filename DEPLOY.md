@@ -168,6 +168,23 @@ finance.example.com {
   ```
 - **冷备**：`systemctl stop finweb` 后直接 `cp -a /opt/finbook/data /backup/cold-$(date +%F)` 整个目录。
 - **轮转建议**：每日全量 + 保留 30 天（cron 脚本按上例组织；同日重跑前先清理旧目录）。
+- **自动化脚本（推荐）**：`deploy/` 下有两个现成脚本，省掉手写 cron：
+  | 脚本 | 作用 | 建议频率 |
+  |---|---|---|
+  | `deploy/backup.sh` | 走产品自身 `POST /api/backups` 逐个账套备份（内部是 WAL checkpoint + 一致快照），并清理超期备份 | 每天一次（凌晨） |
+  | `deploy/healthcheck.sh` | 探 `/api/health` + 账套目录可写性 + 磁盘水位，连续失败才告警（避免抖动误报） | 每 5 分钟 |
+
+  ```bash
+  # 口令别写进脚本：放环境变量或同目录 .env（chmod 600）
+  echo 'FINBOOK_ADMIN_PASS=你的口令' > /opt/finbook/backup.env && chmod 600 /opt/finbook/backup.env
+  # 宝塔计划任务填：FINBOOK_ADMIN_PASS 由任务环境变量提供，然后
+  bash /opt/finbook/deploy/backup.sh
+  bash /opt/finbook/deploy/healthcheck.sh
+  ```
+  > 用管理员账号跑备份脚本是安全的：管理员登录不绑定设备、也不踢掉其他会话，
+  > 不会把正在用系统的同事挤下线。但该账号若处于「必须修改口令」状态，除改密接口外
+  > 全部 401，脚本会报「获取账套列表失败」——先用浏览器登录改完口令即可。
+  > 脚本只覆盖应用内账套备份；`realm.db` 与外置 `.attachments/` 仍需按上面的热备/冷备单独处理。
 - **恢复（务必按顺序）**：
   1. `systemctl stop finweb`（或停容器）
   2. 用备份覆盖 `realm.db`
@@ -189,8 +206,12 @@ finance.example.com {
 ## 8. 运维命令
 
 ```bash
-# 健康检查
+# 存活探针：只回答「进程还在收请求吗」，**不碰任何依赖**（恒返回 ok）
 curl http://127.0.0.1:8080/api/health
+
+# 深度探针：真去查账号库 / 账套库 / 数据目录可否读写
+# 依赖不可用时返回 **503**，并列出具体哪一项坏了
+curl -i http://127.0.0.1:8080/api/health/ready
 
 # 查看日志（含访问日志与启动横幅）
 journalctl -u finweb -f
@@ -205,6 +226,24 @@ cargo run -p findb --release --example reset_pwd -- /opt/finbook/data/books/comp
 # 常规做法：平台管理员在 Web 端「平台账号/用户管理」重置口令，用户首次登录强制改密
 ```
 
+### 8.1 为什么有两个探针
+
+| 端点 | 含义 | 碰依赖 | 失败时该做什么 |
+|---|---|---|---|
+| `/api/health` | liveness | 否 | **重启**应用 |
+| `/api/health/ready` | readiness | 是（账号库 / 账套库 / 数据目录） | **摘流量**，别重启应用 |
+
+这个区分是硬要求：liveness 一旦碰 DB，数据库变慢就会把容器判成 unhealthy，
+编排器随即重启应用 —— 于是「数据库一慢就重启应用，重启又让数据库更慢」，
+把一次本可自愈的抖动放大成宕机。
+
+反过来，只查 liveness 也不够：它返回常量 `ok`，磁盘写满、账套文件损坏、
+账号库被锁这些「系统已经不能用了」的状态它一律报健康。**监控要盯 readiness。**
+
+`healthcheck.sh` 默认查 readiness；`deploy/finweb.service` 与 `Dockerfile`
+已把 `FINBOOK_REQUIRE_BOOKS_DIR=true` 打开，数据目录不存在时服务会**启动失败**
+而不是凭空建一个目录开始记账（详见 §10）。
+
 ## 9. 安全检查清单
 
 - [ ] 反向代理已启用 HTTPS，8080 未对外暴露；纯 HTTPS 下 `FINWEB_SECURE_COOKIE=true`
@@ -214,3 +253,28 @@ cargo run -p findb --release --example reset_pwd -- /opt/finbook/data/books/comp
 - [ ] 平台管理员口令已预置或用自动生成口令后立即改密
 - [ ] 普通用户账号由管理员开通，默认强制首登改密
 - [ ] 账套内默认管理员 `admin` 已改默认口令（新账套首登强制改密）
+
+## 10. 数据目录必须事先存在（防静默数据丢失）
+
+`FINBOOK_REQUIRE_BOOKS_DIR=true` 时，`FINBOOK_BOOKS_DIR` 指向的目录不存在，
+服务会**直接启动失败**并说明原因，而不是自动创建一个。
+
+为什么值得这么严格：容器部署时 `--volume` 路径写错、或 bind mount 因宿主机
+目录不存在而没挂上，服务会在**容器可写层**里凭空造一个 `books` 目录。
+然后一切照常：能登录、能录凭证、备份脚本也照常把 `.fbk` 写进同一层。
+问题在于没人收到任何信号 —— 直到容器重建，账套和备份一起消失。
+
+> 那个场景下 `df` 看磁盘是满的、`/api/health` 报 ok、监控一片绿色。
+> 唯一的征兆是数据在重建后没了，而那时已经无法追溯。
+
+```bash
+# 部署前自检：先建好宿主机目录再起容器
+mkdir -p /srv/finbook/books && chown -R 10001:10001 /srv/finbook
+docker run -d -v /srv/finbook/books:/data/books finbook
+
+# 确认数据确实落在宿主机上（而不是可写层）
+docker inspect <容器> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+```
+
+确认部署不需要持久化（例如临时演示环境）时，显式关掉：
+`FINBOOK_REQUIRE_BOOKS_DIR=0`。

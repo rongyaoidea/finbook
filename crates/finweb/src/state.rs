@@ -1,6 +1,6 @@
 //! Web 服务共享状态：账号库、账套注册表、会话管理、鉴权提取器与错误类型。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -13,6 +13,7 @@ use axum_extra::extract::cookie::CookieJar;
 use fincore::user::{PasswordPolicy, Perm, Role, User};
 use findb::{users, Db, DbError};
 use rand::Rng;
+use tracing::error;
 
 use crate::realm::{ensure_book_admin, RealmDb, RealmUser as RealmAccount};
 
@@ -102,7 +103,7 @@ impl WebState {
         let moved = match self.realm.reassign_books_to_admin() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[finweb] 账套归属迁移失败: {e}");
+                error!(error = %e, "账套归属迁移失败");
                 return 0;
             }
         };
@@ -120,7 +121,7 @@ impl WebState {
             let db = match self.books.open(key) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("[finweb] 迁移补套内管理员失败（{key} 打不开）: {e}");
+                    error!(book = %key, error = %e, "迁移补套内管理员失败：账套打不开");
                     continue;
                 }
             };
@@ -144,7 +145,7 @@ impl WebState {
                 Ok(())
             })();
             if let Err(e) = ensured {
-                eprintln!("[finweb] 迁移补套内管理员失败（{key}）: {e}");
+                error!(book = %key, error = %e, "迁移补套内管理员失败");
             }
         }
         println!(
@@ -163,12 +164,23 @@ impl WebState {
 /// 账套注册表：key（文件名，不带扩展名）→ 文件路径
 pub struct BookRegistry {
     inner: Mutex<Vec<(String, PathBuf)>>,
+    /// 已完成 schema 初始化的账套 key。
+    ///
+    /// Web 端每个请求都要借出账套连接，而 `Db::open` 里的 `schema::init` 每次
+    /// 都得为几十张表跑一遍存在性检查（防"版本号对但表不全"的半损坏库）。
+    /// 账套文件是长期不变的，迁移只需在首次打开时做一次，这里记住结果：
+    /// 命中时走 `open_no_migrate`（只设连接级 PRAGMA，省掉全表检查）。
+    ///
+    /// 账套文件被换掉时标记同步清除（恢复账套会 `unregister` + `register`），
+    /// 下次打开重新走完整迁移检查。
+    migrated: Mutex<HashSet<String>>,
 }
 
 impl BookRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Vec::new()),
+            migrated: Mutex::new(HashSet::new()),
         }
     }
 
@@ -188,6 +200,9 @@ impl BookRegistry {
     /// 注销账套（删除账套时调用）：避免后续请求把已删除文件重新打开成空库
     pub fn unregister(&self, key: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| k != key);
+        // 账套文件可能已被恢复成另一份（或已删除）：清掉初始化标记，
+        // 下次打开重新走 schema 完整检查，而不是沿用旧文件的结论。
+        lock(&self.migrated).remove(key);
     }
 
     /// 所有账套 key + 文件路径（供列表展示）
@@ -210,7 +225,13 @@ impl BookRegistry {
             .find(|(k, _)| k == key)
             .map(|(_, p)| p.clone())
             .ok_or_else(|| DbError::Fin(fincore::FinError::msg(format!("账套不存在：{key}"))))?;
-        Db::open(&path).map_err(Into::into)
+        if lock(&self.migrated).contains(key) {
+            // 首次打开已跑过 schema 初始化：只设连接级 PRAGMA，跳过全表检查
+            return Db::open_no_migrate(&path);
+        }
+        let db = Db::open(&path)?;
+        lock(&self.migrated).insert(key.to_string());
+        Ok(db)
     }
 }
 
@@ -738,7 +759,7 @@ impl IntoResponse for AppError {
             }
             AppError::Db(e) => {
                 // 内部错误详情只记服务端日志，不返给客户端（防表名/路径/SQL 泄露）。
-                eprintln!("[finweb] db error: {e}");
+                error!(error = %e, "数据库错误");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(serde_json::json!({ "error": "数据库错误，请稍后重试或联系管理员" })),
@@ -746,7 +767,7 @@ impl IntoResponse for AppError {
                     .into_response()
             }
             AppError::Internal(m) => {
-                eprintln!("[finweb] internal error: {m}");
+                error!(error = %m, "内部错误");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(serde_json::json!({ "error": "服务器内部错误，请稍后重试" })),

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use findb::{users, Db, DbError, DbResult};
 use fincore::user::{burn_argon2, hash_password, verify_password, PasswordPolicy, Role, User};
 use rusqlite::{Connection, OptionalExtension};
+use tracing::error;
 
 /// 全局账号（平台层）
 #[derive(Clone, Debug)]
@@ -981,7 +982,7 @@ impl RealmDb {
                         n += 1;
                     }
                 }
-                Err(e) => eprintln!("[realm] 扫描账套失败 {}: {e}", p.display()),
+                Err(e) => error!(book = %p.display(), error = %e, "扫描账套失败"),
             }
         }
         Ok(n)
@@ -1024,7 +1025,7 @@ impl RealmDb {
             let db = match Db::open(&p) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("[realm] 同步口令打不开账套 {}: {e}", p.display());
+                    error!(book = %p.display(), error = %e, "同步口令：账套打不开");
                     continue;
                 }
             };
@@ -1034,16 +1035,16 @@ impl RealmDb {
                     u.must_change_pwd = must_change;
                     u.locked_until = None;
                     if let Err(e) = users::update(&db, &u) {
-                        eprintln!("[realm] 同步口令写账套失败 {}: {e}", p.display());
+                        error!(book = %p.display(), error = %e, "同步口令：写账套失败");
                         continue;
                     }
                     if let Err(e) = findb::security::clear_attempts(&db, Some(username)) {
-                        eprintln!("[realm] 同步口令清失败计数失败 {}: {e}", p.display());
+                        error!(book = %p.display(), error = %e, "同步口令：清失败计数失败");
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[realm] 同步口令读账套失败 {}: {e}", p.display());
+                    error!(book = %p.display(), error = %e, "同步口令：读账套失败");
                 }
             }
         }

@@ -31,8 +31,15 @@ Group=finbook
 WorkingDirectory=/opt/finbook
 Environment=FINBOOK_REALM=/opt/finbook/data/realm.db
 Environment=FINBOOK_BOOKS_DIR=/opt/finbook/data/books
+# 数据目录必须事先存在：挂错路径时宁可启动失败，也不要在磁盘上凭空造一个
+# books 目录开始记账（那样数据看似正常，磁盘一坏/重装就没了，且无人察觉）。
+Environment=FINBOOK_REQUIRE_BOOKS_DIR=true
 Environment=FINBOOK_LISTEN=127.0.0.1:8080
 Environment=FINWEB_STATIC_DIR=/opt/finbook/static
+# 前置 HTTPS 反代时开启：会话 Cookie 加 Secure 标志，只经 HTTPS 传输。
+# 本服务自己只监听 127.0.0.1（明文），但对外那一跳若走了 HTTPS 就应打开。
+# 若确认部署在纯 HTTP 内网（无反代），改为 false，否则浏览器不会回传 Cookie。
+Environment=FINWEB_SECURE_COOKIE=true
 # 可选：预置平台管理员口令（否则首次启动自动生成并打印一次）
 # Environment=FINBOOK_ADMIN_USER=admin
 # Environment=FINBOOK_ADMIN_PASS=ChangeMe123

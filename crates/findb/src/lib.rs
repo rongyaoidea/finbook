@@ -117,14 +117,27 @@ pub struct Db {
 }
 
 impl Db {
-    /// 打开已有账套
+    /// 打开已有账套（并按需执行 schema 迁移）
     pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
+        let db = Self::open_no_migrate(path)?;
+        schema::init(&db.conn)?;
+        Ok(db)
+    }
+
+    /// 打开已有账套并设置连接级 PRAGMA，但**不跑 schema 迁移**。
+    ///
+    /// 仅供已确认该文件完成迁移的调用方使用——Web 层账套注册表在首次
+    /// [`Db::open`] 成功后记住该状态，之后每个请求省掉 `tables_complete`
+    /// 的全表检查（该检查要为几十张表各跑一次 `sqlite_master` 查询）。
+    /// 账套文件被替换后必须重新走 [`Db::open`]（恢复账套路径会注销账套，
+    /// 顺带清掉这个标记）。未确认的新旧账套一律用 [`Db::open`]。
+    pub fn open_no_migrate<P: AsRef<Path>>(path: P) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             return Err(FinError::msg(format!("账套文件不存在：{}", path.display())).into());
         }
         let conn = Connection::open(&path)?;
-        schema::init(&conn)?;
+        schema::apply_pragmas(&conn)?;
         Ok(Self { conn, path })
     }
 

@@ -86,6 +86,61 @@ pub fn po_estimate_add(
         },
         ..fincore::Entry::new(2, biz.ap.as_str(), memo.as_str())
     };
+    // 暂估封顶：同一 PO + 物料的**未结算**暂估累计，不得超过该 PO 的累计到货金额。
+    //
+    // 回归背景：`po_estimate` 表只有普通索引、没有唯一约束，金额又全靠手填，
+    // 所以同一批货能被反复登记暂估 —— 每登记一次就生成一张「借 存货 / 贷 应付」
+    // 的凭证，应付与存货双双虚增，且没有任何一处会报错。这不是「数据脏」，
+    // 是账实可以凭空做出来。
+    //
+    // 销售侧有对等守卫（`scm::prod_from_so` 封顶在「订购 − 已发 − 已下推」），
+    // 采购侧此前**完全裸奔**。对标 ERPNext / Odoo 的 received vs billed 一致性检查。
+    //
+    // 口径直接复用 `scm::po_received_gross`（价税合计 × 已收/订购，含税），
+    // 不另造算法 —— 两处口径一旦分叉，守卫就会拿错误的额度去拦正确的操作。
+    if !est_amount.is_positive() {
+        return Err(fincore::FinError::msg("暂估金额必须为正数").into());
+    }
+    let line = po
+        .lines
+        .iter()
+        .find(|l| l.item_code == item)
+        .ok_or_else(|| fincore::FinError::msg(format!("采购订单里没有物料 {item}")))?;
+    // 金额/数量列一律 TEXT 存储：不在 SQL 里 SUM（SQLite 对 TEXT 的 SUM 返回
+    // Real，精度和类型都不可靠），取回后在 Money 里累加。
+    let mut st = db.conn().prepare(
+        "SELECT qty FROM po_receipt WHERE po_id=?1 ORDER BY id",
+    )?;
+    let recv_qty = st
+        .query_map([po_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .fold(fincore::Money::ZERO, |acc, q| acc + fincore::Money::parse_or_zero(q));
+    // `po_receipt` 只记数量、不分物料（整单收货），所以到货金额按**订购数量占比**
+    // 折算到本物料：整单到货金额 × (本行订购量 ÷ 全单订购量)。
+    let gross = crate::scm::po_received_gross(&po, recv_qty);
+    let ordered_all: fincore::Money = po.lines.iter().map(|l| l.qty_ordered).sum();
+    let cap = gross
+        .checked_div(ordered_all)
+        .map(|u| u * line.qty_ordered)
+        .unwrap_or(fincore::Money::ZERO);
+    let mut st2 = db.conn().prepare(
+        "SELECT est_amount FROM po_estimate WHERE po_id=?1 AND item=?2 AND settled=0 ORDER BY id",
+    )?;
+    let open_est = st2
+        .query_map(rusqlite::params![po_id, item], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .fold(fincore::Money::ZERO, |acc, a| acc + fincore::Money::parse_or_zero(a));
+    if open_est + est_amount > cap {
+        return Err(fincore::FinError::state(format!(
+            "暂估金额超出可暂估额度：本次 {est_amount}，本物料未结算暂估累计 {open_est}，\
+             但累计到货金额只有 {cap}。\n\
+             （到货金额按订单价税合计 × 已收/订购推导，含税。\
+             暂估不得超过实收 —— 否则应付与存货会凭空多出一截。）"
+        ))
+        .into());
+    }
     let tx = db.write_tx()?;
     let date = period.first_day();
     let no = crate::vouchers::next_no_of(&tx, period, "记")?;
@@ -368,6 +423,118 @@ mod tests {
     use super::*;
     use crate::tests::mem;
 
+    /// 暂估封顶：应收货限制，防止同一批货被反复登记暂估把应付做虚。
+    ///
+    /// 回归背景：`po_estimate` 只有普通索引（`idx_pe_po`，非 UNIQUE），
+    /// `est_amount` 又是全手填、`po_estimate_add` 此前**零校验**。于是同一 PO
+    /// 同一物料可以无限次登记暂估，每登一次就出一张「借 存货 / 贷 应付」凭证 ——
+    /// 应付与存货双双虚增，全程无任何报错。销售侧 `prod_from_so` 早就有封顶，
+    /// 采购侧此前完全裸奔。
+    ///
+    /// 对标 ERPNext / Odoo 的 received vs billed 一致性检查。
+    #[test]
+    fn estimate_is_capped_by_received_amount() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = crate::scm::PurchaseOrder::new(
+            p,
+            NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            "S01",
+            "供应商A",
+            "u",
+        );
+        po.no = crate::scm::po_next_no(&db, p).unwrap();
+        po.lines.push(crate::scm::PoLine {
+            id: 0, po_id: 0, item_code: "140301".into(), item_name: "原料".into(),
+            qty_ordered: m("100"), qty_received: m("0"), unit_price: m("10"),
+            tax_rate: m("0"), amount: m("1000"), tax_amount: m("0"), memo: String::new(),
+        });
+        let po_id = crate::scm::po_save(&db, &mut po).unwrap();
+
+        // ① 货还没到就暂估 —— 应收货限制
+        let e = po_estimate_add(&db, po_id, p, "140301", m("800"), "u").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("超出可暂估额度"),
+            "没收货就登暂估必须被拒：{e:?}"
+        );
+        assert_eq!(
+            po_estimate_open_sum(&db, po_id).unwrap(),
+            Money::ZERO,
+            "被拒时不能留下暂估记录"
+        );
+
+        // ② 收货 100（= 订购量，到货金额 1000）后可暂估，但不能超过
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,'2026-01-08',100,'')",
+                rusqlite::params![po_id, p.ymm()],
+            )
+            .unwrap();
+        po_estimate_add(&db, po_id, p, "140301", m("800"), "u").unwrap();
+        // 再登 300 → 累计 1100 > 1000，第二次必须被拒
+        let e2 = po_estimate_add(&db, po_id, p, "140301", m("300"), "u").unwrap_err();
+        assert!(
+            format!("{e2:?}").contains("超出可暂估额度"),
+            "累计超实收必须被拒：{e2:?}"
+        );
+        // 剩余额度仍可登：800 + 200 = 1000，正好用完
+        po_estimate_add(&db, po_id, p, "140301", m("200"), "u").unwrap();
+        assert_eq!(
+            po_estimate_open_sum(&db, po_id).unwrap(),
+            m("1000"),
+            "额度应当正好用满，不能因为守卫而少登"
+        );
+
+        // ③ 超收可如实入账，额度也随之放大（守卫不该把真实超收挡掉）
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,'2026-01-09',50,'')",
+                rusqlite::params![po_id, p.ymm()],
+            )
+            .unwrap();
+        po_estimate_add(&db, po_id, p, "140301", m("500"), "u").unwrap();
+        assert_eq!(po_estimate_open_sum(&db, po_id).unwrap(), m("1500"));
+
+        // ④ 已冲回的不占额度：否则发票到票后反而登不进新暂估
+        let open: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM po_estimate WHERE po_id=?1 AND settled=0",
+            [po_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(open, 3, "三条未结算暂估");
+    }
+
+    /// 冲回后额度释放：发票到票、反向冲回之后，该物料应能重新暂估。
+    #[test]
+    fn settled_estimate_frees_up_the_cap() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut po = crate::scm::PurchaseOrder::new(
+            p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "S01", "供应商A", "u");
+        po.no = crate::scm::po_next_no(&db, p).unwrap();
+        po.lines.push(crate::scm::PoLine {
+            id: 0, po_id: 0, item_code: "140301".into(), item_name: "原料".into(),
+            qty_ordered: m("100"), qty_received: m("0"), unit_price: m("10"),
+            tax_rate: m("0"), amount: m("1000"), tax_amount: m("0"), memo: String::new(),
+        });
+        let po_id = crate::scm::po_save(&db, &mut po).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,'2026-01-08',100,'')",
+                rusqlite::params![po_id, p.ymm()],
+            )
+            .unwrap();
+        // 额度 1000：一次性登满
+        let (est_id, _) = po_estimate_add(&db, po_id, p, "140301", m("1000"), "u").unwrap();
+        assert!(po_estimate_add(&db, po_id, p, "140301", m("1"), "u").is_err(),
+            "额度已用满，追加必须被拒");
+        // 冲回后额度释放
+        po_estimate_settle(&db, est_id, NaiveDate::from_ymd_opt(2026, 1, 20).unwrap(), "u")
+            .unwrap()
+            .unwrap();
+        po_estimate_add(&db, po_id, p, "140301", m("1000"), "u")
+            .expect("冲回后额度应释放，能重新暂估全额");
+    }
+
     #[test]
     fn estimate_and_reconcile() {
         let db = mem();
@@ -380,6 +547,14 @@ mod tests {
             tax_rate: m("0"), amount: m("1000"), tax_amount: m("0"), memo: String::new(),
         });
         let po_id = crate::scm::po_save(&db, &mut po).unwrap();
+        // 先收货再暂估：暂估额度来自实收量（`po_received_gross`），
+        // 货还没到就登暂估会被封顶守卫拒掉 —— 这是有意的，见下方守卫测试。
+        db.conn()
+            .execute(
+                "INSERT INTO po_receipt(po_id,period,date,qty,memo) VALUES(?1,?2,'2026-01-08',100,'')",
+                rusqlite::params![po_id, p.ymm()],
+            )
+            .unwrap();
         // 暂估 800（自动出凭证：借 140301 / 贷 220201 供应商 S01）
         let (est_id, evid) = po_estimate_add(&db, po_id, p, "140301", m("800"), "u").unwrap();
         assert_eq!(po_estimate_open_sum(&db, po_id).unwrap(), m("800"));

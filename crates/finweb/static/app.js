@@ -204,7 +204,7 @@ function reasonDialog(title, hint, placeholder) {
     mask.setAttribute("aria-label", title);
     mask.innerHTML = `<div class="modal">
       <h3>${esc(title)}</h3>
-      <p class="muted" style="margin:0 0 12px;line-height:1.6">${esc(hint)}</p>
+      <p class="muted" style="margin:0 0 12px;line-height:1.6;white-space:pre-wrap">${esc(hint)}</p>
       <textarea id="rd-text" rows="3" style="width:100%" placeholder="${esc(placeholder || "")}"></textarea>
       <div class="foot">
         <button class="btn ghost" id="rd-cancel">取消</button>
@@ -2268,7 +2268,8 @@ async function openVoucherEditor(id, seedEntries) {
   if ($("#v-amend", mask)) $("#v-amend", mask).onclick = async () => {
     const reason = await reasonDialog(
       "更正凭证",
-      "将作废本凭证，并生成一张内容相同、带更正关系的新凭证（原期间、原日期）。请写明更正原因 —— 原因会同时记入凭证摘要、操作日志与操作人日志，事后审计只查得到这些。",
+      "将作废本凭证，并生成一张内容相同、带更正关系的新凭证（原期间、原日期）。请写明更正原因 —— 原因会同时记入凭证摘要、操作日志与操作人日志，事后审计只查得到这些。\n\n" +
+      "只调整金额或时点、希望总账里留下一笔冲销记录的，请改用「红字冲销」：更正链会把原凭证作废，总账上看不出曾经记错过。",
       "例：金额录错，应为 1200"
     );
     if (!reason) return;

@@ -57,10 +57,12 @@ VOLUME ["/data"]
 ENV FINBOOK_REALM=/data/realm.db \
     FINBOOK_BOOKS_DIR=/data/books \
     FINBOOK_LISTEN=0.0.0.0:8080 \
-    FINWEB_STATIC_DIR=/app/static
+    FINWEB_STATIC_DIR=/app/static \
+    FINWEB_SECURE_COOKIE=true \
+    FINBOOK_REQUIRE_BOOKS_DIR=true
 # 非 root 运行：数据库文件属主为 finbook（bind mount 时请确保宿主机目录 uid=10001 可写）
 USER finbook
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 || exit 1'
+  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /api/health HTTP/1.0\r\n\r\n" >&3 && grep -q ok <&3'
 CMD ["finweb"]

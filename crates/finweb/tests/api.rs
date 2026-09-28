@@ -11252,13 +11252,118 @@ async fn quote_to_order_and_doc_print() {
     );
 }
 
+/// 暂估必须封顶在实收金额内 —— 端到端走 HTTP。
+///
+/// 回归背景：`po_estimate` 只有普通索引（非 UNIQUE），`est_amount` 全手填，
+/// `po_estimate_add` 此前零校验。同一 PO 同一物料可反复登记暂估，每登一次
+/// 就出一张「借 存货 / 贷 应付」凭证，应付与存货双双虚增，全程无报错。
+/// 销售侧 `prod_from_so` 早有封顶，采购侧此前完全裸奔。
+#[tokio::test]
+async fn estimate_is_capped_by_receipt_over_http() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/po",
+            &sid,
+            serde_json::json!({
+                "period": 202601, "date": "2026-01-05", "supplier_code": "S01",
+                "supplier_name": "供应商甲", "status": "Confirmed", "memo": "",
+                "lines": [{ "item_code": "140301", "qty_ordered": "100", "unit_price": "10", "tax_rate": "0" }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "建采购订单应成功");
+    let pid = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // ① 没收货就登暂估：额度 0，必须被拒
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/estimate",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "item": "140301", "est_amount": "500" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "没收货就暂估应被拒");
+    let msg = body_string(resp).await;
+    assert!(msg.contains("超出可暂估额度"), "错误信息要说清原因：{msg}");
+
+    // ② 收 100（税率 0，含税 1000），登满 1000 可以
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "date": "2026-01-08", "qty": "100" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购收货应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/estimate",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "item": "140301", "est_amount": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "额度内暂估应成功");
+    let est_id = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // ③ 再登一次（哪怕金额只有 1 元）必须被拒 —— 额度已用满，
+    //    这正是原先能把应付凭空做虚的那条路
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/estimate",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "item": "140301", "est_amount": "1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "额度用满后重复登记暂估必须被拒（重复入账 = 应付虚增）"
+    );
+
+    // ④ 冲回后额度释放：发票到票、暂估冲回之后应能重新暂估全额
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/procure/estimate/{est_id}/settle"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "冲回应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/estimate",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "item": "140301", "est_amount": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "冲回后额度应释放，能重新暂估全额：{}",
+        body_string(resp).await
+    );
+}
+
 /// 采购暂估自动出凭证：登记（借存货/贷应付-供应商）+ 冲回反向 + 幂等。
 #[tokio::test]
 async fn estimate_auto_voucher() {
     let (state, _bd, _dir) = test_state();
     let sid = boss_in_b1(&state).await;
 
-    // 建采购订单（S01，140301 30×9）
+    // 建采购订单（S01，140301 300×9）
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/procure/po",
@@ -11266,7 +11371,7 @@ async fn estimate_auto_voucher() {
             serde_json::json!({
                 "period": 202601, "date": "2026-01-05", "supplier_code": "S01",
                 "supplier_name": "供应商甲", "status": "Draft", "memo": "",
-                "lines": [{ "item_code": "140301", "qty_ordered": "30", "unit_price": "9", "tax_rate": "0.13" }]
+                "lines": [{ "item_code": "140301", "qty_ordered": "300", "unit_price": "9", "tax_rate": "0.13" }]
             }),
         ))
         .await
@@ -11274,6 +11379,19 @@ async fn estimate_auto_voucher() {
     assert_eq!(resp.status(), StatusCode::OK, "建采购订单应成功");
     let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let pid = r["id"].as_i64().unwrap();
+
+    // 先收货再暂估：暂估额度来自实收量（封顶在「价税合计 × 已收/订购」），
+    // 货没到就登暂估会被守卫拒掉 —— 那正是守卫要挡的「凭空虚增应付」。
+    // 收 300 → 额度 2700×1.13 = 3051，够登 800。
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/procure/receipt",
+            &sid,
+            serde_json::json!({ "po_id": pid, "period": 202601, "date": "2026-01-08", "qty": "300" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "采购收货应成功");
 
     // 登记暂估 800 → 借140301 / 贷220201(S01)
     let resp = handlers::router(state.clone())
@@ -16797,6 +16915,104 @@ async fn voucher_amend_links_old_and_new() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "新凭证记账");
+}
+
+/// 探针必须**能抓到故障** —— 否则它是虚假的安全感。
+///
+/// 回归背景：原 `/api/health` 返回常量 `ok`（不碰任何依赖），于是磁盘写满、
+/// 账套文件损坏、账号库打不开这些「系统已不可用」的状态，它一律报健康。
+/// 监控拿着这样的答案会一直显示「一切正常」，人就不去查别的地方了。
+///
+/// 这里用「账套文件被截断成垃圾」模拟真实损坏：文件存在、能打开，
+/// 但查询时才报错 —— 正是 `Connection::open` 惰性打开最容易漏过的那类故障。
+#[tokio::test]
+async fn readiness_probe_detects_a_corrupt_book_file() {
+    let (state, bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // ① 正常状态：liveness 与 readiness 都 200
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "健康时 readiness 应 200");
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], true, "健康时 ok 应为 true：{r}");
+    assert_eq!(r["checks"]["realm"]["ok"], true);
+    assert_eq!(r["checks"]["books_dir_writable"]["ok"], true);
+
+    // ② 把账套文件写坏（截断成非 SQLite 内容）
+    let fbk = std::fs::read_dir(&bd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "fbk").unwrap_or(false))
+        .expect("应有一个账套文件");
+    std::fs::write(&fbk, b"this is definitely not a sqlite database").unwrap();
+
+    // ③ liveness 仍 200（进程确实还活着）—— 这正是两者的分工
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health", &sid))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "liveness 不该碰依赖：账套坏了不代表进程死了"
+    );
+
+    // ④ readiness 必须抓到：503，且明说是哪个账套坏了
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "账套损坏时 readiness 必须报 503，否则负载均衡会继续往坏实例打流量"
+    );
+    let r: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(r["ok"], false, "响应体也要明说不可用：{r}");
+    assert_eq!(
+        r["checks"]["book_sample"]["ok"], false,
+        "要指出是抽样账套查询失败：{r}"
+    );
+    let detail = r["checks"]["book_sample"].to_string();
+    assert!(
+        detail.contains("error"),
+        "必须给出错误原因，否则运维看到「不健康」却不知道修什么：{detail}"
+    );
+}
+
+/// 探针不该在数据目录里留下垃圾，也不该把自己的临时文件当成账套。
+#[tokio::test]
+async fn readiness_probe_leaves_no_files_behind() {
+    let (state, bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/health/ready", &sid))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let names: Vec<String> = std::fs::read_dir(&bd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "探针跑完目录里应只剩账套本身，实际：{names:?}"
+    );
+    assert!(
+        names[0].ends_with(".fbk"),
+        "探针的临时文件不能以 .fbk 结尾，否则下次启动会被当成新账套注册：{names:?}"
+    );
 }
 
 /// 发票列表必须限量返回（原先 limit=None，一次把全库发票读进内存并整包序列化）。

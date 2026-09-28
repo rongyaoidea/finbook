@@ -3703,7 +3703,7 @@ function permMatrixHtml(roles, u) {
     const granters = [u.role, ...(u.roles || [])].filter((rc) =>
       ((roles.find((x) => x.role === rc) || {}).perms || []).some((pp) => pp.code === p.code)
     ).map((rc) => ((roles.find((x) => x.role === rc) || {}).label) || rc);
-    const base = granters.length ? `（来自：${granters.join(" + ")}）` : "（无岗位默认）";
+    const base = granters.length ? `（来自：${granters.join(" + ")}）` : "（无权限）";
     const cur = stateOf(p.code);
     return `<tr><td>${esc(p.label)}</td><td><select data-perm="${esc(p.code)}">
       <option value="role" ${cur === "role" ? "selected" : ""}>跟随角色 ${base}</option>

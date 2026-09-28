@@ -3042,6 +3042,7 @@ async function viewImports(main) {
         <textarea id="imp-text" rows="8"></textarea>
       </div>
       <div id="imp-result" class="muted" style="margin-top:10px;min-height:20px;white-space:pre-wrap;font-size:13px"></div>
+      <div id="imp-issues" style="margin-top:8px;display:none"></div>
     </div>
     <div class="panel" id="imp-mapping-wrap" style="display:none">
       <h3 style="margin:0 0 10px">缺失科目映射</h3>
@@ -3110,13 +3111,47 @@ async function viewImports(main) {
     const template = $("#imp-template").value;
     if (!text.trim() && !fileB64) { toast("请粘贴 CSV 内容或选择 Excel 文件", "err"); return; }
     try {
-      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null }) });
+      const period = parseInt(($("#imp-period").value || "0").replace(/[^0-9]/g, ""), 10) || 0;
+      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null, period }) });
       const missing = (r && r.missing) || [];
+      const issues = (r && r.issues) || [];
       const wrap = $("#imp-mapping-wrap");
       const box = $("#imp-mapping");
+      const runBtn = $("#imp-run");
+
+      // 逐条问题：按类别分组，error 排前面。
+      // 原来预检只回答「有没有不存在的科目」，期间已结账 / 科目停用这类
+      // 真正会让导入失败的原因要点完「执行导入」才暴露，那时数据已经写进去一半。
+      const issueBox = $("#imp-issues");
+      if (issues.length) {
+        const byCat = {};
+        for (const i of issues) (byCat[i.category] = byCat[i.category] || []).push(i);
+        issueBox.innerHTML = Object.keys(byCat).map((cat) => `
+          <div style="margin-bottom:8px">
+            <b style="color:${byCat[cat].some((x) => x.level === "error") ? "var(--err)" : "var(--muted)"}">${esc(cat)}</b>
+            <ul style="margin:4px 0 0 18px;padding:0">
+              ${byCat[cat].map((i) => `<li style="font-size:13px">${esc(i.detail)}</li>`).join("")}
+            </ul>
+          </div>`).join("");
+        issueBox.style.display = "";
+      } else {
+        issueBox.style.display = "none";
+        issueBox.innerHTML = "";
+      }
+
+      // 有 error 就别让用户点执行 —— 但这只是前端提示，真正把关仍在写入路径
+      if (r && r.blocking) {
+        runBtn.disabled = true;
+        runBtn.title = "预检发现会导致导入失败的问题，请先处理";
+      } else {
+        runBtn.disabled = false;
+        runBtn.title = "";
+      }
+
       if (missing.length === 0) {
         wrap.style.display = "none";
-        $("#imp-result").textContent = "✅ 预检通过：所有科目在账套中均存在，可直接执行导入。";
+        const extra = (r && r.errors) ? `⚠ ${r.errors} 个问题、${r.warns || 0} 个提醒` : "✅ 预检通过";
+        $("#imp-result").textContent = `${extra}${r && r.total_rows ? `（共 ${r.total_rows} 行数据）` : ""}：所有科目在账套中均存在。`;
         return;
       }
       box.innerHTML = missing.map((m) => `
@@ -3128,7 +3163,7 @@ async function viewImports(main) {
           </select>
         </div>`).join("");
       wrap.style.display = "";
-      $("#imp-result").textContent = `找到 ${missing.length} 个缺失科目，请选择映射或忽略。`;
+      $("#imp-result").textContent = `找到 ${missing.length} 个缺失科目，请选择映射或忽略。缺失科目可映射，不算阻断。`;
       $all(".imp-map", box).forEach((s) => s.addEventListener("change", () => {
         mapping[s.dataset.code] = s.value;
       }));

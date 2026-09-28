@@ -11,6 +11,7 @@
 use std::io::Cursor;
 
 use fincore::{AuxRef, Entry, Money, Period, Voucher, VoucherSource};
+use rusqlite::OptionalExtension;
 
 use crate::balances::{self, BeginRow};
 use crate::vouchers;
@@ -460,6 +461,57 @@ pub struct MissingAccount {
     pub count: usize,
 }
 
+/// 预检问题：一条一个，按「会不会让导入直接失败」分 error / warn。
+#[derive(Clone, Debug)]
+pub struct ImportIssue {
+    /// `error` = 导不进去；`warn` = 能进但要留意
+    pub level: &'static str,
+    /// 问题类别（前端按它分组显示）
+    pub category: &'static str,
+    /// 人类可读的具体说明（含涉及的编码 / 行号）
+    pub detail: String,
+}
+
+/// 预检报告。
+///
+/// 为什么要从「只查缺失科目」扩成这个：原来的预检只回答「有没有不存在的科目」，
+/// 而导入真正会失败的常见原因还有好几个 —— 期间已结账、科目已停用、
+/// 编码在文件里重复。用户点完「执行导入」才发现，**错了一半的数据已经写进去了**
+/// （档案类是逐条幂等写入、中断可重跑，凭证类更麻烦）。预检存在的意义就是把
+/// 这些在写入前一次性说清楚。
+#[derive(Clone, Debug, Default)]
+pub struct ImportPreview {
+    /// 参与检查的数据行数
+    pub total_rows: usize,
+    /// 缺失科目（保持原字段，前端映射 UI 直接用）
+    pub missing_accounts: Vec<MissingAccount>,
+    /// 逐条问题
+    pub issues: Vec<ImportIssue>,
+}
+
+impl ImportPreview {
+    pub fn errors(&self) -> usize {
+        self.issues.iter().filter(|i| i.level == "error").count()
+    }
+    pub fn warns(&self) -> usize {
+        self.issues.iter().filter(|i| i.level == "warn").count()
+    }
+    /// 能不能直接导入：只要有一条 error 就不该让用户点执行。
+    ///
+    /// 注意这不是硬门 —— 真正把关仍在写入路径（这里是「早告诉」，
+    /// 不是「唯一拦点」）。缺失科目例外：那个可以靠映射解决，不算阻断。
+    pub fn blocking(&self) -> bool {
+        self.issues.iter().any(|i| {
+            i.level == "error" && i.category != CATEGORY_MISSING
+        })
+    }
+}
+
+pub const CATEGORY_MISSING: &str = "科目缺失";
+pub const CATEGORY_CLOSED: &str = "期间已结账";
+pub const CATEGORY_DISABLED: &str = "科目已停用";
+pub const CATEGORY_DUP: &str = "编码重复";
+
 /// 把 CSV 文本拆成行列表（每行是单元格列表），供 Excel / 文本统一处理
 fn text_to_rows(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
@@ -477,7 +529,15 @@ fn text_to_rows(text: &str) -> Vec<Vec<String>> {
 }
 
 /// 提取文件中引用的所有科目编码（去重、带次数），供预检使用
-fn collect_codes(rows: &[Vec<String>], tmpl: ImportTemplate, is_begin: bool) -> Vec<String> {
+/// 收集科目编码并**保留出现次数**。
+///
+/// 单独拆出来是因为 [`collect_codes`] 会去重（只返回 key），重复信息在那里
+/// 就丢了 —— 而「同一科目在文件里出现多次」正是预检要提示用户的。
+fn collect_code_counts(
+    rows: &[Vec<String>],
+    tmpl: ImportTemplate,
+    is_begin: bool,
+) -> std::collections::HashMap<String, usize> {
     let mut map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for f in rows {
         // 科目列位置随来源模板不同：期初恒为第 1 列；凭证通用/用友为第 4 列，金蝶为第 5 列
@@ -494,7 +554,11 @@ fn collect_codes(rows: &[Vec<String>], tmpl: ImportTemplate, is_begin: bool) -> 
             *map.entry(code).or_insert(0) += 1;
         }
     }
-    let mut out: Vec<String> = map.keys().cloned().collect();
+    map
+}
+
+fn collect_codes(rows: &[Vec<String>], tmpl: ImportTemplate, is_begin: bool) -> Vec<String> {
+    let mut out: Vec<String> = collect_code_counts(rows, tmpl, is_begin).into_keys().collect();
     out.sort();
     out
 }
@@ -908,6 +972,83 @@ pub fn analyze_missing(
     Ok(out)
 }
 
+/// 完整预检：期间结账状态 + 科目是否存在/停用 + 文件内编码重复。
+///
+/// `text` 传空串表示「本次不按科目列检查」（主数据类如科目表本身没有科目引用），
+/// 与旧 `analyze_missing` 的约定一致。
+pub fn analyze_import(
+    db: &Db,
+    text: &str,
+    tmpl: ImportTemplate,
+    is_begin: bool,
+    period: Option<Period>,
+) -> DbResult<ImportPreview> {
+    let mut pv = ImportPreview::default();
+    let rows = if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        text_to_rows(text)
+    };
+    // 数据行数（跳过表头与空行），用于告诉用户「这份文件一共多少行」
+    pv.total_rows = rows.len().saturating_sub(1);
+
+    // ① 期间已结账 —— 这是最该提前拦的一条：导入写的是草稿没错，但凭证一旦
+    //    要记账就会撞「期间不能已结账」，而那时用户已经导完并以为完事了。
+    if let Some(p) = period {
+        let closed: Option<i32> = db.conn().query_row(
+            "SELECT 1 FROM period_state WHERE period=?1 AND closed=1",
+            [p.ymm()],
+            |r| r.get(0),
+        )
+        .optional()?;
+        if closed.is_some() {
+            pv.issues.push(ImportIssue {
+                level: "error",
+                category: CATEGORY_CLOSED,
+                detail: format!("期间 {} 已结账，数据导进去也无法记账（需先反结账）", p),
+            });
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(pv);
+    }
+
+    // ② 缺失科目 + 停用科目 + 文件内重复编码
+    let chart = crate::accounts::chart(db)?;
+    // 用带次数的版本：collect_codes 会去重，重复信息在那里就丢了
+    let counts = collect_code_counts(&rows, tmpl, is_begin);
+    let mut codes: Vec<&String> = counts.keys().collect();
+    codes.sort();
+    for (code, n) in counts.iter() {
+        if *n > 1 {
+            pv.issues.push(ImportIssue {
+                level: "warn",
+                category: CATEGORY_DUP,
+                // 重复不等于错：期初表里同一科目按方向分两行是常见写法。
+                // 所以只提示，让用户自己判断，而不是拦下来。
+                detail: format!("编码 {code} 在文件里出现 {n} 次（期初表同科目分方向是正常的）"),
+            });
+        }
+    }
+    for code in codes {
+        match chart.get(code) {
+            None => pv.missing_accounts.push(MissingAccount {
+                code: code.clone(),
+                name: String::new(),
+                count: counts.get(code).copied().unwrap_or(0),
+            }),
+            Some(a) if a.disabled => pv.issues.push(ImportIssue {
+                level: "error",
+                category: CATEGORY_DISABLED,
+                detail: format!("科目 {code}（{}）已停用，导入的凭证过不了记账校验", a.name),
+            }),
+            _ => {}
+        }
+    }
+    Ok(pv)
+}
+
 /// 执行导入：把源科目编码按 `mapping`（源编码 → 目标编码）替换后再写入。
 /// 不在 mapping 里的缺失科目会跳过并警告；已存在科目不受影响。
 pub fn apply_mapping(code: &str, mapping: &std::collections::HashMap<String, String>) -> String {
@@ -1255,6 +1396,141 @@ mod tests {
         assert!(codes.contains(&"9999"), "应列出 9999：{codes:?}");
         assert!(codes.contains(&"8888"), "应列出 8888：{codes:?}");
         assert!(!codes.contains(&"1001"), "已存在科目不应列出：{codes:?}");
+    }
+
+    /// 完整预检必须在**写入之前**把会失败的原因说清楚。
+    ///
+    /// 加这条的起因：原来的预检只回答「有没有不存在的科目」，而导入真正会失败的
+    /// 常见原因还有几个 —— 期间已结账、科目已停用。用户点完「执行导入」才发现，
+    /// 错的那部分数据可能已经写进去了（档案类是逐条幂等写入、凭证类更麻烦）。
+    #[test]
+    fn analyze_import_flags_closed_period_and_disabled_account() {
+        let db = mem();
+
+        // 干净账套：不该有任何阻断项
+        let csv = "科目,方向,金额\n1001,借,10000\n";
+        let pv = analyze_import(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 1).unwrap()),
+        )
+        .unwrap();
+        assert!(!pv.blocking(), "干净账套不该阻断：{:?}", pv.issues);
+        assert_eq!(pv.total_rows, 1, "应数出 1 行数据（不含表头）：{:?}", pv);
+        assert!(pv.missing_accounts.is_empty(), "1001 存在：{:?}", pv.missing_accounts);
+
+        // ① 期间已结账 → 必须拦
+        db.conn()
+            .execute(
+                "INSERT INTO period_state(period, closed, closed_at, closed_by)
+                 VALUES(202601, 1, '2026-02-01', 'u1')",
+                [],
+            )
+            .unwrap();
+        let pv = analyze_import(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 1).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            pv.blocking(),
+            "期间已结账必须阻断（导进去也记账不了）：{:?}",
+            pv.issues
+        );
+        assert!(
+            pv.issues.iter().any(|i| i.category == CATEGORY_CLOSED),
+            "应报出「期间已结账」：{:?}",
+            pv.issues
+        );
+        // 没结账的期间不该被误伤
+        let pv_ok = analyze_import(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 2).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            !pv_ok.issues.iter().any(|i| i.category == CATEGORY_CLOSED),
+            "未结账期间不该报闭期：{:?}",
+            pv_ok.issues
+        );
+
+        // ② 科目已停用 → 必须拦
+        db.conn().execute("UPDATE account SET disabled=1 WHERE code='1001'", []).unwrap();
+        let pv2 = analyze_import(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 2).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            pv2.blocking(),
+            "科目停用必须阻断（凭证过不了记账校验）：{:?}",
+            pv2.issues
+        );
+        assert!(
+            pv2.issues.iter().any(|i| i.category == CATEGORY_DISABLED),
+            "应报出「科目已停用」：{:?}",
+            pv2.issues
+        );
+
+        // ③ 文件内重复编码 → 只提示不阻断
+        //    （期初表里同一科目按借贷方向分两行是常见写法，报 error 会误伤）
+        let dup = "科目,方向,金额\n1001,借,10000\n1001,贷,2000\n";
+        let pv3 = analyze_import(
+            &db,
+            dup,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 2).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            pv3.issues.iter().any(|i| i.category == CATEGORY_DUP),
+            "应提示编码重复：{:?}",
+            pv3.issues
+        );
+        let dup_issue = pv3
+            .issues
+            .iter()
+            .find(|i| i.category == CATEGORY_DUP)
+            .unwrap();
+        assert_eq!(dup_issue.level, "warn", "重复只应是 warn，不该阻断");
+        // 期末初表的停用科目仍在，所以这里只断言「重复没被当成 error」
+        assert!(
+            pv3.issues
+                .iter()
+                .filter(|i| i.category == CATEGORY_DUP)
+                .all(|i| i.level == "warn"),
+            "重复编码不得是 error：{:?}",
+            pv3.issues
+        );
+
+        // ④ 缺失科目可以靠映射解决 → 不算阻断
+        let miss = "科目,方向,金额\n9999,借,1\n";
+        let pv4 = analyze_import(
+            &db,
+            miss,
+            ImportTemplate::Generic,
+            true,
+            Some(Period::new(2026, 2).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(pv4.missing_accounts.len(), 1, "应列出 9999：{:?}", pv4);
+        assert!(
+            !pv4.blocking(),
+            "缺失科目可映射，不该阻断导入：{:?}",
+            pv4.issues
+        );
     }
 
     #[test]

@@ -4499,7 +4499,13 @@ async fn import_template(
         .into_response())
 }
 
-/// 预检：返回文件中引用但账套不存在的科目（供用户选择映射或忽略）
+/// 预检：写入**之前**把会失败 / 要留意的问题一次说清楚。
+///
+/// 原来只回答「有没有不存在的科目」，而导入真正会失败的常见原因还有几个：
+/// 期间已结账、科目已停用、编码在文件里重复。用户点完「执行导入」才发现时，
+/// 错的那部分数据可能已经写进去了（档案类是逐条幂等写入、凭证类更麻烦）。
+///
+/// 缺失科目不算阻断 —— 它可以靠映射解决，所以由 `blocking()` 排除。
 async fn import_analyze(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -4528,21 +4534,46 @@ async fn import_analyze(
         } else {
             req.text.clone()
         };
-        // 主数据类（aux/item/account/opening_stock）无科目引用——预检直接返回空
-        // （行级错误由执行时 warnings 呈现；空 text 走同一条解析路径保证类型一致）
-        let missing = if matches!(
+        // 主数据类（aux/item/account/opening_stock）无科目引用——按科目列的那部分
+        // 预检跳过（行级错误由执行时 warnings 呈现），但**期间结账检查对所有类型
+        // 都要做**：凭证与期初都落到具体期间，闭着的时候导进去也记账不了。
+        let has_account_refs = !matches!(
             req.kind.as_str(),
             "aux" | "item" | "account" | "opening_stock" | "arap_opening"
-        ) {
-            findb::imports::analyze_missing(&db, "", tmpl, is_begin)?
+        );
+        let ymm = if req.period > 0 {
+            period_checked(req.period)?.ymm()
         } else {
-            findb::imports::analyze_missing(&db, &text, tmpl, is_begin)?
+            current_period(&state2, &user).ymm()
         };
-        let items: Vec<serde_json::Value> = missing
+        let pv = findb::imports::analyze_import(
+            &db,
+            if has_account_refs { &text } else { "" },
+            tmpl,
+            is_begin,
+            Some(fincore::Period::from_ymm(ymm)),
+        )?;
+        let items: Vec<serde_json::Value> = pv
+            .missing_accounts
             .iter()
             .map(|m| json!({ "code": m.code, "count": m.count }))
             .collect();
-        Ok(json!({ "missing": items }))
+        let issues: Vec<serde_json::Value> = pv
+            .issues
+            .iter()
+            .map(|i| json!({ "level": i.level, "category": i.category, "detail": i.detail }))
+            .collect();
+        Ok(json!({
+            "missing": items,
+            // 新增：逐条问题 + 汇总。前端把 issues 按 category 分组显示，
+            // blocking=true 时禁用「执行导入」按钮（但不阻断 API 调用 ——
+            // 真正把关仍在写入路径，这里是「早告诉」而不是「唯一拦点」）。
+            "issues": issues,
+            "errors": pv.errors(),
+            "warns": pv.warns(),
+            "blocking": pv.blocking(),
+            "total_rows": pv.total_rows,
+        }))
     })
     .await
     .map_err(|e| AppError::Internal(format!("导入预检失败：{e}")))??;

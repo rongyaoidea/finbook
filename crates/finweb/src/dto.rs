@@ -440,6 +440,11 @@ pub struct ImportAnalyzeReq {
     /// Excel 文件内容（base64，.xlsx/.xls/.ods）；与 text 二选一
     #[serde(default)]
     pub file: Option<String>,
+    /// 期间（YYYYMM）。预检要靠它判断「这个期间是不是已经结账了」——
+    /// 闭期导进去也记账不了，必须在写入前就告诉用户。
+    /// 0 / 不传 = 用账套当前期间。
+    #[serde(default)]
+    pub period: i32,
 }
 
 /// 导入执行请求

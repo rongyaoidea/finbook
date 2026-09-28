@@ -330,12 +330,68 @@ fn tedge_if(from: &str, to: &str, cond: &str) -> WfEdge {
 ///
 /// 金额阈值取 5000 / 50000 是财务惯例里的常见档位（小额主管批、中额加财务主管、
 /// 大额再上总经理），不是某一行业的强制标准——企业应按自身授权制度改。
+///
+/// ## 为什么有「小微」系列模板（`micro_*`）
+///
+/// 其余模板的审批节点几乎都写 `supervisor`（财务主管）。那是**有主管的
+/// 中大型企业**的形态。可现实中大量小企业根本没有财务主管这个岗位 ——
+/// 只有会计与出纳两人。此时照搬那些模板会有两个问题：
+///
+/// 1. **审批人名不副实**。`intercept` 的门禁是「审核权限恒可批，否则须命中
+///    节点参与人角色」；会计角色**没有** `VoucherAudit`（见 `Role::Accountant`
+///    的注释：录入与记账同账户完成），所以会计批不了 `supervisor` 节点。
+///    实际批的人是**平台管理员**——审批链上挂着一个财务系统管理员，
+///    名字却写着「财务主管审批」，追溯时只会误导。
+/// 2. **多一跳且无内控增益**。2 人公司本来就没有能互相牵制的第三方，
+///    硬套两级审批只是把单据卡在系统里等人点。
+///
+/// 所以这里给出**与「会计 + 出纳」两岗结构相符**的模板，让小企业不必去改
+/// 别人模板里的角色名。角色写 `accountant` / `cashier` 是刻意的：会签兜底
+/// 让有审核权限的人也能代批（见 `intercept` 里 `audit_ok` 计票那段），
+/// 所以小公司即便只有一个人兼两岗，流程照样走得完。
 pub fn templates() -> Vec<WfTemplate> {
     vec![
         WfTemplate {
+            key: "micro_single".into(),
+            name: "小微单级（会计审）".into(),
+            desc: "制单 → 会计审批。**给只有会计、没有财务主管的小企业**：\
+                   订单/请购/报价等由会计一岗签出即可，省掉一个不存在的岗位。\
+                   注意：制单与审批通常是同一个人，属于**弱内控**——如果还想留一道关，\
+                   建议改用「小微两岗」或开启账套参数「审核环节」由出纳/管理员审凭证。".into(),
+            biz_types: vec![
+                BIZ_QUOTATION.into(),
+                BIZ_PURCHASE_REQ.into(),
+                BIZ_PURCHASE_ORDER.into(),
+                BIZ_SALES_ORDER.into(),
+                BIZ_PRODUCTION_ORDER.into(),
+            ],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("acct", "approve", "会计审批", &["accountant"], 250.0, 140.0),
+            ],
+            edges: vec![tedge("start", "acct")],
+        },
+        WfTemplate {
+            key: "micro_two_role".into(),
+            name: "小微两岗（会计 → 出纳）".into(),
+            desc: "制单 → 会计复核 → 出纳付款。**收付款/报销专用**，对应「会计管账、\
+                   出纳管钱」的两岗分工：出纳节点对应实际付款动作，也是资金留痕的一环。\
+                   账套参数「要求出纳签字」开启时，付款凭证记账前还会再要一次出纳签字。".into(),
+            biz_types: vec![BIZ_RECEIPT.into(), BIZ_CLAIM.into()],
+            requires_fields: vec![],
+            nodes: vec![
+                tnode("start", "start", "制单", &[], 60.0, 140.0),
+                tnode("acct", "approve", "会计复核", &["accountant"], 240.0, 140.0),
+                tnode("cash", "approve", "出纳付款", &["cashier"], 430.0, 140.0),
+            ],
+            edges: vec![tedge("start", "acct"), tedge("acct", "cash")],
+        },
+        WfTemplate {
             key: "simple".into(),
-            name: "单级审批".into(),
-            desc: "制单 → 主管审批。小额、高频单据用（如报价单、请购单）。".into(),
+            name: "单级审批（主管）".into(),
+            desc: "制单 → 主管审批。小额、高频单据用（如报价单、请购单）。\
+                   ⚠ 需要企业里真有「财务主管」岗位；没有的话请用「小微单级」。".into(),
             biz_types: vec![BIZ_QUOTATION.into(), BIZ_PURCHASE_REQ.into()],
             requires_fields: vec![],
             nodes: vec![
@@ -347,7 +403,7 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "standard".into(),
             name: "标准两级（业务 → 财务）".into(),
-            desc: "制单 → 业务主管 → 财务主管。业务与财务两道分离，通用性最好的一档。".into(),
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」/「小微两岗」。制单 → 业务主管 → 财务主管。业务与财务两道分离，通用性最好的一档。".into(),
             biz_types: vec![
                 BIZ_QUOTATION.into(),
                 BIZ_PURCHASE_REQ.into(),
@@ -364,7 +420,7 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "claim_full".into(),
             name: "报销三级（部门 → 财务 → 出纳）".into(),
-            desc: "制单 → 部门负责人 → 财务主管 → 出纳付款。报销单专用，出纳节点对应实际付款动作。".into(),
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」/「小微两岗」。制单 → 部门负责人 → 财务主管 → 出纳付款。报销单专用，出纳节点对应实际付款动作。".into(),
             biz_types: vec![BIZ_CLAIM.into()],
             requires_fields: vec![],
             nodes: vec![
@@ -382,7 +438,7 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "funds".into(),
             name: "资金单据（财务 → 出纳）".into(),
-            desc: "制单 → 财务主管 → 出纳复核。收付款单专用；出纳节点为流程留痕，硬门仍需账套参数「出纳签字」配合。".into(),
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」/「小微两岗」。制单 → 财务主管 → 出纳复核。收付款单专用；出纳节点为流程留痕，硬门仍需账套参数「出纳签字」配合。".into(),
             biz_types: vec![BIZ_RECEIPT.into()],
             requires_fields: vec![],
             nodes: vec![
@@ -400,7 +456,8 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "order_standard".into(),
             name: "订单两级（业务 → 财务）".into(),
-            desc: "制单 → 业务主管 → 财务主管。采购/销售订单专用：订单一旦签出就是对外的\
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」。\
+                  制单 → 业务主管 → 财务主管。采购/销售订单专用：订单一旦签出就是对外的\
                   商业承诺，金额风险高于报价与请购，所以固定两级而不是单级。".into(),
             biz_types: vec![
                 BIZ_PURCHASE_ORDER.into(),
@@ -417,7 +474,8 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "order_tiered".into(),
             name: "订单金额分级".into(),
-            desc: "按**价税合计**分级：≤5万 业务主管批完；>5万 加财务主管；>50万 再上总经理。\
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」。\
+                  按**价税合计**分级：≤5万 业务主管批完；>5万 加财务主管；>50万 再上总经理。\
                   生产订单没有金额，改用数量模板（见「生产订单两段审」）。".into(),
             biz_types: vec![BIZ_PURCHASE_ORDER.into(), BIZ_SALES_ORDER.into()],
             requires_fields: vec!["amount".into()],
@@ -441,7 +499,9 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "prod_two_stage".into(),
             name: "生产订单两段审（计划 → 开工）".into(),
-            desc: "制单 → 生产计划员确认（核对 BOM/产能/库存）→ 生产负责人批准开工。\
+            desc: "⚠ 本模板需要企业里真有「生产计划员/生产负责人/厂长」岗位；\
+                  只有会计与出纳的话请改用「小微单级」。\
+                  制单 → 生产计划员确认（核对 BOM/产能/库存）→ 生产负责人批准开工。\
                   条件用 planned_qty 数量而非金额——生产订单本来就没有金额字段。".into(),
             biz_types: vec![BIZ_PRODUCTION_ORDER.into()],
             requires_fields: vec!["planned_qty".into()],
@@ -463,7 +523,7 @@ pub fn templates() -> Vec<WfTemplate> {
         WfTemplate {
             key: "amount_tiered".into(),
             name: "金额分级审批".into(),
-            desc: "≤5000 主管批完归档；>5000 加财务主管；>50000 直接上总经理。阈值与节点均可在画布上改。".into(),
+            desc: "⚠ 本模板需要企业里真有「财务主管」岗位；没有的话请改用「小微单级」/「小微两岗」。≤5000 主管批完归档；>5000 加财务主管；>50000 直接上总经理。阈值与节点均可在画布上改。".into(),
             biz_types: vec![BIZ_CLAIM.into(), BIZ_RECEIPT.into()],
             requires_fields: vec!["amount".into()],
             nodes: vec![
@@ -2104,6 +2164,111 @@ mod tests {
         match intercept(&db, BIZ_RECEIPT, 1, &cashier, true, "已付").unwrap() {
             Gate::Final { approved } => assert!(approved, "出纳批完应到终态"),
             other => panic!("出纳批完应到终态：{other:?}"),
+        }
+    }
+
+    /// 「小微」模板必须真的能被**只有会计 + 出纳**的公司走完 ——
+    /// 不是「模板存在」，而是「每个节点都有人能批、不卡死」。
+    ///
+    /// 这条是加 `micro_*` 模板的起因：预置模板原本清一色 `supervisor`，
+    /// 而小企业没有财务主管。会计角色**没有** `VoucherAudit`（见
+    /// `Role::Accountant` 的注释），所以会计批不了 `supervisor` 节点 ——
+    /// 实际只能由平台管理员代批，审批链上挂个管理员却写着「财务主管审批」。
+    #[test]
+    fn micro_templates_are_walkable_by_accountant_and_cashier_only() {
+        let db = mem();
+        // 这家公司只有两个岗位：会计 + 出纳。**刻意不给 supervisor。**
+        let acc = User::new("acc", "会计", Role::Accountant);
+        let cash = User::new("cash", "出纳", Role::Cashier);
+        crate::users::insert(&db, &acc).unwrap();
+        crate::users::insert(&db, &cash).unwrap();
+
+        // ① 小微单级：会计制单 → 会计审批 → 终态
+        let f = apply_template(&db, "micro_single", BIZ_PURCHASE_ORDER, "acc").unwrap();
+        flow_set_status(&db, f.id, true, "acc").unwrap();
+        match intercept(&db, BIZ_PURCHASE_ORDER, 1, &acc, true, "同意").unwrap() {
+            Gate::Final { approved } => assert!(approved, "会计应能自己批完小微单级"),
+            other => panic!("小微单级应到终态：{other:?}"),
+        }
+
+        // ② 小微两岗：会计制单 → 会计复核 → 出纳付款 → 终态
+        let f2 = apply_template(&db, "micro_two_role", BIZ_RECEIPT, "acc").unwrap();
+        flow_set_status(&db, f2.id, true, "acc").unwrap();
+        match intercept(&db, BIZ_RECEIPT, 1, &acc, true, "同意").unwrap() {
+            Gate::Pending { next } => assert_eq!(next, "出纳付款", "应推进到出纳节点"),
+            other => panic!("应推进到出纳付款：{other:?}"),
+        }
+        // 出纳没到出纳节点前不该能批
+        assert!(
+            intercept(&db, BIZ_RECEIPT, 1, &cash, true, "已付").is_ok(),
+            "出纳在非当前节点时不该报错卡死（应只是没票）"
+        );
+        match intercept(&db, BIZ_RECEIPT, 1, &cash, true, "已付").unwrap() {
+            Gate::Final { approved } => assert!(approved, "出纳批完应到终态"),
+            other => panic!("出纳批完应到终态：{other:?}"),
+        }
+    }
+
+    /// 预置模板的节点参与人只能是**系统里真实存在的角色编码**。
+    ///
+    /// 写错一个字母（如 `supervisr`）不会编译失败、也不会在落流程时报错 ——
+    /// 只会让那个节点永远没人能批，单据卡在系统里。要靠测试兜住。
+    #[test]
+    fn preset_template_participants_are_all_real_roles() {
+        let valid: std::collections::HashSet<String> = [
+            Role::Admin,
+            Role::Supervisor,
+            Role::Accountant,
+            Role::Cashier,
+            Role::Auditor,
+            Role::OrderClerk,
+            Role::Keeper,
+            Role::Receivables,
+            Role::Payables,
+            Role::CostAccountant,
+            Role::Production,
+            Role::Viewer,
+        ]
+        .iter()
+        .map(|r| role_code(r))
+        .collect();
+        for t in templates() {
+            for node in &t.nodes {
+                for p in &node.participants {
+                    assert!(
+                        valid.contains(p),
+                        "模板【{}】节点【{}】的参与人 {:?} 不是任何真实角色编码",
+                        t.name,
+                        node.name,
+                        p
+                    );
+                }
+            }
+        }
+    }
+
+    /// 依赖 `supervisor` 的模板必须在描述里说明「需要这个岗位」。
+    ///
+    /// 理由：照搬一个自己不存在的岗位，等于替企业做了一个它并不存在的内控设计，
+    /// 而且审批人实际会变成平台管理员（会签兜底），追溯时极具误导性。
+    /// 模板名和描述是用户选择模板时唯一能看到的信息，警告必须在那里。
+    #[test]
+    fn templates_requiring_a_supervisor_say_so_in_their_description() {
+        for t in templates() {
+            let needs_supervisor = t
+                .nodes
+                .iter()
+                .any(|n| n.participants.iter().any(|p| p == "supervisor"));
+            if !needs_supervisor {
+                continue;
+            }
+            assert!(
+                t.desc.contains("财务主管") || t.desc.contains("岗位"),
+                "模板【{}】用了 supervisor 岗位却没在描述里说明，\
+                 用户会照搬一个公司里并不存在的岗位：{}",
+                t.name,
+                t.desc
+            );
         }
     }
 

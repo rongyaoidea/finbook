@@ -3009,7 +3009,7 @@ async function viewImports(main) {
       <div class="toolbar" style="box-shadow:none;border:none;padding:0;margin:0">
         <label>导入类型</label>
         <select id="imp-kind">
-          <optgroup label="基础资料（各岗位迁移）">
+          <optgroup label="基础资料（会计/各岗位）">
             <option value="aux">辅助核算档案（客户/供应商/部门/存货…）</option>
             <option value="item">存货档案</option>
             <option value="account">会计科目</option>
@@ -3021,6 +3021,13 @@ async function viewImports(main) {
           </optgroup>
           <optgroup label="凭证（会计）">
             <option value="voucher">记账凭证</option>
+          </optgroup>
+          <optgroup label="出纳（银行对账）">
+            <!-- 出纳的数据不走这张表：银行对账单的对账/勾对是另一套逻辑
+                 （要按金额+日期容差去勾账内分录，CSV 结构也不同）。所以这里
+                 给出的是**入口跳转**而不是多一个导入类型 —— 早先出纳在这张
+                 表里一个选项都找不到，得自己知道去「银行对账」页。 -->
+            <option value="__bank">银行对账单 → 导入并自动勾对（转到银行对账）</option>
           </optgroup>
         </select>
         <label>来源模板</label>
@@ -3096,6 +3103,17 @@ async function viewImports(main) {
   const kindSel = $("#imp-kind");
   const syncKind = () => {
     const k = kindSel.value;
+    // 出纳那一项是**入口跳转**，不是导入类型：银行对账单要对账内分录做
+    // 金额+日期容差勾对，CSV 结构与这里的档案/凭证导入完全不同，
+    // 硬塞进同一个 kind 只会让人以为「导进来就等于对上了」。
+    if (k === "__bank") {
+      toast("银行对账单在「期末 → 银行对账」里导入并自动勾对，正在跳转…");
+      const bc = $all(".nav-item").find((b) => b.dataset.view === "bank");
+      if (bc) bc.click();
+      else toast("没有「银行对账」入口，可能当前账号缺「凭证录入」权限", "err");
+      kindSel.value = "aux";
+      return;
+    }
     $("#imp-text").placeholder = `或直接粘贴 CSV 内容…\n列：${TPL_COLS[k] || ""}\n（或点「下载模板」拿标准模板填）`;
     $("#imp-analyze").textContent = k === "begin" || k === "voucher" ? "预检科目" : "预检";
   };
@@ -3112,27 +3130,40 @@ async function viewImports(main) {
     if (!text.trim() && !fileB64) { toast("请粘贴 CSV 内容或选择 Excel 文件", "err"); return; }
     try {
       const period = parseInt(($("#imp-period").value || "0").replace(/[^0-9]/g, ""), 10) || 0;
-      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null, period }) });
+      const r = await api("/import/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, text, template, file: fileB64 || null, period, mapping }) });
       const missing = (r && r.missing) || [];
       const issues = (r && r.issues) || [];
       const wrap = $("#imp-mapping-wrap");
       const box = $("#imp-mapping");
       const runBtn = $("#imp-run");
 
-      // 逐条问题：按类别分组，error 排前面。
-      // 原来预检只回答「有没有不存在的科目」，期间已结账 / 科目停用这类
-      // 真正会让导入失败的原因要点完「执行导入」才暴露，那时数据已经写进去一半。
+      // 逐条问题：按类别分组，error 排前面，带源文件行号。
+      // 原来预检只回答「有没有不存在的科目」，期间已结账 / 科目停用 / 借贷不平
+      // 这类真正会让导入失败的原因要点完「执行导入」才暴露。行号是刚需 ——
+      // 几百行里错 3 行时，「借贷不平 ×3」用户无从下手。
       const issueBox = $("#imp-issues");
       if (issues.length) {
         const byCat = {};
         for (const i of issues) (byCat[i.category] = byCat[i.category] || []).push(i);
-        issueBox.innerHTML = Object.keys(byCat).map((cat) => `
+        // 同一类别内按行号排序，方便从头往下改
+        issueBox.innerHTML = Object.keys(byCat).sort((a, b) => {
+          const ea = byCat[a].some((x) => x.level === "error") ? 0 : 1;
+          const eb = byCat[b].some((x) => x.level === "error") ? 0 : 1;
+          return ea - eb;
+        }).map((cat) => {
+          const list = byCat[cat].slice().sort((x, y) => (x.row || 0) - (y.row || 0));
+          return `
           <div style="margin-bottom:8px">
-            <b style="color:${byCat[cat].some((x) => x.level === "error") ? "var(--err)" : "var(--muted)"}">${esc(cat)}</b>
+            <b style="color:${list.some((x) => x.level === "error") ? "var(--err)" : "var(--muted)"}">${esc(cat)}（${list.length}）</b>
             <ul style="margin:4px 0 0 18px;padding:0">
-              ${byCat[cat].map((i) => `<li style="font-size:13px">${esc(i.detail)}</li>`).join("")}
+              ${list.map((i) => {
+                const tag = i.level === "error" ? '<span style="color:var(--err)">✕</span>' : '<span class="muted">!</span>';
+                const at = i.row ? `<span class="muted">[行 ${esc(i.row)}]</span> ` : "";
+                return `<li style="font-size:13px">${tag} ${at}${esc(i.detail)}</li>`;
+              }).join("")}
             </ul>
-          </div>`).join("");
+          </div>`;
+        }).join("");
         issueBox.style.display = "";
       } else {
         issueBox.style.display = "none";
@@ -3164,8 +3195,11 @@ async function viewImports(main) {
         </div>`).join("");
       wrap.style.display = "";
       $("#imp-result").textContent = `找到 ${missing.length} 个缺失科目，请选择映射或忽略。缺失科目可映射，不算阻断。`;
-      $all(".imp-map", box).forEach((s) => s.addEventListener("change", () => {
+      $all(".imp-map", box).forEach((s) => s.addEventListener("change", async () => {
         mapping[s.dataset.code] = s.value;
+        // 改完映射立刻重跑预检：映射能消掉「科目缺失」，也可能暴露新的
+        // 问题（映射到停用科目上）。不刷新的话用户看到的是上一轮的结果。
+        $("#imp-analyze").click();
       }));
     } catch (e) { $("#imp-result").textContent = "预检失败：" + e.message; }
   });
@@ -3184,9 +3218,15 @@ async function viewImports(main) {
         r.warnings.slice(0, 20).forEach((w) => lines.push("  · " + w));
         if (r.warnings.length > 20) lines.push(`  …共 ${r.warnings.length} 条警告`);
       }
+      // 明确说清「导完之后该干什么」—— 不说的话「导入成功」很容易被理解成
+      // 「已经进账了」，而凭证其实是草稿，还要审核 → 记账。
+      if (r.next_steps && r.next_steps.length) {
+        lines.push("", "接下来：");
+        r.next_steps.forEach((s) => lines.push("  → " + s));
+      }
       $("#imp-result").textContent = lines.join("\n");
       toast(`已导入 ${r.ok} 条`, "ok");
-      state.view = "dashboard";
+      // 不要自动跳走：结果和「接下来」都在这一屏上，跳走等于把刚说的话藏起来
     } catch (e) { $("#imp-result").textContent = "导入失败：" + e.message; }
   });
 

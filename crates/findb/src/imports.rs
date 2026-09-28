@@ -468,7 +468,10 @@ pub struct ImportIssue {
     pub level: &'static str,
     /// 问题类别（前端按它分组显示）
     pub category: &'static str,
-    /// 人类可读的具体说明（含涉及的编码 / 行号）
+    /// 源文件行号（1-based）。给行号是刻意的：几百行里错 3 行时，
+    /// 「借贷不平 ×3」用户无从下手，「第 42–45 行」才能直接定位。
+    pub row: Option<usize>,
+    /// 人类可读的具体说明
     pub detail: String,
 }
 
@@ -511,6 +514,9 @@ pub const CATEGORY_MISSING: &str = "科目缺失";
 pub const CATEGORY_CLOSED: &str = "期间已结账";
 pub const CATEGORY_DISABLED: &str = "科目已停用";
 pub const CATEGORY_DUP: &str = "编码重复";
+pub const CATEGORY_UNBALANCED: &str = "凭证借贷不平";
+pub const CATEGORY_BAD_AMOUNT: &str = "金额无法识别";
+pub const CATEGORY_EMPTY_VOUCHER: &str = "空凭证会被丢弃";
 
 /// 把 CSV 文本拆成行列表（每行是单元格列表），供 Excel / 文本统一处理
 fn text_to_rows(text: &str) -> Vec<Vec<String>> {
@@ -972,7 +978,142 @@ pub fn analyze_missing(
     Ok(out)
 }
 
-/// 完整预检：期间结账状态 + 科目是否存在/停用 + 文件内编码重复。
+/// 凭证导入的预检：借贷不平衡 / 金额不可解析 / 会变成空凭证。
+///
+/// 复用**真实导入器用的同一套**行提取与分组规则（`extract_voucher_line` +
+/// 与 `import_vouchers_rows` 相同的「新凭证边界」判定）。这一点很重要：
+/// 预检如果自己另写一套解析，预检说「平」而导入说「跳过」，用户会完全
+/// 不知道该信哪个 —— 那是比没有预检更糟的结果。
+///
+/// 顺带修掉一个「静默丢弃」：导入时 `flush` 遇到 `entries.is_empty()` 直接
+/// `return Ok(())` —— 既不计入 `skipped`，也不产生凭证级警告。于是
+/// 一张所有分录金额都不可解析的凭证会**人间蒸发**：用户看到「成功 N 条」，
+/// 以为全导进去了。这里把这种情况显式报出来。
+fn analyze_vouchers(
+    rows: &[Vec<String>],
+    tmpl: ImportTemplate,
+    mapping: &std::collections::HashMap<String, String>,
+) -> Vec<ImportIssue> {
+    let mut issues = Vec::new();
+    // 按与导入器相同的边界规则把行分组成「一张张凭证」
+    struct Open {
+        start: usize,
+        end: usize,
+        date: chrono::NaiveDate,
+        word: String,
+        debit: Money,
+        credit: Money,
+        entries: usize,
+    }
+    let mut pending: Option<Open> = None;
+    let mut pending_no: Option<i32> = None;
+
+    fn close(pending: &mut Option<Open>, issues: &mut Vec<ImportIssue>) {
+        if let Some(v) = pending.take() {
+            let tag = if v.word.trim().is_empty() { "记" } else { v.word.trim() };
+            if v.entries == 0 {
+                // 整张凭证一条分录都没进来 —— 导入时会**静默丢弃**
+                issues.push(ImportIssue {
+                    level: "error",
+                    category: CATEGORY_EMPTY_VOUCHER,
+                    row: Some(v.start + 1),
+                    detail: format!(
+                        "第 {}–{} 行这张凭证一条分录都没解析出来（金额列全不可识别？），\
+                         导入时会被**静默丢弃**且不计入跳过数",
+                        v.start + 1,
+                        v.end + 1
+                    ),
+                });
+                return;
+            }
+            if v.debit != v.credit {
+                issues.push(ImportIssue {
+                    level: "error",
+                    category: CATEGORY_UNBALANCED,
+                    row: Some(v.start + 1),
+                    detail: format!(
+                        "第 {}–{} 行的{tag}字凭证借贷不平：借 {} / 贷 {}，差 {}（导入时整张跳过）",
+                        v.start + 1,
+                        v.end + 1,
+                        v.debit.fmt_money(),
+                        v.credit.fmt_money(),
+                        (v.debit - v.credit).fmt_money()
+                    ),
+                });
+            }
+        }
+    }
+
+    for (i, f) in rows.iter().enumerate() {
+        let Some(line) = extract_voucher_line(tmpl, f) else {
+            continue; // 表头 / 说明行
+        };
+        if !line.warn.is_empty() {
+            // 金额不可识别的行：导入器是「丢弃该分录，整张凭证随后因不平衡被跳过」。
+            // 预检要报出来，否则用户只看到「成功 N 条」，不知道哪张被丢了。
+            if pending.is_none() {
+                pending = Some(Open {
+                    start: i,
+                    end: i,
+                    date: line.date,
+                    word: String::new(),
+                    debit: Money::ZERO,
+                    credit: Money::ZERO,
+                    entries: 0,
+                });
+            }
+            if let Some(v) = pending.as_mut() {
+                v.end = i;
+            }
+            for w in &line.warn {
+                issues.push(ImportIssue {
+                    level: "error",
+                    category: CATEGORY_BAD_AMOUNT,
+                    row: Some(i + 1),
+                    detail: format!("第 {} 行：{w}（该分录会被丢弃）", i + 1),
+                });
+            }
+            continue;
+        }
+        // ↓ 与 import_vouchers_rows 里的判定逐字对齐
+        let new_voucher = match &pending {
+            Some(v) => {
+                let date_changed = v.date != line.date;
+                let no_changed = tmpl == ImportTemplate::Kingdee && pending_no != line.no;
+                let balanced_boundary = tmpl != ImportTemplate::Kingdee
+                    && v.entries > 0
+                    && v.debit == v.credit;
+                date_changed || no_changed || balanced_boundary
+            }
+            None => true,
+        };
+        if new_voucher {
+            close(&mut pending, &mut issues);
+            pending_no = line.no;
+            pending = Some(Open {
+                start: i,
+                end: i,
+                date: line.date,
+                word: line.word.clone(),
+                debit: Money::ZERO,
+                credit: Money::ZERO,
+                entries: 0,
+            });
+        }
+        if let Some(v) = pending.as_mut() {
+            v.end = i;
+            if !line.word.trim().is_empty() {
+                v.word = line.word.trim().to_string();
+            }
+            v.debit += line.debit;
+            v.credit += line.credit;
+            v.entries += 1;
+        }
+    }
+    close(&mut pending, &mut issues);
+    let _ = mapping;
+    issues
+}
 ///
 /// `text` 传空串表示「本次不按科目列检查」（主数据类如科目表本身没有科目引用），
 /// 与旧 `analyze_missing` 的约定一致。
@@ -982,6 +1123,22 @@ pub fn analyze_import(
     tmpl: ImportTemplate,
     is_begin: bool,
     period: Option<Period>,
+) -> DbResult<ImportPreview> {
+    analyze_import_mapped(db, text, tmpl, is_begin, period, &Default::default())
+}
+
+/// [`analyze_import`] 的带科目映射版本。
+///
+/// 映射只影响「科目缺失」那部分：映射后能落到真实科目上的，就不该再报缺失。
+/// 借贷平衡 / 金额不可解析这些**与映射无关**（金额列认不出来，映射也救不了），
+/// 所以不重复计算。
+pub fn analyze_import_mapped(
+    db: &Db,
+    text: &str,
+    tmpl: ImportTemplate,
+    is_begin: bool,
+    period: Option<Period>,
+    mapping: &std::collections::HashMap<String, String>,
 ) -> DbResult<ImportPreview> {
     let mut pv = ImportPreview::default();
     let rows = if text.trim().is_empty() {
@@ -1005,7 +1162,8 @@ pub fn analyze_import(
             pv.issues.push(ImportIssue {
                 level: "error",
                 category: CATEGORY_CLOSED,
-                detail: format!("期间 {} 已结账，数据导进去也无法记账（需先反结账）", p),
+                row: None,
+            detail: format!("期间 {} 已结账，数据导进去也无法记账（需先反结账）", p),
             });
         }
     }
@@ -1027,11 +1185,17 @@ pub fn analyze_import(
                 category: CATEGORY_DUP,
                 // 重复不等于错：期初表里同一科目按方向分两行是常见写法。
                 // 所以只提示，让用户自己判断，而不是拦下来。
+                row: None,
                 detail: format!("编码 {code} 在文件里出现 {n} 次（期初表同科目分方向是正常的）"),
             });
         }
     }
     for code in codes {
+        // 映射能把源编码落到真实科目上的，就不该再报缺失 —— 否则用户刚选完
+        // 映射，预检还是说「缺科目」，会开始不信这个功能。
+        if mapping.contains_key(code) {
+            continue;
+        }
         match chart.get(code) {
             None => pv.missing_accounts.push(MissingAccount {
                 code: code.clone(),
@@ -1041,10 +1205,18 @@ pub fn analyze_import(
             Some(a) if a.disabled => pv.issues.push(ImportIssue {
                 level: "error",
                 category: CATEGORY_DISABLED,
+                row: None,
                 detail: format!("科目 {code}（{}）已停用，导入的凭证过不了记账校验", a.name),
             }),
             _ => {}
         }
+    }
+
+    // ③ 凭证专属：借贷不平 / 金额不可识别 / 会变成空凭证
+    //    复用真实导入器的行提取与分组规则，避免「预检说平、导入说跳过」，
+    //    那种不一致比没有预检更糟。
+    if !is_begin {
+        pv.issues.extend(analyze_vouchers(&rows, tmpl, mapping));
     }
     Ok(pv)
 }
@@ -1530,6 +1702,117 @@ mod tests {
             !pv4.blocking(),
             "缺失科目可映射，不该阻断导入：{:?}",
             pv4.issues
+        );
+    }
+
+    /// 凭证预检必须报出：借贷不平、金额不可解析、以及**会被静默丢弃的空凭证**。
+    ///
+    /// 最后一条是这里最要紧的：导入时 `flush` 遇到 `entries.is_empty()` 直接
+    /// `return Ok(())` —— 既不计入 `skipped`，也不产生凭证级警告。一张所有分录
+    /// 金额都不可解析的凭证会**人间蒸发**，用户看到「成功 N 条」以为全导进去了。
+    ///
+    /// 预检复用真实导入器的行提取与分组规则（`extract_voucher_line` + 同样的
+    /// 新凭证边界判定），避免「预检说平、导入说跳过」那种不一致 ——
+    /// 那比没有预检更糟，因为用户会不知道该信哪个。
+    #[test]
+    fn analyze_vouchers_flags_unbalanced_and_empty() {
+        let db = mem();
+        let csv = "\
+日期,凭证字,摘要,科目编码,借方,贷方
+2026-01-15,记,平的一笔,1001,100,0
+2026-01-15,记,平的一笔,2001,0,100
+2026-01-15,记,不平的一笔,1001,50,0
+2026-01-15,记,不平的一笔,2001,0,30
+2026-01-15,记,金额坏了,1001,abc,0
+";
+        let pv = analyze_import(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            false,
+            Some(Period::new(2026, 1).unwrap()),
+        )
+        .unwrap();
+
+        let cats: Vec<&str> = pv.issues.iter().map(|i| i.category).collect();
+        assert!(
+            cats.contains(&CATEGORY_UNBALANCED),
+            "应报出借贷不平：{:?}",
+            pv.issues
+        );
+        assert!(
+            cats.contains(&CATEGORY_BAD_AMOUNT),
+            "应报出金额无法识别：{:?}",
+            pv.issues
+        );
+        // 带行号，用户才能定位
+        let unbal = pv
+            .issues
+            .iter()
+            .find(|i| i.category == CATEGORY_UNBALANCED)
+            .unwrap();
+        assert!(unbal.row.is_some(), "借贷不平必须带行号：{unbal:?}");
+        assert_eq!(unbal.level, "error");
+        assert!(
+            pv.blocking(),
+            "借贷不平 / 金额坏行会让导入丢凭证，必须阻断：{:?}",
+            pv.issues
+        );
+
+        // 整张凭证的分录全被丢弃 → 静默蒸发，必须被预检抓到
+        let all_bad = "\
+日期,凭证字,摘要,科目编码,借方,贷方
+2026-01-20,记,全是坏金额,1001,xx,0
+2026-01-20,记,全是坏金额,2001,0,yy
+";
+        let pv2 = analyze_import(
+            &db,
+            all_bad,
+            ImportTemplate::Generic,
+            false,
+            Some(Period::new(2026, 1).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            pv2.issues
+                .iter()
+                .any(|i| i.category == CATEGORY_EMPTY_VOUCHER),
+            "会被静默丢弃的空凭证必须报出来（导入时不计入 skipped、也不报警告）：{:?}",
+            pv2.issues
+        );
+        assert!(
+            pv2.blocking(),
+            "空凭证蒸发是静默数据丢失，必须阻断：{:?}",
+            pv2.issues
+        );
+    }
+
+    /// 映射能消掉「科目缺失」：用户选完映射后预检不该还在说缺科目。
+    #[test]
+    fn analyze_import_respects_account_mapping() {
+        let db = mem();
+        let csv = "科目,方向,金额\n9999,借,100\n";
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert("9999".to_string(), "1001".to_string());
+
+        // 不带映射：应报缺失
+        let pv = analyze_import(&db, csv, ImportTemplate::Generic, true, None).unwrap();
+        assert_eq!(pv.missing_accounts.len(), 1, "未映射时应报缺失：{:?}", pv);
+
+        // 带映射：不该再报缺失（否则用户刚选完映射，预检还是说缺，会开始不信它）
+        let pv2 = analyze_import_mapped(
+            &db,
+            csv,
+            ImportTemplate::Generic,
+            true,
+            None,
+            &mapping,
+        )
+        .unwrap();
+        assert!(
+            pv2.missing_accounts.is_empty(),
+            "已映射的科目不该再报缺失：{:?}",
+            pv2.missing_accounts
         );
     }
 

@@ -445,6 +445,10 @@ pub struct ImportAnalyzeReq {
     /// 0 / 不传 = 用账套当前期间。
     #[serde(default)]
     pub period: i32,
+    /// 科目映射（源编码 → 目标编码）。预检也要带上：映射后能落到真实科目上的
+    /// 就不该再报「缺失科目」，否则用户刚选完映射、预检还是说缺，会开始不信它。
+    #[serde(default)]
+    pub mapping: std::collections::HashMap<String, String>,
 }
 
 /// 导入执行请求

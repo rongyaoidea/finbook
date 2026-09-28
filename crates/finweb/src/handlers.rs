@@ -4546,12 +4546,13 @@ async fn import_analyze(
         } else {
             current_period(&state2, &user).ymm()
         };
-        let pv = findb::imports::analyze_import(
+        let pv = findb::imports::analyze_import_mapped(
             &db,
             if has_account_refs { &text } else { "" },
             tmpl,
             is_begin,
             Some(fincore::Period::from_ymm(ymm)),
+            &req.mapping,
         )?;
         let items: Vec<serde_json::Value> = pv
             .missing_accounts
@@ -4602,6 +4603,7 @@ async fn import_run(
     let fallback_ymm = current_period(&state, &user).ymm();
     let explicit_ymm = if req.period > 0 { Some(period_checked(req.period)?.ymm()) } else { None };
     let state2 = state.clone();
+    let kind = req.kind.clone();
     let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, AppError> {
         let db = state2.db_for(&key)?;
         let tmpl = findb::imports::ImportTemplate::parse(&req.template);
@@ -4658,10 +4660,41 @@ async fn import_run(
                 }
             }
         };
+        // 明确告诉用户「导完之后该干什么」。
+        //
+        // 为什么要加这个：导入的凭证落 `Draft`（与手工录入一致，导入不绕过内控），
+        // 但「导入成功」很容易被理解成「已经进账了」。实际上还要审核 → 记账，
+        // 资金类凭证还要出纳签字。不说清楚，用户会以为导完就算完，下个月
+        // 对账才发现一笔没上。
+        let next_steps: Vec<String> = match kind.as_str() {
+            "voucher" => {
+                let opts = findb::options_of(db.conn());
+                let mut v = vec![format!(
+                    "{} 张凭证已导入为**草稿**（导入不绕过内控，与手工录入一致）",
+                    res.ok
+                )];
+                if opts.enable_audit {
+                    v.push("本账套开启了审核环节 → 需先「审核」再「记账」".to_string());
+                }
+                if opts.require_cashier {
+                    v.push(
+                        "本账套要求出纳签字 → 涉及现金/银行科目的凭证，出纳签字后才能记账"
+                            .to_string(),
+                    );
+                }
+                v.push("核对无误后到「凭证」页批量审核 → 批量记账".to_string());
+                v
+            }
+            "begin" | "opening_stock" | "arap_opening" => {
+                vec!["期初数据已写入。请确认「期初余额」页的合计与对方账套一致后再启用记账".to_string()]
+            }
+            _ => vec!["档案类导入为逐条幂等写入：中断后重跑会跳过已存在的编码，可安全重导".to_string()],
+        };
         Ok(json!({
             "ok": res.ok,
             "skipped": res.skipped,
             "warnings": res.warnings,
+            "next_steps": next_steps,
         }))
     })
     .await

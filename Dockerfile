@@ -63,6 +63,25 @@ ENV FINBOOK_REALM=/data/realm.db \
 # 非 root 运行：数据库文件属主为 finbook（bind mount 时请确保宿主机目录 uid=10001 可写）
 USER finbook
 EXPOSE 8080
+# ⚠ 这条 healthcheck 里的 `&&` 链是**必需的**，不要"简化"成
+#   `exec 3<>/dev/tcp/127.0.0.1:8080 || exit 1`。
+#
+# bash 陷阱：当 `exec` 只带重定向、且是 `-c` 字符串里最后一条命令时，bash 会走
+# exec 优化（原地 re-exec 自己），此时重定向被当成**普通文件路径**打开，于是报
+# `No such file or directory`（ENOENT）—— 而 /dev/tcp 并不是真实文件。
+# 后面接 `&& <cmd>` 时不走该优化，netredir 才生效。
+#
+# 已在生产实测确认两种写法的差别（同一镜像内）：
+#   `... && printf ... >&3 && grep -q ok <&3`  → 退出码 0，拿到 HTTP/1.0 200 OK
+#   `... || exit 1`                          → 退出码 1，ENOENT，healthcheck 恒失败
+#
+# 症状极具迷惑性：应用完全正常（/api/health 返回 ok、容器内 TCP 也通、
+# readiness 全绿），但 `docker ps` 长期显示 unhealthy 且 FailingStreak 一直涨。
+# 恒失败的探针比没有探针更糟 —— 它训练所有人忽略健康信号，真出事时也不会有人看。
+#
+# 这个镜像刻意不含 curl / wget（见上方 debian-slim 基础镜像），所以只能借
+# bash 的 /dev/tcp。更稳的做法是给 finweb 加 `--health` 自检子命令，让
+# HEALTHCHECK 直接跑二进制、不依赖 shell 技巧。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /api/health HTTP/1.0\r\n\r\n" >&3 && grep -q ok <&3'
 CMD ["finweb"]

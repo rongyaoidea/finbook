@@ -8,11 +8,266 @@
 //! 3. 金额完全相同 + 方向相反（日期不限）
 //!
 //! 一对多（一笔银行流水对多张凭证）在自动阶段不做，留给手工。
+//!
+//! 另有一条**可选**的收尾链路：导入流水 → 自动勾对 → **对没勾上的流水生成凭证草稿**
+//! → 审核 → 记账。见 [`gen_vouchers`]。
 
 use chrono::NaiveDate;
-use fincore::{Money, Period};
+use fincore::{AuxKind, AuxRef, Entry, Money, Period, Voucher, VoucherSource};
 
 use crate::{balances, Db, DbResult};
+
+/// 一条被跳过的流水（附原因）—— 让用户知道「哪些没处理、为什么」，
+/// 而不是只看到一个数字。
+#[derive(Clone, Debug)]
+pub struct SkipRow {
+    pub stmt_id: i64,
+    pub biz_date: String,
+    pub summary: String,
+    pub amount: Money,
+    pub reason: String,
+}
+
+/// 流水生成凭证的结果
+#[derive(Clone, Debug, Default)]
+pub struct GenResult {
+    /// 生成的凭证张数
+    pub generated: usize,
+    /// 生成后顺带勾上的流水行数（应当 == generated：一张凭证一条流水）
+    pub linked: usize,
+    /// 跳过的流水 + 原因
+    pub skipped: Vec<SkipRow>,
+    /// 生成的凭证 id（便于前端跳过去看）
+    pub voucher_ids: Vec<i64>,
+}
+
+/// 对方科目怎么定：进账认客户（贷应收）、支出认供应商（借应付）。
+///
+/// 方向搞反会做出方向相反的往来，所以这里写死成对偶关系而不是让调用方传：
+/// 银行进账只可能是「客户给钱」（贷应收），银行支出只可能是「我们给供应商钱」
+/// （借应付）。反过来意味着对方是我们欠的（预收/预付），那是另一类业务，
+/// 不该由「银行流水自动生成凭证」去猜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counterparty {
+    Customer,
+    Supplier,
+}
+
+/// 摘要里找出对方单位。
+///
+/// 银行摘要格式千奇百怪（「网银转入 深圳市XX有限公司」「收-华东商贸」…），
+/// 没法可靠解析。唯一稳的锚点是**对方名称作为子串出现在摘要里**。
+/// 多个都命中时取**名称最长**的 —— 最长的那个通常是最具体的那个
+/// （「深圳市XX有限公司」比「XX」更可能是真名）。
+fn match_counterparty(summary: &str, map: &std::collections::HashMap<String, String>) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None;
+    for (code, name) in map {
+        if name.is_empty() || !summary.contains(name.as_str()) {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((_, n)) => name.chars().count() > n.chars().count(),
+        };
+        if better {
+            best = Some((code.clone(), name.clone()));
+        }
+    }
+    best
+}
+
+/// 从**未勾对**的银行流水生成凭证草稿。
+///
+/// ## 为什么只做「能匹配往来单位」的那部分
+///
+/// 另一种做法是给所有未勾对流水生成凭证、对方挂「待定」科目。**这里刻意不做**：
+/// 「待定」会在期末变成一堆没法处理的余额，而且用户往往到期末才发现。
+/// 匹配不上的行原样留在对账页让人处理 —— 看得见的未处理，好过看不见的垃圾。
+///
+/// ## 生成的凭证长什么样
+///
+/// 只包含「银行侧 + 往来侧」两行：
+/// - 进账（客户回款）：借 `account`（银行/现金科目） / 贷 `biz.ar` 应收账款（辅助=客户）
+/// - 支出（付供应商）：借 `biz.ap` 应付账款（辅助=供应商） / 贷 `account`（银行/现金科目）
+///
+/// **不含收入/成本侧**。所以若对应的销售/采购尚未入账，应收/应付会出现
+/// 负数（贷方余额）。这不是 bug，是这条路子的固有前提：**它只适合往来已经
+/// 记好、只差银行侧没记的场景**（即「勾对没勾上但业务确实发生过」）。
+/// 这一点在返回值里如实说明，界面上也要显示。
+///
+/// ## 内控
+///
+/// 生成的凭证一律 `Draft`，且 `source = Import`，与手工录入同一条路径：
+/// 要过 `enable_audit`（若开启）、要过 `require_cashier`（资金类科目必然命中）
+/// 才能记账。**绝不自动记账** —— 自动拿银行流水直接记账等于绕过出纳签字，
+/// 那是这套系统里最不该被自动掉的一关。
+///
+/// ## 幂等
+///
+/// 生成后立刻把该流水行 `link` 到新分录，于是它不再是 `entry_id IS NULL`，
+/// 再跑一次不会重复生成。
+pub fn gen_vouchers(db: &Db, period: Period, account: &str, who: &str) -> DbResult<GenResult> {
+    let acct = account.trim();
+    if acct.is_empty() {
+        return Err(fincore::FinError::validate("缺少银行/现金科目").into());
+    }
+    let chart = crate::accounts::chart(db)?;
+    if !chart.get(acct).is_some() {
+        return Err(fincore::FinError::not_found(format!("科目不存在：{acct}")).into());
+    }
+    let biz = crate::options_of(db.conn()).biz_accounts;
+    let customers = aux_map(db, AuxKind::Customer)?;
+    let suppliers = aux_map(db, AuxKind::Supplier)?;
+
+    let mut res = GenResult::default();
+    let stmts = list(db, period, acct)?;
+
+    // 整批一个事务：中途失败整体回滚，不留「生成了一半」的凭证
+    let tx = db.write_tx()?;
+    for s in stmts.iter().filter(|s| !s.matched()) {
+        let amt = s.signed();
+        if amt.is_zero() {
+            res.skipped.push(skip_of(s, "金额为 0，无需生成"));
+            continue;
+        }
+        let in_flow = amt.is_positive();
+        // 进账找客户、支出找供应商（方向与往来类型是对偶的，见 Counterparty 说明）
+        let want = if in_flow { Counterparty::Customer } else { Counterparty::Supplier };
+        let map = match want {
+            Counterparty::Customer => &customers,
+            Counterparty::Supplier => &suppliers,
+        };
+        let Some((aux_code, aux_name)) = match_counterparty(&s.summary, map) else {
+            let kindname = if in_flow { "客户" } else { "供应商" };
+            res.skipped.push(skip_of(
+                s,
+                &format!("摘要里认不出{kindname}名称（不猜对方科目，留给人工处理）"),
+            ));
+            continue;
+        };
+        let other = if in_flow { biz.ar.as_str() } else { biz.ap.as_str() };
+        if other.trim().is_empty() {
+            res.skipped.push(skip_of(
+                s,
+                "账套参数未配置应收/应付科目（参数 → 业务科目），无法确定对方科目",
+            ));
+            continue;
+        }
+        if chart.get(other).is_none() {
+            res.skipped.push(skip_of(
+                s,
+                &format!("对方科目 {other} 在科目表里不存在，请先修正业务科目参数"),
+            ));
+            continue;
+        }
+
+        let word = "记";
+        let no = crate::vouchers::next_no_of(&tx, period, word)?;
+        let mut v = Voucher::new(period, s.biz_date, word.to_string(), no);
+        v.source = VoucherSource::Import;
+        let text = format!("{} {}", aux_name, s.summary);
+        v.memo = format!("银行流水自动生成：{} {}", s.biz_date, text);
+
+        // 两种方向都是「借方一笔 + 贷方一笔」：
+        //   进账（客户回款）借 银行 / 贷 应收(客户)
+        //   支出（付供应商）借 应付(供应商) / 贷 银行
+        let mut debit = if in_flow {
+            Entry::new(1, acct, text.clone())
+        } else {
+            Entry::new(1, other, text.clone())
+        };
+        let mut credit = if in_flow {
+            Entry::new(2, other, text.clone())
+        } else {
+            Entry::new(2, acct, text.clone())
+        };
+        // 方向判断用带符号的 `amt`，**填进分录必须用绝对值** ——
+        // 支出时 `signed()` 是负数，直接写进 debit 会撞「金额不能为负数」。
+        let magnitude = if amt.is_negative() { -amt } else { amt };
+        debit.debit = magnitude;
+        credit.credit = magnitude;
+        let kind = want_aux_kind(want);
+        if in_flow {
+            // 贷应收，辅助挂客户
+            credit.aux.set(kind, Some(aux_code.clone()));
+        } else {
+            // 借应付，辅助挂供应商
+            debit.aux.set(kind, Some(aux_code.clone()));
+        }
+        // 银行/现金科目本身也带辅助（银行账户），不填过不了记账校验 ——
+        // 「科目 100201 核算银行账户，必须填写银行账户」。取该科目下的第一个
+        // 银行账户；一个都没有就跳过这一笔，不静默塞个假的。
+        let bank_aux = first_bank_aux(db, acct)?;
+        let Some(bank_code) = bank_aux else {
+            res.skipped.push(skip_of(
+                s,
+                &format!("科目 {acct} 核算银行账户但账套里一个银行账户都没建，请先在「资金 → 银行账户」建一个"),
+            ));
+            continue;
+        };
+        if in_flow {
+            debit.aux.set(AuxKind::Bank, Some(bank_code));
+        } else {
+            credit.aux.set(AuxKind::Bank, Some(bank_code));
+        }
+        v.entries = vec![debit, credit];
+        let vid = crate::vouchers::save_in(&tx, &mut v)?;
+        // 找到银行侧那条分录，勾上流水行 —— 这一步同时保证幂等
+        let entry_id: i64 = tx.query_row(
+            "SELECT id FROM voucher_entry WHERE voucher_id=?1 AND account_code=?2 ORDER BY line LIMIT 1",
+            rusqlite::params![vid, acct],
+            |r| r.get(0),
+        )?;
+        link(&tx, s.id, entry_id, who)?;
+        res.generated += 1;
+        res.linked += 1;
+        res.voucher_ids.push(vid);
+    }
+    tx.commit()?;
+    Ok(res)
+}
+
+/// 取该银行/现金科目下的第一个银行账户辅助编码。
+///
+/// 银行科目本身带 `AuxKind::Bank` 辅助，不填会被记账校验拒
+/// （「科目 100201 核算银行账户，必须填写银行账户」）。取第一个是有意的：
+/// 流水只带账号的少数情况才需要精确对应，绝大多数对账单不带账号，
+/// 按第一个挂上即可 —— 人工仍可在凭证上改。
+fn first_bank_aux(db: &Db, account: &str) -> DbResult<Option<String>> {
+    Ok(crate::auxs::codes(db, AuxKind::Bank)?.into_iter().next())
+}
+
+fn want_aux_kind(c: Counterparty) -> AuxKind {
+    match c {
+        Counterparty::Customer => AuxKind::Customer,
+        Counterparty::Supplier => AuxKind::Supplier,
+    }
+}
+
+fn aux_map(
+    db: &Db,
+    kind: AuxKind,
+) -> DbResult<std::collections::HashMap<String, String>> {
+    let mut m = std::collections::HashMap::new();
+    for code in crate::auxs::codes(db, kind)? {
+        if let Some(e) = crate::auxs::get(db, kind, &code)? {
+            if !e.disabled {
+                m.insert(e.code, e.name);
+            }
+        }
+    }
+    Ok(m)
+}
+
+fn skip_of(s: &Statement, reason: &str) -> SkipRow {
+    SkipRow {
+        stmt_id: s.id,
+        biz_date: s.biz_date.to_string(),
+        summary: s.summary.clone(),
+        amount: s.signed(),
+        reason: reason.to_string(),
+    }
+}
 
 /// 银行对账单流水
 #[derive(Clone, Debug)]
@@ -146,7 +401,7 @@ pub fn clear(db: &Db, period: Period, account: &str) -> DbResult<usize> {
     )?)
 }
 
-/// 勾对：一条银行流水 ↔ 一条凭证分录
+/// 勾对：一条银行流水 ? 一条凭证分录
 pub fn link(c: &impl crate::AsConn, stmt_id: i64, entry_id: i64, who: &str) -> DbResult<()> {
     c.conn_ref().execute(
         "UPDATE bank_statement SET entry_id=?2, matched_at=?3, matched_by=?4 WHERE id=?1",
@@ -490,7 +745,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
 
 /// 金额解析：去掉千分位、货币符号、括号负数
 pub fn parse_money(s: &str) -> Money {
-    let mut t = s.trim().replace([',', '￥', '¥', '$', ' '], "");
+    let mut t = s.trim().replace([',', '￥', '￥', '$', ' '], "");
     let neg = t.starts_with('(') && t.ends_with(')');
     if neg {
         t = t.trim_start_matches('(').trim_end_matches(')').to_string();
@@ -590,12 +845,148 @@ pub fn import_csv(
 mod tests {
     use super::*;
     use fincore::voucher::{Entry, Voucher, VoucherStatus};
+    use fincore::AuxEntity;
     use fincore::Period;
+
+    /// 构造一条「除测试自己填的字段外全为空」的流水基准。
+    /// 刻意不复用上面那个 `stmt()` 辅助：它会对金额做 `Money::parse`，
+    /// 传 "0" 会撞 `ParseError::TooShort`。
+    fn mk_stmt(period: Period) -> Statement {
+        Statement {
+            id: 0,
+            period,
+            account_code: "100201".into(),
+            biz_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            summary: String::new(),
+            settle_no: String::new(),
+            debit: Money::ZERO,
+            credit: Money::ZERO,
+            balance: Money::ZERO,
+            entry_id: None,
+            matched_at: None,
+            matched_by: None,
+        }
+    }
 
     fn tmpdb(name: &str) -> Db {
         let p = std::env::temp_dir().join(format!("finbook_bank_{name}.fbk"));
         let _ = std::fs::remove_file(&p);
         Db::create(&p, &crate::tests::test_opts()).unwrap()
+    }
+
+    /// 流水生成凭证：只对**认得出往来单位**的未勾对流水生成，其余原样留下。
+    ///
+    /// 断言的是**边界**而不只是 happy path：认不出的行必须留在对账页、
+    /// 不能给它们挂「待定」科目 —— 那种挂账要到期末才暴露且往往没人处理。
+    /// 顺带验幂等（生成后流水已被勾上，再跑不会重复生成）与内控（凭证是草稿）。
+    #[test]
+    fn gen_vouchers_only_handles_recognizable_counterparties() {
+        let db = tmpdb("gen");
+        let period = Period::new(2026, 1).unwrap();
+        // 业务科目参数：应收/应付必须有值，否则对方科目定不下来
+        let mut opts = crate::options_of(db.conn());
+        // 必须用**末级**科目：1122 / 2202 是汇总节点，记账校验会拒
+        // （「非末级科目，不能记账」）。末级才是真正能落分录的地方。
+        opts.biz_accounts.ar = "112201".into(); // 应收货款
+        opts.biz_accounts.ap = "220201".into(); // 应付货款
+        db.set_options(&opts).unwrap();
+        // 往来单位
+        crate::auxs::insert(
+            &db,
+            &AuxEntity::new(AuxKind::Customer, "C001", "华东商贸有限公司"),
+        )
+        .unwrap();
+        crate::auxs::insert(
+            &db,
+            &AuxEntity::new(AuxKind::Supplier, "S001", "南方原材料厂"),
+        )
+        .unwrap();
+        // 银行科目本身带「银行账户」辅助，不建一个过不了记账校验
+        crate::auxs::insert(
+            &db,
+            &AuxEntity::new(AuxKind::Bank, "B01", "工行基本户"),
+        )
+        .unwrap();
+
+        // ① 进账，摘要含客户名 → 应生成
+        // ② 支出，摘要含供应商名 → 应生成
+        // ③ 进账但认不出对方（"网银转入"） → 必须跳过
+        insert(
+            &db,
+            &Statement {
+                biz_date: NaiveDate::from_ymd_opt(2026, 1, 6).unwrap(),
+                summary: "收 华东商贸有限公司 货款".into(),
+                settle_no: "SN1".into(),
+                debit: Money::parse("1000").unwrap(),
+                credit: Money::ZERO,
+                balance: Money::parse("1000").unwrap(),
+                ..mk_stmt(period)
+            },
+        )
+        .unwrap();
+        insert(
+            &db,
+            &Statement {
+                biz_date: NaiveDate::from_ymd_opt(2026, 1, 8).unwrap(),
+                summary: "付 南方原材料厂 采购款".into(),
+                settle_no: "SN2".into(),
+                debit: Money::ZERO,
+                credit: Money::parse("600").unwrap(),
+                balance: Money::parse("400").unwrap(),
+                ..mk_stmt(period)
+            },
+        )
+        .unwrap();
+        insert(
+            &db,
+            &Statement {
+                biz_date: NaiveDate::from_ymd_opt(2026, 1, 9).unwrap(),
+                summary: "网银转入 手续费".into(),
+                settle_no: "SN3".into(),
+                debit: Money::parse("20").unwrap(),
+                credit: Money::ZERO,
+                balance: Money::parse("420").unwrap(),
+                ..mk_stmt(period)
+            },
+        )
+        .unwrap();
+
+        let r = gen_vouchers(&db, period, "100201", "u1").unwrap();
+        assert_eq!(r.generated, 2, "只应生成认得出对方的 2 张：{r:?}");
+        assert_eq!(r.linked, 2, "生成后应把流水勾上：{r:?}");
+        assert_eq!(r.skipped.len(), 1, "认不出对方的必须留下：{r:?}");
+        assert!(
+            r.skipped[0].reason.contains("认不出"),
+            "跳过原因要说清为什么：{:?}",
+            r.skipped[0]
+        );
+
+        // 生成的凭证必须是**草稿**（不绕过审核/出纳签字）
+        for vid in &r.voucher_ids {
+            let v = crate::vouchers::get(&db, *vid).unwrap().unwrap();
+            assert_eq!(
+                v.status,
+                VoucherStatus::Draft,
+                "自动生成的凭证必须是草稿，不能绕过内控"
+            );
+            assert_eq!(v.entries.len(), 2, "只含银行侧 + 往来侧两行");
+            assert!(v.balanced(), "生成的凭证必须借贷平衡：{:?}", v.entries);
+            // 银行侧那条必须在，且带银行科目
+            assert!(
+                v.entries.iter().any(|e| e.account_code == "100201"),
+                "应含银行科目那一行：{:?}",
+                v.entries
+            );
+        }
+
+        // 幂等：再跑一次不应重复生成（流水已被勾上）
+        let r2 = gen_vouchers(&db, period, "100201", "u1").unwrap();
+        assert_eq!(r2.generated, 0, "已勾对的流水不该再生成：{r2:?}");
+        let total: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM voucher", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "库里应当只有 2 张凭证：{total}");
     }
 
     #[allow(dead_code)]

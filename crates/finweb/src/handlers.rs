@@ -644,6 +644,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/bank", get(get_bank))
         .route("/api/bank/import", post(import_bank))
         .route("/api/bank/auto-match", post(auto_match_bank))
+  .route("/api/bank/gen-vouchers", post(gen_bank_vouchers))
         .route("/api/bank/link", post(link_bank))
         .route("/api/bank/unlink", post(unlink_bank))
         .route("/api/bank/clear", post(clear_bank))
@@ -11750,6 +11751,57 @@ struct BankLinkReq {
 #[derive(Deserialize)]
 struct BankStmtIdReq {
     pub stmt_id: i64,
+}
+
+/// 银行流水生成凭证（出纳）
+///
+/// 只处理**未勾对**且**能从摘要里认出往来单位**的流水：
+/// 进账认客户（贷应收）、支出认供应商（借应付）。认不出的原样留在对账页 ——
+/// 刻意不给「待定」科目兜底，那种挂账要到期末才暴露，且往往没人处理。
+///
+/// 生成的凭证一律草稿：还要过审核、要过出纳签字（资金科目必然命中）才能记账。
+/// **不自动记账** —— 拿银行流水直接记账等于把出纳签字这一关自动掉。
+async fn gen_bank_vouchers(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Json(req): Json<BankAutoReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::VoucherNew)?;
+    let period = period_checked(req.ymm)?;
+    let account = req.account.trim().to_string();
+    if account.is_empty() {
+        return Err(AppError::bad_request("缺少银行科目 account"));
+    }
+    let db = state.db_for(&user.book_key)?;
+    let r = findb::bank::gen_vouchers(&db, period, &account, user.username())?;
+    db.log(
+        user.username(),
+        "银行对账",
+        "流水生成凭证",
+        &format!(
+            "生成 {} 张 / 跳过 {} 条",
+            r.generated,
+            r.skipped.len()
+        ),
+    )?;
+    Ok(Json(json!({
+        "generated": r.generated,
+        "linked": r.linked,
+        "voucher_ids": r.voucher_ids,
+        "skipped": r.skipped.iter().map(|s| json!({
+            "stmt_id": s.stmt_id,
+            "date": s.biz_date,
+            "summary": s.summary,
+            "amount": s.amount.fmt_money(),
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+        // 把前提说清楚：生成的凭证只含「银行侧 + 往来侧」，不含收入/成本侧。
+        // 往来未入账时应收/应付会出现负数 —— 这是这条路子的固有前提，不是 bug。
+        "note": "生成的凭证只含银行侧与往来侧两行（借 银行/贷 应收 或 借 应付/贷 银行），\
+                 不含收入与成本侧。适用于「往来已记好、只差银行侧没记」的场景；\
+                 若销售/采购尚未入账，应收/应付会出现负数，请在记账前核对。\
+                 凭证为草稿，需审核（若开启）并经出纳签字后才能记账。",
+    })))
 }
 
 async fn get_bank(

@@ -5520,6 +5520,7 @@ async function viewBank(main) {
       <div class="spacer"></div>
       <label>日期容差 <input id="bk-tol" type="number" value="3" style="width:56px" /> 天</label>
       ${can("voucher_new") ? `<button class="btn ghost" id="bk-auto">自动勾对</button>` : ""}
+      ${can("voucher_new") ? `<button class="btn ghost" id="bk-gen">未勾对的生成凭证</button>` : ""}
       ${can("voucher_new") ? `<button class="btn ghost" id="bk-import">导入对账单</button>` : ""}
       ${can("voucher_new") ? `<button class="btn ghost" id="bk-link">手工勾对</button>` : ""}
       ${can("voucher_new") ? `<button class="btn danger" id="bk-clear">清空对账单</button>` : ""}
@@ -5577,6 +5578,42 @@ async function viewBank(main) {
       toast(`自动勾对 ${r.matched} 对（结算号 ${r.by_no}、金额+日期 ${r.by_amount_date}、金额 ${r.by_amount}；存疑 ${r.ambiguous}）`, "ok");
       load();
     } catch (e) { toast(e.message, "err"); }
+  };
+  if ($("#bk-gen", main)) $("#bk-gen", main).onclick = async () => {
+    const p = periodOf(), acct = accountOf();
+    // 明确说清这条路子的边界，再让用户点：认不出的行会被留下，
+    // 生成的凭证只含银行侧 + 往来侧、不含收入成本侧。
+    const m = modal(`<h3>对未勾对的流水生成凭证</h3>
+      <div class="muted" style="font-size:12px;line-height:1.7;margin-bottom:8px">
+        期间 <b>${esc(p)}</b> · 科目 <b>${esc(acct)}</b><br>
+        · 只处理<b>还没勾对</b>的流水；已勾对的不动。<br>
+        · 摘要里能认出<b>客户名</b>的进账 → 借 银行 / 贷 应收；认出<b>供应商名</b>的支出 → 借 应付 / 贷 银行。<br>
+        · 认不出的<b>原样留在对账页</b>，不会给你挂「待定」科目 —— 那种挂账要到期末才暴露。<br>
+        · 生成的凭证是<b>草稿</b>：还要审核、还要出纳签字才能记账。<b>不会自动记账。</b><br>
+        · 凭证只含银行侧与往来侧，<b>不含收入与成本侧</b>。适用于「往来已记好、只差银行侧没记」；
+        若销售/采购尚未入账，应收/应付会出现负数。
+      </div>
+      <div class="foot"><button class="btn primary" id="bg-ok">生成</button><button class="btn ghost" id="bg-cancel">取消</button></div>`);
+    $("#bg-cancel", m).onclick = closeModal;
+    $("#bg-ok", m).onclick = async () => {
+      closeModal();
+      try {
+        const r = await post("/bank/gen-vouchers", { ymm: parseInt(p, 10), account: acct, tolerance: 0 });
+        if (!r.generated && !r.skipped.length) { toast("没有可处理的流水（可能都已勾对）", "err"); return; }
+        // 跳过的行逐条说原因 —— 用户要知道哪些没处理、为什么
+        const m2 = modal(`<h3>生成结果</h3>
+          <div style="font-size:13px;line-height:1.7">
+            已生成 <b>${r.generated}</b> 张凭证草稿，并已把 ${r.linked} 条流水勾上。<br>
+            ${r.skipped.length ? `<b>跳过 ${r.skipped.length} 条</b>（原样留在对账页）：<ul style="margin:6px 0 0 18px;padding:0">${
+              r.skipped.map((s) => `<li>${esc(s.date)} ${esc(s.summary)} ${esc(s.amount)}<br><span class="muted">↳ ${esc(s.reason)}</span></li>`).join("")
+            }</ul>` : ""}
+            <p class="muted" style="margin-top:10px;font-size:12px">${esc(r.note || "")}</p>
+          </div>
+          <div class="foot"><button class="btn primary" id="bg2-ok">知道了</button></div>`);
+        $("#bg2-ok", m2).onclick = closeModal;
+        load();
+      } catch (e) { toast(e.message, "err"); }
+    };
   };
   if ($("#bk-link", main)) $("#bk-link", main).onclick = async () => {
     if (!selStmt || !selBook) { toast("请分别在左右两表各选一行", "err"); return; }

@@ -816,7 +816,11 @@ CREATE TABLE IF NOT EXISTS po_receipt (
     warehouse   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_po_rcpt ON po_receipt(po_id);
-CREATE INDEX IF NOT EXISTS idx_po_rcpt_item ON po_receipt(po_id, item_code);
+-- 注意：`idx_po_rcpt_item(po_id, item_code)` **不能**写在 DDL 里。
+-- `CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，所以旧账套上 `po_receipt`
+-- 保持 v1 的旧结构（没有 item_code），紧接着的 CREATE INDEX 引用一个不存在的列
+-- → DDL 失败 → 整个 init 事务回滚 → 迁移静默不生效，版本号永远停在旧值。
+-- 那个索引在 `init` 里、**加列之后**建（紧跟 `migrate_generic(MIGRATE_V5)`）。
 
 -- ===========================================================================
 -- 到岸成本（Landed Cost）
@@ -1940,6 +1944,28 @@ pub fn init(conn: &Connection) -> Result<(), DbError> {
             migrate_generic(conn, MIGRATE_V25)?;
             migrate_generic(conn, MIGRATE_V26)?;
             migrate_generic(conn, MIGRATE_V31)?;
+            // v35：`po_receipt` 分行收货的索引。**必须放在加列之后**（即 MIGRATE_V6 之后 ——
+            // 那两条 `po_receipt` 列在 MIGRATE_V6 清单里，不在 MIGRATE_V5）。
+            //
+            // 两条教训，都是生产事故级的：
+            //
+            // ① **不能写进 DDL**。`CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，
+            //    旧账套上的 `po_receipt` 保持 v1 旧结构（没有 `item_code`）。DDL 里紧跟
+            //    着建索引就引用了不存在的列 → DDL 报错 → 整个 `init` 事务回滚 →
+            //    迁移**静默不生效**、版本号停在旧值；账套随后被按新代码打开，首个
+            //    收货/退货请求报 `no such column: item_code`。
+            //    全新账套不会暴露（表由 DDL 新建、自带新列），所以全量测试与 E2E 全绿
+            //    也照样漏 —— 只有**升级上来的旧账套**会炸。
+            // ② **必须放在真正加列的那个清单之后**，而不是「看起来相邻」的位置。
+            //    早先插在 MIGRATE_V5 之后 / MIGRATE_V6 之前，同样炸，只是炸在 `init`
+            //    内部而不是 DDL，报错信息几乎一样，很有迷惑性。
+            //
+            // 通用规则：**引用迁移新增列的索引一律建在 `migrate_generic` 之后**，
+            // 且要确认那几列确实属于它后面那个清单。
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_po_rcpt_item ON po_receipt(po_id, item_code)",
+                [],
+            )?;
             // v30：仓库主数据种默认仓（建表在 DDL；老账套升级即得，幂等）
             conn.execute(
                 "INSERT OR IGNORE INTO warehouse(code,name,is_default,disabled,memo)
@@ -2054,6 +2080,101 @@ mod tests {
     /// **只核对表名、不核对列** —— 于是漏抬 `SCHEMA_VERSION` 时：
     /// 全新账套一切正常（DDL 里已含新列），只有升级上来的旧账套会在第一次
     /// 点「更正」时炸 `no such column: amends_id`。
+    ///
+    /// ⚠ 这条用例只覆盖「列」。**索引**是另一种翻车方式，见下一条。
+    ///
+    /// 旧账套（v34 的**旧结构** `po_receipt`）升级后必须拿到 item_code / warehouse。
+    ///
+    /// 回归背景（生产事故级）：`idx_po_rcpt_item(po_id, item_code)` 曾写在 DDL 里。
+    /// `CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，所以旧账套上的 `po_receipt`
+    /// 保持 v1 旧结构（没有 `item_code`）→ 紧接着的 CREATE INDEX 引用不存在的列
+    /// → DDL 失败 → 整个 `init` 事务回滚 → 迁移静默不生效、版本号停在 34。
+    /// 账套随后被按新代码打开，**首个收货/退货请求就报 `no such column: item_code`**。
+    ///
+    /// 为什么全量测试与 E2E 都绿：它们都建**全新账套**，而全新账套的表由 DDL 新建、
+    /// 自带新列，索引引用当然有效。**只有升级上来的旧账套会炸。**
+    ///
+    /// 所以本用例的关键：用**旧结构**的表跑 init，而不是 DDL 新建的表。
+    /// 上面那条用例正是用 DDL 新建的表（只 DROP 了 voucher 的列），掩盖了这个 bug。
+    ///
+    /// 教训适用于任何「老表 + 迁移新增列」：**引用新列的索引必须建在加列之后，
+    /// 不能写进 DDL。**
+    #[test]
+    fn old_book_with_legacy_po_receipt_upgrades_cleanly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        // 造出「po_receipt 是 v1 旧结构 + 版本号停在 34」的存量账套
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_po_rcpt_item;
+             CREATE TABLE po_receipt_legacy (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 po_id       INTEGER NOT NULL,
+                 period      INTEGER NOT NULL,
+                 date        TEXT NOT NULL,
+                 qty         TEXT NOT NULL DEFAULT '0',
+                 memo        TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO po_receipt_legacy(po_id,period,date,qty,memo)
+                 VALUES(7, 202601, '2026-01-08', '100', '历史整单收货');
+             DROP TABLE po_receipt;
+             ALTER TABLE po_receipt_legacy RENAME TO po_receipt;
+             CREATE INDEX IF NOT EXISTS idx_po_rcpt ON po_receipt(po_id);
+             INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','34');",
+        )
+        .unwrap();
+        for c in ["item_code", "warehouse"] {
+            assert!(
+                !column_exists(&conn, "po_receipt", c).unwrap(),
+                "前置条件：旧结构的 po_receipt 不应有 {c}"
+            );
+        }
+        let old_qty: String = conn
+            .query_row("SELECT qty FROM po_receipt WHERE po_id=7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_qty, "100", "前置条件：历史收货行应存在");
+
+        // 诊断分界：DDL 必须能**单独**在旧结构账套上执行。
+        // 回归前它在这里就炸（`CREATE INDEX ... (po_id, item_code)` 引用未新增的列），
+        // 后面的 `migrate_generic` 根本没机会跑 —— 先单独验 DDL，才能分清是
+        // 「DDL 引用了不存在的列」还是「加列本身失败」。
+        conn.execute_batch(DDL)
+            .expect("DDL 必须能在旧结构账套上单独执行（回归前它在 CREATE INDEX 处炸掉）");
+
+        init(&conn).expect("旧账套升级必须成功（曾因索引引用未新增的列而整体回滚）");
+
+        for c in ["item_code", "warehouse"] {
+            assert!(
+                column_exists(&conn, "po_receipt", c).unwrap(),
+                "旧账套升级后必须补上 po_receipt.{c}"
+            );
+        }
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION.to_string(), "版本号没推进 = 迁移整体回滚了");
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_po_rcpt_item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_po_rcpt_item 必须在加列之后建起来");
+        // 旧数据完好，新列取默认值（'' = 整单收货，与升级前口径一致）
+        let row: (String, String, String) = conn
+            .query_row("SELECT qty, item_code, warehouse FROM po_receipt WHERE po_id=7", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row.0, "100", "历史收货量不能丢");
+        assert_eq!(row.1, "", "旧行的新列应取默认空串（= 整单收货）");
+        assert_eq!(row.2, "");
+        // 幂等：再跑一次不报错
+        init(&conn).unwrap();
+        for c in ["item_code", "warehouse"] {
+            assert!(column_exists(&conn, "po_receipt", c).unwrap());
+        }
+    }
     ///
     /// 这条路径**只有本测试能覆盖**：集成测试与 E2E 全都建全新账套。
     #[test]

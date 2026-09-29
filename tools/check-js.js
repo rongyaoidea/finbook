@@ -103,9 +103,68 @@ for (const f of idTargets) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// nginx sub_filter 锚点检查
+//
+// 为什么要查这个：某些部署的反代并不只是"转发"，它还在**下发时改写 app.js**
+// （在 vhost 里配 sub_filter，具体配置路径因面板而异，不写进本仓库）：
+//
+//     sub_filter 'r.status === 401'
+//                'r.status === 401 || (r.status === 403 && data && data.error === "未登录或会话已失效")';
+//     header_filter_by_lua_block { if ngx.status == 401 and upstream_addr ~= "" then ngx.status = 403 end }
+//
+// 起因：finweb 的 401 不带 WWW-Authenticate，浏览器收到后会把已缓存的 Basic
+// 凭据一起清掉，下一轮又撞上第一道 basic 框 —— 用户表现为"登录两遍"。
+// 于是反代把上游 401 改写成 403，并让前端把"403 + 未登录"也当会话失效处理。
+//
+// **这个补丁靠 app.js 里的字面量 `r.status === 401` 生效。** 一旦重构
+// api()（换变量名、改成 switch、抽成常量）字面量消失，sub_filter 就静默变成
+// 空操作，症状是"用户偶发要登录两遍"——本地和 CI 全绿，只有生产复现。
+// 语法检查抓不到这种"部署配置依赖源码字面量"的耦合，所以在这里机器化。
+//
+// 判定（两条都要满足）：
+//   1. 该字面量在 app.js 里**恰好出现 1 次**——0 次 = 补丁失效；
+//      >1 次 = 补丁会在多处注入，可能改到不该改的分支。
+//   2. 它前面（同一函数内）必须有 `let data = null` 之类的 data 声明，
+//      否则注入的 `data &&` 引用未定义变量 → 直接 ReferenceError，整个前端白屏。
+// ---------------------------------------------------------------------------
+const ANCHOR = "r.status === 401";
+const appFile = path.join(STATIC, "app.js");
+if (fs.existsSync(appFile)) {
+  const src = fs.readFileSync(appFile, "utf8");
+  const hits = src.split(ANCHOR).length - 1;
+  if (hits !== 1) {
+    bad++;
+    console.log(
+      `FAIL nginx sub_filter 锚点 \`${ANCHOR}\` 在 app.js 里出现 ${hits} 次（应为 1 次）——\n` +
+        `    生产 nginx 靠这个字面量把上游 401 改写成 403 并让前端识别会话失效；\n` +
+        `    0 次 = 补丁静默失效，症状是「用户要登录两遍」；>1 次 = 补丁会改到多处分支。\n` +
+        `    修法：保证 api() 里恰有一处 \`if (r.status === 401) {\`，不要抽成常量或换写法。`
+    );
+  } else {
+    // 注入的表达式里用了 data，必须在同一函数作用域内已声明
+    const at = src.indexOf(ANCHOR);
+    // 往上找最近的函数起点
+    const before = src.slice(0, at);
+    const fnStart = Math.max(
+      before.lastIndexOf("\nasync function "),
+      before.lastIndexOf("\nfunction ")
+    );
+    const scope = src.slice(fnStart < 0 ? 0 : fnStart, at);
+    if (!/\b(let|const|var)\s+data\b/.test(scope)) {
+      bad++;
+      console.log(
+        `FAIL nginx sub_filter 锚点 \`${ANCHOR}\` 所在函数里没有 data 声明——\n` +
+          `    nginx 注入的 \`data && data.error === "未登录或会话已失效"\` 会引用未定义的 data，\n` +
+          `    结果是整页 ReferenceError 白屏。修法：在 401 判断之前声明 data。`
+      );
+    }
+  }
+}
+
 console.log(
   bad === 0
-    ? `OK: ${targets.length} 个 JS 文件语法通过 + ${idTargets.length} 个文件无重复 id`
+    ? `OK: ${targets.length} 个 JS 文件语法通过 + ${idTargets.length} 个文件无重复 id + nginx sub_filter 锚点在位`
     : `FAIL: ${bad} 个问题`
 );
 process.exit(bad === 0 ? 0 : 1);

@@ -82,6 +82,88 @@ docker run -d --name finbook -p 127.0.0.1:8080:8080 \
   ```
 - 数据卷务必定期备份（见 §6）
 
+### 4.1 ⚠️ 发布端口必须匹配反代实际连的地址
+
+**这是本项目实际踩过的坑：改端口映射会让站点整体 502，而容器 healthcheck 全绿。**
+
+反向代理连的地址**不是**「宿主哪个端口」，而是「它配置里写死的那个」。上游地址写错 /
+端口没发布，用户看到的就是 502 Bad Gateway，而后端日志一切正常 —— 因为请求根本没
+到后端。
+
+**动端口前必须先确认这三件事**（不要凭印象推导）：
+
+```bash
+# 1) 反代配置里写死的上游地址是什么
+nginx -T 2>/dev/null | grep -nE 'proxy_pass|listen |server_name'
+
+# 2) 容器实际监听的端口
+docker exec <容器> sh -c 'cat /proc/net/tcp | awk "NR>1 {print \$2}"'
+#    或直接看镜像默认值：grep FINBOOK_LISTEN Dockerfile
+
+# 3) 宿主机上该端口是否真的有人监听
+ss -lntp | grep <端口>
+```
+
+上游可能是**回环**（`127.0.0.1`），也可能是**宿主在 docker bridge 网段上的地址**。
+这两种对应的端口绑定方式不同：
+
+| 上游写法 | 必须这样发布 | 原因 |
+|---|---|---|
+| `127.0.0.1:<P>` | `-p 127.0.0.1:<P>:<P>` | docker-proxy 只在回环监听 |
+| `<宿主 bridge IP>:<P>` | `-p <P>:<P>`（绑 `0.0.0.0`） | 回环绑定在 bridge 地址上没有监听 |
+| 宿主某个别的端口 | `-p <该端口>:<容器端口>` | 端口号不必相同，但容器侧要对得上 |
+
+**改完端口必须从反代那侧验，而不是从容器内**：
+
+```bash
+# 1) 直接打反代配置里的上游地址，必须 200（唯一能证明反代链路通了的检查）
+curl -s -o /dev/null -w '%{http_code}\n' http://<上游地址>/api/health     # 期望 200
+
+# 2) 经反代：若外层有 basic 认证，无凭据应得 401（反代自己的挑战）；
+#    **得 502 就是上游不通**
+curl -sk -o /dev/null -w '%{http_code}\n' -H 'Host: <对外域名或IP>' https://127.0.0.1/
+
+# 3) 看反代错误日志确认它连的是哪个地址
+tail /var/log/nginx/<站点>.error.log
+#    典型信息：connect() failed (111: Connection refused) ... upstream: "http://<上游>/"
+```
+
+> 教训：`docker inspect` 显示 healthy 只说明**容器内**探针通过。宿主→容器的
+> 端口映射错了，healthcheck 发现不了。只看 healthy 就宣布部署完成，会让站点
+> 挂着 502 而你以为是好的。
+
+> `FINWEB_SECURE_COOKIE` 要和「TLS 在哪里终结」对上：若 finweb 前面没有一层
+> 终结 TLS 的反代（或用户直连 http），设成 `true` 会让 Cookie 发不出去，
+> 表现为**整站无法登录**。
+
+> ⚠️ **不要把生产环境的主机名、IP、面板/反代配置路径、口令文件路径写进本仓库。**
+> 本文档所在的仓库是公开的。上面这些具体值请记在仓库之外（密码管理器 / 私人笔记）；
+> 本文只保留**方法**，不记录任何一台具体机器的坐标。
+
+### 4.2 ⚠️ 若反代会改写 app.js，别改 `api()` 的 401 写法
+
+某些部署会在反代里对下发的前端 JS 做 `sub_filter` 改写。典型场景：finweb 的 401
+不带 `WWW-Authenticate`，浏览器收到后会把已缓存的 Basic 凭据一起清掉，下一轮又撞上
+第一道 basic 框 —— 用户表现为「要登录两遍」。于是反代把上游 401 改写成 403，并让前端
+把「403 + 未登录」也当会话失效处理：
+
+```nginx
+sub_filter 'r.status === 401'
+           'r.status === 401 || (r.status === 403 && data && data.error === "未登录或会话已失效")';
+header_filter_by_lua_block {
+    if ngx.status == 401 and (ngx.var.upstream_addr or "") ~= "" then ngx.status = 403 end
+}
+```
+
+**这个补丁靠 `app.js` 里的字面量 `r.status === 401` 生效。** 重构 `api()` 时若把
+它改成 `res.status === 401`、抽成常量、或改成 switch，字面量一消失补丁就静默
+失效，症状是「用户偶发要登录两遍」—— 本地和 CI 全绿，只有生产复现。
+
+`node tools/check-js.js` 里有两条机器检查兜住这件事（锚点必须**恰好出现 1 次**，
+且同函数内必须有 `data` 声明，否则注入的 `data &&` 会 ReferenceError 白屏）。
+**改 `api()` 后必须跑它。** 即便你当前没有用 `sub_filter`，这个检查也建议保留：
+它防的是「日后有人在这层加了同类补丁」时被静默打断。
+
 ## 5. HTTPS 反向代理（必须）
 
 finweb 本身只提供 HTTP。**生产环境禁止把 8080 裸暴露到公网**（口令明文传输）。

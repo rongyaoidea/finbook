@@ -336,13 +336,70 @@ mod tests {
     fn crud_extra_perms() {
         let db = mem();
         let mut u = User::new("test", "测试", Role::Cashier);
-        u.extra_perms = vec![Perm::PeriodClose];
+        // 用 VoucherAudit 当"额外授权"的样本：出纳与会计两个角色都没有它，
+        // 也不会触发职责互斥（本测试要验的是 extra_perms 能不能落库再读回来，
+        // 不是验某个具体权限）。原来这里用的是 PeriodClose —— 会计加上结账权后，
+        // 出纳拿结账权就撞上职责互斥了（见 duty_separation_blocks_cashier_holding_）。
+        u.extra_perms = vec![Perm::VoucherAudit];
         u.set_password("test123");
         let id = insert(&db, &u).unwrap();
         let got = get_by_id(&db, id).unwrap().unwrap();
-        assert!(got.can(Perm::PeriodClose));
+        assert!(got.can(Perm::VoucherAudit));
         delete(&db, id).unwrap();
         assert!(get_by_id(&db, id).unwrap().is_none());
+    }
+
+    /// 出纳签字与会计核心权限不能同时在一个账号上。
+    ///
+    /// 这条规则以前**没有任何直接测试**（只有 `insert`/`update` 两条路径顺带调用
+    /// 它，且当时的用例恰好都合法，跑不到互斥分支）。规则一旦被改坏，症状是
+    /// 「出纳既能签字又能记账」—— 一条本该被系统拦住的舞弊路径被放开了。
+    ///
+    /// 钉住三件事：
+    ///   1. 纯出纳（只有 CashierSign）可以；
+    ///   2. 出纳 + 任意一项会计核心权限（额外授权来的也算）不行；
+    ///   3. 管理员不受约束。
+    ///
+    /// 第 2 条的样本特意用 `PeriodClose`（结账）：会计拿到结账权之后，「出纳 +
+    /// 结账」就成了新的互斥组合，这是本轮改动新引入的组合，必须测到。
+    #[test]
+    fn duty_separation_blocks_cashier_holding_() {
+        // 纯出纳：合法
+        let ok = User::new("cash", "出纳", Role::Cashier);
+        assert!(User::validate_duty_separation(&ok).is_ok(),
+            "纯出纳不应被拦：{:?}",User::validate_duty_separation(&ok)
+        );
+
+        // 出纳 + 结账：会计核心权限，不合法
+        for p in [
+            Perm::PeriodClose,
+            Perm::VoucherPost,
+            Perm::VoucherDelete,
+            Perm::AccountEdit,
+            Perm::Opening,
+            Perm::CarryForward,
+            Perm::OrderOps,
+            Perm::Warehouse,
+        ] {
+            let mut u = User::new("cash", "出纳", Role::Cashier);
+            u.extra_perms = vec![p];
+            assert!(User::validate_duty_separation(&u).is_err(),
+                "出纳额外获得「{}」应被职责互斥拦下",
+                p.label()
+            );
+        }
+
+        // 兼任两个岗位（会计 + 出纳）同样不行
+        let mut both = User::new("both", "会计兼出纳", Role::Accountant);
+        both.roles = vec![Role::Cashier];
+        assert!(User::validate_duty_separation(&both).is_err(),
+            "会计兼出纳（两个岗位并存）应被拦"
+        );
+
+        // 管理员不受约束 —— 否则无法给自己配权限
+        let mut admin = User::new("root", "管理员", Role::Admin);
+        admin.extra_perms = vec![Perm::PeriodClose];
+        assert!(User::validate_duty_separation(&admin).is_ok());
     }
 
     #[test]

@@ -435,7 +435,7 @@ pub fn stock_summary(db: &Db, period: Period, method: CostMethod) -> DbResult<Ve
 
         let mut st = StockState::new();
         // 标准成本单价必须喂进状态机（与 `stock_state` 同一处理）。
-        // 这条路径自己 new 状态机、**不经过** stock_state，所以要在��里补一次；
+        // 这条路径自己 new 状态机、**不经过** stock_state，所以要在这里补一次；
         // 漏了就是「期末计价按标准成本、销售成本结转按移动加权」那种口径分裂。
         if method == CostMethod::Standard {
             st.set_standard_cost(item_standard_cost(db, &item)?);

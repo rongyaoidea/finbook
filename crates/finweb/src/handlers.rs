@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use axum::routing::{delete, get, post, put};
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
-use fincore::{Account, AuxEntity, AuxKind, AuxMask, AuxQuery, AuxRef, BookOptions, Direction, Entry, Money, Period, Role, User, Voucher, VoucherStatus};
+use fincore::{Account, AuxEntity, AuxKind, AuxMask, AuxQuery, AuxRef, BookOptions, Direction, Entry, Money, Period, Role, User, Voucher, VoucherSource, VoucherStatus};
 use fincore::user::Perm;
 use tracing::error;
 use findb::accounts;
@@ -904,7 +904,7 @@ async fn post_login(
 ) -> Result<Response, AppError> {
     // 全局登录（认账号库，而非某一套账）
     let username = req.username.trim().to_string();
-    // 设备指纹必须非空：空串会让"一人一机"首次绑定写成空值从而永久绕过校验
+    // 设备指纹必须非空：空串会被写进绑定名单，等于给这个账号留了一条万能通道
     let device_id = req.device_id.trim().to_string();
     if device_id.is_empty() || device_id.len() > 128 {
         return Err(AppError::bad_request("缺少有效的设备标识，请刷新页面后重试"));
@@ -966,16 +966,27 @@ async fn post_login(
     let _ = state
         .realm
         .record_login_attempt(&username, true, ip.as_deref().unwrap_or(""));
-    // "一人一机"（平台层）：普通账号绑定首个登录设备，换设备需管理员重置；管理员可多端
+    // 设备绑定（平台层）：普通账号最多绑 RealmDb::MAX_DEVICES_PER_USER 台，超出需管理员
     if !ru.is_admin {
-        match state.realm.bind_device(&username, &device_id)? {
+        match state
+        .realm
+        .bind_device(&username, &device_id, &req.device_name)?
+    {
             Ok(()) => {}
             Err(msg) => return Err(AppError::forbidden(msg)),
         }
     }
-    // 普通账号登录时踢掉旧会话（一人一会话）；管理员不受限，可多端并存
+    // 顶掉「同一台设备」上的旧会话，但**保留其它设备的会话**。
+    //
+    // 原来这里是 remove_by_username（清该账号全部会话），那与「一个账号可绑两台设备」
+    // 直接冲突：第 2 台设备一登录就把第 1 台踢下线，用户体感仍然是只能登一台，
+    // 绑定上限也就只是个数字。
+    //
+    // 管理员仍然不受限：运维账号不该被这套机制管。
     if !ru.is_admin {
-        state.sessions.remove_by_username(&username);
+        state
+            .sessions
+            .remove_by_username_and_device(&username, &device_id);
     }
     let token = state.sessions.create(
         &username,
@@ -2310,7 +2321,8 @@ async fn reset_platform_password(
     Ok(Json(json!({"ok": true})))
 }
 
-/// 平台层重置设备绑定（Web"一人一机"）：解绑后该账号下次登录自动绑定新设备
+/// 平台层重置设备绑定：解绑**全部**已绑定设备后，该账号可在任意设备重新登录
+/// （重新绑定仍受 `RealmDb::MAX_DEVICES_PER_USER` 上限约束）
 async fn reset_platform_device(
     State(state): State<Arc<WebState>>,
     user: RealmUser,
@@ -2390,7 +2402,26 @@ async fn create_user(
         u.deny_perms = req.deny_perms;
     }
     let id = users::insert(&db, &u)?;
-    db.log(user.username(), "安全", "新建用户", &format!("创建账号「{username}」（{}）", req.role.label()))?;
+    // 账套层的「首登改密」要同步到平台账号，否则不生效。
+    //
+    // 为什么不生效：登录门禁 `post_login` 读的是**平台层**的
+    // `ru.must_change_pwd`（见 post_login 的 LoginResp），账套里那一位只影响
+    // 账套内的记录。实测：建号时账套层明确传 `must_change_pwd:false`，平台层
+    // 开号时没传（默认 true），结果仍然被拦在「必须先改密」上。
+    //
+    // 为什么在这里同步而不是在登录时取交集：平台账号是为这个账套的身份而存在
+    // 的，管理员在账套里表达的「这个人不用改密」就是他的真实意图；让登录门禁
+    // 去扫所有账套成员关系，既多一次 IO，又会出现「A 账套开着、B 账套关着」
+    // 这种没法解释的组合。只在**显式传值**时同步，不做隐式覆盖。
+    if !req.must_change_pwd && ru.must_change_pwd {
+        state.realm.set_must_change_pwd(&username, false)?;
+        db.log(
+            user.username(),
+            "安全",
+            "新建用户",
+            &format!("账号「{username}」设为免首登改密（同步到平台账号）"),
+        )?;
+    }
     Ok(Json(json!({"id": id})))
 }
 
@@ -2562,7 +2593,7 @@ async fn reset_user_device(
         return Err(AppError::not_found("该用户不在当前账套"));
     }
     users::reset_device(&db, &username)?;
-    // 立刻下线该用户全部会话：旧设备不能靠存量会话绕过"一人一机"
+    // 立刻下线该用户**全部**会话（含其它已绑定设备）：旧设备不能靠存量会话继续用
     state.sessions.remove_by_username(&username);
     db.log(user.username(), "安全", "重置设备绑定", &format!("重置「{username}」的设备绑定"))?;
     Ok(Json(json!({"ok": true})))
@@ -2649,8 +2680,19 @@ async fn get_options(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
 ) -> Result<Json<fincore::BookOptions>, AppError> {
-    user.require(Perm::SysOption)?;
     let db = state.db_for(&user.book_key)?;
+    // 读参数放宽到「能记账的人」，写仍然要 SysOption。
+    //
+    // 为什么：前端的凭证编辑器要用 `enable_audit` 决定「记账」按钮的行为，
+    // 而 `afterLogin()` 也要读参数。原来会计/出纳读参数一律 403，于是
+    // `state.bookOptions = null`、界面按「未开审核」处理 —— 用户完全看不到
+    // 「本账套开了审核环节」这个事实，只在点记账被拒时才第一次知道。
+    // 让人能读自己每天都要面对的那个开关，成本几乎为零。
+    if !user.can(Perm::SysOption)
+        && !(user.can(Perm::VoucherPost) || user.can(Perm::VoucherAudit))
+    {
+        return Err(AppError::forbidden("没有「账套参数」权限"));
+    }
     Ok(Json(db.options()))
 }
 
@@ -3140,6 +3182,26 @@ async fn period_carry_forward(
     let rows = snap.profit_loss_rows(&chart);
     if rows.is_empty() {
         return Err(AppError::bad_request("本期损益类科目没有发生额，无需结转"));
+    }
+    // 已结转过就先说清楚，不要让用户对着「没有可结转的分录」去猜。
+    //
+    // 账结法天生幂等：结转凭证把各损益科目的本期净发生额清零，再点一次自然没有
+    // 分录可结。功能上没错，错的是提示——原来只说「净发生额均为 0」，用户无法
+    // 区分「本期压根没做业务」和「已经结过了」，只能去翻凭证。实测重复点击时账面
+    // 明明有 658,000 的损益额，提示却说「损益发生额均为零」。
+    //
+    // 这里主动查本期已有的结转凭证，把因果和补救一起给出。
+    let carried: Vec<String> = vouchers::list(&db, &vouchers::VoucherQuery::period(period))?
+        .into_iter()
+        .filter(|v| v.source == VoucherSource::CarryForward && v.status != VoucherStatus::Void)
+        .map(|v| format!("{} #{}", v.word, v.no))
+        .collect();
+    if !carried.is_empty() && rows.iter().all(|r| r.debit.round2().eq(&r.credit.round2())) {
+        return Err(AppError::bad_request(format!(
+            "本期损益已结转过（{}），各损益科目净发生额已清零，无需重复结转。\
+             如需重新结转，请先删除该凭证再执行",
+            carried.join("、")
+        )));
     }
     let date = period.last_day();
     let word = db
@@ -5685,7 +5747,7 @@ async fn export_tax_vat(
     let s = |v: &fincore::Money| v.fmt_money();
 
     row(&[
-        "增值税一般纳税���申报表（主表）".into(),
+        "增值税一般纳税人申报表（主表）".into(),
         format!("税款所属期：{}", f.period),
         format!("纳税人名称：{company}"),
         format!("纳税人识别号：{}", db.options().tax_no),
@@ -10456,8 +10518,37 @@ async fn delete_receipt(
 
 // ---------------- 收付款单审核流 + 存货盘点 ----------------
 
-/// 审核收付款单（对标金蝶）：同事务生成资金凭证 + FIFO 自动核销。审核权 = VoucherAudit
-/// （审核人/主管/管理员——出纳录单、审核人把关，职责分离）。
+/// 收付款单的「审核」判据：**VoucherAudit 或 VoucherPost 二者其一**。
+///
+/// 原来只认 `VoucherAudit`，于是「只有会计 + 出纳、没有财务主管」的小微企业
+/// **永远把收付款单变不成凭证** —— 出纳录单，会计想审，但 `Role::Accountant`
+/// 按三权分离刻意不带 `VoucherAudit`（制单/审核/记账要分开），于是两个人谁也
+/// 审不了。这条死路是在 2026-09-29 补出纳日常 E2E 时实测撞出来的。
+///
+/// 为什么放开给 `VoucherPost` 是安全的、而且才是对的控制：
+/// · 收付款单的凭证是**系统按单据自动生成**的（不是人手敲的），三方分离针对的是
+///   「自己录的凭证自己审自己记」；单据来源不同，可审的人也就该不同。
+/// · 真正的控制是「**要记账的那个人看过这张单**」。`VoucherPost` 恰好就是记账权
+///   持有者 —— 会计审完直接记；出纳（只有 VoucherNew/Edit/Sign）自己审不了自己
+///   提的单，两头仍然分开。
+/// · 不动 `enable_audit`：手工凭证的审核闸门原样保留，两人公司在建账向导里选
+///   「不启用审核环节」即可，两条路径互不影响。
+///
+/// `audit_receipt` 与 `unaudit_receipt` **必须用同一个判据** —— 只给"审"放开而
+/// 不给"撤审"，会出现「会计能审但撤不回来」，那比一开始就没有还糟。
+fn require_receipt_gate(user: &CurrentUser) -> Result<(), AppError> {
+    if user.can(Perm::VoucherAudit) || user.can(Perm::VoucherPost) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden(
+            "没有「凭证审核」或「记账」权限，不能审核收付款单",
+        ))
+    }
+}
+
+/// 审核收付款单（对标金蝶）：同事务生成资金凭证 + FIFO 自动核销。审核权 =
+/// **VoucherAudit 或 VoucherPost**（见 `require_receipt_gate`）——出纳录单，
+/// 有记账权的人把关；两者都没有时（出纳想审自己提的单）仍然拦住。
 async fn audit_receipt(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
@@ -10482,7 +10573,7 @@ async fn audit_receipt(
             return Ok(Json(json!({ "ok": true, "rejected": true })));
         }
         findb::workflow::Gate::NoFlow => {
-            user.require(Perm::VoucherAudit)?;
+            require_receipt_gate(&user)?;
         }
         findb::workflow::Gate::Final { approved: true } => {}
     }
@@ -10502,7 +10593,7 @@ async fn unaudit_receipt(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Perm::VoucherAudit)?;
+    require_receipt_gate(&user)?;
     let db = state.db_for(&user.book_key)?;
     findb::receipt::receipt_unaudit(&db, id)?;
     db.log(user.username(), "资金", "撤销审核收付款单", &format!("#{id}"))?;
@@ -12806,13 +12897,42 @@ async fn list_begin(
     Ok(Json(rows))
 }
 
+/// 期初保存请求。
+///
+/// `rows` + `delete_ids` 是有意设计的：原来 body 是裸数组、只有 upsert 语义，
+/// **界面上的「移除」永远落不了地** —— 前端把行从草稿删掉、提交时只带剩下的行，
+/// 后端按 (account_code, aux_key) 做 upsert，于是被移除的那行留在库里。实测：
+/// 移除 140501 → 保存 → DB 里那行纹丝不动，试算平衡从平衡变成差 999,999。
+/// 会计改个错字重新保存，期初金额就翻倍。
+///
+/// 不做「整表替换」而按 id 精确删：同一张表可能还有别人维护的行（带辅助核算
+/// 维度的期初），按提交集合反推该删谁会误删。
+///
+/// 保留 `#[serde(untagged)]` 的裸数组分支：老客户端与既有集成测试仍在发裸数组，
+/// 改成只认对象会让它们全部 422。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BeginSaveReq {
+    Wrapped {
+        #[serde(default)]
+        rows: Vec<BeginRowInput>,
+        #[serde(default)]
+        delete_ids: Vec<i64>,
+    },
+    Rows(Vec<BeginRowInput>),
+}
+
 async fn save_begin(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,
-    Json(rows): Json<Vec<BeginRowInput>>,
+    Json(req): Json<BeginSaveReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Perm::Opening)?;
     let db = state.db_for(&user.book_key)?;
+    let (rows, delete_ids) = match req {
+        BeginSaveReq::Wrapped { rows, delete_ids } => (rows, delete_ids),
+        BeginSaveReq::Rows(rows) => (rows, Vec::new()),
+    };
     // 数据范围：范围外的科目不得写期初（防越权维护）
     for r in &rows {
         let code = r.account_code.trim();
@@ -12820,11 +12940,48 @@ async fn save_begin(
             return Err(AppError::forbidden(format!("无权维护科目 {code} 的期初余额")));
         }
     }
+    // 科目必须真实存在。
+    //
+    // 为什么这道必须有：期初是所有报表的起点。凭证录入那条路上有「非末级科目不能
+    // 记账」「核算数量科目必须填数量」「借贷不平衡」一整套校验，唯独期初这条路
+    // 原来是裸的。实测写一个不存在的 `999999` → 200 ok → 试算平衡**没有这一行**、
+    // 总额照样报「平衡」→ 资产负债表也查不到。也就是**钱从所有报表里静默消失，
+    // 而唯一的兜底守卫（试算平衡）报告一切正常**。会计把科目编码打错一位就踩到。
+    //
+    // 只校验「存在」，不校验「是不是末级」：期初按汇总层科目（1405 库存商品、
+    // 1122 应收账款这类）建余额是常规做法。
+    let codes: Vec<String> = rows
+        .iter()
+        .map(|r| r.account_code.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if !codes.is_empty() {
+        let mut missing: Vec<String> = Vec::new();
+        for c in &codes {
+            if accounts::get(&db, c)?.is_none() && !missing.contains(c) {
+                missing.push(c.clone());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "科目 {} 不存在，期初未保存。请先在「会计科目」建好该科目，或检查编码是否输错",
+                missing.join("、")
+            )));
+        }
+    }
     // 期初整批导入必须原子：upsert_begin 里是裸 conn.execute，每行各自成隐式事务，
     // 第 k 行失败时前 k-1 行已经提交，客户端既无法判断落地了哪些行，也无法安全重试。
     // 改为在调用方事务里逐行 upsert_begin_on（事务可 Deref 成 Connection），
     // 整批要么全成、要么全回滚；操作日志同事务写入，不会出现"数据进了、日志没进"。
     let tx = db.write_tx()?;
+    // 先删后写，且与写入同事务：任一步失败整体回滚，不会出现「删了但没补上」
+    let mut deleted = 0usize;
+    for id in &delete_ids {
+        if *id > 0 {
+            balances::delete_begin_on(&tx, *id)?;
+            deleted += 1;
+        }
+    }
     let mut n = 0;
     for r in rows {
         let code = r.account_code.trim();
@@ -12858,10 +13015,18 @@ async fn save_begin(
         user.username(),
         "期初",
         "保存期初余额",
-        &format!("保存 {} 条", n),
+        &format!(
+            "保存 {} 条{}",
+            n,
+            if deleted > 0 {
+                format!("，删除 {deleted} 条")
+            } else {
+                String::new()
+            }
+        ),
     )?;
     tx.commit().map_err(findb::DbError::from)?;
-    Ok(Json(json!({"ok": true, "count": n})))
+    Ok(Json(json!({"ok": true, "count": n, "deleted": deleted})))
 }
 
 // ---------------- 操作日志 ----------------

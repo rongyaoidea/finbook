@@ -18,10 +18,13 @@ async function seed(page) {
     ],
   });
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
-  // 审核环节默认开：先审核，再走批量记账（batch-post 与 post 共用同一道闸门）
+  // 两道闸门默认都开：先审核、再出纳签字，然后才走批量记账。
+  // batch-post 与 post 共用同一套闸门 —— 批量入口**不**绕过任何一道。
   for (const v of list) {
     const a = await page.request.post(`/api/vouchers/${v.id}/audit`, { data: {} });
-    expect(a.ok(), `审核凭证 ${v.id} 应成功`).toBeTruthy();
+    expect(a.ok(), `审核凭证 ${v.id} 应成功：${await a.text()}`).toBeTruthy();
+    const g = await page.request.post(`/api/vouchers/${v.id}/sign`, { data: {} });
+    expect(g.ok(), `出纳签字凭证 ${v.id} 应成功：${await g.text()}`).toBeTruthy();
   }
   const resp = await page.request.post("/api/vouchers/batch-post", {
     data: { ids: list.map((v) => v.id) },

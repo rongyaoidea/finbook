@@ -1,4 +1,4 @@
-﻿//! 余额与账簿的实时聚合
+//! 余额与账簿的实时聚合
 //!
 //! 设计要点：**不物化余额表**。
 //! 余额 = 期初 + 已记账凭证发生额，每次查询实时算。单机 SQLite 下十万级分录仍是毫秒级，
@@ -883,6 +883,16 @@ pub fn upsert_begin_on(conn: &rusqlite::Connection, r: &BeginRow) -> DbResult<()
 pub fn delete_begin(db: &Db, id: i64) -> DbResult<()> {
     db.conn()
         .execute("DELETE FROM begin_balance WHERE id=?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// 同 `delete_begin`，但只在调用方事务内执行。
+///
+/// 为什么需要事务版本：期初保存要「先按界面移除的 id 删掉、再 upsert 其余行」
+/// 并保证整体原子。原来只有非事务版，删除与写入无法绑在一个事务里 ——
+/// 删成功但后续写入失败，就会留下「界面以为删了、库里没删」或反之的半截状态。
+pub fn delete_begin_on(conn: &rusqlite::Connection, id: i64) -> DbResult<()> {
+    conn.execute("DELETE FROM begin_balance WHERE id=?1", rusqlite::params![id])?;
     Ok(())
 }
 

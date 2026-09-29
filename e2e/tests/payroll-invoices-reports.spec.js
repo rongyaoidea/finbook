@@ -1,5 +1,5 @@
 const { test, expect } = require("@playwright/test");
-const { newBook, postVoucher } = require("../helpers");
+const { newBook, postVoucher, auditSignPost } = require("../helpers");
 
 test("工资：职员档案→工资行个税→计提凭证", async ({ page }) => {
   await newBook(page, `E2E工资${Date.now()}`);
@@ -103,8 +103,7 @@ test("自定义报表：建表保存→按期间生成取数", async ({ page }) 
   // H-3：自定义报表 QM/LFS 按已记账取数，先记账
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
   // 默认账套开着审核环节：先审核再记账
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/audit`, { data: {} })).status()).toBe(200);
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`, { data: {} })).status()).toBe(200);
+  await auditSignPost(page, list[0].id);
 
   await page.click('.nav-item[data-view="custom-reports"]');
   await page.click("#cr-new");
@@ -134,6 +133,13 @@ test("期末对账：试算平衡通过", async ({ page }) => {
   await page.click("#v-audit");
   await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
   await page.locator("#v-table tbody [data-edit]").first().click();
+  // 出纳签字（默认开）：记账的前置闸门之一。
+  await expect(page.locator("#v-sign")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-sign");
+  // 签字也会关闭弹窗（closeModal），所以要再打开一次才点得到「记账」。
+  await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 5_000 }).catch(() => {});
+  await page.locator("#v-table tbody [data-edit]").first().click();
+
   await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 10_000 });

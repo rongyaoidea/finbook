@@ -679,8 +679,17 @@ pub struct BookOptions {
     /// 工作流——那等于单方面改变他们已经习惯的操作顺序，且在途单据会卡住。
     #[serde(default)]
     pub enable_audit: bool,
-    /// 出纳签字前置（可选，默认关闭）：开启后**涉及现金/银行科目**的凭证须出纳签字才能记账。
-    /// 旧账套没有该字段时按关闭处理。
+    /// 出纳签字前置（**默认开启**）：**涉及现金/银行科目**的凭证须出纳签字才能记账。
+    ///
+    /// 为什么默认开而不是默认关：现金/银行是内控风险最高的一块，而「默认关」意味着
+    /// 一套新建的账套**默认就是绕过出纳的** —— 谁都不必做任何决定，就已经在绕了。
+    /// 与 `enable_audit` 保持同一取向（默认开、要关得显式关）。
+    ///
+    /// 单人记账、或确实没有出纳岗的小微企业，可以在账套参数里显式关掉 ——
+    /// 建账向导也会问「有没有出纳」并据此设默认值。
+    ///
+    /// 旧账套没有该字段时按关闭处理（`#[serde(default)]`）：不追溯改存量账套 ——
+    /// 那等于单方面改变他们已经习惯的操作顺序，且在途单据会卡住。
     #[serde(default)]
     pub require_cashier: bool,
     /// （已废弃）审核环节已移除：未记账凭证核对后直接记账。
@@ -742,7 +751,9 @@ impl Default for BookOptions {
             enable_foreign: false,
             // 审核环节默认开（三权分离）；要关得在账套参数里显式关，是一次有意识的决定
             enable_audit: true,
-            require_cashier: false,
+            // 出纳签字同样默认开：现金/银行是内控风险最高的一块，
+            // 「默认关」等于新建账套一出生就默认绕过出纳。
+            require_cashier: true,
             require_audit: true,
             biz_accounts: BizAccounts::default(),
             budget_control: String::new(),

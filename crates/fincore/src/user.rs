@@ -199,12 +199,36 @@ impl Role {
             Role::Admin => Perm::all(),
             Role::Supervisor => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherAudit, VoucherUnaudit,
-                VoucherPost, VoucherUnpost, CashierSign, AccountEdit, AuxEdit, Opening,
+                VoucherPost, VoucherUnpost, AccountEdit, AuxEdit, Opening,
                 CarryForward, PeriodClose, Report, FinReport, Export, AuditLog, OrderOps,
                 Warehouse, PriceView, PriceEdit, CostOps, ProductionOps,
+                // ⚠️ 这里原来有 `CashierSign`，后果是**财务主管这个岗位根本建不出来**。
+                //
+                // `validate_duty_separation` 的判据是「有效权限里同时出现 CashierSign 与
+                // 任一会计核心权限就拒绝」，而主管这一组恰好两样都有 —— 于是每一次
+                // `create_user(role="supervisor")` 都被拒：
+                //   「会计与出纳权限不可出现在同一账号：出纳签字与会计核心权限（…）互斥」
+                // 讽刺的是这条规则**本来就是为了阻止这件事**才写的。
+                //
+                // 为什么零测试发现：`backup_admin_only` 之类用例都是 `User::new()`
+                // 直接造对象、**不走 `users::insert`**，所以根本没触发校验；而
+                // 全仓**没有任何一个测试真的创建过主管账号**。
+                //
+                // 从职责上也不该给：财务主管是审核/监督岗，兼了出纳签字就等于
+                // 「既审又签」，把出纳签字这道内控架空了 —— 而出纳签字正是这套系统
+                // 里最有价值的控制之一。出纳签字只归出纳（`Role::Cashier`）。
             ],
             Role::Accountant => &[
                 VoucherNew, VoucherEdit, VoucherDelete, VoucherPost, AccountEdit, AuxEdit,
+                // PeriodClose：结账是会计的本职动作，不是监督动作。
+                //
+                // 为什么给：审核（VoucherAudit）之所以不给会计，是三权分离 ——
+                // 制单/审核/记账要分开才有控制意义。但**结账没有这个控制价值**，
+                // 它只是把本期封起来。原来只有 Supervisor 有 PeriodClose，于是
+                // 「只有会计+出纳、没有财务主管」的小微企业**永远结不了账**：
+                // 期末处理页对会计直接显示「没有「期末结账」权限」，连按钮都没有。
+                // 实测确认过这条死路。
+                PeriodClose,
                 Opening, CarryForward, Report, FinReport, OrderOps, Warehouse,
                 PriceView, PriceEdit, CostOps, ProductionOps,
             ],
@@ -741,9 +765,12 @@ mod tests {
         let mut u = User::new("zs", "张三", Role::Accountant);
         assert!(u.can(Perm::VoucherNew));
         assert!(!u.can(Perm::VoucherAudit));
-        assert!(!u.can(Perm::PeriodClose));
-        u.extra_perms.push(Perm::PeriodClose);
+        // 结账：会计必须有（原来这里断言"没有"，把 bug 当规范钉住了）。
+        // 见 two_person_company_can_close_the_month 的说明。
         assert!(u.can(Perm::PeriodClose));
+        // 额外授权机制本身仍然有效 —— 拿一个会计确实没有的权限验
+        u.extra_perms.push(Perm::Backup);
+        assert!(u.can(Perm::Backup), "逐项开启应生效");
         u.disabled = true;
         assert!(!u.can(Perm::VoucherNew));
     }
@@ -916,5 +943,71 @@ mod tests {
         assert!(admin.can(Perm::UserManage), "管理员不受逐项关闭限制");
         admin.deny_perms.push(Perm::Backup);
         assert!(admin.can(Perm::Backup));
+    }
+
+    /// 「只有会计 + 出纳、没有财务主管」的小微企业必须能把一个月走完。
+    ///
+    /// 这条是真实踩出来的：原来 `PeriodClose` 只挂在 `Role::Supervisor` 上，于是
+    /// 期末处理页对会计连按钮都不渲染（只显示「没有「期末结账」权限」）。两人公司
+    /// 里根本没有财务主管，也就**永远结不了账** —— 账做到 12 月就断了。
+    ///
+    /// 之所以该给会计：审核（`VoucherAudit`）不给会计是三权分离，制单/审核/记账
+    /// 分开才有控制意义；**结账没有这个控制价值**，它只是把本期封起来。所以本测试
+    /// 同时钉住两头：结账要给，审核仍然不给（免得哪天为了"跑通流程"把三权分离也
+    /// 一起废掉）。
+    /// 每个角色都**建得出来** —— 而且是真走校验那条路。
+    ///
+    /// 这条是被一个真 bug 逼出来的：`Role::Supervisor` 的权限组里原本含
+    /// `CashierSign`，于是它同时命中「出纳签字」和「会计核心权限」，
+    /// `validate_duty_separation` 必然拒绝 —— **财务主管这个岗位根本建不出来**。
+    ///
+    /// 之所以零测试发现：既有用例都是 `User::new()` 直接造对象、不走
+    /// `validate_duty_separation`，而全仓没有任何一个测试真的创建过主管账号。
+    /// 只测 `Role::perms()` 的内容是看不出"这个角色根本用不了"的。
+    #[test]
+    fn every_role_passes_duty_separation() {
+        // 关联函数不能 use 出来（`use Type::assoc_fn` 不合法），只能写全名
+        fn check(u: &User) -> Result<(), String> {
+            User::validate_duty_separation(u)
+        }
+        for (role, name) in [
+            (Role::Admin, "系统管理员"),
+            (Role::Supervisor, "财务主管"),
+            (Role::Accountant, "会计"),
+            (Role::Cashier, "出纳"),
+            (Role::Viewer, "只读"),
+        ] {
+            let u = User::new("probe", name, role);
+            assert!(
+                check(&u).is_ok(),
+                "{} 角色建不出来：{:?} —— 它的权限组同时命中了出纳签字与会计核心权限，\
+                 users::insert 会直接拒绝，于是这个岗位形同虚设",
+                name,
+                check(&u)
+            );
+        }
+        // 出纳签字只归出纳：主管兼了就把这道内控架空了
+        let sup = User::new("sup", "财务主管", Role::Supervisor);
+        assert!(!sup.can(Perm::CashierSign), "财务主管不该兼出纳签字");
+        let cash = User::new("cash", "出纳", Role::Cashier);
+        assert!(cash.can(Perm::CashierSign), "出纳必须有签字权");
+    }
+
+    #[test]
+    fn two_person_company_can_close_the_month() {
+        let acc = User::new("acc", "会计", Role::Accountant);
+        assert!(acc.can(Perm::PeriodClose), "会计必须能期末结账，否则两人公司断在年末");
+
+        let cashier = User::new("cash", "出纳", Role::Cashier);
+        // 出纳连凭证都不该碰，结账更不必给
+        assert!(!cashier.can(Perm::PeriodClose), "结账不应下沉到出纳");
+
+        // 三权分离仍然成立：会计自己录的凭证自己不能审
+        assert!(
+            !acc.can(Perm::VoucherAudit),
+            "会计不得自带审核权（制单/审核须分离）"
+        );
+        // 但记账权必须在，否则开了审核环节就两头落空
+        assert!(acc.can(Perm::VoucherPost), "会计必须有记账权");
     }
 }

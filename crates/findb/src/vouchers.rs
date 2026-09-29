@@ -1997,10 +1997,12 @@ mod tests {
     /// 夹具为了让别的用例专注各自主题而关掉审核，默认值本身必须有人盯住，否则
     /// 「默认关」和「测试方便」就永远分不清了。
     ///
-    /// 三段都要验：
-    /// ① `BookOptions::default()` 就是开的
+    /// 四段都要验：
+    /// ① `BookOptions::default()` 里**两道闸门**都是开的
     /// ② 默认账套下草稿直接记账被拒，且错误信息指向「先审核」这个下一步
-    /// ③ 审核通过后可以记账（闸门不是死路）
+    /// ③ 审核通过后**仍然**被出纳闸门拦住 —— 证明两道闸门是串联的，
+    ///    审核不是出纳签字的替代品（反过来也成立：签字不能顶替审核）
+    /// ④ 两道都过了才能记账（闸门不是死路）
     #[test]
     fn audit_default_blocks_direct_post() {
         // ① 默认值
@@ -2009,9 +2011,11 @@ mod tests {
             d.enable_audit,
             "审核环节必须默认开启：默认关等于「谁录的单谁就能记」，三权分离形同虚设"
         );
+        // 注意：assert! 的第 2 个参数是 **token tree** 不是表达式，
+        // 所以不能写成 "a" + "b"（rustc 报 expected `,` found `+`）——必须是一个字面量。
         assert!(
-            !d.require_cashier,
-            "出纳签字不是全行业默认（只对资金类有意义），应保持关闭待显式开启"
+            d.require_cashier,
+            "出纳签字必须默认开启：现金/银行是内控风险最高的一块，默认关等于新建账套一出生就默认绕过出纳 —— 谁都不必做任何决定，就已经在绕了"
         );
 
         // ② 默认账套：草稿直接记账被拒
@@ -2026,8 +2030,17 @@ mod tests {
         let err = post(&db, id, "u").unwrap_err().to_string();
         assert!(err.contains("审核"), "错误信息应指向「先审核」：{err}");
 
-        // ③ 审核后可记（闸门不是死路）
+        // ③ 审核过了**仍然**被出纳闸门拦住：sample() 借记 1001 库存现金，
+        //    命中 is_cash。
         audit(&db, id, "auditor").unwrap();
+        let err2 = post(&db, id, "u").unwrap_err().to_string();
+        assert!(
+            err2.contains("出纳") || err2.contains("签字"),
+            "审核之后应轮到出纳签字这道闸，错误信息要指向它：{err2}"
+        );
+
+        // ④ 两道都过 → 记账成功（闸门不是死路）
+        sign(&db, id, "出纳小李").unwrap();
         post(&db, id, "u").unwrap();
         assert_eq!(get(&db, id).unwrap().unwrap().status, VoucherStatus::Posted);
     }

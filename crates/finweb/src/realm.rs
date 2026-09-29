@@ -25,7 +25,9 @@ pub struct RealmUser {
     pub is_admin: bool,
     pub disabled: bool,
     pub must_change_pwd: bool,
-    /// 绑定的设备指纹（Web 端"一人一机"）；空 = 尚未绑定，下次登录自动绑定
+    /// **第一台**设备的指纹。只为账号列表的「已绑定/未绑定」显示同步；
+    /// 授权判定一律读 `realm_user_device` 表（见 `device_allowed`）——
+    /// 用它判就退回了一台机。空 = 尚未绑定，下次登录自动绑定
     pub device_id: String,
     pub created_at: String,
     /// 锁定截止时间（`%Y-%m-%d %H:%M:%S`，空 = 未锁定）；由平台口令策略 max_fail/lock_minutes 驱动
@@ -97,6 +99,23 @@ CREATE TABLE IF NOT EXISTS realm_api_key (
     expires_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_realm_api_key_prefix ON realm_api_key(prefix);
+"#;
+
+/// 账号 ↔ 设备的绑定名单（一个账号最多 `MAX_DEVICES_PER_USER` 台）。
+///
+/// 为什么单独一张表，而不是在 `realm_user` 上加 `device_id2`：加列只能表达固定台数，
+/// 想改上限就得再迁移一次；而且「哪台是哪台」一旦超过两台就没法用列表达。
+const DEVICE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS realm_user_device (
+    username    TEXT NOT NULL,
+    device_id   TEXT NOT NULL,
+    device_name TEXT NOT NULL DEFAULT '',
+    bound_at    TEXT NOT NULL DEFAULT '',
+    last_seen   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (username, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_realm_user_device_username
+    ON realm_user_device(username);
 "#;
 
 /// 账号库（单进程内以 Mutex<Connection> 持有，WAL 模式下并发安全）
@@ -192,7 +211,8 @@ impl RealmDb {
         Ok(())
     }
 
-    /// 轻量迁移：为早期创建的库补上后加的列（device_id / locked_until）
+    /// 轻量迁移：为早期创建的库补上后加的列（device_id / locked_until），
+    /// 以及「一个账号可绑多台设备」用的 `realm_user_device` 表。
     fn migrate(&self) -> DbResult<()> {
         let conn = self.inner.lock().unwrap();
         let cols: Vec<String> = conn
@@ -211,6 +231,26 @@ impl RealmDb {
                 "ALTER TABLE realm_user ADD COLUMN locked_until TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
+        }
+
+        // 设备绑定从「单列 device_id」升级成「集合」。单列表达不了两台：第二台设备
+        // 要么覆盖第一台（旧的立刻失效），要么被拒。所以新建一张表，并把旧列里已有的
+        // 绑定搬进去 —— **不搬的话升级后所有账号的设备绑定会静默消失**，等于给全部
+        // 用户解绑：安全后果是「绑定形同虚设」，症状是「谁都能登」，而且**不报任何错**。
+        conn.execute_batch(DEVICE_SCHEMA)?;
+        // execute() 返回受影响行数 —— 这里**必须**用 execute 而不是 query_row：
+        // query_row 期望恰好一行，而全新 realm 里没有任何已绑定设备，这条
+        // INSERT...SELECT 影响 0 行，会返回 QueryReturnedNoRows 把建库整个搞崩
+        // （实测 186 个集成测试同时挂在 realm 打开那一行）。
+        let moved = conn.execute(
+            "INSERT OR IGNORE INTO realm_user_device(username, device_id, bound_at, last_seen)
+             SELECT username, device_id, created_at, created_at
+             FROM realm_user WHERE device_id <> ''",
+            [],
+        )?;
+        if moved > 0 {
+            // 旧库一个账号最多一个值，去重天然成立；bound_at/last_seen 用 created_at 顶替
+            tracing::info!(count = moved, "已把单列 device_id 的绑定迁移到 realm_user_device");
         }
         Ok(())
     }
@@ -589,64 +629,125 @@ impl RealmDb {
         Ok(())
     }
 
-    /// 设备绑定（Web 端"一人一机"）：首次登录自动绑定当前设备。
-    /// 单次持锁内完成"读-判-写"，并用条件 UPDATE 兜底，
-    /// 避免两个设备几乎同时首次登录时互相覆盖绑定。
-    /// 返回 Result：Ok = 绑定成功或无绑定；Err(msg) = 该账号已绑定其它设备。
-    pub fn bind_device(&self, username: &str, device_id: &str) -> DbResult<Result<(), String>> {
+    /// 一个账号最多绑几台设备。
+    ///
+    /// 为什么是 2 而不是 1：实际场景里同一个人有两台机器是常态（公司台式机 + 家里
+    /// 笔记本，或者手机 + 电脑），锁死 1 台的结果是用户隔几天就要找管理员重置一次
+    /// 设备绑定 —— 一个安全功能如果天天要人工介入，实际效果就是被绕过。
+    ///
+    /// 为什么不是"不设上限"：上限是这个功能**全部**的控制力来源。不限台数等于没有
+    /// 绑定（口令泄露后攻击者从任何机器都能登）。2 台是"覆盖真实需要"与"保留控制"的交点。
+    /// 仍然**不做 LRU 自动挤出** —— 悄悄踢掉用户正在用的那台，比直接拒绝更让人困惑。
+    pub const MAX_DEVICES_PER_USER: usize = 2;
+
+    /// 设备绑定：登录时把当前设备登记进来。
+    ///
+    /// 返回 `Result`：`Ok(())` = 已在名单内或新绑定成功；`Err(msg)` = 名单已满。
+    /// 判定与写入都在**同一次持锁**内完成；插入用 `INSERT OR IGNORE` + 条件 UPDATE，
+    /// 两台设备几乎同时首次登录时不会互相顶掉名额。
+    pub fn bind_device(
+        &self,
+        username: &str,
+        device_id: &str,
+        device_name: &str,
+    ) -> DbResult<Result<(), String>> {
         let conn = self.inner.lock().unwrap();
-        let cur: Option<String> = conn
-            .query_row(
-                "SELECT device_id FROM realm_user WHERE username=?1",
-                rusqlite::params![username],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let cur = match cur {
-            Some(c) => c,
-            None => {
-                return Err(DbError::Fin(fincore::FinError::msg("账号不存在")));
-            }
-        };
-        if !cur.is_empty() {
-            return if cur == device_id {
-                Ok(Ok(()))
-            } else {
-                Ok(Err("该账号已绑定其它设备，如需更换请联系管理员重置设备".to_string()))
-            };
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // 账号不存在要报错（原来查 device_id 列顺带做了这件事，现在要显式查）
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM realm_user WHERE username=?1",
+            rusqlite::params![username],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(DbError::Fin(fincore::FinError::msg("账号不存在")));
         }
-        // 条件更新：仅当仍为空时写入，并发首登不会互相覆盖
-        let n = conn.execute(
+        // 已在名单内：只刷新 last_seen / device_name（换浏览器版本会改 device_name）
+        let updated = conn.execute(
+            "UPDATE realm_user_device SET last_seen=?3, device_name=?4
+             WHERE username=?1 AND device_id=?2",
+            rusqlite::params![username, device_id, now, device_name],
+        )?;
+        if updated > 0 {
+            return Ok(Ok(()));
+        }
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM realm_user_device WHERE username=?1",
+            rusqlite::params![username],
+            |r| r.get(0),
+        )?;
+        if count as usize >= Self::MAX_DEVICES_PER_USER {
+            return Ok(Err(format!(
+                "该账号已绑定 {count} 台设备（上限 {} 台），如需更换请联系管理员重置设备绑定",
+                Self::MAX_DEVICES_PER_USER
+            )));
+        }
+        // INSERT OR IGNORE：同一设备并发首登时第二次插入被忽略，updated==0 走上面的分支
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO realm_user_device(username, device_id, device_name, bound_at, last_seen)
+             VALUES(?1,?2,?3,?4,?4)",
+            rusqlite::params![username, device_id, device_name, now],
+        )?;
+        if inserted == 0 {
+            return Ok(Ok(()));
+        }
+        // 旧列同步"第一台"，只为账号列表的"已绑定/未绑定"显示（授权判定一律读表）
+        conn.execute(
             "UPDATE realm_user SET device_id=?2 WHERE username=?1 AND device_id=''",
             rusqlite::params![username, device_id],
         )?;
-        Ok(if n == 1 {
-            Ok(())
-        } else {
-            // 竞态下另一请求抢先绑定：回读最新值判定
-            let now: String = conn.query_row(
-                "SELECT device_id FROM realm_user WHERE username=?1",
-                rusqlite::params![username],
-                |r| r.get(0),
-            )?;
-            if now == device_id {
-                Ok(())
-            } else {
-                Err("该账号已绑定其它设备，如需更换请联系管理员重置设备".to_string())
-            }
-        })
+        Ok(Ok(()))
     }
 
-    /// 解绑设备（管理员「重置设备」）：清空后该账号下次登录自动重新绑定
+    /// 逐请求复核：当前设备是否在该账号的绑定名单内。
+    ///
+    /// 名单**为空** = 还没绑过 → 放行（登录时的 `bind_device` 会去登记）。
+    /// 管理员豁免（`Role::Admin => Perm::all()`，运维账号不该被设备绑定锁死）。
+    ///
+    /// 这里读表而不是读 `realm_user.device_id` 那一列：那是"第一台"的快照，只为列表显示
+    /// 保留同步。用它做授权就退回了"一台机"，而且两处判定会各写一份必然分叉。
+    pub fn device_allowed(&self, username: &str, device_id: &str) -> DbResult<bool> {
+        let conn = self.inner.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM realm_user_device WHERE username=?1",
+            rusqlite::params![username],
+            |r| r.get(0),
+        )?;
+        if count == 0 {
+            return Ok(true);
+        }
+        let hit: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM realm_user_device WHERE username=?1 AND device_id=?2",
+            rusqlite::params![username, device_id],
+            |r| r.get(0),
+        )?;
+        Ok(hit > 0)
+    }
+
+    /// 该账号已绑定的设备数（账号列表显示"已绑定/未绑定"用）
+    pub fn bound_device_count(&self, username: &str) -> DbResult<i64> {
+        let conn = self.inner.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM realm_user_device WHERE username=?1",
+            rusqlite::params![username],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// 解绑全部设备（管理员「重置设备」）：清空后该账号可在任意设备重新登录
     pub fn clear_device(&self, username: &str) -> DbResult<()> {
         let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "DELETE FROM realm_user_device WHERE username=?1",
+            rusqlite::params![username],
+        )?;
+        // 旧列一并清掉，否则列表会显示"已绑定"但实际没绑
         conn.execute(
             "UPDATE realm_user SET device_id='' WHERE username=?1",
             rusqlite::params![username],
         )?;
         Ok(())
     }
-
     /// 修改自身口令（需校验旧口令）
     pub fn change_password(
         &self,
@@ -786,6 +887,22 @@ impl RealmDb {
         )?)
     }
 
+    /// 设置平台账号的「首登改密」开关。
+    ///
+    /// 为什么需要单独一个方法：登录门禁 `post_login` 读的就是
+    /// `realm_user.must_change_pwd` 这一位，账套内的 `user.must_change_pwd`
+    /// 只影响账套内的记录、**完全不参与登录判断**。于是管理员在账套里建号时
+    /// 明确传 `must_change_pwd:false`（"这人是我设的口令，不用再改"），用户
+    /// 仍被拦在「必须先改密」上。实测确认过这条不一致。
+    pub fn set_must_change_pwd(&self, username: &str, v: bool) -> DbResult<()> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute(
+            "UPDATE realm_user SET must_change_pwd=?2 WHERE username=?1",
+            rusqlite::params![username, v as i64],
+        )?;
+        Ok(())
+    }
+
     // ---- 开放 API 密钥 ----
 
     /// 签发一把密钥。**明文只在返回值里出现一次**，库里只留哈希。
@@ -853,7 +970,7 @@ impl RealmDb {
         Ok(out)
     }
 
-    /// 把密钥表整表拼成文本，用���断言「库里没有明文」。
+    /// 把密钥表整表拼成文本，用它断言「库里没有明文」。
     ///
     /// 为什么用 dump 而不去查具体字段：`api_key_list` 已经在结构上排除了
     /// 明文，用它来证明「没存明文」是循环论证。真正要验的是**表里那一列

@@ -925,6 +925,42 @@ async function showSetupWizard() {
       <label>本位币</label>
       <input id="set-currency" value="${opts.base_currency || "CNY"}" />
     </div>
+    <div class="field">
+      <label>审核环节</label>
+      <div class="u-row" style="gap:16px;align-items:flex-start">
+        <label class="u-row tight" style="cursor:pointer">
+          <input type="radio" name="set-audit" id="set-audit-on" value="1" ${opts.enable_audit ? "checked" : ""} />
+          <span>启用（<b>有独立的审核人</b>，如财务主管）</span>
+        </label>
+        <label class="u-row tight" style="cursor:pointer">
+          <input type="radio" name="set-audit" id="set-audit-off" value="0" ${opts.enable_audit ? "" : "checked"} />
+          <span>不启用（<b>会计自己录自己记</b>）</span>
+        </label>
+      </div>
+      <div class="u-sm u-dim" style="margin-top:4px">
+        启用后，未审核的凭证不能记账。若本企业<b>没有</b>除会计之外能审核的人
+        （如只有会计+出纳、没有财务主管），请选「不启用」——否则会计既不能记账
+        也不能审核，凭证会一直卡住。此项之后可在「账套参数」里改。
+      </div>
+    </div>
+    <div class="field">
+      <label>出纳签字</label>
+      <div class="u-row" style="gap:16px;align-items:flex-start">
+        <label class="u-row tight" style="cursor:pointer">
+          <input type="radio" name="set-cash" id="set-cash-on" value="1" ${opts.require_cashier ? "checked" : ""} />
+          <span>启用（<b>有出纳岗</b>，资金进出由出纳复核）</span>
+        </label>
+        <label class="u-row tight" style="cursor:pointer">
+          <input type="radio" name="set-cash" id="set-cash-off" value="0" ${opts.require_cashier ? "" : "checked"} />
+          <span>不启用（<b>没有出纳岗</b>，会计自己管钱）</span>
+        </label>
+      </div>
+      <div class="u-sm u-dim" style="margin-top:4px">
+        启用后，<b>涉及现金/银行科目</b>的凭证记账前须出纳签字。若本企业没有出纳岗
+        （一个人记账），请选「不启用」——否则现金/银行存款的凭证会一直卡在
+        「需出纳签字」，而没有人能签。此项之后可在「账套参数」里改。
+      </div>
+    </div>
     <div class="foot">
       <button class="btn ghost" id="setup-later">稍后再说</button>
       <button class="btn primary" id="setup-save">创建账套</button>
@@ -941,10 +977,27 @@ async function showSetupWizard() {
     if (start_period <= 0) { toast("启用期间格式应为 YYYY-MM", "err"); return; }
     try {
       const cur = await api("/options");
-      const merged = Object.assign({}, cur, { company, start_period, base_currency: $("#set-currency").value.trim() || "CNY" });
+      const enable_audit = ($("#set-audit-on") && $("#set-audit-on").checked) || false;
+      // 出纳签字同样要落到账套参数上。**不显式写就会继承出厂默认 true**，
+      // 于是「一个人记账」的小微企业建完账套才发现现金凭证永远记不了账 ——
+      // 那个坑正是这一问要挡掉的。
+      const require_cashier = ($("#set-cash-on") && $("#set-cash-on").checked) || false;
+      const merged = Object.assign({}, cur, {
+        company,
+        start_period,
+        base_currency: $("#set-currency").value.trim() || "CNY",
+        enable_audit,
+        require_cashier,
+      });
       await api("/options", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(merged) });
+      // 提示要把**两道闸门**的实际状态都说出来。
+      // 原来只说审核：用户看到「已启用审核环节」就以为万事大吉，
+      // 结果第一次录现金凭证就被出纳签字拦下，说不出为什么。
+      const notes = [];
+      notes.push(enable_audit ? "已启用审核环节" : "未启用审核环节（会计可自行记账）");
+      notes.push(require_cashier ? "已启用出纳签字" : "未启用出纳签字（无出纳岗）");
+      toast(`账套创建成功（${notes.join("，")}）`, "ok");
       closeModal();
-      toast("账套创建成功", "ok");
       resetToDashboard();
       render();
     } catch (err) { toast(err.message, "err"); }
@@ -1273,27 +1326,46 @@ function applyHashOnBoot() {
 //     E2E 全靠 `.nav-item[data-view=...]` 点击进入页面，隐藏了就全超时。
 //   · 收藏（星标）：点导航项右侧的 ☆ 置顶成「常用」。
 //   · 最近：最近 8 个去过的页面，去重后在收藏下面。
-const LS_FAV = "nav_fav";
-const LS_REC = "nav_recent";
+//
+// ⚠️ 「收藏 / 最近」必须做两道过滤，缺任何一道都是权限泄漏（实测发现）：
+//   1. **按 isNavVisible 过滤**。原来只判 `NAV_INDEX[id]` 存在，于是出纳能在
+//      「最近」里看到并点进「期初建账 / 固定资产 / 期末处理」——这三个都要求
+//      他没有的权限（opening / account_edit / period_close），点进去只得到
+//      「权限不足」。主列表一直是正确过滤的，只有这条路径漏了。
+//   2. **按登录账号分区**。原来所有账号共用 `nav_fav` / `nav_recent` 两个 key，
+//      同一台电脑上会计访问过的模块，出纳登录后一眼看到 —— 既是入口泄漏，
+//      也是隐私泄漏（能看到同事在做什么）。
 const LS_SEC = "nav_sec_collapsed";
 const MAX_RECENT = 8;
 
 function lsGet(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
-function getFavs() { return lsGet(LS_FAV, []).filter((id) => NAV_INDEX[id]); }
+// 账号分区的 key：`nav_fav@acc` / `nav_recent@cash`。未登录时退回匿名分区，
+// 避免把上一个账号的数据算到新账号头上。
+function acctKey(base) {
+  const u = (session.user && (session.user.username || session.user.display_name)) || "_anon";
+  return base + "@" + u;
+}
+function getFavs() {
+  return lsGet(acctKey("nav_fav"), []).filter((id) => NAV_INDEX[id] && isNavVisible(NAV_INDEX[id]));
+}
 function toggleFav(id) {
-  const f = getFavs();
+  const f = lsGet(acctKey("nav_fav"), []).filter((x) => NAV_INDEX[x]);
   const i = f.indexOf(id);
   if (i >= 0) f.splice(i, 1); else f.unshift(id);
-  lsSet(LS_FAV, f);
+  lsSet(acctKey("nav_fav"), f);
 }
-function getRecent() { return lsGet(LS_REC, []).filter((id) => NAV_INDEX[id] && !getFavs().includes(id)); }
+function getRecent() {
+  const favs = getFavs();
+  return lsGet(acctKey("nav_recent"), [])
+    .filter((id) => NAV_INDEX[id] && isNavVisible(NAV_INDEX[id]) && favs.indexOf(id) < 0);
+}
 function touchRecent(id) {
-  if (!NAV_INDEX[id] || id === "dashboard") return;
-  let r = lsGet(LS_REC, []).filter((x) => NAV_INDEX[x]);
+  if (!NAV_INDEX[id] || !isNavVisible(NAV_INDEX[id]) || id === "dashboard") return;
+  let r = lsGet(acctKey("nav_recent"), []).filter((x) => NAV_INDEX[x]);
   r = r.filter((x) => x !== id);
   r.unshift(id);
-  lsSet(LS_REC, r.slice(0, MAX_RECENT));
+  lsSet(acctKey("nav_recent"), r.slice(0, MAX_RECENT));
 }
 function isNavVisible(n) {
   const pa = !!session.platformAdmin;
@@ -1770,10 +1842,20 @@ function autoNumbers(root) {
 // 只在**确定是空**时才动，两种判定：
 //   1. tbody 完全没有子元素；
 //   2. tbody 只有一个 tr、只有一个 colspan 单元格、**里面没有按钮/输入框**，
-//      且文字是已知占位词（「加载中…」「暂无数据」…）。
+//      且文字是已知占位词（「暂无数据」…）。
 // 条件 2 里的「没有按钮」是关键：像 loadVouchers 的失败态会放一个「重试」
 // 按钮，那种行绝不能被覆盖——覆盖了就等于把重试入口删了。
-const EMPTY_PLACEHOLDERS = /^(加载中|加载中…|加载中\.\.\.|加载|暂无数据|无数据|没有数据|暂无|空空如也|—|-|)$/;
+//
+// ⚠️「加载中…」**不在**占位词里，这是本轮修掉的一个真 bug。
+// 「加载中」是**待定**状态，不是空、也不是失败。把它当空态处理会渲染出
+// 「⚠ 加载失败 / 数据没能取回来，可能是网络问题或会话过期 / 重试」——
+// 而那一刻**什么都没失败**，请求还在飞。实测出纳打开「固定资产」（无
+// account_edit 权限）时 permanently 停在这个假错误态：上面一行红字写着
+// 「没有「科目维护」权限」，下面跟着一个永远点不成功的「重试」，用户会去
+// 排查根本不存在的网络问题。
+// 真正的失败由各视图自己的 catch 报（api() 抛错时不会走到空态处理）。
+const LOADING_PLACEHOLDERS = /^(加载中|加载中…|加载中\.\.\.|加载)$/;
+const EMPTY_PLACEHOLDERS = /^(暂无数据|无数据|没有数据|暂无|空空如也|—|-|)$/;
 function emptyStateHtml(table, mode, detail) {
   const t = (table.dataset || {}) ;
   const title = t.emptyTitle || (mode === "error" ? "加载失败" : mode === "noperm" ? "没有权限" : "暂无数据");
@@ -1797,6 +1879,9 @@ function emptyStateHtml(table, mode, detail) {
 function autoEmptyRows(root) {
   const r = root || document.getElementById("main");
   if (!r) return;
+  // 页面已经说了「没权限/出错」时也不补空态 —— 判定已下沉到占位词分类上：
+  // 「加载中…」不再是占位词（见 EMPTY_PLACEHOLDERS 上方注释），所以无权限的
+  // 页面不会再被叠上一个「⚠ 加载失败 + 重试」。
   $all("table.grid", r).forEach((table) => {
     if (table.dataset.noEmpty) return;
     const tb = table.tBodies[0];
@@ -1816,10 +1901,12 @@ function autoEmptyRows(root) {
     // 有交互元素 = 是有意义的行（重试按钮、跳转链接、错误详情），不动
     if (td.querySelector("button, a, input, select, textarea")) return;
     const txt = (td.textContent || "").trim();
+    // 「还在加载」既不是空态也不是失败态：原样留着。视图自己的 catch 会把真正的
+    // 错误写进摘要行；这里再补一个「加载失败 + 重试」只会说谎。
+    if (LOADING_PLACEHOLDERS.test(txt)) return;
     if (!EMPTY_PLACEHOLDERS.test(txt)) return;
     const cols = (table.tHead && table.tHead.rows[0] ? table.tHead.rows[0].cells.length : 1) || 1;
-    const mode = /加载/.test(txt) ? "error" : "empty";
-    td.innerHTML = emptyStateHtml(table, mode);
+    td.innerHTML = emptyStateHtml(table, "empty");
   });
 }
 
@@ -2112,15 +2199,29 @@ function renderMain() {
   updateCrumb();
   const fn = VIEWS[state.view] || viewDashboard;
   const r = fn(main);
-  // 列偏好：同步表结构先挂一次（async 表由 api() 回调补挂）
+  // 列偏好 / 排序 / 列宽 / title：作用于同步建出来的骨架，可以立刻做
   try { autoColPrefs(); } catch (e) {}
   try { autoColSort(); } catch (e) {}
   try { autoColResize(); } catch (e) {}
   try { autoCellTitles(); } catch (e) {}
-  // 通用后处理：负数红字 + 空态识别 + 溢出收纳（opt-in）
   try { autoNumbers(); } catch (e) {}
-  try { autoEmptyRows(); } catch (e) {}
   try { autoOverflowMenus(); } catch (e) {}
+  // 空态识别必须**等视图的异步加载跑完**。
+  //
+  // `fn(main)` 返回的是 Promise，绝大多数视图在第一个 await 上就会先把
+  // <tbody> 填成「加载中…」，再 await api()。原来这里不等，直接判空态，于是
+  // 「加载中…」被当成"加载失败"渲染成「⚠ 加载失败 / 可能是网络问题 / 重试」——
+  // 而那一刻请求还在飞，什么都没失败。数据回来后 api() 的成功路径会重跑一次
+  // 空态识别把它覆盖掉，所以正常页面看不出来；**加载失败时就永久停在假错误态**：
+  // 实测出纳打开「固定资产」（无 account_edit）同时看到「没有「科目维护」权限」
+  // 和一个永远点不成功的「重试」。
+  //
+  // 改成等 Promise settle：数据到了就正常判空，没到就等 api() 自己那条路径。
+  // 视图若抛错（同步 throw）也要走一遍，否则它自己渲染的失败态拿不到后处理。
+  Promise.resolve(r).then(
+    () => { try { autoEmptyRows(); } catch (e) {} },
+    () => { try { autoEmptyRows(); } catch (e) {} }
+  );
   return r;
 }
 
@@ -3058,7 +3159,7 @@ async function openVoucherEditor(id, seedEntries) {
       ${editable ? `<button class="btn ghost" id="v-save-new">保存并新增</button>` : ""}
       ${can("voucher_audit") && id > 0 && status === "draft" ? `<button class="btn ghost" id="v-audit">审核</button>` : ""}
       ${can("voucher_unaudit") && id > 0 && status === "audited" ? `<button class="btn ghost" id="v-unaudit">反审核</button>` : ""}
-      ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}
+      ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") && !v.cashier ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}
       ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") && v.cashier ? `<button class="btn ghost" id="v-unsign">取消签字</button>` : ""}
       ${can("voucher_post") && canPost ? `<button class="btn primary" id="v-post">记账</button>` : ""}
       ${can("voucher_unpost") && status === "posted" && !inAmendSet ? `<button class="btn ghost" id="v-unpost">反记账</button>` : ""}
@@ -4753,7 +4854,7 @@ async function loadUsers() {
       toast(dis ? "已停用，该账号全部会话已下线" : "已启用", "ok"); loadUsers();
     } catch (e) { toast(e.message, "err"); }
   });
-  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`重置 ${b.dataset.resetDev} 的设备绑定？该账号可在新设备重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定，其会话已下线", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
+  $all("[data-reset-dev]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`重置 ${b.dataset.resetDev} 的设备绑定？将解绑该账号「全部」已绑定设备并强制下线，下次登录重新绑定。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.resetDev)}/reset-device`, { method: "POST" }); toast("已重置设备绑定，其会话已下线", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
   $all("[data-unlock]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`解锁 ${b.dataset.unlock}？解锁后可重新登录。`))) return; try { await api(`/users/${encodeURIComponent(b.dataset.unlock)}/unlock`, { method: "POST" }); toast("已解锁", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
   $all("[data-del]").forEach((b) => b.onclick = async () => { if (!(await confirmDialog(`删除用户 ${b.dataset.del}？删除后该账号无法登录（历史操作日志保留）。`, true))) return; try { await api(`/users/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); } catch (e) { toast(e.message, "err"); } });
 }
@@ -4975,7 +5076,7 @@ async function viewPlatformUsers(main) {
         } catch (err) { toast(err.message, "err"); }
       };
     } else if (act === "dev") {
-      if (!(await confirmDialog(`重置「${u}」的设备绑定？该账号将被强制下线，下次登录自动绑定新设备。`, true))) return;
+      if (!(await confirmDialog(`重置「${u}」的设备绑定？将解绑「全部」已绑定设备（上限 2 台）并强制下线，下次登录重新绑定。`, true))) return;
       try { await api(`/platform/users/${encodeURIComponent(u)}/reset-device`, { method: "POST" }); toast("设备绑定已重置", "ok"); load(); } catch (err) { toast(err.message, "err"); }
     } else if (act === "del") {
       if (!(await confirmDialog(`确定删除账号「${u}」？该操作不可恢复（其创建的账套需先删除）。`, true))) return;
@@ -7015,7 +7116,7 @@ async function viewPoReconcile(main) {
 // 只能靠人肉记忆，缺货时更无法反查「哪些订单正等着这批料」。
 //
 // 弹窗第一件事是**先算 ATP**（现货 + 在途 − 已占用）并把三个分量都摆出来。
-// 只给一个 ATP 数字，被算错了也不知道错在哪一项；而且下���前就该看到
+// 只给一个 ATP 数字，被算错了也不知道错在哪一项；而且下推前就该看到
 // 「现货不够、但下推生产之后够不够」，而不是只能事后看库存。
 async function openPushProd(soId, after) {
   const id = Number(soId);
@@ -9224,7 +9325,7 @@ async function renderReceipts(body) {
             <td>${d.voucher_id ? `<a href="#" data-rc-v="${d.voucher_id}">凭证 #${d.voucher_id}</a>` : "—"}</td>
             <td>${d.status === "audited" ? '<span class="tag ok">已审核</span>' : '<span class="tag warn">待审核</span>'}<span data-wftag="receipt:${d.id}"></span></td>
             <td>${esc(d.memo || "")}</td>
-            <td class="row-actions">${can("voucher_audit") ? (d.status === "draft" ? `<button class="btn ghost sm" data-rc-audit="${d.id}">审核</button>` : `<button class="btn ghost sm" data-rc-unaudit="${d.id}">撤审</button>`) : ""}<button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
+            <td class="row-actions">${can("voucher_audit") || can("voucher_post") ? (d.status === "draft" ? `<button class="btn ghost sm" data-rc-audit="${d.id}">审核</button>` : `<button class="btn ghost sm" data-rc-unaudit="${d.id}">撤审</button>`) : ""}<button class="btn ghost sm" data-rc-d="${d.id}">删除</button></td></tr>`).join("")}</tbody></table>`
         : `<div class="muted">暂无收付款单</div>`;
       fillWfTags($("#rc-list"));
       $all("[data-rc-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openVoucherEditor(parseInt(a.dataset.rcV, 10)); });
@@ -10025,21 +10126,69 @@ async function viewBegin(main) {
 
 // rows：BeginRow 列表；year_begin 带符号（借正贷负），前端拆成 方向 + 金额 文本框
 function renderBegin(main, rows) {
-  if (!state.beginDraft) state.beginDraft = rows.map((r) => ({
-    id: r.id, account_code: r.account_code,
-    dir: String(r.year_begin).trim().startsWith("-") ? "credit" : "debit",
-    yb: fmt(String(Math.abs(parseFloat(r.year_begin) || 0))),
-    ad: fmt(r.debit_accum), ac: fmt(r.credit_accum), qty: r.qty_begin == null ? "" : fmt(r.qty_begin),
-  }));
+  if (!state.beginDraft) {
+    state.beginDraft = rows.map((r) => ({
+      id: r.id, account_code: r.account_code,
+      // orig_code：库里的原始编码。改了编码的行保存时要删旧行（见 #bg-save），
+      // 没有它就无法判断"用户改过编码"还是"本来就是这个编码"。
+      orig_code: r.account_code,
+      dir: String(r.year_begin).trim().startsWith("-") ? "credit" : "debit",
+      yb: fmt(String(Math.abs(parseFloat(r.year_begin) || 0))),
+      ad: fmt(r.debit_accum), ac: fmt(r.credit_accum), qty: r.qty_begin == null ? "" : fmt(r.qty_begin),
+    }));
+    // 草稿重建 = 之前那批"待删 id"已经作废。带着旧 id 去删，会删掉这一轮刚读回来的行。
+    state.beginRemoved = [];
+  }
   const draft = state.beginDraft;
   const num = (s) => parseFloat(String(s).replace(/,/g, "")) || 0;
-  const render = () => {
-    const nameOf = (code) => { const a = (state.accounts || []).find((x) => x.code === code); return a ? a.name : ""; };
+  // 试算合计单独抽出来：输入时**只改这几个数字**，不重建整张表。
+  //
+  // 为什么必须实时：改造前合计只在 render() 里算，而 render() 只在「添加/移除
+  // 科目行」时触发。实测填入 154 万真实数据，卡片仍显示 0.00 / ✓平衡；故意
+  // 造成 165,999 的不平衡，也照样显示「✓ 平衡」。这个指示器是会计在录入阶段
+  // 唯一的笔误守卫，死了就等于没有。
+  //
+  // 又为什么不能靠 render()：那会重建 <input>，正在输入的那个框失焦、
+  // 光标跳到开头，打字根本没法连贯。
+  const computeTotals = () => {
     const sumYbDebit = draft.filter((r) => r.dir === "debit").reduce((s, r) => s + num(r.yb), 0);
     const sumYbCredit = draft.filter((r) => r.dir === "credit").reduce((s, r) => s + num(r.yb), 0);
     const sumAd = draft.reduce((s, r) => s + num(r.ad), 0);
     const sumAc = draft.reduce((s, r) => s + num(r.ac), 0);
     const balanced = Math.abs((sumYbDebit + sumAd) - (sumYbCredit + sumAc)) < 0.005;
+    return { sumYbDebit, sumYbCredit, sumAd, sumAc, balanced };
+  };
+  const paintTotals = () => {
+    const box = $("#bg-totals", main);
+    if (!box) return;
+    const t = computeTotals();
+    // font-size:16px 是刻意的：.card .v 默认 26px，期初金额动辄七位数
+    // （"1,544,100.00"），26px 下会撑破卡片。原来是写在 render() 里的内联样式，
+    // 抽到 paintTotals 时必须一起搬过来，否则是场看不见的版式回归。
+    const cell = (k, v, color, id) =>
+      `<div class="card"><div class="k">${k}</div><div class="v" style="font-size:16px${color ? `;color:${color}` : ""}"${id ? ` id="${id}"` : ""}>${v}</div></div>`;
+    box.innerHTML =
+      cell("年初借方合计", fmt(t.sumYbDebit.toFixed(2))) +
+      cell("年初贷方合计", fmt(t.sumYbCredit.toFixed(2))) +
+      cell("借方累计合计", fmt(t.sumAd.toFixed(2))) +
+      cell("贷方累计合计", fmt(t.sumAc.toFixed(2))) +
+      cell(
+        "试算平衡",
+        t.balanced ? "✓ 平衡" : "✗ 不平衡（差 " + fmt(Math.abs((t.sumYbDebit + t.sumAd) - (t.sumYbCredit + t.sumAc)).toFixed(2)) + "）",
+        t.balanced ? "var(--ok)" : "var(--err)",
+        // id 要留着：E2E 靠 #bg-balance 断言"不平衡 + 差额"，
+        // 抽成 cell() 时顺手丢掉的正是这个锚点
+        "bg-balance"
+      );
+    // 账上有数据却报「平衡」是最糟的形态（空表恒等），给个明确信号
+    const hasAny = draft.some((r) => num(r.yb) || num(r.ad) || num(r.ac));
+    const note = $("#bg-balance-note", main);
+    if (note) note.textContent = !hasAny && t.balanced ? "尚未填写任何金额" : "";
+  };
+  const render = () => {
+    const nameOf = (code) => { const a = (state.accounts || []).find((x) => x.code === code); return a ? a.name : ""; };
+    // 合计不在这里算了 —— 抽到 computeTotals/paintTotals，才能随输入实时刷新。
+    // 留着一份"只在重绘时算"的副本，正是原来那个恒显示 ✓平衡 的死守卫。
     main.innerHTML = `
       <h2>期初建账</h2>
       <div class="toolbar">
@@ -10053,41 +10202,76 @@ function renderBegin(main, rows) {
           <tbody>
             ${draft.length ? draft.map((r, i) => `
               <tr>
-                <td><input class="bg-code" data-i="${i}" value="${esc(r.account_code)}" style="width:110px" ${r.id > 0 ? "readonly" : ""} /></td>
+                <td><input class="bg-code" data-i="${i}" value="${esc(r.account_code)}" style="width:110px" /></td>
                 <td class="muted">${esc(nameOf(r.account_code))}</td>
                 <td><select class="bg-dir" data-i="${i}"><option value="debit" ${r.dir !== "credit" ? "selected" : ""}>借</option><option value="credit" ${r.dir === "credit" ? "selected" : ""}>贷</option></select></td>
                 <td class="num"><input class="bg-yb num" data-i="${i}" value="${esc(r.yb)}" style="width:120px;text-align:right" /></td>
                 <td class="num"><input class="bg-ad num" data-i="${i}" value="${esc(r.ad)}" style="width:120px;text-align:right" /></td>
                 <td class="num"><input class="bg-ac num" data-i="${i}" value="${esc(r.ac)}" style="width:120px;text-align:right" /></td>
                 <td class="num"><input class="bg-qty num" data-i="${i}" value="${esc(r.qty)}" style="width:90px;text-align:right" /></td>
-                <td>${r.id > 0 ? `<span class="muted" style="font-size:12px">已有</span>` : `<button class="btn ghost sm" data-rm="${i}">移除</button>`}</td>
+                <td class="row-actions">
+                  ${r.id > 0 ? `<span class="muted" style="font-size:12px">已有</span>` : ""}
+                  <button class="btn ghost sm" data-rm="${i}" title="移除这一行">移除</button>
+                </td>
               </tr>`).join("") : `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">暂无期初数据，点「添加科目行」开始建账</td></tr>`}
           </tbody>
         </table>
       </div>
-      <div class="cards" style="margin-top:14px">
-        <div class="card"><div class="k">年初借方合计</div><div class="v" style="font-size:16px">${fmt(sumYbDebit.toFixed(2))}</div></div>
-        <div class="card"><div class="k">年初贷方合计</div><div class="v" style="font-size:16px">${fmt(sumYbCredit.toFixed(2))}</div></div>
-        <div class="card"><div class="k">借方累计合计</div><div class="v" style="font-size:16px">${fmt(sumAd.toFixed(2))}</div></div>
-        <div class="card"><div class="k">贷方累计合计</div><div class="v" style="font-size:16px">${fmt(sumAc.toFixed(2))}</div></div>
-        <div class="card"><div class="k">试算平衡</div><div class="v" style="font-size:16px;color:${balanced ? "var(--ok)" : "var(--err)"}">${balanced ? "✓ 平衡" : "✗ 不平衡"}</div></div>
-      </div>`;
-    $all(".bg-code", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].account_code = inp.value.trim());
-    $all(".bg-dir", main).forEach((sel) => sel.onchange = () => draft[+sel.dataset.i].dir = sel.value);
-    $all(".bg-yb", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].yb = inp.value);
-    $all(".bg-ad", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].ad = inp.value);
-    $all(".bg-ac", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].ac = inp.value);
+      <div class="cards" id="bg-totals" style="margin-top:14px"></div>
+      <div class="muted u-sm" id="bg-balance-note" style="margin-top:6px;min-height:16px"></div>`;
+    paintTotals();
+    $all(".bg-code", main).forEach((inp) => inp.oninput = () => { draft[+inp.dataset.i].account_code = inp.value.trim(); });
+    $all(".bg-dir", main).forEach((sel) => sel.onchange = () => { draft[+sel.dataset.i].dir = sel.value; paintTotals(); });
+    $all(".bg-yb", main).forEach((inp) => inp.oninput = () => { draft[+inp.dataset.i].yb = inp.value; paintTotals(); });
+    $all(".bg-ad", main).forEach((inp) => inp.oninput = () => { draft[+inp.dataset.i].ad = inp.value; paintTotals(); });
+    $all(".bg-ac", main).forEach((inp) => inp.oninput = () => { draft[+inp.dataset.i].ac = inp.value; paintTotals(); });
     $all(".bg-qty", main).forEach((inp) => inp.oninput = () => draft[+inp.dataset.i].qty = inp.value);
-    $all("[data-rm]", main).forEach((b) => b.onclick = () => { draft.splice(+b.dataset.rm, 1); render(); });
-    $("#bg-add").onclick = () => { draft.push({ id: 0, account_code: "", dir: "debit", yb: "", ad: "", ac: "", qty: "" }); render(); };
+    // 「移除」要把已有行的 id 记进待删清单，否则界面看着行没了、库里纹丝不动。
+    //
+    // 原先是两处叠加：① 保存只提交"有科目编码"的行，后端是 upsert（ON CONFLICT
+    // DO UPDATE），**没有任何删除语义**；② 更前面一步，已经保存过的行压根**不渲染
+    // 移除按钮**（r.id > 0 时那格显示"已有"），编码框还是 readonly —— 也就是
+    // 会计录错一个科目之后，在界面上**没有任何办法把它删掉或改掉**。
+    // 实测：移除 140501 → 保存 → DB 纹丝不动，试算平衡从平衡变成差 999,999。
+    //
+    // 按 id 精确删，不做"整表替换"：同一张表可能还有别人维护的行（带辅助核算
+    // 维度的期初），按提交集合反推该删谁会误删。
+    $all("[data-rm]", main).forEach((b) => b.onclick = () => {
+      const gone = draft[+b.dataset.rm];
+      if (gone && gone.id > 0) (state.beginRemoved = state.beginRemoved || []).push(gone.id);
+      draft.splice(+b.dataset.rm, 1);
+      render();
+    });
+    $("#bg-add").onclick = () => { draft.push({ id: 0, account_code: "", orig_code: "", dir: "debit", yb: "", ad: "", ac: "", qty: "" }); render(); };
     $("#bg-save").onclick = async () => {
-      const payload = draft
-        .filter((r) => r.account_code)
-        .map((r) => ({ account_code: r.account_code, dir: r.dir, yb: r.yb.replace(/,/g, ""), ad: r.ad.replace(/,/g, ""), ac: r.ac.replace(/,/g, ""), qty: r.qty ? r.qty.replace(/,/g, "") : null }));
+      // 改了编码的已有行 = 删旧行 + 按新编码插入。upsert 的键是 (account_code,
+      // aux_key)，只提交新编码的话旧行会留在库里，变成"同一个科目两笔期初"。
+      // 所以这里把 orig_code 与当前编码不一致的行 id 也算进待删清单。
+      const deleteIds = (state.beginRemoved || []).slice();
+      const payload = [];
+      for (const r of draft) {
+        const code = (r.account_code || "").trim();
+        if (!code) continue;
+        if (r.id > 0 && (r.orig_code || "") !== code) deleteIds.push(r.id);
+        payload.push({ account_code: code, dir: r.dir, yb: r.yb.replace(/,/g, ""), ad: r.ad.replace(/,/g, ""), ac: r.ac.replace(/,/g, ""), qty: r.qty ? r.qty.replace(/,/g, "") : null });
+      }
+      // 录入了金额但试算不平：先拦一道，别让不平衡的期初落库。
+      // 后端也会校验（见 save_begin 的科目存在性检查），但这里能给出
+      // 精确到差额的提示，且不必往返一趟。
+      const t = computeTotals();
+      const hasAny = draft.some((r) => num(r.yb) || num(r.ad) || num(r.ac));
+      if (hasAny && !t.balanced) {
+        const diff = Math.abs((t.sumYbDebit + t.sumAd) - (t.sumYbCredit + t.sumAc)).toFixed(2);
+        if (!(await confirmDialog(`期初试算不平衡，差额 ${diff}。\n\n` +
+          `借贷不平的期初会让后面所有报表都带着这个差额走。仍要保存吗？`, true))) return;
+      }
       try {
-        const r = await api("/begin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        toast(`已保存 ${r.count || payload.length} 条期初`, "ok");
+        const r = await api("/begin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ rows: payload, delete_ids: deleteIds }) });
+        const n = (r && r.count) || payload.length;
+        const d = (r && r.deleted) || 0;
+        toast(`已保存 ${n} 条期初${d ? `，删除 ${d} 条` : ""}`, "ok");
         state.beginDraft = null;
+        state.beginRemoved = null;
         viewBegin(main);
       } catch (e) { toast(e.message, "err"); }
     };

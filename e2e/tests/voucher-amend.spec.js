@@ -1,5 +1,5 @@
 const { test, expect } = require("@playwright/test");
-const { newBook } = require("../helpers");
+const { newBook, auditSignPost } = require("../helpers");
 
 // 凭证更正链（Cancel -> Amend）
 //
@@ -29,13 +29,11 @@ async function postedVoucher(page, amount) {
   });
   expect(r.ok(), `建凭证应成功：${await r.text()}`).toBeTruthy();
   const id = (await r.json()).id;
-  // 审核环节**默认开启**：草稿不能直接记账，必须先审核。
-  // （引擎层的单测用 `mem()` 夹具，它是 enable_audit=false，
-  //   所以这条只有 E2E 能守住 —— 少了这步 4 个用例会一起红。）
-  const a = await page.request.post(`/api/vouchers/${id}/audit`);
-  expect(a.ok(), `审核应成功：${await a.text()}`).toBeTruthy();
-  const p = await page.request.post(`/api/vouchers/${id}/post`);
-  expect(p.ok(), `记账应成功：${await p.text()}`).toBeTruthy();
+  // 两道闸门**默认都开**：草稿不能直接记账，必须先审核；涉及现金/银行科目的
+  // 还要先出纳签字。
+  // （引擎层的单测用 `tests::test_opts()` 夹具，它把两道闸门都显式关掉了，
+  //   所以「默认开着」这件事只有 E2E 守得住 —— 少了这步 4 个用例会一起红。）
+  await auditSignPost(page, id);
   return id;
 }
 
@@ -161,16 +159,25 @@ test("更正链三张成套：任何一张都不能被单独反记账（撤一�
   const old = await (await page.request.get(`/api/vouchers/${vid}`)).json();
   const red_id = old.amend.amended_by;
 
-  // 三张都记账
-  // 注意：更正链产出的红冲与更正是**新凭证**（草稿态），账套开着审核环节时
-  // 必须先审核才能记账 —— `postedVoucher` 只替原凭证做了审核。
+  // 三张最终都要是「已记账」，但**起点不同**：
+  //   · 原凭证 vid ——postedVoucher() 已经记好了，别再碰
+  //     （对它再审核会被拒：「已记账凭证不能审核」）
+  //   · 红冲 red_id / 更正 new_id ——更正链产出的**新凭证**（草稿态），
+  //     两道闸门都要重新走一遍
+  //
+  // 原来这里逐张 if/else 分支，正是「原凭证已审核、红冲未审核」这种状态最容易
+  // 漏掉一道闸门的地方；现在分成两句：已记账的只断言，新草稿的一律走完整三步。
   for (const [id, what] of [[vid, "原凭证"], [red_id, "红冲"], [new_id, "更正"]]) {
-    if (id !== vid) {
-      const a = await page.request.post(`/api/vouchers/${id}/audit`);
-      expect(a.ok(), `${what} 审核应成功：${await a.text()}`).toBeTruthy();
+    try {
+      if (id === vid) {
+        const v0 = await (await page.request.get(`/api/vouchers/${vid}`)).json();
+        expect(v0.status, `${what}应仍保持已记账（不该被这条用例改动）`).toBe("posted");
+      } else {
+        await auditSignPost(page, id);
+      }
+    } catch (e) {
+      throw new Error(`${what}：${e.message}`);
     }
-    const p = await page.request.post(`/api/vouchers/${id}/post`);
-    expect(p.ok(), `${what} 记账应成功：${await p.text()}`).toBeTruthy();
   }
 
   // 任何一张被单独反记账都必须被拒

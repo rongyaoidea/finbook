@@ -2231,8 +2231,7 @@ pub fn prod_save(db: &Db, order: &mut ProductionOrder) -> DbResult<i64> {
     Ok(id)
 }
 
-/// 草稿 → 已下达。条件更新（`AND status='draft'`）防并发：两个���示点
-/// 同时下达，只有一个能成功，另一个拿到「不是草稿」而不是把状态覆盖掉。
+/// 草稿 → 已下达。条件更新（`AND status='draft'`）防并发：并发下达时，只有一个能成功，另一个拿到「不是草稿」而不是把状态覆盖掉。
 pub fn prod_release(db: &Db, id: i64) -> DbResult<()> {
     let n = db.conn().execute(
         "UPDATE production_order SET status='released', updated_at=?2 WHERE id=?1 AND status='draft'",

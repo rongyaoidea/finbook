@@ -36,13 +36,23 @@ fn test_state() -> (Arc<WebState>, PathBuf, tempfile::TempDir) {
         // 以及税务申报表的表头。留空会让这类断言看着像产品 bug。
         company: "测试公司".into(),
         tax_no: "91110000TEST000001".into(),
-        // 测试夹具显式关掉审核环节：绝大多数用例的主题是银行对账 / 核销 / 账龄 /
-        // 报表，不是审核闸门，给它们统一加上「审核 + 记账」两步只会淹没真正的主题。
+        // 测试夹具**显式**关掉两道闸门：绝大多数用例的主题是银行对账 / 核销 / 账龄 /
+        // 报表 / 结账，不是审核闸门也不是出纳签字，给它们统一加上「审核 + 签字 + 记账」
+        // 三步只会淹没真正的主题。
         //
-        // 生产默认值是**开**（三权分离，见 fincore::account::BookOptions 文档），
-        // 由 `audit_default_on_for_new_books` / `audit_gate_blocks_post_until_audited`
-        // 两个用例专门盯住默认行为与闸门语义——夹具关掉不等于默认关掉。
+        // 生产默认值两道都是**开**（三权分离 + 现金/银行须出纳签字，见
+        // fincore::account::BookOptions 文档），由 `audit_default_on_for_new_books`、
+        // `require_cashier_gates_post_and_scopes_to_funds`、
+        // `audit_gate_blocks_post_until_audited` 三个用例专门盯住默认值与闸门语义 ——
+        // 夹具关掉不等于默认关掉。
+        //
+        // ⚠️ 这两行**必须显式写出来**，不能靠 `..Default::default()` 继承。
+        // 实测过：require_cashier 的默认值从 false 改成 true 的那天，186 条用例里
+        // 28 条集体变红，报错全是干巴巴的「记账应成功 left: 400 right: 200」，
+        // 指向的是记账逻辑，实际是夹具静默继承了新默认值。
+        // check-ci.js 现在会检查本夹具是否把两个开关都显式列出。
         enable_audit: false,
+        require_cashier: false,
         ..Default::default()
     };
     let book_path = books_dir.join("b1.fbk");
@@ -790,6 +800,16 @@ async fn last_admin_cannot_be_removed() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "最后一个管理员不可删除");
 }
 
+/// 平台层设备绑定：一个账号最多绑 **2 台**，第三台被拒，管理员重置后可重新绑定。
+///
+/// 为什么不是 1 台：真实场景里同一个人两台机器是常态（公司台式机 + 家里笔记本）。
+/// 锁死 1 台的结果是用户隔几天就要找管理员重置一次 —— 一个安全功能如果天天要人工
+/// 介入，实际效果就是被绕过。
+///
+/// 为什么不是不限：上限是这个功能**全部**的控制力来源。不限台数等于没有绑定，
+/// 口令泄露后攻击者从任何机器都能登。
+///
+/// 原测试断言的是「第二台被拒」（一人一机），已随语义变更改写。
 #[tokio::test]
 async fn platform_device_binding_and_reset() {
     let (state, _bd, _dir) = test_state();
@@ -817,15 +837,56 @@ async fn platform_device_binding_and_reset() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 平台层「一人一机」：第二台设备登录被拒绝（403），需管理员重置
-    let (status, _) = login_with_device(&state, "emp", "Emp654321", "dev-B").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "其它设备登录应被拒绝");
+    // 改密会清掉该账号的全部会话，所以先拿一个新的 dev-A 会话再测「两台并存」。
+    // 不重新登录的话 s1 早就死了 —— 那是改密的语义，与设备绑定无关，
+    // 混在一起测就会把「改密踢会话」误读成「新设备踢掉旧设备」。
+    let (status, s1b) = login_with_device(&state, "emp", "Emp654321", "dev-A").await;
+    assert_eq!(status, StatusCode::OK, "原设备重新登录应成功（已绑定）");
+
+    // 第二台设备**应当能登**（上限 2 台）
+    let (status, s2) = login_with_device(&state, "emp", "Emp654321", "dev-B").await;
+    assert_eq!(status, StatusCode::OK, "第二台设备应可登录并绑定");
+
+    // 两台都在用：各自会话互不影响（这是「一人两机」的核心诉求）
+    for (label, sid) in [("dev-A", &s1b), ("dev-B", &s2)] {
+        let resp = handlers::router(state.clone())
+            .oneshot(authed_get("/api/books", sid))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{label} 的会话应仍然有效（两台设备互不踢下线）");
+    }
+
+    // 第三台设备被拒：上限就是上限
+    let (status, _) = login_with_device(&state, "emp", "Emp654321", "dev-C").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "第三台设备应被拒绝（上限 2 台）");
+
+    // 拒绝信息要说清是几台上限，而不是笼统的「已绑定其它设备」——
+    // 用户看到「已绑定 2 台设备（上限 2 台）」才知道该找谁解绑
+    let r = handlers::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "username": "emp", "password": "Emp654321",
+                        "device_id": "dev-C", "device_name": "第三台"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_string(r).await;
+    assert!(body.contains("2 台设备"), "提示要说明已绑台数与上限：{body}");
 
     // 非管理员不能重置设备
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             "/api/platform/users/emp/reset-device",
-            &s1,
+            &s1b,
             serde_json::json!({}),
         ))
         .await
@@ -844,14 +905,18 @@ async fn platform_device_binding_and_reset() {
     assert_eq!(resp.status(), StatusCode::OK, "管理员重置设备应成功");
     // 旧会话已失效
     let resp = handlers::router(state.clone())
-        .oneshot(authed_get("/api/books", &s1))
+        .oneshot(authed_get("/api/books", &s1b))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "重置设备后旧会话应失效");
 
-    // 重置后 dev-B 可登录
-    let (status, _) = login_with_device(&state, "emp", "Emp654321", "dev-B").await;
-    assert_eq!(status, StatusCode::OK, "重置设备后新设备应可登录");
+    // 重置后两台都能重新绑定（不是只放行一台）
+    for dev in ["dev-A", "dev-B"] {
+        let (status, _) = login_with_device(&state, "emp", "Emp654321", dev).await;
+        assert_eq!(status, StatusCode::OK, "重置后 {dev} 应可重新绑定");
+    }
+    let (status, _) = login_with_device(&state, "emp", "Emp654321", "dev-C").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "重置后仍应保持 2 台上限");
 }
 
 #[tokio::test]
@@ -3735,7 +3800,9 @@ async fn consolidate_books() {
     let vid2 = serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()["id"]
         .as_i64()
         .unwrap();
-    // b2 走生产建账路径 → 审核环节默认开，记账前必须先审核（与 b1 夹具不同）
+    // b2 走生产建账路径 → **两道闸门默认都开**（审核 + 出纳签字），与 b1 夹具不同。
+    // 夹具在 test_state() 里显式关掉了两道闸门，所以 b1 那张不需要这两步 ——
+    // 这也正是夹具必须显式声明、不能靠继承默认值的原因。
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             &format!("/api/vouchers/{vid2}/audit"),
@@ -3745,6 +3812,16 @@ async fn consolidate_books() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "b2 审核");
+    // 出纳签字：b2 的凭证借记 1001 库存现金，生产默认开着出纳闸门。
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid2}/sign"),
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_ok(resp, "b2 出纳签字").await;
     let resp = handlers::router(state.clone())
         .oneshot(authed_post(
             &format!("/api/vouchers/{vid2}/post"),
@@ -3753,7 +3830,7 @@ async fn consolidate_books() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "b2 记账");
+    assert_ok(resp, "b2 记账").await;
 
     // 合并汇总：1001 合计 300、2001 合计 -300（借正贷负）
     let resp = handlers::router(state.clone())
@@ -5463,10 +5540,29 @@ async fn audit_default_on_for_new_books() {
         o["enable_audit"], true,
         "新建账套的审核环节必须默认开启（制单/审核/记账三权分离）"
     );
-    // 出纳签字仍默认关：它是资金域节点，不是全行业默认（见 settle.rs 口径说明）
+    // 出纳签字现在也**默认开**。原来是 false，理由是「资金域节点不是全行业默认」——
+    // 但那等于新建账套一出生就在默认绕过出纳：谁都不必做任何决定，就已经在绕了。
+    // 与审核环节保持同一取向（默认开、要关得在账套参数里显式关，是一次有意识的决定）。
     assert_eq!(
-        o["require_cashier"], false,
-        "出纳签字不设全行业默认，需要时在账套参数显式开"
+        o["require_cashier"], true,
+        "新建账套的出纳签字必须默认开启（现金/银行是内控风险最高的一块）"
+    );
+    // 建账向导要问「有没有出纳」：选了不启用才写 false
+    let mut o2 = o.clone();
+    o2["require_cashier"] = serde_json::json!(false);
+    let r = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &admin_sid, o2))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "显式关掉出纳签字应当允许");
+    let r = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &admin_sid))
+        .await
+        .unwrap();
+    let back: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        back["require_cashier"], false,
+        "关掉后应能读回 false（显式关闭必须真的生效）"
     );
 }
 
@@ -5531,6 +5627,20 @@ async fn audit_gate_blocks_post_until_audited() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "审核应成功");
+    // 本用例自建账套，走的是**生产默认**（两道闸门都开）。凭证贷记 1001 库存现金，
+    // 所以审核过了还要过出纳签字那道闸 —— 补上这一步，用例才真的走完「记账」这条路。
+    //
+    // 顺带钉住一件事：出纳闸门**不是**审核的替代品。反过来（没审核就签字能不能记）
+    // 由前面的 400 断言已经覆盖。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/vouchers/{vid}/sign"),
+            &admin_sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_ok(r, "出纳签字应成功").await;
     let r = handlers::router(state.clone())
         .oneshot(authed_post(
             &format!("/api/vouchers/{vid}/post"),
@@ -5539,7 +5649,7 @@ async fn audit_gate_blocks_post_until_audited() {
         ))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "审核后应能记账");
+    assert_ok(r, "审核 + 签字后应能记账").await;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -10964,6 +11074,19 @@ fn money_num(s: &str) -> f64 {
     s.replace(',', "").parse::<f64>().unwrap_or(0.0)
 }
 
+/// 断言「应当成功」，失败时把**响应体**一起打出来。
+///
+/// 本项目里绝大多数写接口的失败都是 400/403/409，而**拒绝原因只写在 body 里**：
+/// 「该账套启用了审核环节，请先审核凭证再记账」/「涉及现金或银行科目，需出纳签字」/
+/// 「试算不平衡」/「该期间已结账」。裸的 `assert_eq!(status, OK, "记账应成功")`
+/// 只留下 `left: 400 right: 200`，读失败的人无法判断是哪道闸门，只能自己再改一遍
+/// 加打印 —— 那是把成本推给下一个人。
+async fn assert_ok(resp: axum::response::Response, what: &str) {
+    let st = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "{what}：实际 {st}，响应体 {body}");
+}
+
 /// 建一张已记账凭证（返回 id）
 async fn post_voucher(
     state: &Arc<WebState>,
@@ -10995,7 +11118,11 @@ async fn post_voucher(
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "记账应成功");
+    // 断言必须带上响应体：记账被拒全是 400，而 400 的**原因写在 body 里**
+    // （「该账套启用了审核环节」/「涉及现金银行科目需出纳签字」/「试算不平衡」…）。
+    // 只写「记账应成功」的话，一次失败只留下一句 left: 400 right: 200，
+    // 排查得再跑一遍加打印 —— 那是把成本推给下一个读失败的人。
+    assert_ok(resp, "记账应成功").await;
     id
 }
 
@@ -11048,7 +11175,7 @@ async fn trial_balance_default_posted_only_h3() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "记账应成功");
+    assert_ok(resp, "记账应成功").await;
     let resp = handlers::router(state.clone())
         .oneshot(authed_get(
             "/api/reports/trial-balance?from=202601&to=202601",
@@ -12435,7 +12562,7 @@ async fn funds_daily_by_date_report() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "记账应成功");
+    assert_ok(resp, "记账应成功").await;
 
     let fetch = |sid: String, date: &'static str| {
         let state = state.clone();
@@ -17691,4 +17818,561 @@ fn block_inserts(state: &Arc<WebState>, book: &str, table: &str) {
         .unwrap_or_else(|e| panic!("装 {table} 阻断触发器失败: {e}"));
 }
 
+// ===========================================================================
+// 回归测试：2026-09-29 全岗位流程走查发现的 8 个缺陷
+//
+// 这一批的共同点：**每个缺陷都是"操作成功但结果不对"**，界面上看不出异常，
+// 只有拿数字对账才发现。所以每条测试都断言具体数值/具体文案，不断言 HTTP 200。
+// ===========================================================================
 
+/// ③ 期初写不存在的科目必须被拒 —— 修前钱从所有报表里静默消失。
+///
+/// 实测：写 `999999` 返回 `200 {"count":1,"ok":true}`，随后
+///   · 试算平衡报表**没有这一行**，总额照样报「平衡」
+///   · 资产负债表查不到这 1,000,000
+/// 凭证录入那条路上有「非末级科目不能记账」「核算数量科目必须填数量」「借贷不平衡」
+/// 一整套校验，唯独期初这条路原来是裸的。会计把科目编码打错一位就踩到。
+#[tokio::test]
+async fn begin_rejects_nonexistent_account() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 一批里混一个不存在的科目：整批必须被拒，且真实那行也不能落地
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!({
+                "rows": [
+                    { "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null },
+                    { "account_code": "999999", "dir": "debit", "yb": "1000000", "ad": "0", "ac": "0", "qty": null }
+                ],
+                "delete_ids": []
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "不存在科目应 400：{b}");
+    assert!(
+        b.contains("999999"),
+        "报错必须点名是哪个科目，否则会计不知道改哪一位：{b}"
+    );
+
+    // 拒绝时不能留半截数据
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        rows.as_array().unwrap().is_empty(),
+        "校验失败必须整批不落地：{rows}"
+    );
+
+    // 对照：真实科目照常能存（别把校验写太死）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!([{ "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null }]),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "真实科目应能存：{b}");
+}
+
+/// ④ 界面上的「移除」必须真删库里的行。
+///
+/// 实测：移除 140501 → 保存 → DB 纹丝不动 → 试算平衡从「1,544,100 vs 1,544,100 平衡」
+/// 变成「1,544,100 vs 2,544,099 不平衡」，而界面上那行已经不见了。会计改个错字
+/// 重新保存，期初金额就翻倍。
+///
+/// 根因：后端 `upsert_begin_on` 是 `ON CONFLICT DO UPDATE`，**没有任何删除语义**；
+/// 前端把行从草稿删掉后只提交剩下的行，于是被删的那行永远留在库里。
+#[tokio::test]
+async fn begin_delete_ids_actually_remove_rows() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 先存 3 条
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!([
+                { "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null },
+                { "account_code": "2001", "dir": "credit", "yb": "3000", "ad": "0", "ac": "0", "qty": null },
+                { "account_code": "2202", "dir": "credit", "yb": "2000", "ad": "0", "ac": "0", "qty": null }
+            ]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "先存 3 条");
+
+    // 读回 id
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id_of = |code: &str| -> i64 {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["account_code"] == code)
+            .unwrap_or_else(|| panic!("应有 {code}：{rows}"))["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let (id1001, id2001, _) = (id_of("1001"), id_of("2001"), id_of("2202"));
+
+    // 界面上移除 2001（3,000 贷方），另两行原样重发
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!({
+                "rows": [
+                    { "account_code": "1001", "dir": "debit", "yb": "5000", "ad": "0", "ac": "0", "qty": null },
+                    { "account_code": "2202", "dir": "credit", "yb": "2000", "ad": "0", "ac": "0", "qty": null }
+                ],
+                "delete_ids": [id2001]
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "带删除的保存应成功：{b}");
+    assert!(b.contains("\"deleted\":1"), "响应应报告删了几条：{b}");
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let codes: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["account_code"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        codes.len(),
+        2,
+        "移除后应只剩 2 行，实际 {codes:?} —— 被移除的行还留在库里"
+    );
+    assert!(!codes.contains(&"2001"), "2001 必须消失，实际 {codes:?}");
+
+    // 只 upsert 一条、**不带** delete_ids：另一条不能被误删
+    // （这条钉住"按 id 精确删"而不是"整表替换"——后者会删掉别人维护的行）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/begin",
+            &sid,
+            serde_json::json!({
+                "rows": [
+                    { "account_code": "1001", "dir": "debit", "yb": "6000", "ad": "0", "ac": "0", "qty": null }
+                ],
+                "delete_ids": []
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "只改一行应成功");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/begin", &sid))
+        .await
+        .unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let arr = rows.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "不带 delete_ids 时未提及的行必须保留：{rows}");
+    // Money 序列化成字符串（"6000.00"），不是 JSON number —— 前端 renderBegin 里
+    // 也是按 String(r.year_begin) 处理的
+    let yb1001: f64 = arr
+        .iter()
+        .find(|r| r["account_code"] == "1001")
+        .expect("1001 行应在")["year_begin"]
+        .as_str()
+        .unwrap_or_else(|| panic!("year_begin 应是字符串金额：{rows}"))
+        .parse()
+        .unwrap();
+    assert_eq!(yb1001, 6000.0, "重发的行应是覆盖而非新增（原来翻倍就是这么来的）：{rows}");
+    let _ = id1001;
+}
+
+/// ⑦ 账套层的「免首登改密」必须真正生效。
+///
+/// 实测：管理员在账套里建号时明确传 `must_change_pwd:false`（"口令是我设的，不用改"），
+/// 用户仍被拦在「必须先改密」上。根因：登录门禁读的是**平台层**
+/// `realm_user.must_change_pwd`（见 `post_login` 的 LoginResp），账套内那一位
+/// 只影响账套内的记录，完全不参与登录判断。
+#[tokio::test]
+async fn book_level_no_password_change_flag_reaches_the_login_gate() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = boss_in_b1(&state).await;
+
+    // 平台开通账号（平台层默认 must_change_pwd = true）
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid,
+            serde_json::json!({ "username": "acc7", "display_name": "会计", "password": "Init@123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号");
+    assert!(
+        state.realm.get_user("acc7").unwrap().unwrap().must_change_pwd,
+        "平台开号默认应要求首登改密（对照组：本测试要证明账套层能把它关掉）"
+    );
+
+    // 拉进账套，明确不要首登改密
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss_sid,
+            serde_json::json!({
+                "username": "acc7", "display_name": "会计", "password": "",
+                "role": "accountant", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "拉进账套：{b}");
+
+    // 关键断言：平台层的开关也被关掉了
+    assert!(
+        !state.realm.get_user("acc7").unwrap().unwrap().must_change_pwd,
+        "账套层设了免改密，平台层必须同步 —— 否则登录门禁读到的仍是 true"
+    );
+
+    // 且登录响应里不再要求改密
+    let (st, _sid) = login(&state, "acc7", "Init@123456").await;
+    assert_eq!(st, StatusCode::OK, "acc7 应能直接登录");
+}
+
+/// ⑧ 重复点「结转损益」必须说清是"已经结过了"，而不是"损益发生额为零"。
+///
+/// 实测：第一次结转生成 658,000 的凭证，第二次点，提示是
+///   「导入数据有误：本期没有需要结转的损益类科目（损益发生额均为零）」
+/// 而账上明明有 658,000 的损益额。两处都误导：
+///   · "导入数据有误" 是加在 `From<FinError>` 上的万能前缀，任何引擎错误都会被说成
+///     导入错误（用户根本没在导入）
+///   · "损益发生额均为零" 把「已结转过」说成「本期没做业务」
+#[tokio::test]
+async fn carry_forward_twice_explains_it_was_already_carried() {
+    let (state, _bd, _dir) = test_state();
+    let sid = boss_in_b1(&state).await;
+
+    // 本期发生一笔费用：借 6401 1000 / 贷 1001 1000
+    post_voucher(&state, &sid, 1, serde_json::json!([
+        { "line": 1, "account_code": "6401", "summary": "费用", "debit": "1000", "credit": "0" },
+        { "line": 2, "account_code": "1001", "summary": "付", "debit": "0", "credit": "1000" }
+    ]))
+    .await;
+
+    // 第一次结转：成功，生成 1,000 的结转凭证
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/periods/202601/carry-forward",
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "第一次结转应成功：{b}");
+
+    // 第二次：应被拒（账结法幂等），但提示必须说清原因
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/periods/202601/carry-forward",
+            &sid,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "重复结转应被拒：{b}");
+    assert!(
+        b.contains("已结转过"),
+        "提示必须说明「已结转过」，否则用户以为账做错了：{b}"
+    );
+    assert!(
+        !b.contains("导入数据有误"),
+        "结转不是导入操作，不该带「导入数据有误」前缀：{b}"
+    );
+    assert!(
+        !b.contains("损益发生额均为零"),
+        "本期有 1,000 费用，说「损益发生额均为零」是错的：{b}"
+    );
+}
+
+/// ⑤ 会计必须能读账套参数（否则看不到「本账套开了审核环节」这个事实）。
+///
+/// 实测：会计访问 `/api/options` 返回 403，前端 `state.bookOptions` 一直是 null，
+/// 界面按「未开审核」处理，用户点记账被拒时才知道有审核环节。
+#[tokio::test]
+async fn accountant_can_read_book_options_to_see_audit_flag() {
+    let (state, _bd, _dir) = test_state();
+    let boss_sid = boss_in_b1(&state).await;
+
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss_sid,
+            serde_json::json!({ "username": "acc8", "display_name": "会计", "password": "Init@123456" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "开通平台账号");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss_sid,
+            serde_json::json!({
+                "username": "acc8", "display_name": "会计", "password": "",
+                "role": "accountant", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "拉进账套");
+    let (_st, acc_sid) = login(&state, "acc8", "Init@123456").await;
+    // 登录只到平台层，进账套要再选一次（没选账套时所有账套内端点返回 401「请先选择账套」）
+    let st = select_book(&state, &acc_sid, "b1").await;
+    assert_eq!(st, StatusCode::OK, "acc8 应能进入 b1");
+
+    // 会计应能读到 enable_audit 这个开关
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &acc_sid))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(st, StatusCode::OK, "会计应能读账套参数：{b}");
+    assert!(
+        b.contains("enable_audit"),
+        "响应里必须有 enable_audit，否则界面无从知道要不要先审核：{b}"
+    );
+    let opts: serde_json::Value = serde_json::from_str(&b).unwrap();
+
+    // 但写仍然要 SysOption —— 读放宽不能顺带把写也放开。
+    //
+    // 用**刚读到的完整参数**原样 PUT，而不是随手编一个残缺对象：
+    // axum 的 Json<T> 提取器先于 handler 里的权限检查执行，body 不合法会先拿到
+    // 422，那时测到的是校验不是权限，白测。
+    let mut attempt = opts.clone();
+    attempt["company"] = serde_json::json!("改名试试");
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_put("/api/options", &acc_sid, attempt))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let b = body_string(resp).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "会计不得改账套参数（读放宽≠写放宽）：{b}"
+    );
+    // 顺带确认参数真没被改
+    let resp = handlers::router(state.clone())
+        .oneshot(authed_get("/api/options", &boss_sid))
+        .await
+        .unwrap();
+    let after: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_ne!(
+        after["company"], "改名试试",
+        "被拒的写入不该有任何效果：{after}"
+    );
+}
+
+// ===========================================================================
+// 回归测试：收付款单的「审核」判据
+//
+// 起因是补出纳日常 E2E 时实测撞出来的死路：出纳录单、会计想审，但
+// `Role::Accountant` 按三权分离刻意不带 `VoucherAudit` —— 而
+// `audit_receipt` 的 `Gate::NoFlow` 分支只认 `VoucherAudit`，
+// 于是「只有会计+出纳、没有财务主管」的小微企业**永远把收付款单变不成凭证**。
+//
+// 特别注意：这条判据**与 `enable_audit` 无关**。所以在建账向导里选「不启用审核环节」
+// 也救不了它 —— 向导的承诺在收付款这条路径上是破的。
+//
+// 修法：`require_receipt_gate` = VoucherAudit **或** VoucherPost。
+// ===========================================================================
+
+/// 建一个「出纳 + 会计」都在套里的账套，返回两个 sid 的取用方式。
+/// 账号已存在时复用（`platform` 层一人一机，同一用户名不能登两次）。
+async fn two_person(page: &std::sync::Arc<finweb::state::WebState>, tag: &str) -> (String, String) {
+    let boss = boss_in_b1(page).await;
+    for (u, pw, role) in [
+        (format!("csh_{tag}"), "Cash@2026d", "cashier"),
+        (format!("acc_{tag}"), "Acc@2026dd", "accountant"),
+    ] {
+        let r = handlers::router(page.clone())
+            .oneshot(authed_post(
+                "/api/platform/users",
+                &boss,
+                serde_json::json!({ "username": u, "display_name": u, "password": pw }),
+            ))
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "开通平台账号 {u}");
+        let r = handlers::router(page.clone())
+            .oneshot(authed_post(
+                "/api/users",
+                &boss,
+                serde_json::json!({
+                    "username": u, "display_name": u, "password": "",
+                    "role": role, "must_change_pwd": false
+                }),
+            ))
+            .await
+            .unwrap();
+        let st = r.status();
+        let b = body_string(r).await;
+        assert!(st.is_success(), "把 {u} 拉进账套：{b}");
+    }
+    // 财务主管（唯一有 VoucherAudit 的常规岗位）
+    let r = handlers::router(page.clone())
+        .oneshot(authed_post(
+            "/api/platform/users",
+            &boss,
+            serde_json::json!({ "username": format!("sup_{tag}"), "display_name": "主管", "password": "Sup@2026dd" }),
+        ))
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "开通主管平台账号");
+    let r = handlers::router(page.clone())
+        .oneshot(authed_post(
+            "/api/users",
+            &boss,
+            serde_json::json!({
+                "username": format!("sup_{tag}"), "display_name": "主管", "password": "",
+                "role": "supervisor", "must_change_pwd": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "把主管拉进账套");
+
+    // login 只到平台层，账套内端点还要先选账套（否则一律 401「请先选择账套」）
+    let (_, csh) = login(page, &format!("csh_{tag}"), "Cash@2026d").await;
+    let (_, acc) = login(page, &format!("acc_{tag}"), "Acc@2026dd").await;
+    let (_, sup) = login(page, &format!("sup_{tag}"), "Sup@2026dd").await;
+    for sid in [&csh, &acc, &sup] {
+        assert_eq!(
+            select_book(page, sid, "b1").await,
+            StatusCode::OK,
+            "选账套应成功"
+        );
+    }
+    (csh, format!("{acc}|{sup}"))
+}
+
+#[tokio::test]
+async fn receipt_audit_gates_on_audit_or_post_permission() {
+    let (state, _bd, _dir) = test_state();
+    let (csh, pair) = two_person(&state, "rcptgate").await;
+    let (acc, sup) = pair.split_once('|').unwrap();
+
+    // 出纳录一张收款单（VoucherNew 够用）
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            "/api/funds/receipts",
+            &csh,
+            serde_json::json!({
+                "date": "2026-01-15", "kind": "receipt", "fund_account": "100201",
+                "party": "C01", "amount": "100", "memo": "gate"
+            }),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "出纳应能录收付款单：{b}");
+    let rid: i64 = serde_json::from_str::<serde_json::Value>(&b).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // ① 出纳自己审自己的单 → 必须 403。
+    //    这是这道闸门的核心：放开给 VoucherPost 之后，"谁录谁审"这条路不能也一起放开。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{rid}/audit"),
+            &csh,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "出纳不该能审核自己提的收付款单"
+    );
+
+    // ② 会计（无 VoucherAudit、有 VoucherPost）→ 应当能审。
+    //    修前这里是 403，两人公司就卡死在这一步。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{rid}/audit"),
+            acc,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "会计（VoucherPost）应能审核收付款单：{b}");
+    let vid = serde_json::from_str::<serde_json::Value>(&b).unwrap()["voucher_id"]
+        .as_i64()
+        .expect("审核后应生成凭证");
+    assert!(vid > 0, "审核后应带出凭证 id：{b}");
+
+    // ③ 撤审必须用**同一套**判据 —— 只放开"审"不放开"撤"，
+    //    会出现「会计能审但撤不回来」，那比一开始就没有还糟。
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{rid}/unaudit"),
+            acc,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "会计应能撤销审核（与审核同一判据）：{b}");
+
+    // ④ 主管（有 VoucherAudit）当然也可以 —— 原有的路不能被改坏
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{rid}/audit"),
+            sup,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = body_string(r).await;
+    assert_eq!(st, StatusCode::OK, "主管（VoucherAudit）应仍能审核：{b}");
+
+    // ⑤ 出纳撤审同样 403
+    let r = handlers::router(state.clone())
+        .oneshot(authed_post(
+            &format!("/api/funds/receipts/{rid}/unaudit"),
+            &csh,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "出纳不该能撤审");
+}

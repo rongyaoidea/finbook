@@ -32,7 +32,11 @@ async function purgeOwnBooks(page) {
   }
 }
 
-/// 登录 → 建账（起始期间 2026-01）→ 停在可用界面
+/// 登录 → 建账（起始期间 2026-01）→ 停在可用界面。**返回账套全名**。
+///
+/// 返回值不是多余的：一个 realm 里会攒下多本书（前面测试建的、别的 worker 建的），
+/// `loginAs` 不按名字选就会进错账套 —— 症状是「上一段刚拿到的凭证 id 一访问就 404」，
+/// 排查方向会被带偏到"凭证被删了"。我为此白查了一轮。
 async function newBook(page, company) {
   await page.goto("/");
   await expect(page.locator("#u")).toBeVisible({ timeout: 15_000 });
@@ -52,6 +56,23 @@ async function newBook(page, company) {
   await page.click("#cb-save");
 
   await expect(page.locator('.nav-item[data-view="vouchers"]')).toBeVisible({ timeout: 15_000 });
+
+  // 回读确认这是**出厂默认**的配置，而不是碰巧能用。
+  // 整套 E2E 跑在这个配置上，所以必须显式断言：哪天有人改了默认值，
+  // 这里立刻红，而不是让 70 多条用例集体以别的理由挂掉、把人引向错误方向。
+  const o = await (await page.request.get("/api/options")).json();
+  if (o.require_cashier !== true) {
+    throw new Error(
+      `新建账套的出纳签字应为默认开启，实际 ${o.require_cashier} —— ` +
+        "整套 E2E 跑在出厂默认上，默认值被改了必须先弄清为什么"
+    );
+  }
+  if (o.enable_audit !== true) {
+    throw new Error(
+      `新建账套的审核环节应为默认开启，实际 ${o.enable_audit}`
+    );
+  }
+  return name;
 }
 
 /// 审核并记账该期间全部草稿凭证。
@@ -60,13 +81,19 @@ async function newBook(page, company) {
 /// 取 `status='posted'`），所以凡是要验证核销/报表口径的用例，录完凭证必须记账，
 /// 否则列表会是空的——那是正确行为，不是 bug。
 ///
-/// 【为什么先审核再记账】新建账套的审核环节**默认开**（`BookOptions::enable_audit`，
-/// 制单/审核/记账三权分离，见 fincore::account::BookOptions 文档），草稿直接记账
-/// 会被后端拒（400「该账套启用了审核环节，请先审核凭证再记账」）。
+/// 【为什么是「审核 → 签字 → 记账」三步】新建账套**两道闸门默认都开**：
+/// · `enable_audit`（审核环节）：草稿直接记账被拒（400「该账套启用了审核环节…」）
+/// · `require_cashier`（出纳签字）：**涉及现金/银行科目的**凭证没签字被拒
 ///
-/// 这里刻意走**真实生产流程**（审核 → 记账），而不是在 E2E 里把账套的审核关掉：
-/// 关掉虽然能跑过，但那样 E2E 就测不到「默认要审核」这条新行为了，等于把回归网
-/// 自己剪了。审核环节的默认值本身由 api.rs 的 audit_default_on_new_books 盯住。
+/// 这里刻意走**真实生产流程**，而不是在 E2E 里把两个开关都关掉：关掉虽然能跑过，
+/// 但那样整套 E2E 就跑在一个**出厂不存在的配置**上，等于把回归网自己剪了。
+/// 两个默认值本身由 api.rs 的 `audit_default_on_for_new_books` 盯住，
+/// `newBook` 也会在建完账套后回读确认。
+///
+/// 签字这一步由 admin 代劳：`Role::Admin => Perm::all()` 含 `CashierSign`。
+/// 这**削弱**了出纳签字的控制力（签字人 = 记账人），但对单管理员的测试环境是唯一
+/// 可行解；真正要验「出纳与会计分离」的用例在 `cashier-daily.spec.js`，那里换的是
+/// 真的出纳账号。
 async function postAllDrafts(page, period) {
   const r = await page.request.get(
     `/api/vouchers?period=${encodeURIComponent(period)}&status=draft&limit=200`
@@ -78,7 +105,11 @@ async function postAllDrafts(page, period) {
     // 先审核（默认账套开着审核环节，未审核不能记账）
     const a = await page.request.post(`/api/vouchers/${v.id}/audit`, { data: {} });
     if (!a.ok()) throw new Error(`审核凭证 ${v.id} 失败：${a.status()} ${await a.text()}`);
-    // 再记账
+    // 再出纳签字（默认账套开着出纳签字；涉及现金/银行的凭证没签字不能记账）。
+    // 对不涉及资金科目的凭证这一步是无害的幂等操作，不必先查是不是资金凭证。
+    const s = await page.request.post(`/api/vouchers/${v.id}/sign`, { data: {} });
+    if (!s.ok()) throw new Error(`出纳签字 ${v.id} 失败：${s.status()} ${await s.text()}`);
+    // 最后记账
     const p = await page.request.post(`/api/vouchers/${v.id}/post`, { data: {} });
     if (!p.ok()) throw new Error(`记账凭证 ${v.id} 失败：${p.status()} ${await p.text()}`);
     n++;
@@ -133,4 +164,108 @@ async function auditAllDrafts(page, period) {
   return (list || []).length;
 }
 
-module.exports = { newBook, postVoucher, postAllDrafts, auditAllDrafts };
+/// 把一张草稿凭证推到「已记账」：审核 → 出纳签字 → 记账。
+///
+/// 两道闸门都是**生产默认开**（`enable_audit` / `require_cashier`），所以任何要
+/// 「这张凭证进总账」的用例都得走这三步。签字这一步由 admin 代劳
+/// （`Role::Admin => Perm::all()` 含 `CashierSign`）—— 对单管理员的测试环境这是
+/// 唯一可行解；真正验「出纳与会计分离」的用例在 cashier-daily.spec.js，
+/// 那里换的是真的出纳账号。
+///
+/// 失败时把三步各自的响应体都报出来：单看「记账 400」猜不出是审核还是签字拦的。
+async function auditSignPost(page, id, { sign = true } = {}) {
+  const a = await page.request.post(`/api/vouchers/${id}/audit`, { data: {} });
+  if (!a.ok()) {
+    throw new Error(`审核凭证 ${id} 失败：${a.status()} ${await a.text()}`);
+  }
+  if (sign) {
+    const g = await page.request.post(`/api/vouchers/${id}/sign`, { data: {} });
+    if (!g.ok()) {
+      throw new Error(`出纳签字 ${id} 失败：${g.status()} ${await g.text()}`);
+    }
+  }
+  const p = await page.request.post(`/api/vouchers/${id}/post`, { data: {} });
+  if (!p.ok()) {
+    throw new Error(`记账凭证 ${id} 失败：${p.status()} ${await p.text()}`);
+  }
+  return true;
+}
+
+/// 在当前账套里开一个岗位账号（出纳等），返回登录后的 username。
+///
+/// 为什么需要：E2E 此前**全部用 admin 一个身份**跑，于是权限相关的一切
+/// （侧栏可见性、越权拦截、按角色分区的东西）根本没被测过。2026-09-29 的
+/// 全岗位走查就是靠手工开第二个账号才发现「侧栏『最近』不校验权限」这类问题。
+///
+/// 平台账号必须先开（账套内子账号只是岗位/权限分配，口令沿用平台账号）。
+///
+/// **账号已存在时容忍并复用**：`purgeOwnBooks` 只删账套，不删平台账号。标准跑法
+/// （`e2e\run-local.ps1`）每次都重建 realm 所以看不出来，但对着一个用过的开发
+/// 服务器直接 `npx playwright test` 时，第二次跑就会撞「该用户名已存在」而
+/// 整条用例挂掉 —— 症状是"测试自己搞坏了自己的环境"。
+async function addBookUser(page, { username, password, role, display }) {
+  // 1) 平台层开通（已存在就跳过）
+  const probe = await page.request.get("/api/platform/users");
+  if (probe.ok()) {
+    const body = await probe.json();
+    const users = Array.isArray(body) ? body : body.users || [];
+    if (!users.some((u) => (u.username || u) === username)) {
+      await page.click('.nav-item[data-view="platform-users"]');
+      await page.click("#pu-add");
+      await page.fill("#nc-u", username);
+      await page.fill("#nc-p", password);
+      await page.click("#nc-save");
+      await expect(page.locator("#pu-list")).toContainText(username, { timeout: 15_000 });
+    }
+  }
+
+  // 2) 拉进当前账套，定岗（已在套里就跳过）
+  const res = await page.request.post("/api/users", {
+    data: {
+      username,
+      display_name: display || username,
+      password: "",
+      role,
+      must_change_pwd: false,
+    },
+  });
+  if (!res.ok()) {
+    const t = await res.text();
+    if (!/已存在/.test(t)) {
+      throw new Error(`把 ${username} 拉进账套失败：${res.status()} ${t}`);
+    }
+  }
+  return username;
+}
+
+/// 切换到另一个账号（同一浏览器上下文 —— 这正是验证 localStorage 按账号分区的必要条件）
+///
+/// `book` = 目标账套全名（`newBook` 的返回值）。**必须传**：一个 realm 里会攒下
+/// 多本书，`.book-enter` 取第一个就是进错账套 —— 症状是刚拿到的凭证 id 一访问就 404，
+/// 会被误读成"凭证被删了"。不传就退化成"第一个"，并在这里说明为什么不能这么用。
+async function loginAs(page, username, password, book) {
+  await page.request.post("/api/logout", { data: {} }).catch(() => {});
+  await page.goto("/");
+  await expect(page.locator("#u")).toBeVisible({ timeout: 15_000 });
+  await page.fill("#u", username);
+  await page.fill("#p", password);
+  await page.click('#login-form button[type="submit"]');
+  // 非管理员看不到「新建账套」，用账套列表出现作为「登录完成」的判据
+  await expect(page.locator("#book-list")).toBeVisible({ timeout: 15_000 });
+  const target = book
+    ? page.locator(`.book-enter[data-company="${book}"]`)
+    : page.locator(".book-enter").first();
+  await expect(target, `账套选择页里找不到「${book}」—— 是不是建账时名字不一致？`).toHaveCount(1);
+  await target.click();
+  await expect(page.locator('.nav-item[data-view="vouchers"]')).toBeVisible({ timeout: 15_000 });
+}
+
+module.exports = {
+  newBook,
+  postVoucher,
+  postAllDrafts,
+  auditAllDrafts,
+  auditSignPost,
+  addBookUser,
+  loginAs,
+};

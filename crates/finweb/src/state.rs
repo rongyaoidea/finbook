@@ -450,7 +450,7 @@ pub struct SessionInfo {
     pub username: String,
     /// 管理员标志（决定能否看全部账套）
     pub is_admin: bool,
-    /// 登录时的设备指纹（用于逐请求复核"一人一机"策略）
+    /// 登录时的设备指纹（用于逐请求复核「设备在不在绑定名单内」）
     pub device_id: String,
     pub last_active: i64,
     /// 会话创建时刻：用于绝对寿命上限，touch 不能把它往后推
@@ -567,9 +567,27 @@ impl SessionStore {
     }
 
     /// 清掉某个用户的全部会话（重置设备绑定 / 删除 / 停用账号时调用），
-    /// 否则旧设备上的会话还能继续用到自然过期，"一人一机"会被绕过。
+    /// 否则旧设备上的会话还能继续用到自然过期，设备绑定会被绕过。
     pub fn remove_by_username(&self, username: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, i| i.username != username);
+    }
+
+    /// 只清掉「某账号在**某台设备**上」的会话。
+    ///
+    /// 登录时用：同一台设备重复登录要顶掉它自己上一个会话（否则旧 token 一直有效，
+    /// 泄露后失效不了），但**别的设备的会话必须留着** —— 一个账号允许绑
+    /// `MAX_DEVICES_PER_USER` 台，这些会话要能并存，否则"允许绑两台"就只是个数字：
+    /// 第 2 台一登录就把第 1 台踢下线，用户体感仍然是只能登一台。
+    ///
+    /// 与 `remove_by_username`（全清）、`remove_others`（改密后清别人那几台）是三种
+    /// 不同语义，别混用：
+    /// · 登录 → 本设备（这里）
+    /// · 改密 → 别人的设备（remove_others）
+    /// · 重置设备 / 停用 / 删号 → 全部（remove_by_username）
+    pub fn remove_by_username_and_device(&self, username: &str, device_id: &str) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, i| {
+            !(i.username == username && i.device_id == device_id)
+        });
     }
 
     /// 吊销某个用户名下除当前会话外的全部会话（改密后调用：当前设备是本人，
@@ -633,10 +651,15 @@ impl FromRequestParts<Arc<WebState>> for RealmUser {
             state.sessions.remove(&token);
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
         }
-        // "一人一机"逐请求复核。CurrentUser 提取器里本来就有这段，但平台级接口
+        // 设备绑定逐请求复核。CurrentUser 提取器里本来就有这段，但平台级接口
         // （建账套、选账套、改密）只走本提取器；缺了它，被管理员重置过设备的旧
         // 浏览器仍能拿着旧会话在账套之外建套、改密。
-        if !ru.is_admin && !ru.device_id.is_empty() && ru.device_id != info.device_id {
+        // 逐请求复核「当前设备在不在该账号的绑定名单内」。
+        //
+        // 判定读 `realm_user_device` 表，不读 `realm_user.device_id` 那一列 —— 那是
+        // 「第一台」的快照（只为了账号列表显示同步），用它判就退回了一台机，而且这两处
+        // 各写一份必然分叉。名单为空 = 还没绑过，放行（登录时会去登记）。
+        if !ru.is_admin && !state.realm.device_allowed(&info.username, &info.device_id)? {
             state.sessions.remove(&token);
             return Err(AppError::unauthorized(
                 "该账号已在其他设备登录，本设备会话已被下线",
@@ -757,11 +780,16 @@ impl FromRequestParts<Arc<WebState>> for CurrentUser {
             state.sessions.remove(&token);
             return Err(AppError::forbidden("账号已被停用，请联系管理员"));
         }
-        // "一人一机"逐请求复核（平台层 Web 设备绑定，与桌面端账套内 device_id 相互独立）：
-        // 管理员豁免；普通账号一旦在平台层绑定了新设备，旧设备会话立即失效。
+        // 设备绑定逐请求复核（平台层 Web 设备绑定，与桌面端账套内 device_id 相互独立）：
+        // 管理员豁免；普通账号的设备必须在该账号的绑定名单内（上限
+        // `RealmDb::MAX_DEVICES_PER_USER` = 2 台）。
         // 不能拿账套内 user.device_id 与浏览器指纹比较——那是桌面端绑定的机器指纹，
         // 会令「桌面端登录过 → Web 端同账号所有请求 403」的双端互斥。
-        if !ru.is_admin && !ru.device_id.is_empty() && ru.device_id != info.device_id {
+        //
+        // 判定读 `realm_user_device` 表，不读 `realm_user.device_id` 那一列 —— 那是
+        // 「第一台」的快照（只为了账号列表显示同步），用它判就退回了一台机，而且这两处
+        // 各写一份必然分叉。名单为空 = 还没绑过，放行（登录时会去登记）。
+        if !ru.is_admin && !state.realm.device_allowed(&info.username, &info.device_id)? {
             state.sessions.remove(&token);
             return Err(AppError::unauthorized(
                 "该账号已在其他设备登录，本设备会话已被下线",
@@ -818,7 +846,14 @@ impl From<DbError> for AppError {
 
 impl From<fincore::FinError> for AppError {
     fn from(e: fincore::FinError) -> Self {
-        AppError::BadRequest(format!("导入数据有误：{e}"))
+        // 原来给**所有**引擎错误都加了「导入数据有误：」前缀。这是错的：这个 From
+        // 是全局转换，任何一处 `?` 掉一个 FinError 都会经过它 —— 结转损益、凭证
+        // 记账、结账校验全都算。实测重复点「结转损益」，用户看到的是
+        //   ⚠ 导入数据有误：本期没有需要结转的损益类科目（损益发生额均为零）
+        // 而他根本没有在导入数据，也确实有 658,000 的损益额（第一次已结转）。
+        // 引擎层的信息本来就是写给人看的（「科目表缺少「本年利润」科目…」），
+        // 这里原样透传；确需标注来源的，由具体调用点自己拼。
+        AppError::BadRequest(e.to_string())
     }
 }
 

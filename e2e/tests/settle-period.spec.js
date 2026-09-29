@@ -53,6 +53,13 @@ test("期末处理：结转损益→记账→结账，期间状态推进", async
   await page.click("#v-audit");
   await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
   await page.locator("#v-table tbody [data-edit]").first().click();
+  // 出纳签字（默认开）：这一步也是记账的前置。
+  await expect(page.locator("#v-sign")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-sign");
+  // 签字也会关闭弹窗（closeModal），所以要再打开一次才点得到「记账」。
+  await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 5_000 }).catch(() => {});
+  await page.locator("#v-table tbody [data-edit]").first().click();
+
   await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 10_000 });

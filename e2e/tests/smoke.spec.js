@@ -48,6 +48,14 @@ test("会计月度闭环：建账→录凭证→记账→结账→报表", async
   await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
 
   await page.locator("#v-table tbody [data-edit]").first().click();
+  // 出纳签字（默认开）：涉及现金/银行科目的凭证记账前要点一下。
+  // 不点的话「记账」会被后端拒，症状是**弹窗不关**（错误 toast 留在里面）。
+  await expect(page.locator("#v-sign")).toBeVisible({ timeout: 10_000 });
+  await page.click("#v-sign");
+  // 签字也会关闭弹窗（closeModal），所以要再打开一次才点得到「记账」。
+  await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 5_000 }).catch(() => {});
+  await page.locator("#v-table tbody [data-edit]").first().click();
+
   await expect(page.locator("#v-post")).toBeVisible({ timeout: 10_000 });
   await page.click("#v-post");
   await expect(page.locator(".modal-mask")).toHaveCount(0, { timeout: 10_000 });

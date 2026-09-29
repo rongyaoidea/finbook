@@ -162,9 +162,381 @@ if (fs.existsSync(appFile)) {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// 三条前端行为检查（2026-09-29 全岗位流程走查发现的 ①②⑥）
+//
+// 这三条的共同形态：**代码看起来完全正常，界面上也不报错，只有走一遍流程才发现
+// 结果是错的**。所以不能靠"改的时候记得"，得让机器盯着。
+//
+// 判据一律取**函数体**（顶格 function 到下一个顶格 `}`），不在全文件里 grep：
+// 一个会误报的检查等于没有检查 —— 人会开始无视它，真 bug 就一起漏了。
+// ---------------------------------------------------------------------------
+const appSrc = fs.existsSync(appFile) ? fs.readFileSync(appFile, "utf8") : "";
+const appLines = appSrc.split(/\r?\n/);
+
+/** 取某个顶层函数的完整函数体；找不到返回 "" */
+function fnBody(name) {
+  let start = -1;
+  for (let i = 0; i < appLines.length; i++) {
+    if (new RegExp("^(?:async\\s+)?function\\s+" + name + "\\s*\\(").test(appLines[i])) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return "";
+  for (let i = start + 1; i < appLines.length; i++) {
+    if (/^\}/.test(appLines[i])) return appLines.slice(start, i + 1).join("\n");
+  }
+  return "";
+}
+
+/**
+ * 剥掉行注释再比对。
+ *
+ * 为什么必须剥：这几条检查要判「代码里有没有做某个判断」，而函数体里的注释
+ * 恰恰会把关键词原样念一遍（例：autoEmptyRows 的注释里有「没有权限」「403」）。
+ * 不剥注释的话，把守卫整行删掉，检查照样通过 —— 我第一版就栽在这：
+ * 变异测试报「FAIL 放过了 ⑥ 去掉 autoEmptyRows 的权限提前 return」。
+ * 靠注释过关的检查比没有检查更糟，它给人虚假的安全感。
+ */
+const stripComments = (src) => src.replace(/\/\/[^\n]*/g, "");
+
+const rule = (title) => {
+  console.log(
+    "FAIL " + title + "\n" +
+      "    （对应 2026-09-29 走查发现：缺陷只在走流程时暴露，语法检查与后端测试都抓不到）"
+  );
+};
+
+// --- ① 侧栏「收藏 / 最近」必须按当前角色可见性过滤 + 按账号分区 -----------------
+//
+// 实测：出纳在「最近」里看到并点进了「期初建账 / 固定资产 / 期末处理」——这三个
+// 都要求他没有的权限（opening / account_edit / period_close），点进去只得到
+// 「权限不足」。主导航一直是正确过滤的，只有 localStorage 这条路径漏了。
+//
+// 附带修的隐私问题：两个 key 原来所有账号共用，同一台电脑上会计访问过的模块，
+// 出纳登录后一眼看到 —— 既是入口泄漏也是隐私泄漏。
+if (appSrc) {
+  for (const fn of ["getFavs", "getRecent"]) {
+    const body = stripComments(fnBody(fn));
+    if (!body) {
+      bad++;
+      rule(`${fn}() 不见了 —— 侧栏「收藏/最近」的权限过滤是它的职责，改名或删除请同步改本检查`);
+    } else if (!/isNavVisible\s*\(/.test(body)) {
+      bad++;
+      rule(
+        `${fn}() 没有调 isNavVisible() —— 收藏/最近会列出当前角色看不到的页面，` +
+          `\n    出纳能点进会计专属页并撞上「权限不足」。修法：在 filter 里加 isNavVisible(NAV_INDEX[id])。`
+      );
+    }
+  }
+  // 账号分区：要判的是 acctKey **函数体**真的在拼用户名，不是「文件里出现过 acctKey
+  // 这个词」（第一版就是这么写的，把 acctKey 改成 return base 照样通过）
+  const ak = stripComments(fnBody("acctKey"));
+  if (!ak) {
+    bad++;
+    rule("acctKey() 不见了 —— 收藏/最近必须按登录账号分区");
+  } else if (!/session\.user/.test(ak) || !/base\s*\+\s*"/.test(ak)) {
+    bad++;
+    rule(
+      `acctKey() 里没有把当前登录用户名拼进 key —— localStorage 的 nav_fav / nav_recent ` +
+        `\n    会变成所有账号共用，同一台电脑上同事访问过哪些模块一眼可见。修法：return base + "@" + <username>;`
+    );
+  }
+}
+
+// --- ② 期初的试算平衡必须随输入实时重算 ---------------------------------------
+//
+// 实测：填入 154 万真实数据，卡片仍显示 0.00 / ✓平衡；故意造成 165,999 的
+// 不平衡，也照样显示「✓ 平衡」。根因：合计只在 render() 里算，而 render() 只在
+// 「添加/移除科目行」时触发，oninput 只写 draft 不重绘。
+//
+// 判据：三个金额输入框的 oninput 都必须调 paintTotals()。刻意不检查 render()
+// 本身 —— 走 render() 会重建 <input>，正在输入的框失焦、光标跳到开头。
+if (appSrc) {
+  const body = stripComments(fnBody("renderBegin"));
+  if (!body) {
+    bad++;
+    rule("renderBegin() 不见了 —— 期初试算平衡的重算入口是它，本检查需要跟着改");
+  } else {
+    // ④ 已保存的行也必须能删。
+    //
+    // 原先那一格是 `${r.id > 0 ? "已有" : 移除按钮}` —— **已经保存过的行压根没有
+    // 移除按钮**，编码框还是 readonly。也就是会计录错一个科目之后，界面上既删不掉
+    // 也改不了，只能去数据库里手改。后端补的 delete_ids 因此是死代码。
+    // 判据：data-rm 按钮不能是某个三元式的 **false 分支**（`… : \`<button … data-rm`）。
+    //
+    // 不要写成「那一格里不能出现 id > 0」—— 合法写法就是把「已有」标记和按钮放在
+    // 同一格里（`${r.id > 0 ? '<span>已有</span>' : ''}<button … data-rm>`），
+    // 那种写法会被误判（我第一版就误判了，检查在正确代码上报红）。
+    // 真正要禁的只有"按钮被 : 包住"，而 false 分支必然以字符串字面量开头，
+    // 所以 `: \`<button` 这个形状是唯一需要禁的。
+    const rmCell = (() => {
+      const rmAt = body.indexOf('data-rm="${i}"');
+      if (rmAt < 0) return null;
+      const s = body.lastIndexOf("<td", rmAt);
+      const e = body.indexOf("</td>", rmAt);
+      return { found: true, text: body.slice(s < 0 ? 0 : s, e < 0 ? rmAt + 200 : e) };
+    })();
+    if (!rmCell) {
+      bad++;
+      rule(
+        `renderBegin() 里找不到渲染 data-rm 的按钮 —— 已保存的行可能又变回"不可移除"了\n` +
+          `    （原来就是 r.id > 0 ? "已有" : 移除按钮，会计录错科目后界面上删不掉也改不了）。\n` +
+          `    修法：移除按钮无条件渲染，"已有"只作为附加标记。`
+      );
+    } else if (/:\s*[`'"]\s*<button[^>]*data-rm/.test(rmCell.text)) {
+      bad++;
+      rule(
+        `data-rm 按钮被写成了三元式的 false 分支 —— 已保存的行将没有移除按钮，后端补的\n` +
+          `    delete_ids 永远走不到。修法：按钮无条件渲染，"已有"另起一个标记。`
+      );
+    }
+    // 改编码的已有行必须删旧行，否则 upsert 会在新编码下再插一条、旧编码那条留着。
+    // 两处都要在：写入侧（orig_code: … 初始化）与读取侧（r.orig_code 比较）。
+    // 只查 "orig_code" 这个词会被读取侧的 r.orig_code 骗过 —— 变异测试报过
+    // 「FAIL 放过了 ④ 不再记录 orig_code」。
+    // 注意必须锚到 `orig_code: r.account_code`：只查 "orig_code:" 会被
+    // 「添加空行」时 push 的 `orig_code: ""` 骗过（变异测试报过「放过了」）。
+    if (!/orig_code\s*:\s*r\.account_code/.test(body)) {
+      bad++;
+      rule(
+        `renderBegin() 读回期初行时没有记录 orig_code —— 会计把已保存行的科目编码改掉后，\n` +
+          `    upsert 会按新编码插一条、旧编码那条留在库里，同一个科目出现两笔期初。\n` +
+          `    修法：初始化时加 orig_code: r.account_code。`
+      );
+    }
+    if (!/r\.orig_code/.test(body)) {
+      bad++;
+      rule(
+        `保存时没有比较 r.orig_code —— 改了编码的已有行不会被删旧行，新旧两条并存。\n` +
+          `    修法：if (r.id > 0 && (r.orig_code || "") !== code) deleteIds.push(r.id);`
+      );
+    }
+    for (const cls of ["bg-yb", "bg-ad", "bg-ac"]) {
+      // 抓 `... $all(".bg-yb", main).forEach((inp) => inp.oninput = ...)` 这一行
+      const handlers = body
+        .split("\n")
+        .filter((l) => l.includes(cls) && /\.oninput\s*=/.test(l));
+      if (handlers.length === 0) {
+        bad++;
+        rule(
+          `renderBegin() 里找不到 .${cls} 的 oninput —— 年初/累计金额输了不重算试算平衡，` +
+            `\n    会计会照着一个恒显示「✓平衡」的假守卫录完整个期初。`
+        );
+      } else if (!handlers.some((h) => /paintTotals\s*\(\s*\)/.test(h))) {
+        bad++;
+        rule(
+          `.${cls} 的 oninput 没有调 paintTotals() —— 输入金额时试算平衡不刷新，` +
+            `\n    界面继续显示上一次的数字（实测填 154 万仍显示 0.00 / ✓平衡）。`
+        );
+      }
+    }
+  }
+}
+
+// --- ⑥ 「加载中…」不能被渲染成「加载失败 + 重试」 ------------------------------
+//
+// 实测：出纳打开「固定资产」，同时看到「没有「科目维护」权限」和
+// 「⚠ 加载失败 / 数据没能取回来，可能是网络问题或会话过期 / 重试」，而重试
+// 永远不会成功（是无权限，不是网络问题）。用户会去排查不存在的网络故障。
+//
+// 根因有两条，缺一不可，所以两条都钉：
+//   1. `EMPTY_PLACEHOLDERS` 里**不能**含「加载中」。它是待定状态，不是空、不是失败。
+//   2. `render()` 判空态前必须**等视图的 Promise settle**。多数视图先填
+//      「加载中…」再 await api()，不等就是在请求还在飞时判它失败。
+//
+// 第一版我把判据写成「autoEmptyRows 里有匹配权限文案的提前 return」——那是猜的
+// 机制，真实机制是竞态，猜错的方向检查就永远通过（变异测试当时也没能揭穿它，
+// 因为我把注释里的「权限」二字算成了守卫）。教训记在这里：判据要钉**机制**，
+// 不要钉**表象**。
+if (appSrc) {
+  const stripAll = (s) => s.replace(/\/\/[^\n]*/g, "");
+  const constRe = (name) => {
+    const m = new RegExp("const\\s+" + name + "\\s*=\\s*([^;]+);").exec(stripAll(appSrc));
+    return m ? m[1] : "";
+  };
+  const emptyRe = constRe("EMPTY_PLACEHOLDERS");
+  if (!emptyRe) {
+    bad++;
+    rule("找不到 EMPTY_PLACEHOLDERS —— 空态占位词表改名或删除了，本检查需要跟着改");
+  } else if (/加载/.test(emptyRe)) {
+    bad++;
+    rule(
+      `EMPTY_PLACEHOLDERS 又把「加载中」算成空态了 —— 会渲染出「⚠ 加载失败 + 重试」，` +
+        `\n    而那一刻请求还在飞、什么都没失败；加载真失败时这个假错误态还会永久留着。\n` +
+        `    修法：「加载中」归 LOADING_PLACEHOLDERS，autoEmptyRows 里遇到它直接 return。`
+    );
+  }
+  const loadRe = constRe("LOADING_PLACEHOLDERS");
+  if (!loadRe || !/加载/.test(loadRe)) {
+    bad++;
+    rule(
+      `缺少 LOADING_PLACEHOLDERS（或它不含「加载中」）—— 「待定」必须有自己的一类，` +
+        `\n    混进 EMPTY_PLACEHOLDERS 就是把待定当失败。`
+    );
+  }
+  const body = stripComments(fnBody("autoEmptyRows"));
+  if (!body) {
+    bad++;
+    rule("autoEmptyRows() 不见了 —— 占位词分类的判定在它里面");
+  } else if (!/LOADING_PLACEHOLDERS\.test\(txt\)\s*\)\s*return;/.test(body)) {
+    bad++;
+    rule(
+      `autoEmptyRows() 遇到「加载中」没有直接 return —— 待定状态仍会被改写成空态` +
+        `\n    （空态或"加载失败 + 重试"）。修法：if (LOADING_PLACEHOLDERS.test(txt)) return;`
+    );
+  }
+  // renderMain() 里判空态必须等 Promise settle
+  const renderBody = stripComments(fnBody("renderMain"));
+  if (!renderBody) {
+    bad++;
+    rule("renderMain() 不见了 —— 空态判定的时机在它里面");
+  } else if (!/Promise\.resolve\(r\)\s*\.\s*then\([\s\S]{0,400}autoEmptyRows\(\)/.test(renderBody)) {
+    bad++;
+    rule(
+      `renderMain() 没有等视图的 Promise settle 就判空态 —— fn(main) 返回的 Promise 在第一个\n` +
+        `    await 上还没 resolve，此时 <tbody> 里全是「加载中…」，被判成"加载失败"渲染出\n` +
+        `    「⚠ 加载失败 + 重试」。修法：把 autoEmptyRows() 放进 Promise.resolve(r).then(...) 里。`
+    );
+  }
+}
+
 console.log(
   bad === 0
     ? `OK: ${targets.length} 个 JS 文件语法通过 + ${idTargets.length} 个文件无重复 id + nginx sub_filter 锚点在位`
     : `FAIL: ${bad} 个问题`
 );
+// --- ⑰ 建账向导必须两道闸门都问、都写进账套参数、提示语都覆盖 ----------------
+//
+// 实测：require_cashier 的出厂默认从 false 改成 true 之后，向导只问审核、不问出纳。
+// 于是「一个人记账」的小微企业建完账套才发现：现金/银行存款的凭证永远卡在
+// 「需出纳签字」，而他根本没有出纳可签 —— **向导里没有任何一个字提到出纳**，
+// 也没有任何报错，只是第一次录现金凭证时被拒。
+//
+// 判据取 showSetupWizard 的函数体：app.js 别处也有 enable_audit（凭证弹窗的
+// 「记账」按钮、账套参数页的 checkbox），全文件 grep 会把「向导没问」判成「问过」。
+if (appSrc) {
+  const wiz = fnBody("showSetupWizard");
+  if (!wiz) {
+    bad++;
+    rule("showSetupWizard() 不见了 —— 建账向导改名时本检查要跟着改");
+  } else {
+    // 判据分三层，缺一层就会被一种绕过方式骗过去：
+    //   ① 函数体里出现字段名            —— 挡住「整个问题删掉」
+    //   ② 出现 `id="set-xxx-on"` 输入元素 —— 挡住「字段名还在但没有那个控件」
+    //   ③ 出现 `$("#set-xxx-on")` 读取    —— 挡住「控件在但值写死成 true」
+    // 第 ② 层不能用 `set-cash-on` 这个词代替：读取那行
+    // `const require_cashier = ($("#set-cash-on") && …)` 里也有同一个词，
+    // 我第一版就这么写，结果把单选删掉检查照样通过。
+    // 第 ③ 层也不能省：只判 ①② 的话，把值改成 `const require_cashier = true`
+    // 依然全绿 —— 而那正是「向导不问用户」的实现方式。
+    for (const g of [
+      { f: "require_cashier", id: "set-cash-on", why: "建账向导必须问「有没有出纳」" },
+      { f: "enable_audit", id: "set-audit-on", why: "建账向导必须问「有没有独立审核人」" },
+    ]) {
+      const hasField = new RegExp("\\b" + g.f + "\\b").test(wiz);
+      if (!hasField) {
+        bad++;
+        rule(
+          `${g.why}：showSetupWizard() 里没有出现 ${g.f}。` +
+            `\n    出处：require_cashier 出厂默认改成 true 之后，向导只问审核不问出纳，` +
+            `\n    「一个人记账」的小微企业建完账套才发现现金凭证永远记不了账，` +
+            `\n    而向导里没有半个字提到出纳。修法：加一对 set-cash 单选并写进账套参数。`
+        );
+        continue;
+      }
+      if (!wiz.includes(`id="${g.id}"`)) {
+        bad++;
+        rule(
+          `showSetupWizard() 读了 ${g.f}，但没有 \`id="${g.id}"\` 这个输入控件` +
+            `\n    （只找 ${g.id} 这个词是不够的：读取它的那行里也有同一个词）`
+        );
+        continue;
+      }
+      if (!wiz.includes(`$("#${g.id}")`)) {
+        bad++;
+        rule(
+          `showSetupWizard() 里没有读取 \`$("#${g.id}")\` —— ${g.f} 的值多半是写死的。` +
+            `\n    控件摆在那里但值恒为 true/false，用户的选择不起作用，等于没问。`
+        );
+      }
+    }
+    // 提示语：判据落在「构成提示的那几行」上，而不是「附近 600 字里出现过」。
+    // 后者被注释一长就失效 —— 我第一版就是这么写的，删掉出纳那句它照样通过。
+    const pushes = wiz.split(/\n/).filter((l) => /notes\.push\(|notes\s*=\s*\[/.test(l));
+    const says = pushes.join("\n");
+    if (!/enable_audit/.test(says) || !/require_cashier/.test(says)) {
+      bad++;
+      rule(
+        `建账成功的提示语没同时说出两道闸门的实际状态` +
+          `\n    判据看的是构成提示的那几行（notes.push / notes = [），` +
+          `\n    不是「附近若干字里出现过」—— 后者被注释一长就失效。` +
+          `\n    原来只说审核：用户以为万事大吉，第一次录现金凭证就被出纳签字拦下，说不出为什么`
+      );
+    }
+    // 正向输出：**没有这行我无法区分「检查通过」和「检查根本没执行」**。
+    // 一检查默默没跑，报的还是「OK」，那比没有检查更危险。
+    console.log("建账向导：审核与出纳签字两问都在，值都写进账套参数，提示语都覆盖");
+  }
+}
+
+// --- ⑱ 弹窗文案不许出现 markdown 强调号 ------------------------------------
+//
+// `confirmDialog` 用 `esc(message)` 渲染 —— 那是 **HTML 转义**，不是 markdown。
+// 所以文案里写了 `**全部**`，用户看到的就是字面的 `**全部**`（带星号）。
+// toast 的文案同样按纯文本显示。
+//
+// 这类错语法检查、变异测试、集成测试全都抓不到，只能靠机器扫 ——
+// 我写「设备上限变 2 台」的文案时就犯了这个，写完顺手 grep 才发现。
+if (appSrc) {
+  const dlgHits = [];
+  appLines.forEach((l, i) => {
+    if (!/confirmDialog\(|toast\(/.test(l)) return;
+    if (/\*\*/.test(l)) dlgHits.push(i + 1);
+  });
+  if (dlgHits.length) {
+    bad++;
+    for (const h of dlgHits) {
+      console.log(`FAIL app.js:${h} 的 confirmDialog/toast 文案里有 markdown 强调号 **`);
+    }
+    console.log(
+      "    confirmDialog 走 esc(message)，那是 HTML 转义不是 markdown；" +
+        "toast 文案同样按纯文本显示。修法：强调用「」书名号，" +
+        "或把 <b> 写进 innerHTML 而不是文案里。"
+    );
+  } else {
+    console.log("弹窗文案：confirmDialog/toast 里没有 markdown 强调号（按纯文本渲染）");
+  }
+}
+
+// --- ⑲ 已签字的凭证不该再显示「出纳签字」按钮 -------------------------------
+//
+// 出纳签字从「默认关」变成「默认开」之后，这个按钮对**所有**用户常驻出现。
+// 已签字时同时摆着「出纳签字」和「取消签字」两个按钮：
+// 点前者是幂等空操作（保留首位签字人），但用户看不出哪个才是该点的。
+// 正确形态是二选一：没签字给「出纳签字」，签过了给「取消签字」。
+//
+// 判据钉在按钮的**显示条件**上（`!v.cashier`），不是「有没有这个按钮」。
+if (appSrc) {
+  const vw = fnBody("openVoucherEditor");
+  if (!vw) {
+    bad++;
+    rule("openVoucherEditor() 不见了 —— 凭证弹窗改名时本检查要跟着改");
+  } else {
+    const signLine = vw.split("\n").find((l) => l.includes('id="v-sign"')) || "";
+    if (signLine && !/!v\.cashier/.test(signLine)) {
+      bad++;
+      rule(
+        `凭证弹窗的「出纳签字」按钮没按「!v.cashier」隐藏` +
+          `\n    已签字时它和「取消签字」并排出现：点前者是幂等空操作，` +
+          `\n    但用户看不出该点哪个。修法：显示条件加上 && !v.cashier。`
+      );
+    } else {
+      console.log("凭证弹窗：已签字时只给「取消签字」，不再并排摆「出纳签字」");
+    }
+  }
+}
+
 process.exit(bad === 0 ? 0 : 1);

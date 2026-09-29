@@ -29,11 +29,13 @@ fn d(y: i32, mo: u32, day: u32) -> NaiveDate {
 }
 
 fn db() -> Db {
+    // 显式关两道闸门：理由见 core_loop.rs 的同名注释，以及 check-ci.js 的夹具检查。
     let opts = BookOptions {
         start_period: Period::new(2026, 1).unwrap(),
         // 集成测试在 crate 外，拿不到 findb::tests::test_opts()（pub(crate)）。
         // 审核默认「开」由 findb 内的 audit_default_blocks_direct_post 盯住。
         enable_audit: false,
+        require_cashier: false,
         ..BookOptions::default()
     };
     Db::in_memory(&opts).unwrap()

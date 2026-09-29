@@ -1,5 +1,5 @@
 const { test, expect } = require("@playwright/test");
-const { newBook, postVoucher } = require("../helpers");
+const { newBook, postVoucher, auditSignPost } = require("../helpers");
 
 test("固定资产：建卡→计提折旧→台账出数", async ({ page }) => {
   await newBook(page, `E2E固资${Date.now()}`);
@@ -31,8 +31,7 @@ test("银行对账：导入对账单→自动勾对→余额调节表一致", as
   // H-3：余额与报表只统计已记账，先记账再对账
   const list = await (await page.request.get("/api/vouchers?period=202601")).json();
   // 默认账套开着审核环节：先审核再记账
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/audit`, { data: {} })).status()).toBe(200);
-  expect((await page.request.post(`/api/vouchers/${list[0].id}/post`, { data: {} })).status()).toBe(200);
+  await auditSignPost(page, list[0].id);
 
   await page.click('.nav-item[data-view="bank"]');
   await page.fill("#bk-acct", "100201");
@@ -71,8 +70,13 @@ test("审核环节：启用后未审核不能记账，审核后可记账", async
   await page.click("#v-audit");
   await expect(page.locator("#v-table tbody")).toContainText("已审核", { timeout: 10_000 });
 
+  // 审核过了还要过出纳签字那道闸（生产默认开）。这条凭证借记 1001 库存现金，
+  // 会被出纳闸门命中。
+  resp = await page.request.post(`/api/vouchers/${id}/sign`);
+  expect(resp.ok(), `出纳签字应成功：${await resp.text()}`).toBeTruthy();
+
   resp = await page.request.post(`/api/vouchers/${id}/post`);
-  expect(resp.status(), "审核后记账应成功").toBe(200);
+  expect(resp.status(), "审核 + 签字后记账应成功").toBe(200);
 
   await page.click('.nav-item[data-view="vouchers"]');
   await expect(page.locator("#v-table tbody")).toContainText("已记账", { timeout: 10_000 });

@@ -214,7 +214,9 @@ a:hover { color: var(--primary-d); }
 .app {
   display: grid;
   grid-template-columns: 200px 1fr;
-  grid-template-rows: 50px 1fr;
+  /* 三行：顶栏 / 页签栏 / 内容。加页签行是为了让「已打开的页面」始终可见 ——
+     改造前只有侧栏一个入口，跳到别的页面后想回去必须滚回侧栏顶部去找。 */
+  grid-template-rows: 50px 36px 1fr;
   height: 100vh;
   overflow: hidden;
 }
@@ -309,6 +311,10 @@ tr.kb-sel { outline: 2px solid var(--primary); outline-offset: -2px; background:
 
 /* Sidebar：深色 + 微妙纹理 */
 .sidebar {
+  /* 显式定位到第 1 列、跨 2~3 行（原来靠自动摆放，加了页签行后必须钉死，
+     否则侧栏只占页签行那一格、下方留白） */
+  grid-column: 1;
+  grid-row: 2 / 4;
   background: var(--sidebar-bg);
   color: var(--sidebar-fg);
   padding: 12px 0 8px;
@@ -347,6 +353,8 @@ tr.kb-sel { outline: 2px solid var(--primary); outline-offset: -2px; background:
 
 /* Main：高滚动容器的圆角裁切 */
 .main {
+  grid-column: 2;
+  grid-row: 3;
   overflow-y: auto;
   padding: 18px 20px 28px;
   background: var(--bg);
@@ -614,10 +622,13 @@ table.grid { min-width: 100%; }
     z-index: 50;
   }
   .main { padding: 14px 14px 24px; }
+  /* 侧栏在此断点变成 position:fixed，不再占网格；但页签栏仍要落在唯一那一列，
+     否则 `grid-column: 2` 会凭空撑出一个隐式第二列，把主区挤窄。 */
+  .tab-bar { grid-column: 1; }
 }
 /* 手机（≤600px）：topbar 换行、卡片单列、工具栏纵向 */
 @media (max-width: 600px) {
-  .app { grid-template-rows: auto 1fr; }
+  .app { grid-template-rows: auto 36px 1fr; }
   .topbar { flex-wrap: wrap; gap: 8px; padding: 8px 12px; min-height: 50px; }
   .topbar .who { display: none; }
   .cards { grid-template-columns: 1fr; }
@@ -710,6 +721,54 @@ table.grid { min-width: 100%; }
 svg.chart { width: 100%; height: 100%; display: block; }
 .ctick { font-size: 10.5px; fill: var(--muted); }
 .chart-note { margin-top: 8px; font-size: 12px; color: var(--subtle); }
+
+/* ── 图表点击放大 ────────────────────────────────────────────
+   改造前走势图只有 190px 高，塞在仪表盘的网格单元里，十几期的走势基本看不出拐点，
+   而放大只能靠「去看那个有完整图表的报表页」。现在图本身可点，直接放大。 */
+.chart-box[data-chart] {
+  position: relative;
+  cursor: zoom-in;
+  border-radius: var(--r-sm);
+  transition: background var(--dur-fast), box-shadow var(--dur-fast);
+}
+.chart-box[data-chart]:hover {
+  background: var(--primary-t);
+  box-shadow: inset 0 0 0 1px var(--panel-border-strong);
+}
+.chart-box[data-chart]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* 角标：默认低调，悬停才显形，避免平时干扰阅读 */
+.chart-zoom {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border-strong);
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity var(--dur-fast);
+  pointer-events: none;
+}
+.chart-box[data-chart]:hover .chart-zoom,
+.chart-box[data-chart]:focus-visible .chart-zoom { opacity: 1; }
+/* 放大视图里的图：保持原始宽高比，不被容器拉伸变形 */
+.chart-big { width: 100%; }
+svg.chart-big { width: 100%; height: auto; display: block; }
+.chart-big-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.chart-big-meta .lg { gap: 16px; }
 
 .warn-panel { border-color: rgba(180, 83, 9, .2); }
 .anom { font-size: 13px; color: var(--warn); padding: 3px 0; }
@@ -1003,6 +1062,9 @@ td.cell-editing input {
 
 /* ── 多页签 ──────────────────────────────────────────────── */
 .tab-bar {
+  /* 网格定位：第 2 列、第 2 行（内容区顶部，固定可见，不随内容滚动） */
+  grid-column: 2;
+  grid-row: 2;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -1011,8 +1073,10 @@ td.cell-editing input {
   border-bottom: 1px solid var(--panel-border);
   overflow-x: auto;
   scrollbar-width: none;
+  /* 只有页签栏本身滚动时，把滚动条藏起来但保留键盘可达性 */
 }
 .tab-bar::-webkit-scrollbar { display: none; }
+.tab-bar:empty { display: none; }
 .tab-item {
   display: inline-flex;
   align-items: center;

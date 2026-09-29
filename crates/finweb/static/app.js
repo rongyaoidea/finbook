@@ -602,42 +602,86 @@ document.addEventListener("contextmenu", (e) => {
 });
 
 // ---------- 多页签 ----------
+//
+// 这段代码早就写好了，但从来没有被调用过（死代码），所以「跳到别的页面后原来的
+// 消失、想回去得滚回侧栏顶部」一直是现状。现在接线，并且**所有切换都走
+// goView()** —— 直接改 state.view 再 renderMain 会绕过 hash 同步、筛选状态
+// 保存/还原、最近访问记录，等于把上一轮做的那些功能在页签路径上全部作废。
 let openTabs = [];
 let activeTabId = null;
+const MAX_TABS = 12;
+const LS_TABS = "open_tabs";
+
+// 刷新后页签还在：页签集合属于「会话布局」，和 localStorage 里的列偏好、
+// 字号是一个层级的东西。过滤掉已经不在导航里的（权限变过 / 页面被删）。
+function tabsLoad() {
+  let ids = [];
+  try { ids = JSON.parse(localStorage.getItem(LS_TABS) || "[]"); } catch (e) { ids = []; }
+  if (!Array.isArray(ids)) ids = [];
+  const valid = ids.filter((id) => typeof id === "string" && VIEWS[id] && NAV_INDEX[id]);
+  if (!valid.includes("dashboard")) valid.unshift("dashboard");
+  return valid.slice(0, MAX_TABS);
+}
+function tabsSave() {
+  try { localStorage.setItem(LS_TABS, JSON.stringify(openTabs.map((t) => t.id))); } catch (e) {}
+}
 function initTabs() {
-  const bar = document.createElement("div");
-  bar.className = "tab-bar"; bar.id = "tab-bar";
-  const main = document.getElementById("main");
-  main.parentNode.insertBefore(bar, main);
-  openTabs = [{ id: "dashboard", label: "工作台" }];
-  activeTabId = "dashboard";
+  openTabs = tabsLoad().map((id) => ({ id, label: navLabel(id) }));
+  activateTab(state.view);
+}
+// 打开并激活一个页签（切视图时统一走这里）。超上限时丢最旧的非工作台页签。
+function activateTab(id) {
+  if (!VIEWS[id]) return;
+  if (!openTabs.find((t) => t.id === id)) {
+    openTabs.push({ id, label: navLabel(id) });
+    // 满了就丢最早的一个，但绝不动当前页和工作台（工作台是回退兜底）
+    if (openTabs.length > MAX_TABS) {
+      const dropAt = openTabs.findIndex((t) => t.id !== "dashboard" && t.id !== id);
+      if (dropAt >= 0) openTabs.splice(dropAt, 1);
+    }
+  }
+  activeTabId = id;
+  tabsSave();
   renderTabs();
+}
+function closeTab(id) {
+  const i = openTabs.findIndex((t) => t.id === id);
+  if (i < 0) return;
+  const wasActive = id === activeTabId;
+  openTabs.splice(i, 1);
+  if (!openTabs.length) openTabs.push({ id: "dashboard", label: navLabel("dashboard") });
+  tabsSave();
+  if (wasActive) {
+    // 落到相邻的页签（左邻优先，和浏览器一致）
+    const next = openTabs[Math.min(i, openTabs.length - 1)];
+    goView(next.id, { force: true });
+  } else {
+    renderTabs();
+  }
 }
 function renderTabs() {
   const bar = document.getElementById("tab-bar");
   if (!bar) return;
   bar.innerHTML = openTabs.map((t) => `
-    <div class="tab-item${t.id === activeTabId ? " active" : ""}" data-tab="${t.id}">
+    <div class="tab-item${t.id === activeTabId ? " active" : ""}" data-tab="${t.id}"
+         role="tab" tabindex="${t.id === activeTabId ? 0 : -1}"
+         aria-selected="${t.id === activeTabId}" title="${esc(t.label)}">
       <span>${esc(t.label)}</span>
-      ${openTabs.length > 1 ? `<span class="tab-close" data-tab-close="${t.id}">${icon("close")}</span>` : ""}
+      ${openTabs.length > 1 ? `<span class="tab-close" data-tab-close="${t.id}" role="button" aria-label="关闭${esc(t.label)}页签">${icon("close")}</span>` : ""}
     </div>`).join("");
   $all(".tab-item", bar).forEach((el) => {
     el.addEventListener("click", (e) => {
-      if (e.target.dataset.tabClose) return;
-      activeTabId = el.dataset.tab; renderTabs(); state.view = activeTabId; renderMain();
+      if (e.target.closest("[data-tab-close]")) return;
+      goView(el.dataset.tab);
     });
   });
-  $all(".tab-close", bar).forEach((el) => {
-    el.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const id = el.dataset.tabClose;
-      openTabs = openTabs.filter((t) => t.id !== id);
-      if (activeTabId === id) { activeTabId = openTabs[openTabs.length - 1]?.id || "dashboard"; state.view = activeTabId; }
-      renderTabs(); renderMain();
-    });
+  $all("[data-tab-close]", bar).forEach((el) => {
+    el.addEventListener("click", (e) => { e.stopPropagation(); closeTab(el.dataset.tabClose); });
   });
+  // 让当前页签可见（页签多到溢出时，新加的在最右，可能已经在可视区外）
+  const cur = bar.querySelector('.tab-item.active');
+  if (cur && cur.scrollIntoView) { try { cur.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (e) { /* 老浏览器忽略 */ } }
 }
-function openTab(id, label) { if (!openTabs.find((t) => t.id === id)) openTabs.push({ id, label }); activeTabId = id; renderTabs(); }
 
 // ---------- 气泡提示 ----------
 let tooltipEl = null;
@@ -1183,6 +1227,9 @@ function goView(id, opts = {}) {
     }
   }
   touchRecent(id);
+  // shell 没建好时不要动页签：登录 / 建账流程里也会走 goView，
+  // 那时 openTabs 还是空数组，activateTab 会把一个残缺的集合写进 localStorage
+  if (shellBuilt) activateTab(id);
   renderSidebar();
   renderMain();
   restoreViewState(id, document.getElementById("main"));
@@ -1195,6 +1242,7 @@ window.addEventListener("popstate", () => {
   const old = document.getElementById("main");
   if (old) saveViewState(state.view, old);
   state.view = id;
+  if (shellBuilt) activateTab(id);
   renderSidebar();
   renderMain();
   restoreViewState(id, document.getElementById("main"));
@@ -1961,6 +2009,7 @@ function renderShell() {
         </div>
       </div>
       <div class="sidebar" id="sidebar"></div>
+      <div class="tab-bar" id="tab-bar" role="tablist" aria-label="已打开的页面"></div>
       <div class="side-mask" id="side-mask"></div>
       <div class="nt-mask" id="nt-mask"></div>
       <aside class="nt-drawer" id="nt-drawer">
@@ -2014,6 +2063,8 @@ function renderShell() {
   ntStart();
   // 侧栏内容交给 renderSidebar()（搜索/收藏/最近都在那里）
   renderSidebar();
+  // 页签（这段以前是死代码，从没被调用过）
+  initTabs();
   shellBuilt = true;
 }
 
@@ -2055,6 +2106,9 @@ function renderMain() {
     old.parentNode.replaceChild(main, old);
   }
   closeAllModals(); // 切视图时关闭遗留弹窗（栈式关闭下不再整体清空）
+  // 图表注册表按视图生命周期清空：旧视图的 chartStore 条目对应的 DOM 已经不存在，
+  // 留着既浪费内存也会让 id 越滚越大
+  chartStore.clear();
   updateCrumb();
   const fn = VIEWS[state.view] || viewDashboard;
   const r = fn(main);
@@ -2120,7 +2174,7 @@ async function viewDashboard(main) {
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px">
           ${tg[dom].map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
             <div class="u-row"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
-            ${lineChartSvg(t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 190)}
+            ${chartBox("line", t.title, t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 190, t.unit)}
           </div>`).join("")}
         </div>
       </div>`).join("");
@@ -2199,9 +2253,12 @@ function moneyFmt(n) {
 function pctFmt(n) { return n.toLocaleString("en-US", { maximumFractionDigits: 1 }) + "%"; }
 
 // 折线图（SVG，纯原生实现）。series: [{name, color, values:number[], anomalies:bool[]}]
-function lineChartSvg(labels, series, height) {
+function lineChartSvg(labels, series, height, opts) {
   const W = 760, H = height || 250;
-  const padL = 62, padR = 14, padT = 16, padB = 30;
+  // padR 默认 14：X 轴标签是 text-anchor="middle"，最后一个标签以最右刻度为中心，
+  // 会被 viewBox 右缘裁掉尾巴（"2026-12" 显示成 "2026-1"）。
+  // 放大视图传大一点的 padR，因为那里恰恰是要看清刻度的地方。
+  const padL = 62, padR = (opts && opts.padR) || 14, padT = 16, padB = 30;
   const iw = W - padL - padR, ih = H - padT - padB;
   const n = labels.length;
   if (!n) return "";
@@ -2238,13 +2295,13 @@ function lineChartSvg(labels, series, height) {
   }
   const zeroAxis = y0 != null ? `<line x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}" stroke="var(--z-400)" stroke-width="1" stroke-dasharray="4 3"/>` : "";
 
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart">${grid}${zeroAxis}${lines}${dots}${yticks}${xlabels}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="${(opts && opts.par) || "none"}" class="${(opts && opts.cls) || "chart"}">${grid}${zeroAxis}${lines}${dots}${yticks}${xlabels}</svg>`;
 }
 
 // 分组柱状图（当月发生额）。groups: [{name, color, values, anomalies}]
-function barChartSvg(labels, groups, height) {
+function barChartSvg(labels, groups, height, opts) {
   const W = 760, H = height || 250;
-  const padL = 62, padR = 14, padT = 16, padB = 30;
+  const padL = 62, padR = (opts && opts.padR) || 14, padT = 16, padB = 30;
   const iw = W - padL - padR, ih = H - padT - padB;
   const n = labels.length;
   if (!n) return "";
@@ -2286,8 +2343,78 @@ function barChartSvg(labels, groups, height) {
 
   function barX(i) { return padL + slot * (i + 0.5); }
   const zeroAxis = y0 != null ? `<line x1="${padL}" y1="${y0.toFixed(1)}" x2="${W - padR}" y2="${y0.toFixed(1)}" stroke="var(--z-400)" stroke-width="1" stroke-dasharray="4 3"/>` : "";
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="chart">${grid}${zeroAxis}${bars}${yticks}${xlabels}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="${(opts && opts.par) || "none"}" class="${(opts && opts.cls) || "chart"}">${grid}${zeroAxis}${bars}${yticks}${xlabels}</svg>`;
 }
+
+// ===========================================================================
+// 图表点击放大
+// ---------------------------------------------------------------------------
+// 走势图原来只有 170~240px 高，塞在仪表盘/报表的网格单元里，十几期的走势基本
+// 分不出拐点，想细看只能去「报表中心」里那个有大图的页面。这里让图本身可点，
+// 点开用同一份数据重画一张大的。
+//
+// 数据不塞进 data-* 属性（序列可能上百个点，转义后体积大且容易出错），
+// 而是存进 chartStore，DOM 上只放一个自增 id。视图重建时 store 会被清空，
+// 所以不会随切页面无限增长。
+// ===========================================================================
+let chartSeq = 0;
+const chartStore = new Map();
+
+function renderChart(kind, labels, data, height, opts) {
+  return kind === "bar" ? barChartSvg(labels, data, height, opts) : lineChartSvg(labels, data, height, opts);
+}
+
+/**
+ * 画一张可点击放大的图。
+ * @param kind    "line" | "bar"
+ * @param title   放大后的标题
+ * @param labels  X 轴标签
+ * @param data    series / groups
+ * @param height  小图高度（px）
+ * @param unit    放大后显示的单位
+ */
+function chartBox(kind, title, labels, data, height, unit) {
+  const svg = renderChart(kind, labels, data, height);
+  if (!svg) return "";
+  const id = "ch" + (++chartSeq);
+  chartStore.set(id, { kind, title, labels, data, unit, smallH: height });
+  return `<div class="chart-box" data-chart="${id}" role="button" tabindex="0"
+       aria-label="放大查看${esc(title)}" title="点击放大">${svg}<span class="chart-zoom">⤢ 点击放大</span></div>`;
+}
+
+function openChartBig(id) {
+  const c = chartStore.get(id);
+  if (!c) return;
+  // 放大图换 preserveAspectRatio：默认的 "none" 会把图硬拉满容器、圆点被压成椭圆，
+  // 坐标轴文字也会横向变形。放大正是要看清刻度，所以这里必须保持原比例。
+  // padR 加大：X 轴标签是居中锚点，最后一个会被 viewBox 右缘裁掉尾巴。
+  const big = renderChart(c.kind, c.labels, c.data, 420, { par: "xMidYMid meet", cls: "chart chart-big", padR: 46 });
+  const legend = (c.data || []).filter((s) => s.name).map((s) =>
+    `<span class="lg-item"><i style="background:${esc(s.color)}"></i>${esc(s.name)}</span>`).join("");
+  const mask = modal(`<h3>${esc(c.title)}</h3>
+    <div class="chart-big">
+      <div class="chart-big-meta">
+        <div class="lg">${legend}</div>
+        ${c.unit ? `<span class="muted" style="font-size:12px">单位：${esc(c.unit)}</span>` : ""}
+      </div>
+      ${big}
+      <div class="muted" style="font-size:12px;margin-top:8px">共 ${c.labels.length} 期 · Esc 关闭</div>
+    </div>
+    <div class="foot"><button class="btn ghost" data-chart-close>关闭</button></div>`, true);
+  const cb = $("[data-chart-close]", mask);
+  if (cb) cb.onclick = closeModal;
+}
+
+// 事件委托：图是渲染出来的，用委托避免每次挂完还得重绑
+document.addEventListener("click", (e) => {
+  const box = e.target.closest && e.target.closest("[data-chart]");
+  if (box) { e.preventDefault(); openChartBig(box.dataset.chart); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const box = e.target.closest && e.target.closest("[data-chart]");
+  if (box) { e.preventDefault(); openChartBig(box.dataset.chart); }
+});
 
 // 指标内因：横向条形列表（带环比变化与占比）
 function driverBars(items, signed) {
@@ -2371,12 +2498,12 @@ async function viewOverview(main) {
 
     <div class="panel" style="margin-top:14px">
       <div class="chart-head"><b>财务走势 · 年初至今累计</b><span class="lg">${legend(cumSeries)}</span></div>
-      <div class="chart-box">${lineChartSvg(labels, cumSeries, 230)}</div>
+      ${chartBox("line", "累计收入与成本", labels, cumSeries, 230, "元")}
       <div class="chart-note">红线圆点 = 异常月份（偏离年内均值 ±2σ 或出现亏损）；折线为 1 月起累计值。</div>
     </div>
     <div class="panel" style="margin-top:14px">
       <div class="chart-head"><b>当月发生额（逐月对比）</b><span class="lg">${legend(monthGroups)}</span></div>
-      <div class="chart-box">${barChartSvg(labels, monthGroups, 230)}</div>
+      ${chartBox("bar", "当月发生额", labels, monthGroups, 230, "元")}
       <div class="chart-note">红三角 = 异常月份；柱状为各月发生额，便于发现突增突减与亏损月。</div>
     </div>
 
@@ -2503,7 +2630,7 @@ async function loadBizOverview(main) {
     const goto = entry && VIEWS[entry] ? `<button class="btn ghost sm" data-biz-go="${entry}">进入</button>` : "";
     const ts = (trendsByDom[dom] || []).map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
         <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
-        ${lineChartSvg(t.periods, (t.series || []).map((s) => ({ name: s.name, color: s.color, values: s.points })), 180)}
+        ${chartBox("line", t.title, t.periods, (t.series || []).map((s) => ({ name: s.name, color: s.color, values: s.points })), 180, t.unit)}
       </div>`).join("");
     return `<div class="panel" style="margin-top:12px">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -2543,9 +2670,9 @@ async function loadBizOverview(main) {
             <button class="btn ghost sm" data-biz-go="settle">进入往来核销</button></div>
           <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px;margin-top:8px">
             <div><div class="muted" style="font-size:12px;margin-bottom:2px">应收</div>
-              ${barChartSvg(arA.buckets, [{ name: "应收", color: "#2563eb", values: arA.sums }], 200)}</div>
+              ${chartBox("bar", "应收账龄分布", arA.buckets, [{ name: "应收", color: "#2563eb", values: arA.sums }], 200, "元")}</div>
             <div><div class="muted" style="font-size:12px;margin-bottom:2px">应付</div>
-              ${barChartSvg(apA.buckets, [{ name: "应付", color: "#f59e0b", values: apA.sums }], 200)}</div>
+              ${chartBox("bar", "应付账龄分布", apA.buckets, [{ name: "应付", color: "#f59e0b", values: apA.sums }], 200, "元")}</div>
           </div>
         </div>`
       : `<div class="toolbar" style="margin-top:8px"><button class="btn ghost sm" data-biz-go="settle">进入往来核销</button></div>`;
@@ -5013,7 +5140,7 @@ async function viewPlatformBooks(main) {
       }));
       if (!groups.length || !groups.some((g) => g.values.some((v) => v !== 0))) return "";
       return `<div class="wb-sec"><h4 style="margin:14px 0 6px">${esc(dom)} · 跨账套对比<span class="muted" style="font-weight:400;font-size:12px"> （单位：元）</span></h4>
-        <div class="panel" style="margin:0;padding:10px 12px">${barChartSvg(okBooks.map((b) => b.company || b.key), groups, 240)}</div></div>`;
+        <div class="panel" style="margin:0;padding:10px 12px">${chartBox("bar", dom + " · 跨账套对比", okBooks.map((b) => b.company || b.key), groups, 240, "元")}</div></div>`;
     }).join("");
 
     const domSections = Object.keys(Object.assign({}, ...Object.values(moneyByDom), ...Object.values(
@@ -5046,7 +5173,7 @@ async function viewPlatformBooks(main) {
           <div class="v">${esc(c.value)}${c.unit === MONEY || c.unit === "件" ? `<span style="font-size:12px;font-weight:400;opacity:.65"> ${esc(c.unit)}</span>` : ""}</div></div>`).join("")}</div></div>`).join("");
       const trends = (b.trends || []).slice(0, 3).map((t) => `<div class="panel" style="margin:0;padding:10px 12px">
         <div style="display:flex;align-items:center;gap:8px"><b style="font-size:13px">${esc(t.title)}</b><span class="muted" style="font-size:12px">单位：${esc(t.unit)}</span></div>
-        ${lineChartSvg(t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 170)}
+        ${chartBox("line", t.title, t.periods, t.series.map((s) => ({ name: s.name, color: s.color, values: s.points })), 170, t.unit)}
       </div>`).join("");
       const todo = (b.todos || []).filter((t) => Number(t.count) > 0);
       return `<div class="panel" style="margin-top:12px">

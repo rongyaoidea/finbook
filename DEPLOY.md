@@ -364,6 +364,57 @@ finance.example.com {
   sqlite3 /opt/finbook/data/realm.db "VACUUM INTO '$BK/realm.db'"
   ```
 - **冷备**：`systemctl stop finweb` 后直接 `cp -a /opt/finbook/data /backup/cold-$(date +%F)` 整个目录。
+### 6.1 ⚠️ 手动备份时踩过的三个坑（`integrity_check` 通过 ≠ 备份可用）
+
+2026-09-30 部署前重写备份脚本时把这三个坑各踩了一遍。它们共同的形状是：
+**校验通过，但备份其实没用**。
+
+| 坑 | 现象 | 为什么校验骗了过去 |
+|---|---|---|
+| 只扫 `/data` 根目录 | 账套一个都没备份到，只拿到一个 0 字节旧文件 | — |
+| 0 字节文件 | `sqlite3` 对空文件返回 **`ok`** | 空文件是「合法的空 SQLite 库」，integrity_check 没有任何意见 |
+| 只拷 `realm.db` | 丢掉尚未 checkpoint 的已提交事务 | WAL 模式下 `.db` 单文件不是完整快照 |
+
+账套**不在** `/data` 根下，而在 `/data/books/*.fbk`（`/data/finbook.fbk` 是 9 月 13 日
+留下的 0 字节旧文件）。所以：
+
+```bash
+# ① 递归，且只取非空的
+for src in $(docker run --rm -v finbook_data:/data --entrypoint sh finbook:latest \
+               -c 'find /data -name "*.fbk" -size +0'); do
+  rel=${src#/data/}
+  docker run --rm -v finbook_data:/data --entrypoint cat finbook:latest "$src" > /tmp/bk.fbk
+
+  # ② 非空 —— 必须单独判，integrity_check 不会替你判
+  [ -s /tmp/bk.fbk ] || { echo "BAD $rel 是 0 字节"; exit 1; }
+
+  # ③ 结构完好
+  ic=$(sqlite3 /tmp/bk.fbk 'pragma integrity_check')
+  [ "$ic" = ok ] || { echo "BAD $rel : $ic"; exit 1; }
+
+  # ④ **业务语义**：证明它真的是账套库，不是「合法但空」的库
+  n=$(sqlite3 /tmp/bk.fbk "select count(*) from sqlite_master where type='table';")
+  [ "${n:-0}" -gt 0 ] || { echo "BAD $rel 里一张表都没有"; exit 1; }
+  echo "OK   $rel  $(stat -c %s /tmp/bk.fbk) bytes  表 $n 张  凭证 $(sqlite3 /tmp/bk.fbk 'select count(*) from voucher;') 张"
+
+  mkdir -p "$(dirname "$DEST/$rel")" && cp /tmp/bk.fbk "$DEST/$rel"
+done
+
+# ⑤ 一个非空的都没找到 = 备份等于没做
+[ "$found" -gt 0 ] || { echo '!! 没找到任何非空 .fbk'; exit 1; }
+
+# ⑥ WAL 模式的身份库：-wal / -shm 必须一起拷
+for n in realm.db realm.db-wal realm.db-shm; do ... ; done
+```
+
+> 顺带：`sqlite3` 只在**宿主机**上（`/usr/bin/sqlite3`），finbook 镜像里没有。
+> 在容器里 `sqlite3 …` 会得到 `sh: sqlite3: not found` —— 而那不是「校验通过」，
+> 是校验根本没跑。
+
+> 备份做完还要**按业务语义回读一次**：`select username from realm_user`、
+> `select company from realm_book`、`select count(*) from account`。
+> 这一步能同时抓住「备份了但不是这份数据」和「备份了但少了关键表」。
+
 - **轮转建议**：每日全量 + 保留 30 天（cron 脚本按上例组织；同日重跑前先清理旧目录）。
 - **自动化脚本（推荐）**：`deploy/` 下有两个现成脚本，省掉手写 cron：
   | 脚本 | 作用 | 建议频率 |

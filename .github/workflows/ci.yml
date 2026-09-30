@@ -119,7 +119,21 @@ jobs:
           cache-to: type=gha,mode=max
       - name: 启动并健康检查（真 finweb 才能通过 /api/health）
         run: |
+          # 关键：账套目录必须**事先存在**。镜像里 ENV FINBOOK_REQUIRE_BOOKS_DIR=true，
+          # 而全新 /data 下只有镜像预建的空目录，没有 books/。finweb 启动时发现账套
+          # 目录不存在就拒绝启动（这是 DEPLOY.md §10 那个防静默数据丢失的守卫），
+          # 表现为容器 Exited(1) + 健康检查永远不通。
+          #
+          # 生产上没踩到是因为数据卷里早就建好了 books/。但**首次部署的人一定会踩**，
+          # 所以 smoke test 必须走真实的部署形态：挂卷 + 预建 books/。
+          #
+          # 不用 -e FINBOOK_REQUIRE_BOOKS_DIR=0：那样守卫就没被验证，
+          # 守卫自己哪天被改坏也不会有人知道。
+          docker volume create finbook-ci-data >/dev/null
+          docker run --rm -v finbook-ci-data:/data --entrypoint mkdir finbook:ci -p /data/books
+          docker run --rm -v finbook-ci-data:/data --entrypoint chown finbook:ci -R finbook:finbook /data
           docker run -d --name finbook-ci -p 127.0.0.1:18080:8080 \
+            -v finbook-ci-data:/data \
             -e FINBOOK_ADMIN_USER=admin \
             -e FINBOOK_ADMIN_PASS='Admin!2026' \
             finbook:ci
@@ -159,7 +173,9 @@ jobs:
           exit 1
       - name: 清理
         if: always()
-        run: docker rm -f finbook-ci || true
+        run: |
+          docker rm -f finbook-ci || true
+          docker volume rm -f finbook-ci-data || true
 
   # ── release 构建产物（Linux x64） ─────────────────────────────────────
   build-linux:

@@ -225,7 +225,10 @@ function authoritativeYamlParse(file) {
     const args = bin === "py" ? ["-3", script, file] : [script, file];
     let out = "";
     try {
-      out = String(execFileSync(bin, args, { encoding: "utf8" }));
+      // stderr 也要收进管道：Windows 的 python3 占位符会往 stderr 写一段
+      // 「Python was not found…Microsoft Store」——用默认 stdio 的话它会直接
+      // 漏到控制台，让一条成功的检查看起来像出了错。
+      out = String(execFileSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
     } catch (e) {
       if (e && e.code === "ENOENT") continue; // 真的没这个可执行文件
       out = String((e && e.stdout) || "") + String((e && e.message) || "");

@@ -524,5 +524,32 @@ docker run -d -v /srv/finbook/books:/data/books finbook
 docker inspect <容器> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
 ```
 
+### 10.1 ⚠️ 用**命名卷**时，`/data/books` 同样要事先建
+
+上面那条只覆盖 **bind mount**。而 README 与 `Dockerfile` 的示例都是**命名卷**：
+`docker run -v finbook_data:/data finbook`。这条路径上「宿主机目录不存在」这个
+说法**对不上** —— 卷是 Docker 凭空建的**空卷**，镜像里预建的只有空 `/data`，
+没有 `books/`。于是服务照样启动失败、照样报那串错，而那串错说的原因
+（bind mount 失败）在这个场景下是**错的**，会让人往错的方向排查。
+
+实测两处都踩过：
+
+- CI 的 `Docker image smoke test` 就是这么挂的 —— `docker run` 没挂卷也没建目录，
+  容器 `Exited(1)`、健康检查永远不通。
+- 第一次看这个报错的人会以为是自己 `--volume` 路径写错了，其实卷是对的、
+  只是里面少一个目录。
+
+```bash
+# 命名卷：先在卷里建好 books/，属主给成 finbook(uid 10001)
+docker volume create finbook_data
+docker run --rm -v finbook_data:/data --entrypoint mkdir    finbook:latest -p /data/books
+docker run --rm -v finbook_data:/data --entrypoint chown    finbook:latest -R finbook:finbook /data
+docker run -d -v finbook_data:/data finbook:latest
+```
+
+> 「起容器前先 mkdir」在 bind mount 上是**为了宿主机目录**，在命名卷上是为了
+> **卷内部** —— 两件事，但结果一样：不做就起不来。而这个差异只写在报错里、
+> 不写在文档里，就会有人被报错带偏。
+
 确认部署不需要持久化（例如临时演示环境）时，显式关掉：
 `FINBOOK_REQUIRE_BOOKS_DIR=0`。

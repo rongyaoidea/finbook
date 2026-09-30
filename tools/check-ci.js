@@ -17,6 +17,7 @@
 const fs = require("fs");
 const { execFileSync } = require("child_process");
 const path = require("path");
+const os = require("os");
 
 let bad = 0;
 
@@ -92,6 +93,27 @@ lines.forEach((l, i) => {
   const m = /^ {2}([a-z][\w-]*):\s*$/.exec(l);
   if (m && i > 17) jobs.push(m[1]);
 });
+const indentBad = checkBlockScalarIndent(s);
+if (indentBad === 0) {
+  console.log("块标量结构：块内无「缩进不足且不像 YAML 结构」的行");
+}
+const yamlVerdict = authoritativeYamlParse(ymlPath);
+if (yamlVerdict === null) {
+  bad++;
+  console.log(
+    `FAIL 无法解析 ${ymlPath}（python3 / python / js-yaml 都不可用），且启发式检查已跑过` +
+      `\n    「无法校验」不等于「校验通过」——我改坏 ci.yml 的那一刻，本检查打印的就是 OK。` +
+      `\n    修法：装 PyYAML（pip install pyyaml）或让 runner 用带 python3 的镜像。`
+  );
+} else {
+  if (!/可解析/.test(yamlVerdict)) {
+    bad++;
+    console.log(`FAIL ${yamlVerdict}`);
+  } else {
+    console.log(yamlVerdict + "（权威判据）");
+  }
+}
+
 const dup = jobs.filter((j, k) => jobs.indexOf(j) !== k);
 if (dup.length) {
   console.log(`FAIL ${ymlPath} job 名重复：${dup.join(", ")}`);
@@ -129,6 +151,104 @@ try {
   }
 }
 
+/**
+ * workflow YAML 的**权威**校验：能解析就解析。
+ *
+ * 优先 python3 / python（本机与 ubuntu-latest runner 都有），其次 js-yaml。
+ * 都不可用时跑一个**明确标注为启发式**的兜底检查 —— 但绝不静默跳过。
+ *
+ * 为什么这么较劲：今天的教训不是「判据写错了」，而是「检查在工具缺失时
+ * 假装通过」。我改坏 ci.yml 的那一刻，check-ci.js 打印的是 OK（它正在输出
+ * 「无 js-yaml，跳过结构解析」）。**一条会静默降级成空转的检查比没有检查更危险** ——
+ * 它让人以为 CI 配置被验证过了。
+ *
+ * 附带一个独立的结构性检查（不依赖任何解析器）：块标量内缩进不足基准、
+ * 且看起来不像 YAML 结构（列表项 / key: / 注释 / 右括号）的行，就是块被提前结束。
+ * 覆盖的正是今天这个错：bash 单引号可以跨行 → 长命令被拆成多行 →
+ * 后两行缩进比基准浅 → shell 合法、YAML 非法。
+ */
+function looksLikeYamlStructure(line) {
+  const t = line.trim();
+  return /^-\s/.test(t) || /^[\w.\-"'\u4e00-\u9fa5]+\s*:/.test(t) || /^#/.test(t) || t === "}" || t === "]" || t === "---";
+}
+
+function checkBlockScalarIndent(src) {
+  const ls = src.split(/\r?\n/);
+  let bad = 0;
+  for (let i = 0; i < ls.length; i++) {
+    const m = /^(\s*)[\w-]+:\s*[|>][-+]?\s*$/.exec(ls[i]);
+    if (!m) continue;
+    const base = m[1].length + 1;
+    for (let j = i + 1; j < ls.length; j++) {
+      const l = ls[j];
+      if (l.trim() === '') continue;
+      const ind = l.length - l.trimStart().length;
+      if (ind >= base) continue;
+      // 缩进不足：要么这是合法的块结束（下一个 YAML 结构），要么就是提前结束
+      if (looksLikeYamlStructure(l)) break;
+      bad++;
+      console.log(
+        `FAIL ${ymlPath} 第 ${j + 1} 行缩进 ${ind} < 块标量基准 ${base}，且不像 YAML 结构` +
+          `\n    块标量起于第 ${i + 1} 行：${ls[i].trim()}` +
+          `\n    这一行既不是列表项、也不是 key:、也不是注释 —— 说明块在这里被**提前结束**，` +
+          `\n    YAML 会转头把它当映射键解析 → workflow 非法 → GitHub 一个 job 都不建` +
+          `\n    （run 在同一秒内 failure，jobs 数组为空，看起来像「CI 挂了但没有失败步骤」）。` +
+          `\n    常见成因：bash 单引号可以跨行，于是把一条长命令拆成多行 —— shell 合法，YAML 非法。` +
+          `\n    修法：写在一行里，或每续行都与首行同缩进。` +
+          `\n    出错行：${l.trim().slice(0, 80)}`
+      );
+      break;
+    }
+  }
+  return bad;
+}
+
+/**
+ * 权威解析：依次试 python3 / python / py，调用 tools/yamlcheck.py（需 PyYAML），
+ * 最后退回 js-yaml。返回 null = 都不可用 —— 调用方必须把「不可用」当**失败**。
+ *
+ * 为什么 Python 单独成文件：把 Python 源码塞进 JS 字符串字面量需要多层引号转义，
+ * 我在一轮里连续踩了三次（漏引号让 Python 行被当 JS 执行、Python 的 chr(10) 留在
+ * JS 里、单双引号嵌套 SyntaxError），而症状都出现在 check-ci.js 里，排查方向被带偏。
+ * 独立文件把这整类问题消掉了：Python 用 Python 语法，JS 用 JS 语法。
+ *
+ * 两个必须处理的「假可用」：
+ *   1. Windows 的 `python3` 常常只是 **Microsoft Store 占位符** —— 它存在、能启动，
+ *      但打印一段提示并非零退出。把它当成「Python 不可用」才能继续试下一个，
+ *      否则会得出「YAML 非法」的错误结论（实测踩过）。
+ *   2. 没装 PyYAML 时脚本返回 9 并打印 NOPYyaml —— 同样要继续，而不是当成通过。
+ */
+function authoritativeYamlParse(file) {
+  const script = path.join(__dirname, "yamlcheck.py");
+  const STUB = /Microsoft Store|was not found|not recognized as an internal/i;
+  for (const bin of ["python3", "python", "py"]) {
+    const args = bin === "py" ? ["-3", script, file] : [script, file];
+    let out = "";
+    try {
+      out = String(execFileSync(bin, args, { encoding: "utf8" }));
+    } catch (e) {
+      if (e && e.code === "ENOENT") continue; // 真的没这个可执行文件
+      out = String((e && e.stdout) || "") + String((e && e.message) || "");
+      if (STUB.test(out)) continue; // Store 占位符 / 未注册，等于不可用
+      if (out.indexOf("NOPYyaml") >= 0) continue; // 没装 PyYAML
+      const y = /YAMLERR line (\d+): *([^\r\n]*)/.exec(out);
+      if (y) return bin + " 判定非法 —— 第 " + y[1] + " 行: " + y[2].trim();
+      const io = /IOERR: *([^\r\n]*)/.exec(out);
+      if (io) return bin + " 读文件失败 —— " + io[1].trim();
+      return bin + " 调用失败 —— " + out.split(/\r?\n/)[0].trim().slice(0, 120);
+    }
+    return bin + "（tools/yamlcheck.py）：YAML 可解析";
+  }
+  try {
+    require("js-yaml").load(fs.readFileSync(file, "utf8"));
+    return "js-yaml：YAML 可解析";
+  } catch (e) {
+    if (e && e.code !== "MODULE_NOT_FOUND") {
+      return "js-yaml 判定非法 —— " + String(e.message).split("\n")[0];
+    }
+  }
+  return null;
+}
 // ---- 2. 变异清单是否还对得上源码 -----------------------------------------
 function listed(script) {
   return JSON.parse(
@@ -579,6 +699,9 @@ bad += encBad;
 // 一个只会在 happy path 上运行的检查，凭什么相信它？这里改坏三样东西各跑一遍：
 // 源码里删掉一行（让某条变异对不上）、CI 里插一个重名 job、CI 里塞一个制表符。
 // 三种都必须被本检查抓住。
+const ANCHOR_MSG =
+  "探针失效：ci.yml 里找不到单行的 docker inspect —— 若那条命令被改写，请同步改本探针的 one 串";
+
 if (process.argv.includes("--selftest")) {
   /** 写文件并**自证真的改了**（from 与 after 必须不同），否则报"探针失效" */
   const poke = (file, from, to) => {
@@ -668,6 +791,26 @@ if (process.argv.includes("--selftest")) {
         const o = fs.readFileSync(p2, "utf8");
         const nl = o.includes("\r\n") ? "\r\n" : "\n";
         fs.writeFileSync(p2, o.split("            require_cashier: false," + nl).join(""));
+        return () => fs.writeFileSync(p2, o);
+      },
+    },
+    {
+      // 照着我今天真犯的错写：bash 单引号跨行 → 长命令拆三行 → 后两行缩进浅于块基准。
+      // shell 合法、YAML 非法 → GitHub 一个 job 都不建（run 秒失败，jobs 数组为空）。
+      name: "ci.yml 块标量被提前结束（bash 单引号跨行拆长命令）",
+      apply: () => {
+        const p2 = ".github/workflows/ci.yml";
+        const o = fs.readFileSync(p2, "utf8");
+        const nl = o.includes("\r\n") ? "\r\n" : "\n";
+        const one =
+          "          docker inspect -f 'Running={{.State.Running}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}}' finbook-ci || true";
+        if (!o.includes(one)) throw new Error(ANCHOR_MSG);
+        const three = [
+          "          docker inspect -f 'Running={{.State.Running}}  Status={{.State.Status}}",
+          "  ExitCode={{.State.ExitCode}}  OOMKilled={{.State.OOMKilled}}",
+          "  Error={{.State.Error}}  StartedAt={{.State.StartedAt}}  FinishedAt={{.State.FinishedAt}}' finbook-ci || true",
+        ].join(nl);
+        fs.writeFileSync(p2, o.replace(one, three));
         return () => fs.writeFileSync(p2, o);
       },
     },

@@ -148,9 +148,7 @@ jobs:
           echo "--- docker ps -a ---"
           docker ps -a --filter name=finbook-ci --format '{{.Names}} {{.Status}} {{.Ports}}' || true
           echo "--- inspect: 状态 / 退出码 / 是否 OOM ---"
-          docker inspect -f 'Running={{.State.Running}}  Status={{.State.Status}}
-  ExitCode={{.State.ExitCode}}  OOMKilled={{.State.OOMKilled}}
-  Error={{.State.Error}}  StartedAt={{.State.StartedAt}}  FinishedAt={{.State.FinishedAt}}' finbook-ci || true
+          docker inspect -f 'Running={{.State.Running}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}}' finbook-ci || true
           echo "--- inspect: 镜像里 /usr/local/bin/finweb 是否存在且可执行 ---"
           docker run --rm --entrypoint sh finbook:ci -c \
             'ls -l /usr/local/bin/finweb; /usr/local/bin/finweb --help 2>&1 | head -5' || true

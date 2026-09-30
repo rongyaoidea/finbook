@@ -617,6 +617,44 @@ try {
   );
   bad++;
 }
+
+// ---- 2c. tools/ 与 e2e/ 的脚本必须可在任何机器上跑 ----
+//
+// 2026-10-01 的 Test job 就是红在这里：selftest-design-doc.js 里写死了
+// `C:\Users\Administrator\...` —— 本地跑**完全正常**（路径就在那儿），
+// 只有 CI 的 Linux runner 上才 ENOENT 崩。也就是说「本地绿」对这一类错误
+// 完全没有证明力，所以必须有一道能在提交前拦住的检查。
+try {
+  const r = execFileSync(process.execPath, [path.join(__dirname, "check-portable.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(r);
+  if (/FAIL/.test(r)) {
+    console.log("可移植性检查：有 FAIL");
+    bad++;
+  }
+  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-portable.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(st);
+  // 判据不能用 `/FAIL/`：自检的**预期输出里就有 `FAIL tools\...`** ——
+  // 那是「变异被正确拦下」的证据。上一版用 `/FAIL/` 判，害得检查把自己的
+  // 成功输出判成失败（我在这上面又栽了一次：看到红就以为自检坏了）。
+  // 正确判据只有两条：① 探针确实拦下了（变异后的退出码非 0）
+  // ② 文件已还原（还原后基线是绿的）。这两条都由 selftest 自己打印。
+  //
+  // 「退出成功？」是**全角问号**，正则里必须原样写，不能写 `\？` ——
+  // `\？` 是「转义问号」，等于半角 `?`，永远匹配不上（我因此多跑了一轮）。
+  if (!/还原后基线：OK/.test(st) || !/变异 1[\s\S]*退出成功？ false/.test(st)) {
+    console.log("可移植性检查的自检没通过 —— 探针没拦下，或文件没还原");
+    bad++;
+  }
+} catch (e) {
+  console.log("可移植性检查未能运行：" + String((e && e.message) || e).split("\n")[0].slice(0, 100));
+  bad++;
+}
 // ---- 3. 编码卫生：全仓库不许有 U+FFFD 替换符 / 非法 UTF-8 / BOM ---------
 //
 // 这不是洁癖：本轮在仓库里找到 3 处**既有**的编码损坏，其中一处在

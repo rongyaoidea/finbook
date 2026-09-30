@@ -1,6 +1,6 @@
 // 给 check-design-doc.js 加自检：证明它真的会拦，而不是永真通过。
 //
-// 「检查通过」不等于「检查有用」。三���探针对应三种失效：
+// 「检查通过」不等于「检查有用」。三个探针对应三种失效：
 //   1. 行号漂移（代码挪了一行，文档没跟）—— 最常见的失效
 //   2. 文档删掉约束声明（「不做信用管理」这行被删了）
 //   3. 文档引用了一个没登记的位置（等于「不受校验的引用」）
@@ -8,7 +8,10 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const ROOT = "C:\\Users\\Administrator\\Documents\\Default Project\\finbook";
+// 仓库根 = tools/ 的上一级。**不能写死绝对路径** —— 同一份脚本要能在
+// 任何机器上跑（本地 Windows、CI 的 Linux）。第一版写死了本机路径，
+// 结果 Test job 在 Linux 上 ENOENT 直接崩。
+const ROOT = path.join(__dirname, "..");
 const CHECK = path.join(ROOT, "tools", "check-design-doc.js");
 const DOC = path.join(ROOT, "docs", "客户管理模块设计.md");
 const SCM = path.join(ROOT, "crates", "findb", "src", "scm.rs");

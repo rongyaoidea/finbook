@@ -581,6 +581,42 @@ for (const rel of REPORT_MD) {
 if (docBad === 0) {
   console.log(`里程碑报告：${REPORT_MD.length} 份需要声明，都已带「历史快照」`);
 }
+
+// ---- 2b. 客户管理模块设计文档：代码引用不许漂移，且自检必须真的会拦 ----
+//
+// 设计文档里写了 `scm.rs:1161`、`sales.rs:757` 这类**行号**引用。
+// 文档里一个过期的行号比没有引用更坏 —— 它会让人**自信地**去改错的地方，
+// 而不像「没写」那样引人警觉。所以它得像代码一样被守。
+//
+// 自检是这块的关键：没有自检，「检查通过」并不能证明「检查有用」。
+// 三个探针分别对着三种失效：代码漂移 / 约束声明被删 / 未登记的引用。
+try {
+  const r = execFileSync(process.execPath, [path.join(__dirname, "check-design-doc.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(r);
+  if (/FAIL/.test(r)) {
+    console.log("设计文档引用检查：有 FAIL");
+    bad++;
+  }
+  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-design-doc.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(st);
+  if (!/全部 3 个探针都生效/.test(st) || /FAIL/.test(st)) {
+    console.log("设计文档检查的自检没通过 —— 说明这个检查本身可能已经失效");
+    bad++;
+  }
+} catch (e) {
+  // 自检脚本缺失或崩了同样算失败：无法校验 ≠ 校验通过。
+  console.log(
+    "设计文档检查未能运行：" +
+      String((e && e.message) || e).split("\n")[0].slice(0, 110)
+  );
+  bad++;
+}
 // ---- 3. 编码卫生：全仓库不许有 U+FFFD 替换符 / 非法 UTF-8 / BOM ---------
 //
 // 这不是洁癖：本轮在仓库里找到 3 处**既有**的编码损坏，其中一处在

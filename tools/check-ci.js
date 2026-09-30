@@ -390,6 +390,47 @@ if (FIX_ROOT) {
   }
 }
 
+// ---- 2.8 里程碑报告必须带「历史快照」声明 ----------------------------------
+//
+// 判据的来历：仓库转公开后，8 份报告里的「MRP运算 ❌ 0%」「测试 203 项」会被
+// 任何读者当成现状。这些结论**实测已被推翻**（MRP / 工序报工 / 委外 / BOM 都已
+// 实现，测试是 657 项 + 73 条 E2E），但文档不会自己更新。
+//
+// 不删那些报告 —— 它们是「当时做了什么」的记录，删掉是另一种信息损失。
+// 关键区别从来不是「文档旧」，而是「旧文档读起来像现状」。
+const REPORT_MD = [
+  "COMPLETION_SUMMARY.md",
+  "DELIVERY_CHECKLIST.md",
+  "ERP_MANUFACTURING_GAP_ANALYSIS.md",
+  "FINAL_MANUFACTURING_ERP_REPORT.md",
+  "FINAL_SECURITY_REPORT.md",
+  "FINAL_VERIFICATION.md",
+  "MANUFACTURING_ERP_IMPLEMENTATION_REPORT.md",
+  "COMPREHENSIVE_COMPARISON.md",
+];
+let docBad = 0;
+for (const rel of REPORT_MD) {
+  const f = path.join(FIX_ROOT || '.', rel);
+  if (!fs.existsSync(f)) continue;
+  const t = fs.readFileSync(f, "utf8");
+  if (t.includes("本文是历史快照")) continue;
+  // 还没加声明。先确认它是不是真的需要 —— 只在含「对照竞品」或「测试条数」时才要求，
+  // 否则一份纯说明性的 md 不该被这条检查卡住
+  const competitive = /金蝶|用友|覆盖度|对标/.test(t);
+  const testCount = /\d+\s*\/\s*\d+\s*passed|\d+\s*项测试|测试[:：]\s*\d+/.test(t);
+  if (!competitive && !testCount) continue;
+  docBad++;
+  bad++;
+  console.log(
+    `FAIL ${rel} 含对照竞品的覆盖度或测试条数声明，但没有「历史快照」声明` +
+      `\n    仓库已公开，读者会把「MRP运算 ❌ 0%」「测试 203 项」当成现状。` +
+      `\n    这些结论实测已被推翻（MRP / 工序报工 / 委外 / BOM 都已实现；测试 657 + 73 E2E）。` +
+      `\n    修法：在一级标题后加一段声明，写清哪些结论已过时、现状去哪看。`
+  );
+}
+if (docBad === 0) {
+  console.log(`里程碑报告：${REPORT_MD.length} 份需要声明，都已带「历史快照」`);
+}
 // ---- 3. 编码卫生：全仓库不许有 U+FFFD 替换符 / 非法 UTF-8 / BOM ---------
 //
 // 这不是洁癖：本轮在仓库里找到 3 处**既有**的编码损坏，其中一处在

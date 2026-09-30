@@ -123,15 +123,41 @@ jobs:
             -e FINBOOK_ADMIN_USER=admin \
             -e FINBOOK_ADMIN_PASS='Admin!2026' \
             finbook:ci
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18080/api/health | grep -q ok; then
+          ok=0
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:18080/api/health 2>/dev/null | grep -q ok; then
               echo "health ok（第 ${i} 次探测）"
-              exit 0
+              ok=1
+              break
+            fi
+            # 容器一退出就没必要继续等了：再探 90 次也是同样的 refused
+            if [ "$(docker inspect -f '{{.State.Running}}' finbook-ci 2>/dev/null)" != "true" ]; then
+              echo "容器在第 ${i} 次探测前已退出，不再等待"
+              break
             fi
             sleep 2
           done
-          echo "::error::容器健康检查失败，输出日志："
-          docker logs finbook-ci || true
+          if [ "$ok" = "1" ]; then exit 0; fi
+          # ---- 失败诊断 ----
+          # 容器自己的输出**实测是空的**（一个字节都没打印就退了），所以只打
+          # docker logs 等于什么都没说。必须带上能区分死因的字段：
+          #   OOMKilled  → 被内核 OOM 杀
+          #   ExitCode   → 进程自己退了
+          #   Error      → 根本没起来（挂载/权限/镜像问题）
+          echo "::error::容器健康检查失败，下面是死因诊断："
+          echo "--- docker ps -a ---"
+          docker ps -a --filter name=finbook-ci --format '{{.Names}} {{.Status}} {{.Ports}}' || true
+          echo "--- inspect: 状态 / 退出码 / 是否 OOM ---"
+          docker inspect -f 'Running={{.State.Running}}  Status={{.State.Status}}
+  ExitCode={{.State.ExitCode}}  OOMKilled={{.State.OOMKilled}}
+  Error={{.State.Error}}  StartedAt={{.State.StartedAt}}  FinishedAt={{.State.FinishedAt}}' finbook-ci || true
+          echo "--- inspect: 镜像里 /usr/local/bin/finweb 是否存在且可执行 ---"
+          docker run --rm --entrypoint sh finbook:ci -c \
+            'ls -l /usr/local/bin/finweb; /usr/local/bin/finweb --help 2>&1 | head -5' || true
+          echo "--- 容器日志（可能为空）---"
+          docker logs finbook-ci 2>&1 | tail -60 || true
+          echo "--- 镜像能否单独起（不映射端口，只看进程是否立刻退出）---"
+          docker run --rm finbook:ci 2>&1 | head -30 || true
           exit 1
       - name: 清理
         if: always()

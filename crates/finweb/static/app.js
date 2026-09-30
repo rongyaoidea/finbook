@@ -11227,6 +11227,28 @@ function openClaimEditor(main, claim, period) {
   try {
     const me = await api("/me");
     session.user = me;
+    // `platformAdmin` 必须在这里补一次。
+    //
+    // 侧栏可见性判据 `isNavVisible` 里有 `if (n.platform && !pa) return false`，
+    // 而这个变量此前**只在登录响应与 showBookPicker 里被写过** —— 刷新页面
+    // 走的是 boot()，两处都不经过，于是「合并报表」这类 platform 项
+    // 一按 F5 就从侧栏消失（登录后第一次进来是好的，刷新后才坏）。
+    //
+    // 这里刻意**不**用 `/api/me` 的 `is_admin`：那是**账套内**管理员
+    // （`PublicUser`，来自 Role::Admin），与平台管理员不是一回事 ——
+    // 一个被拉进账套的普通用户若在那套里恰好是 Role::Admin，直接用
+    // 会让他看见合并报表，越权。
+    //
+    // 走 `/api/books`：它的 `user` 是 `RealmUser`（平台层身份），
+    // `is_admin` 就是平台管理员，语义对得上。该接口对普通账号也返回 200
+    // （`visible_books` 只是按归属过滤账套列表），所以这里不是靠 403
+    // fail-closed，而是**字段本身可信**；真取不到（网络/会话失效）才落回 false。
+    try {
+      const b = await api("/books");
+      session.platformAdmin = !!(b.user && b.user.is_admin);
+    } catch (e) {
+      session.platformAdmin = false;
+    }
     await afterLogin();
   } catch (e1) {
     try {

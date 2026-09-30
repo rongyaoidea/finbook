@@ -101,9 +101,15 @@ const yamlVerdict = authoritativeYamlParse(ymlPath);
 if (yamlVerdict === null) {
   bad++;
   console.log(
-    `FAIL 无法解析 ${ymlPath}（python3 / python / js-yaml 都不可用），且启发式检查已跑过` +
+    `FAIL 无法解析 ${ymlPath}（python3 / python / py / js-yaml 都不可用），且启发式检查已跑过` +
       `\n    「无法校验」不等于「校验通过」——我改坏 ci.yml 的那一刻，本检查打印的就是 OK。` +
-      `\n    修法：装 PyYAML（pip install pyyaml）或让 runner 用带 python3 的镜像。`
+      `\n    修法（按本机实际情况挑一条，别三条都做）：` +
+      `\n      · 没装 Python        → 到 python.org 装，或让 runner 用带 python3 的镜像` +
+      `\n      · 有 Python 没 PyYAML → python -m pip install pyyaml` +
+      `\n      · 有 Python 有 PyYAML 但不在 PATH → 把它加进 PATH（本机就是这个：` +
+      `%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe）` +
+      `\n        否则「装 PyYAML」装完检查照样跑不通（PATH 上只有 Store 占位符别名）` +
+      `\n      · 都不想要           → npm i -D js-yaml（本检查会自动退回它）`
   );
 } else {
   if (!/可解析/.test(yamlVerdict)) {
@@ -217,11 +223,32 @@ function checkBlockScalarIndent(src) {
  *      但打印一段提示并非零退出。把它当成「Python 不可用」才能继续试下一个，
  *      否则会得出「YAML 非法」的错误结论（实测踩过）。
  *   2. 没装 PyYAML 时脚本返回 9 并打印 NOPYyaml —— 同样要继续，而不是当成通过。
+ *
+ * 第三种「找不到」：**真解释器装了但不在 PATH 上**。本机就是如此 —— PATH 上
+ * 只有 Store 占位符，真解释器在 `%LOCALAPPDATA%\Programs\Python\Python312`。
+ * 只试 PATH 上的名字会得出「本机没有 Python」，而事实是「PATH 里没有」。
+ * 所以候选列表里要带上 Windows 官方安装位置的绝对路径。
  */
+/** Windows 上真解释器常在官方安装目录但不在 PATH；Linux/macOS 上返回空。 */
+function winPythonCandidates() {
+  const out = [];
+  for (const base of [process.env.LOCALAPPDATA, process.env.APPDATA]) {
+    if (!base) continue;
+    // Python312 是本机实测的版本；不写死单一版本号 —— 探测失败时报错文案
+    // 会把这个目录打出来，人能自己看到实际版本。
+    for (const ver of ["Python312", "Python313", "Python311"]) {
+      const p = path.join(base, "Programs", "Python", ver, "python.exe");
+      if (fs.existsSync(p)) out.push(p);
+    }
+  }
+  return out;
+}
+
 function authoritativeYamlParse(file) {
   const script = path.join(__dirname, "yamlcheck.py");
   const STUB = /Microsoft Store|was not found|not recognized as an internal/i;
-  for (const bin of ["python3", "python", "py"]) {
+  const CANDS = ["python3", "python", "py", ...winPythonCandidates()];
+  for (const bin of CANDS) {
     const args = bin === "py" ? ["-3", script, file] : [script, file];
     let out = "";
     try {

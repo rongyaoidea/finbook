@@ -10756,8 +10756,14 @@ async fn register_batch(
     user.require(Perm::Warehouse)?;
     let db = state.db_for(&user.book_key)?;
     let direction = if req.direction == "out" { "out" } else { "in" };
+    // 期间取**账套当前期间**，与 stock_adjust / 盘点 / 采购到货同一口径。
+    // 曾经传的是 batch_register 内部自己算的「真实当天」，于是账套停在 2026-01
+    // 而今天 2026-10 时，批次流水落在 202610：批次台账能看到余额
+    //（它按 (item,batch) 汇总、不过滤期间），按期间查的数量金额账却看不到。
+    let period = current_period(&state, &user);
     let (id, no, bal) = findb::batch::batch_register(
         &db,
+        period,
         &req.item,
         &req.batch_no,
         &req.production_date,

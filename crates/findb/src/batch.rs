@@ -112,8 +112,17 @@ pub fn batch_balance(db: &Db, item: &str, batch_no: &str) -> DbResult<Money> {
 /// 登记批次出入：批次不存在则建档（批号空 = 自动 BT+日期+序号）。
 /// 生产日期提供时按存货档案保质期推算失效日期。direction: "in" 入库 / "out" 出库。
 /// 返回 (批次 id, 实际批号, 当前余额)。
+///
+/// `period` 由调用方传入，**不在这里推断**：批次流水与其它库存流水记在同一本
+/// 账上，期间口径必须一致。曾经这里写的是 `Period::from_date(today)`（真实当天），
+/// 而 stock_adjust 用账套当前期间 —— 同一个存货从两个页面写进去会落在不同期，
+/// 批次台账能看到余额（它不过滤期间）、按期间查的数量金额账却看不到。
+///
+/// 期间必须已开放（未结账且不早于建账期），与凭证录入用同一把尺子
+/// （`periods::is_open`）。漏了这道闸门，批次流水就能写进已结账的期间。
 pub fn batch_register(
     db: &Db,
+    period: Period,
     item: &str,
     batch_no: &str,
     production_date: &str,
@@ -133,22 +142,30 @@ pub fn batch_register(
     if direction != "in" && direction != "out" {
         return Err(fincore::FinError::validate("方向只能是 in/out").into());
     }
+    if !crate::periods::is_open(db, period)? {
+        return Err(fincore::FinError::state(format!(
+            "期间 {} 已结账或早于建账期，不能登记批次出入",
+            period.ymm()
+        ))
+        .into());
+    }
     let today = chrono::Local::now().date_naive();
     let no = if batch_no.trim().is_empty() {
         next_batch_no(db, today)?
     } else {
         batch_no.trim().to_string()
     };
-    // 生效日期：生产日期（今天缺省）；失效 = 生产 + 保质期
+    // 生效日期：生产日期（缺省 = **期间首日**，不是今天）。
+    // 用今天会让「生产日期 2026-01-10 / 期间 202610」这种自相矛盾的记录出现 ——
+    // 日期与期间必须同月，报告才是自洽的。
     let pdate = NaiveDate::parse_from_str(production_date.trim(), "%Y-%m-%d")
-        .unwrap_or(today);
+        .unwrap_or_else(|_| period.first_day());
     let days = shelf_life_days(db, item);
     let expiry = if days > 0 {
         (pdate + chrono::Duration::days(days)).format("%Y-%m-%d").to_string()
     } else {
         String::new()
     };
-    let period = Period::from_date(today);
     let signed = if direction == "in" { qty } else { qty.negated() };
     let kind = if direction == "in" {
         crate::business::StockKind::OtherIn
@@ -179,7 +196,8 @@ pub fn batch_register(
         &crate::business::StockMove {
             id: 0,
             period,
-            biz_date: today,
+            // 业务日期跟生产日期走：同一条流水的日期与期间必须同月
+            biz_date: pdate,
             kind,
             item: item.to_string(),
             warehouse: warehouse.to_string(),
@@ -353,7 +371,6 @@ mod tests {
     fn batch_register_fefo_and_locations() {
         let db = mem();
         let p = Period::new(2026, 1).unwrap();
-        let _ = p;
 
         // 配置保质期30天（存货档案 props）
         db.conn()
@@ -365,7 +382,7 @@ mod tests {
 
         // 手工建档：RM02 无档案 → shelf_life=0 → 无失效日期
         let (_id, no1, bal) = batch_register(
-            &db, "RM02", "", "2026-01-10", "", "", m("50"), "in", "", "u",
+            &db, p, "RM02", "", "2026-01-10", "", "", m("50"), "in", "", "u",
         )
         .unwrap();
         assert!(no1.starts_with("BT26"), "自动批号 BT+日期+序号：{no1}");
@@ -373,13 +390,13 @@ mod tests {
 
         // 再入一个指定批号、带生产日期但无保质期
         let (_id2, no2, _b) = batch_register(
-            &db, "RM02", "B-2026-001", "2026-01-05", "WH1", "L01", m("30"), "in", "早批", "u",
+            &db, p, "RM02", "B-2026-001", "2026-01-05", "WH1", "L01", m("30"), "in", "早批", "u",
         )
         .unwrap();
         assert_eq!(no2, "B-2026-001");
         // 出库20 → 余额10
         let (_id3, _no3, bal3) = batch_register(
-            &db, "RM02", "B-2026-001", "", "", "", m("20"), "out", "", "u",
+            &db, p, "RM02", "B-2026-001", "", "", "", m("20"), "out", "", "u",
         )
         .unwrap();
         assert_eq!(bal3, m("10"), "出库后余额10");
@@ -416,7 +433,7 @@ mod tests {
             )
             .unwrap();
         let (_id4, no4, _b4) = batch_register(
-            &db, "RM03", "", "2026-01-10", "", "", m("10"), "in", "", "u",
+            &db, p, "RM03", "", "2026-01-10", "", "", m("10"), "in", "", "u",
         )
         .unwrap();
         let exp = expiring_batches(&db, 999).unwrap();
@@ -440,5 +457,106 @@ mod tests {
         );
         location_delete(&db, lid).unwrap();
         assert!(location_list(&db).unwrap().is_empty());
+    }
+
+    /// 批次流水必须记在**传入的期间**，不能落在「真实当天」。
+    ///
+    /// 这条测试的存在理由：`batch_register` 曾经自己写 `Period::from_date(today)`。
+    /// 那行代码没有任何报错，单元测试也全绿（断言只查批号与余额，都与期间无关），
+    /// 手工测试时账套期间又恰好接近真实日期 —— 于是「同一个存货从批次页写进去
+    /// 落在 202610、从库存调整页写进去落在 202601」这件事，
+    /// 直到有人把账套停在 2026-01 才开始显形，而那时它已经在生产里跑着了。
+    #[test]
+    fn batch_register_uses_given_period_not_today() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        let (_id, _no, _bal) =
+            batch_register(&db, p, "RM02", "B-P", "2026-01-10", "", "", m("7"), "in", "", "u")
+                .unwrap();
+
+        // 直接查流水：period 与 biz_date 都必须是 202601
+        let (per, biz): (i32, String) = db
+            .conn()
+            .query_row(
+                "SELECT period, biz_date FROM stock_move WHERE batch_no='B-P'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            per, 202601,
+            "流水期间必须是传入的 202601，而不是 `Period::from_date(today)`"
+        );
+        assert_eq!(
+            biz.as_str(),
+            "2026-01-10",
+            "业务日期应等于生产日期：同一条流水的日期与期间必须同月"
+        );
+
+        // 生产日期缺省时取**期间首日**，不是今天 —— 否则会出现
+        // 「期间 202601 / 日期 2026-10-01」这种自相矛盾的记录。
+        let (_id2, _no2, _b2) =
+            batch_register(&db, p, "RM02", "B-Q", "", "", "", m("3"), "in", "", "u")
+                .unwrap();
+        let biz2: String = db
+            .conn()
+            .query_row(
+                "SELECT biz_date FROM stock_move WHERE batch_no='B-Q'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(biz2.as_str(), "2026-01-01", "缺省生产日期 = 期间首日");
+    }
+
+    /// 批次登记必须与凭证录入用同一把尺子：已结账 / 早于建账期的期间拒收。
+    ///
+    /// 漏这道闸门时，批次流水能直接写进已结账的期间 —— 结账的意义正是
+    /// 「这个期间的账已经定死了」，而这里成了唯一的例外。
+    #[test]
+    fn batch_register_refuses_closed_period() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        // 早于建账期（mem() 的建账期见测试工厂）
+        let before = Period::new(2000, 1).unwrap();
+        let e = batch_register(
+            &db, before, "RM02", "B-X", "", "", "", m("1"), "in", "", "u",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("建账期"),
+            "早于建账期应被拒并说明原因，实际：{e}"
+        );
+
+        // 结账后拒收。
+        // 直接写结账标记而不走 `periods::close`：那个函数要过「无未记账凭证 /
+        // 试算平衡 / 损益已结转」一整套检查，返回的是**问题清单**而不是 Result，
+        // 用它会让本测试的失败原因变得不清楚（挂在结账检查上还是挂在守卫上？）。
+        // 这里要验的只有「守卫认不认结账标记」这一件事。
+        db.conn()
+            .execute(
+                "INSERT INTO period_state(period, closed) VALUES(?1,1)",
+                rusqlite::params![p.ymm()],
+            )
+            .unwrap();
+        let e2 = batch_register(
+            &db, p, "RM02", "B-Y", "", "", "", m("1"), "in", "", "u",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e2.contains("已结账"),
+            "已结账期间应被拒，实际：{e2}"
+        );
+
+        // 对照组：确认上面的拒绝是守卫干的，不是别的原因（比如期初校验）
+        let open = Period::new(2026, 2).unwrap();
+        assert!(
+            batch_register(&db, open, "RM02", "B-Z", "", "", "", m("1"), "in", "", "u").is_ok(),
+            "未结账且在期内的期间应能登记"
+        );
     }
 }

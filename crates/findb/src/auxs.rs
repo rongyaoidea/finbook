@@ -84,6 +84,7 @@ pub fn get(db: &Db, kind: AuxKind, code: &str) -> DbResult<Option<AuxEntity>> {
 }
 
 pub fn insert(db: &Db, e: &AuxEntity) -> DbResult<i64> {
+    check_parent(db, e.kind, &e.code, e.parent_code.as_deref())?;
     db.conn().execute(
         "INSERT INTO aux_entity(kind,code,name,parent_code,disabled,props_json,memo)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -101,6 +102,7 @@ pub fn insert(db: &Db, e: &AuxEntity) -> DbResult<i64> {
 }
 
 pub fn update(db: &Db, e: &AuxEntity) -> DbResult<()> {
+    check_parent(db, e.kind, &e.code, e.parent_code.as_deref())?;
     db.conn().execute(
         "UPDATE aux_entity SET name=?2,parent_code=?3,disabled=?4,props_json=?5,memo=?6
          WHERE id=?1",
@@ -120,6 +122,122 @@ pub fn delete(db: &Db, id: i64) -> DbResult<()> {
     db.conn()
         .execute("DELETE FROM aux_entity WHERE id=?1", rusqlite::params![id])?;
     Ok(())
+}
+
+// ---------------- parent_code（分级档案）的校验 ----------------
+//
+// 全部四个问题都会让「按层级汇总」崩掉或丢数据：
+//   ① 上级不存在   → 填个不存在的编码，那个客户在层级视图里凭空消失
+//   ② 自环（C01→C01）→ 递归不收敛
+//   ③ 多级环（C01→C02→C01）→ 同样不收敛
+//   ④ 删父不管子   → 子节点变孤儿
+//
+// ①③ 的做法：**先扫全图有没有环**，有就拒（并报出环上的编码）；
+// 没有再模拟这次修改。有历史脏数据时，先修数据再改档案 ——
+// 否则每次改任何一行都会撞上同一个错，用户会觉得「档案不能编辑」。
+
+/// (kind, code) -> 上级编码。**包含平级档案**（值为空串）。
+///
+/// 这个「包含平级」是必须的：我第一版只把有上级的行放进 map，
+/// 于是「上级是否存在」这一问（`map.contains_key(p)`）对**任何平级档案**
+/// 都返回 false —— 结果是「给 C02 指定上级 C01」被判成「C01 不存在」。
+/// 校验一装上，所有给平级档案设上级的操作全被拒。
+/// 这类失败比不校验更糟：它让功能整体不可用，而且报错指向「数据不存在」，
+/// 真实原因是「校验写错了」。
+fn parent_map(db: &Db, kind: AuxKind) -> DbResult<std::collections::BTreeMap<String, String>> {
+    let mut st = db.conn().prepare(
+        "SELECT code, COALESCE(parent_code,'') FROM aux_entity WHERE kind=?1"
+    )?;
+    let rows = st.query_map([kind_str(kind)], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut m = std::collections::BTreeMap::new();
+    for r in rows {
+        let (c, p) = r?;
+        m.insert(c, p);
+    }
+    Ok(m)
+}
+
+/// 图里从 `start` 出发按 parent 上溯，能不能走回自己（= 有环）
+fn reaches(map: &std::collections::BTreeMap<String, String>, start: &str, target: &str) -> bool {
+    let mut cur = map.get(start).map(String::as_str);
+    // 上限：编码数量 + 1。没有这个上限，一个 1000 节点的链会走 1000 步才停，
+    // 而图有环时会**永远**走下去。这里必须靠 map.len() 兜底，不能靠 while 无界。
+    let mut steps = 0usize;
+    while let Some(c) = cur {
+        if c == target {
+            return true;
+        }
+        // 平级档案（上级为空串）就是链的终点。parent_map 现在**包含**平级档案，
+        // 所以不加这一句就会把空串当成一个编码继续上溯（map 里没有 "" 这个键，
+        // 恰好返回 None，但那是靠「查不到」而不是靠「它确实是终点」停下来的）。
+        if c.trim().is_empty() {
+            return false;
+        }
+        steps += 1;
+        if steps > map.len() + 1 {
+            return true; // 超过节点数还没走回自己 = 一定成环
+        }
+        cur = map.get(c).map(String::as_str);
+    }
+    false
+}
+
+/// 保存/更新前校验 parent_code。`code` 是本行自己的编码（更新时传入）。
+pub fn check_parent(db: &Db, kind: AuxKind, code: &str, parent: Option<&str>) -> DbResult<()> {
+    let p = parent.unwrap_or("").trim();
+    if p.is_empty() {
+        return Ok(());
+    }
+    if p == code.trim() {
+        return Err(fincore::FinError::validate(
+            format!("上级编码不能是自己（{code}）—— 会形成环，层级汇总无法收敛"),
+        )
+        .into());
+    }
+    let map = parent_map(db, kind)?;
+    // ① 上级必须存在
+    if !map.contains_key(p) {
+        return Err(fincore::FinError::validate(format!(
+            "上级编码 {p} 不存在（{} 的上级必须在同类档案里已建档）",
+            code.trim()
+        ))
+        .into());
+    }
+    // ③ 这次修改会不会成环：把 p 的上级链走一遍，看能不能走到自己
+    if reaches(&map, p, code.trim()) {
+        return Err(fincore::FinError::validate(format!(
+            "上级 {p} 的上级链已指向 {}，形成环 —— 层级汇总无法收敛",
+            code.trim()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// 库里的层级图是否已经成环（历史脏数据）。返回环上的一个编码。
+pub fn find_parent_cycle(db: &Db, kind: AuxKind) -> DbResult<Option<String>> {
+    let map = parent_map(db, kind)?;
+    for c in map.keys() {
+        if reaches(&map, c, c) {
+            return Ok(Some(c.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// 删除前的子节点检查：返回挂在 `code` 下面的直接子编码
+pub fn children_of(db: &Db, kind: AuxKind, code: &str) -> DbResult<Vec<String>> {
+    let mut st = db.conn().prepare(
+        "SELECT code FROM aux_entity WHERE kind=?1 AND parent_code=?2 ORDER BY code"
+    )?;
+    let rows = st.query_map(rusqlite::params![kind_str(kind), code], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// 某类档案的全部编码（校验重复用）
@@ -233,6 +351,127 @@ pub fn list_settle_types(db: &Db) -> DbResult<Vec<String>> {
         .prepare("SELECT name FROM settle_type ORDER BY sort")?;
     let rows = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+    use crate::tests::mem;
+
+    fn mk(db: &Db, code: &str, parent: Option<&str>) -> AuxEntity {
+        AuxEntity {
+            id: 0,
+            kind: AuxKind::Customer,
+            code: code.into(),
+            name: format!("客户{code}"),
+            parent_code: parent.map(String::from),
+            disabled: false,
+            props: Default::default(),
+            memo: String::new(),
+        }
+    }
+
+    /// 上级必须已建档 —— 填一个不存在的编码，那个客户会在层级视图里凭空消失。
+    #[test]
+    fn parent_must_exist() {
+        let db = mem();
+        insert(&db, &mk(&db, "C01", None)).unwrap();
+        let e = mk(&db, "C02", Some("C99"));
+        let err = insert(&db, &e).unwrap_err().to_string();
+        assert!(err.contains("C99"), "报错要点名不存在的上级编码：{err}");
+        assert!(err.contains("不存在"), "要说清是「不存在」而不是「无效」：{err}");
+    }
+
+    /// 自环：C01 的上级填 C01。
+    #[test]
+    fn parent_cannot_be_self() {
+        let db = mem();
+        insert(&db, &mk(&db, "C01", None)).unwrap();
+        let err = insert(&db, &mk(&db, "C01", Some("C01"))).unwrap_err().to_string();
+        assert!(err.contains("自己"), "要说清是「不能填自己」：{err}");
+    }
+
+    /// 多级环：C01→C02→C01。**这个最容易漏** —— 只查自环的实现挡不住它，
+    /// 而它同样让递归不收敛。
+    #[test]
+    fn parent_cycle_of_length_two_rejected() {
+        let db = mem();
+        insert(&db, &mk(&db, "C01", None)).unwrap();
+        insert(&db, &mk(&db, "C02", Some("C01"))).unwrap();
+
+        // 现在改 C01，让它的上级是 C02 —— C01→C02→C01
+        let mut e = mk(&db, "C01", Some("C02"));
+        e.id = 1; // C01 的 id 是第一个插入的
+        let id = {
+            let r = db
+                .conn()
+                .query_row(
+                    "SELECT id FROM aux_entity WHERE kind='customer' AND code='C01'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            r
+        };
+        e.id = id;
+        let err = update(&db, &e).unwrap_err().to_string();
+        assert!(err.contains("环"), "多级环必须被拒：{err}");
+
+        // 对照组：改成不存在的上级，仍然是「不存在」而不是「环」——
+        // 两种错法要能分开，否则用户不知道自己错在哪。
+        let e2 = mk(&db, "C01", Some("ZZZ"));
+        let err2 = update(&db, &e2).unwrap_err().to_string();
+        assert!(err2.contains("不存在"), "不存在的上级要说「不存在」：{err2}");
+    }
+
+    /// 删除前要知道有没有子节点 —— 删了父，子就成孤儿且没人知道。
+    #[test]
+    fn children_of_reports_subordinates() {
+        let db = mem();
+        insert(&db, &mk(&db, "C00", None)).unwrap();
+        insert(&db, &mk(&db, "C01", Some("C00"))).unwrap();
+        insert(&db, &mk(&db, "C02", Some("C00"))).unwrap();
+        insert(&db, &mk(&db, "C03", Some("C01"))).unwrap();
+
+        let mut kids = children_of(&db, AuxKind::Customer, "C00").unwrap();
+        kids.sort();
+        assert_eq!(kids, vec!["C01".to_string(), "C02".to_string()]);
+        // 只返回**直接**子节点；孙节点不在内（调用方要自己决定是拒绝还是级联）
+        assert!(
+            children_of(&db, AuxKind::Customer, "C01").unwrap() == vec!["C03".to_string()]
+        );
+        assert!(children_of(&db, AuxKind::Customer, "C03").unwrap().is_empty());
+    }
+
+    /// find_parent_cycle：没有环时返回 None；有环时能指出环上的一个编码。
+    ///
+    /// 直接构造环（绕开 check_parent，因为 check_parent 会拦住）——
+    /// 目的是验「历史脏数据能被检出」，那正是 find_parent_cycle 的用途。
+    #[test]
+    fn find_parent_cycle_detects_existing_cycle() {
+        let db = mem();
+        insert(&db, &mk(&db, "C01", None)).unwrap();
+        insert(&db, &mk(&db, "C02", Some("C01"))).unwrap();
+        assert_eq!(
+            find_parent_cycle(&db, AuxKind::Customer).unwrap(),
+            None,
+            "干净的图不该报环"
+        );
+
+        // 绕过校验直接造环：C01 的上级改成 C02
+        db.conn()
+            .execute(
+                "UPDATE aux_entity SET parent_code='C02' WHERE kind='customer' AND code='C01'",
+                [],
+            )
+            .unwrap();
+        let hit = find_parent_cycle(&db, AuxKind::Customer).unwrap();
+        // `matches!` 会 move `hit`，而后面 assert 的格式化参数还要用它 —— 借用
+        assert!(
+            matches!(&hit, Some(c) if c == "C01" || c == "C02"),
+            "应报出环上的编码，实际：{hit:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1060,6 +1060,9 @@ const NAV_ITEMS = [
   { id: "po-reconcile", label: "采购对账", perm: "report", group: "采购" },
   { id: "po-estimate", label: "采购暂估", perm: "order_ops", group: "采购" },
   { id: "procure-quota", label: "供应商配额", perm: "order_ops", group: "采购" },
+  // 客户视图：perm 用 report（不是 aux_edit）—— 出纳要看这张名单（催款要用）、
+  // 要能核销，但不该能改客户档案。详见 docs/客户管理模块设计.md §4。
+  { id: "customers", label: "客户管理", perm: "report", group: "销售" },
   { id: "so-doc", label: "销售单据", perm: "order_ops", group: "销售" },
   { id: "so-reconcile", label: "销售对账", perm: "report", group: "销售" },
   { id: "order-change-log", label: "订单变更", perm: "report", group: "销售" },
@@ -1110,6 +1113,7 @@ const VIEWS = {
   "period-end": viewPeriodEnd,
   "assets": viewAssets,
   "bank": viewBank,
+  "customers": viewCustomers,
   "settle": viewSettle,
   "reconcile": viewReconcile,
   "mrp": viewMrp,
@@ -6244,6 +6248,126 @@ async function viewReconcile(main) {
       $("#rc-result").innerHTML = items.map((i) => `<div class="card"><div class="row"><b>${esc(i.name)}</b><span class="tag ${i.ok ? "ok" : "err"}">${i.ok ? "通过" : "异常"}</span></div><div class="muted">${esc(i.detail)}</div></div>`).join("") || `<div class="muted">暂无对账数据</div>`;
     } catch (e) { toast(e.message, "err"); }
   });
+}
+
+// ===========================================================================
+// 客户管理（只读视图层）
+// ===========================================================================
+//
+// 【为什么只读】客户主数据在辅助档案（aux_entity kind='customer'），全系统唯一一份。
+// 这个页面只做「以客户为主体」的**汇总与明细**：余额口径由后端
+// findb::customers 保证走 settle::open_entries（H-3：只认已记账）。
+//
+// 页面上**故意没有**「编辑客户」按钮 —— 改档案仍然只有辅助档案页一个入口。
+// 加第二个能改客户的地方 = 两份主数据 + 一个同步问题，且必然出现
+// 「销售单据认的客户」与「客户管理里看到的客户」对不上。
+//
+// 【列表默认平铺】查过三个事实：建库种子里没有任何 aux_entity 行、
+// 全仓库 parent_code: Some(...) 0 处、四张业务表都不存层级路径。
+// 树视图是为一个不存在的数据形态做界面。见 docs/客户管理模块设计.md §5.3。
+async function viewCustomers(main) {
+  main.innerHTML = `<h2>客户管理</h2>
+    <div class="toolbar">
+      <label>期间 <input id="cu-period" value="${esc((state.current || '').replace('-', ''))}" style="width:90px" /></label>
+      <label>搜索 <input id="cu-q" placeholder="编码/名称" style="width:140px" /></label>
+      <label style="font-size:12px"><input type="checkbox" id="cu-only-open" checked /> 只看有欠款</label>
+      <button class="btn primary sm" id="cu-load">查询</button>
+      <button class="btn ghost sm" id="cu-print">打印预览</button>
+      <span class="grow"></span>
+      <span class="muted" style="font-size:12px">余额只算**已记账**凭证；改档案请到「辅助档案」</span>
+    </div>
+    <div id="cu-sum" class="muted" style="margin-bottom:6px"></div>
+    <div id="cu-list" class="muted">加载中…</div>`;
+
+  const load = async () => {
+    const per = $("#cu-period").value.trim();
+    const q = $("#cu-q").value.trim();
+    const only = $("#cu-only-open").checked ? "1" : "";
+    try {
+      const r = await api(`/customers?period=${encodeURIComponent(per)}&q=${encodeURIComponent(q)}&only_open=${only}`);
+      const rows = r.rows || [];
+      // 顶部汇总用后端给的字段，不在前端重算 —— 前端重算就是第二套口径。
+      $("#cu-sum").textContent = rows.length
+        ? `${r.total} 个客户 · ${r.open_count} 个有未核销 · 未核销合计 ${r.open_sum}`
+        : "";
+      $("#cu-list").innerHTML = rows.length
+        ? `<table class="grid"><thead><tr>
+            <th>编码</th><th>名称</th><th class="num">应收余额</th><th class="num">未核销</th>
+            <th class="num">笔数</th><th>最长账龄</th><th class="num">期初挂账</th><th></th>
+          </tr></thead><tbody>${rows.map((x) => {
+            const neg = Number(x.balance) < 0;
+            return `<tr>
+              <td>${esc(x.code)}</td>
+              <td>${esc(x.name)}${x.disabled ? ' <span class="tag warn">停用</span>' : ""}</td>
+              <td class="num"${neg ? ' style="color:var(--ok)"' : ""}>${fmt(x.balance)}</td>
+              <td class="num"><b>${fmt(x.open_amount)}</b></td>
+              <td class="num">${Number(x.open_count) || ""}</td>
+              <td>${x.oldest_open_date ? esc(x.oldest_open_date) : "—"}</td>
+              <td class="num">${fmt(x.opening_balance)}</td>
+              <td class="row-actions"><button class="btn ghost sm" data-cu-open="${esc(x.code)}">往来明细</button></td>
+            </tr>`;
+          }).join("")}</tbody></table>`
+        : `<div class="muted">没有符合条件的客户${only ? "（都不欠款，或账上没有应收记录）" : ""}</div>`;
+      $("#cu-list").querySelectorAll("[data-cu-open]").forEach((b) => {
+        b.onclick = () => openCustomerDetail(b.dataset.cuOpen, $("#cu-period").value.trim());
+      });
+    } catch (e) {
+      $("#cu-list").innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`;
+    }
+  };
+  $("#cu-load").addEventListener("click", load);
+  $("#cu-q").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+  // 期间变化时自动重查：用户改了期间却在看上一期的数字，是最容易犯的错之一。
+  $("#cu-period").addEventListener("change", load);
+  $("#cu-only-open").addEventListener("change", load);
+  $("#cu-print").addEventListener("click", () => {
+    printPreview("客户往来汇总", $("#cu-list").querySelector("table"));
+  });
+  await load();
+}
+
+/// 客户详情（弹窗）：顶部汇总 + 往来明细 + 信用占用
+function openCustomerDetail(code, period) {
+  const m = modal(`<h3>客户 ${esc(code)}</h3>
+    <div id="cd-body" class="muted">加载中…</div>
+    <div class="foot"><button class="btn ghost" id="cd-close">关闭</button></div>`);
+  $("#cd-close", m).onclick = closeModal;
+  (async () => {
+    try {
+      const r = await api(`/customers/${encodeURIComponent(code)}?period=${encodeURIComponent(period || "")}`);
+      const c = r.customer || {};
+      const s = c.summary || {};
+      const lines = c.lines || [];
+      const cr = r.credit;
+      const neg = Number(s.balance) < 0;
+      $("#cd-body", m).innerHTML = `
+        <div class="panel" style="margin:0 0 10px">
+          <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px">
+            <span><span class="muted">应收余额</span> <b${neg ? ' style="color:var(--ok)"' : ""}>${fmt(s.balance)}</b></span>
+            <span><span class="muted">未核销</span> <b>${fmt(s.open_amount)}</b>（${Number(s.open_count) || 0} 笔）</span>
+            <span><span class="muted">期初挂账</span> <b>${fmt(s.opening_balance)}</b></span>
+            <span><span class="muted">最早未核销</span> ${s.oldest_open_date ? esc(s.oldest_open_date) : "—"}</span>
+            ${cr ? `<span><span class="muted">信用占用</span> ${fmt(cr.receivable)} / ${Number(cr.limit) > 0 ? fmt(cr.limit) : "<span class=\"muted\">未设额度</span>"}${cr.over ? ' <span class="tag err">超额度</span>' : ""}</span>` : ""}
+          </div>
+        </div>
+        <div style="max-height:340px;overflow:auto">
+        ${lines.length ? `<table class="grid"><thead><tr>
+          <th>日期</th><th>单据</th><th>摘要</th><th>科目</th>
+          <th class="num">金额</th><th class="num">已核销</th><th class="num">未核销</th>
+        </tr></thead><tbody>${lines.map((l) => `<tr${l.from_opening ? ' style="color:var(--muted)"' : ""}>
+          <td>${esc(l.date)}</td>
+          <td>${esc(l.doc_no)}</td>
+          <td>${esc(l.summary || "")}</td>
+          <td>${esc(l.account_code)}</td>
+          <td class="num">${fmt(l.amount)}</td>
+          <td class="num">${fmt(l.settled)}</td>
+          <td class="num">${Number(l.open) !== 0 ? `<b>${fmt(l.open)}</b>` : ""}</td>
+        </tr>`).join("")}</tbody></table>` : `<div class="muted">没有往来记录</div>`}
+        </div>`;
+    } catch (e) {
+      $("#cd-body", m).innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`;
+    }
+  })();
 }
 
 // ===========================================================================

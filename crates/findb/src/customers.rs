@@ -181,7 +181,15 @@ pub fn list(db: &Db, period: Period, q: &str, only_open: bool) -> DbResult<Vec<C
         let mut s = summarize(&ent.code, &ent.name, lines, opening_balance(db, &ent.code, period)?);
         s.parent_code = ent.parent_code.clone().unwrap_or_default();
         s.disabled = ent.disabled;
-        if only_open && s.open_amount.is_zero() {
+        // 「有没有人在追着要钱」不能只看凭证行：期初挂账也是钱。
+        //
+        // 客户只在**期初挂账**欠款时，open_amount = 0（期初不进 open_entries，
+        // 它是影子行）→ 只看 open_amount 的话，他会在催款名单上**完全消失**，
+        // 而那正是最该催的人。E2E `期初挂账单独显示` 实测到了这个。
+        //
+        // 注意：balance 字段的语义**不变**（仍不把期初混进去，与账龄页口径一致）；
+        // 改的只是「要不要出现在名单里」。
+        if only_open && s.open_amount.is_zero() && s.opening_balance.is_zero() {
             continue;
         }
         out.push(s);
@@ -529,6 +537,51 @@ mod tests {
             summary_of(&db, "C01", per).unwrap().balance,
             m("750"),
             "112201 与 112202 必须**合并**计入；AR_ACCOUNT 若改成只认一个末级，会静默少算"
+        );
+    }
+
+    /// 只有期初挂账的客户，必须出现在「只看待催款」名单里。
+    ///
+    /// 回归：期初挂账不进 balance（open_entries 只读凭证分录），所以若判据只看
+    /// balance，客户就会**凭空消失** —— 而他欠 3000，正是最该催的人。
+    /// E2E `期初挂账单独显示，不混进余额` 实测到了这个。
+    #[test]
+    fn opening_only_customer_still_in_only_open() {
+        let db = mem();
+        mk_cust(&db, "C01", "只有期初");
+        mk_cust(&db, "C02", "真的没欠");
+        let per = Period::new(2026, 1).unwrap();
+        settle::arap_opening_insert(
+            &db,
+            &ArapOpening {
+                id: 0,
+                kind: "ar".into(),
+                party_code: "C01".into(),
+                party_name: "只有期初".into(),
+                doc_no: "XS-1".into(),
+                doc_date: "2025-12-01".into(),
+                amount: m("3000"),
+                memo: String::new(),
+                created_by: "u".into(),
+            },
+            "u",
+        )
+        .unwrap();
+
+        let s = summary_of(&db, "C01", per).unwrap();
+        assert_eq!(s.opening_balance, m("3000"));
+        assert_eq!(
+            s.balance,
+            Money::ZERO,
+            "balance 仍为 0 —— 期初不混进余额（与账龄页口径一致），这是对的"
+        );
+
+        let only = list(&db, per, "", true).unwrap();
+        let codes: Vec<&str> = only.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["C01"],
+            "只有期初挂账的客户要出现在催款名单里；真没欠的 C02 不该出现"
         );
     }
 

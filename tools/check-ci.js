@@ -758,25 +758,29 @@ console.log(`编码卫生：扫描 ${tracked.length} 个受版本控制的源文
 //
 // ⚠️ 「文件没找到」必须算**失败**。本检查的第一版路径算错了，`existsSync` 返回
 //    false 就当无事发生 —— 检查自己失效却报喜，正是最坏的一种检查。
+/** 夹具 test_state() 现在在哪个文件里。主检查与自检探针都必须问这个函数，
+ *  不能各写一份 —— 各写一份就会出现「主检查改了、探针没改」这种静默失效。 */
+function fixFixtureFile() {
+  if (!FIX_ROOT) return "crates/finweb/tests/api.rs";
+  for (const rel of [
+    "crates/finweb/tests/common/mod.rs",
+    "crates/finweb/tests/api.rs",
+  ]) {
+    const p = path.join(FIX_ROOT, ...rel.split("/"));
+    if (fs.existsSync(p) && /^(pub )?fn test_state\b/m.test(fs.readFileSync(p, "utf8"))) {
+      return rel;
+    }
+  }
+  // 都没有就退回 api.rs —— 让后面的检查报「找不到夹具」，而不是静默跳过
+  return "crates/finweb/tests/api.rs";
+}
+
 if (FIX_ROOT) {
   // 夹具可能落在 api.rs 或 tests/common/mod.rs（2026-10-01 提取）。
   // 两处都查：只查其中一处，夹具再搬一次就会漏 —— 而漏的表现是
   // 「对着空 body 得出『夹具没写闸门』」的错误结论，比不检查更糟。
-  const FIX_FILES = [
-    path.join(FIX_ROOT, "crates", "finweb", "tests", "api.rs"),
-    path.join(FIX_ROOT, "crates", "finweb", "tests", "common", "mod.rs"),
-  ];
-  let apiSrc = "";
-  let fxFile = "（未找到）";
-  for (const f of FIX_FILES) {
-    if (!fs.existsSync(f)) continue;
-    const src = fs.readFileSync(f, "utf8");
-    if (/^(pub )?fn test_state\b/m.test(src)) {
-      apiSrc = src;
-      fxFile = path.relative(FIX_ROOT, f).split(/[\\/]/).join("/");
-      break;
-    }
-  }
+  const fxFile = fixFixtureFile();
+  const apiSrc = fs.readFileSync(path.join(FIX_ROOT, ...fxFile.split("/")), "utf8");
   // 允许行首空白：`test_opts` 缩进在 `mod tests` 里，而 `test_state` 在顶层。
   // 但**不能**写成「任意位置含 fn xxx(」—— 那会匹配到注释里提到函数名的地方，
   // 然后从一个空 body 上得出「夹具没写闸门」的错误结论。
@@ -928,12 +932,23 @@ if (process.argv.includes("--selftest")) {
     {
       // 夹具退回 ..Default::default() 继承：默认值一改，28 条用例会集体变红，
       // 而报错指向的是记账逻辑，人会往错的方向查。
-      name: "api.rs 测试夹具退回继承默认值（删掉 require_cashier 显式声明）",
+      name: "账套测试夹具退回继承默认值（删掉 require_cashier 显式声明）",
       apply: () => {
-        const p2 = "crates/finweb/tests/api.rs";
+        // 路径**必须和夹具的真实位置同源**：夹具 2026-10-01 从 api.rs 搬到了
+        // tests/common/mod.rs。探针若仍指向 api.rs，那里已经没有那行可删 ——
+        // 变异变成空操作，检查照旧绿，**探针静默退化成永真**。
+        // 而它的名字还叫「api.rs 夹具」，从输出上完全看不出它已经失效。
+        const p2 = fixFixtureFile();
         const o = fs.readFileSync(p2, "utf8");
         const nl = o.includes("\r\n") ? "\r\n" : "\n";
-        fs.writeFileSync(p2, o.split("        require_cashier: false," + nl).join(""));
+        const target = "        require_cashier: false," + nl;
+        if (o.split(target).length - 1 !== 1) {
+          throw new Error(
+            "夹具文件 " + p2 + " 里找不到唯一的 require_cashier 声明 —— " +
+              "探针无法变异（空变异 = 永真）",
+          );
+        }
+        fs.writeFileSync(p2, o.split(target).join(""));
         return () => fs.writeFileSync(p2, o);
       },
     },

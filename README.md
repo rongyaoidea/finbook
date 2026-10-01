@@ -709,15 +709,15 @@ cargo test --workspace
 | 套件 | 数量 |
 |------|------|
 | `fincore`（纯计算引擎） | 113 |
-| `findb`（持久化 + DAO + 安全闸门） | 339 |
+| `findb`（持久化 + DAO + 安全闸门） | 340 |
 | `findb` 端到端 `core_loop` | 21 |
 | `findb` 端到端 `ext_loop` | 7 |
 | `finui` | 1 |
 | `finweb` lib | 4 |
 | `finweb` REST API 集成 | 186 |
 | `finweb` 客户视图 API | 4 |
-| **小计** | **675** |
-| Playwright E2E | 82 |
+| **小计** | **676** |
+| Playwright E2E | 85 |
 
 > E2E 的条数只在 CI 里按**唯一权威来源**核对：
 > `npx playwright test --list` 的 `Total: N tests in M files`。

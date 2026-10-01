@@ -759,7 +759,24 @@ console.log(`编码卫生：扫描 ${tracked.length} 个受版本控制的源文
 // ⚠️ 「文件没找到」必须算**失败**。本检查的第一版路径算错了，`existsSync` 返回
 //    false 就当无事发生 —— 检查自己失效却报喜，正是最坏的一种检查。
 if (FIX_ROOT) {
-  const apiSrc = fs.readFileSync(path.join(FIX_ROOT, "crates", "finweb", "tests", "api.rs"), "utf8");
+  // 夹具可能落在 api.rs 或 tests/common/mod.rs（2026-10-01 提取）。
+  // 两处都查：只查其中一处，夹具再搬一次就会漏 —— 而漏的表现是
+  // 「对着空 body 得出『夹具没写闸门』」的错误结论，比不检查更糟。
+  const FIX_FILES = [
+    path.join(FIX_ROOT, "crates", "finweb", "tests", "api.rs"),
+    path.join(FIX_ROOT, "crates", "finweb", "tests", "common", "mod.rs"),
+  ];
+  let apiSrc = "";
+  let fxFile = "（未找到）";
+  for (const f of FIX_FILES) {
+    if (!fs.existsSync(f)) continue;
+    const src = fs.readFileSync(f, "utf8");
+    if (/^(pub )?fn test_state\b/m.test(src)) {
+      apiSrc = src;
+      fxFile = path.relative(FIX_ROOT, f).split(/[\\/]/).join("/");
+      break;
+    }
+  }
   // 允许行首空白：`test_opts` 缩进在 `mod tests` 里，而 `test_state` 在顶层。
   // 但**不能**写成「任意位置含 fn xxx(」—— 那会匹配到注释里提到函数名的地方，
   // 然后从一个空 body 上得出「夹具没写闸门」的错误结论。
@@ -784,8 +801,12 @@ if (FIX_ROOT) {
   const fx = fnBodyOf(apiSrc, "test_state");
   if (!fx) {
     bad++;
-    console.log("FAIL api.rs 里找不到 test_state() —— 夹具改名时本检查要跟着改");
+    console.log(
+      "FAIL 在 " + FIX_FILES.map((f) => path.relative(FIX_ROOT, f)).join(" / ") +
+        " 里都找不到 test_state() —— 夹具改名或搬走时本检查要跟着改"
+    );
   } else {
+    console.log(`测试夹具：${fxFile} 的 test_state() 显式声明了两道闸门`);
     for (const field of ["enable_audit", "require_cashier"]) {
       if (!new RegExp("\\b" + field + "\\s*:").test(fx)) {
         bad++;

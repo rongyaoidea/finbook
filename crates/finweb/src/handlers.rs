@@ -374,6 +374,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/import/template", get(import_template))
         .route("/api/arap-opening", get(list_arap_opening))
         .route("/api/arap-opening/:id", delete(delete_arap_opening))
+        // 客户视图（只读；余额口径由 findb::customers 保证走 open_entries）
+        .route("/api/customers", get(list_customers))
+        .route("/api/customers/:code", get(get_customer))
         .route("/api/items/master", get(items_master))
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
@@ -4554,6 +4557,91 @@ async fn delete_arap_opening(
 }
 
 /// 存货档案一站式列表（独立存货档案页：档案+计划参数+现量+主单位）
+// ---- 客户视图 ----------------------------------------------------------
+//
+// 两个都是**只读**接口。改客户档案仍然只有 `/api/aux` 一个入口 ——
+// 这里若也能改，就会出现「销售单据认的客户」与「客户管理里的客户」两份主数据。
+async fn list_customers(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Perm::Report 而不是 Perm::AuxEdit：出纳要看这张名单（催款要用）、
+    // 要能核销，但不该能改客户档案。`Report` 在 Role::Cashier 的权限位里，
+    // `aux_edit` 不在 —— 这正是设计 §4 要的分界。
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let per = period_from_query(&state, &user, q.get("period"));
+    let keyword = q.get("q").map(String::as_str).unwrap_or("");
+    let only_open = matches!(q.get("only_open").map(String::as_str), Some("1" | "true"));
+    let rows = findb::customers::list(&db, per, keyword, only_open)?;
+    Ok(Json(json!({
+        "rows": rows,
+        "period": per.ymm(),
+        "total": rows.len(),
+        "open_count": rows.iter().filter(|r| !r.open_amount.is_zero()).count(),
+        "open_sum": rows
+            .iter()
+            .fold(fincore::Money::ZERO, |a, r| a + r.open_amount)
+            .fmt_money(),
+    })))
+}
+
+async fn get_customer(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(code): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let per = period_from_query(&state, &user, q.get("period"));
+    let code = code.trim().to_string();
+    // 编码空的处理：返回 400 而不是「查不到」。
+    // `Path("")` 打不进这个路由（路由就匹配不到），但显式拒绝更清楚，
+    // 且将来若加了 `/api/customers/` 这样的写法不会被静默吞掉。
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少客户编码 code"));
+    }
+    match findb::customers::detail(&db, &code, per)? {
+        Some(d) => Ok(Json(json!({
+            "customer": d,
+            "period": per.ymm(),
+            "credit": findb::sales::credit_check(&db, &code, per)
+                .map(|(recv, lim, over)| json!({
+                    "receivable": recv.fmt_money(),
+                    "limit": lim.fmt_money(),
+                    "over": over,
+                }))
+                .unwrap_or(serde_json::Value::Null),
+        }))),
+        None => Err(AppError::not_found(format!("客户 {code} 未建档"))),
+    }
+}
+
+/// query 里的 period（YYYYMM 或 YYYY-MM），缺省用会话当前期间。
+///
+/// 不传就默认当前期间，是有意的：客户视图是「现在谁欠我钱」，
+/// 而不是一个历史查询工具。要看历史用 ?period= 显式指定。
+fn period_from_query(
+    state: &WebState,
+    user: &CurrentUser,
+    raw: Option<&String>,
+) -> Period {
+    let cur = current_period(state, user);
+    match raw.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => cur,
+        Some(s) => Period::from_ymm_checked(period_checked_digits(s))
+            .or_else(|_| Period::from_ymm_checked(cur.ymm()))
+            .unwrap_or(cur),
+    }
+}
+
+/// `2026-01` / `202601` 都接受（前端两种都可能传来）。
+fn period_checked_digits(s: &str) -> i32 {
+    s.replace('-', "").parse().unwrap_or(0)
+}
+
 async fn items_master(
     State(state): State<Arc<WebState>>,
     user: CurrentUser,

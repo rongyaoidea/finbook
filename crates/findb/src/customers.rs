@@ -8,7 +8,7 @@
 // 自己算一遍 = 两套数字，而「为什么这个客户欠款和往来核销页不一样」
 // 是最难查的一类问题。
 //
-// `tools/check-ci.js` 里有对应��守门人：本文件不许出现
+// `tools/check-ci.js` 里有对应的守门人：本文件不许出现
 // voucher_entry / stock_move 的裸 SELECT。
 //
 // 应收口径：只统计 1122 系（1122 及其子科目，由 open_entries 的

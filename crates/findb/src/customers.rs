@@ -1,0 +1,544 @@
+// findb::customers —— 以客户为主体的视图层。
+//
+// 【最重要的一条】余额只有一处算法。
+// 这里**不许**出现任何自己算应收余额的 SQL：全部走
+// `settle::open_entries("1122")`。理由不是 DRY，是口径一致 ——
+// 全仓 H-3 口径是「只认已记账分录」，而 open_entries 里还有
+// 「期初挂账（arap_opening）作为影子行参与账龄」这套处理。
+// 自己算一遍 = 两套数字，而「为什么这个客户欠款和往来核销页不一样」
+// 是最难查的一类问题。
+//
+// `tools/check-ci.js` 里有对应��守门人：本文件不许出现
+// voucher_entry / stock_move 的裸 SELECT。
+//
+// 应收口径：只统计 1122 系（1122 及其子科目，由 open_entries 的
+// `LIKE ?1||'%'` 自动覆盖）。理由见 docs/客户管理模块设计.md §5.1 ——
+// 1121 应收票据 / 1123 预付账款 / 1221 其他应收 / 1231 坏账准备
+// 性质不同，混进「客户欠款」会让数字没法解释。
+use chrono::NaiveDate;
+use fincore::{AuxKind, AuxQuery, Money, Period};
+
+use crate::settle::{self, OpenEntry};
+use crate::{Db, DbResult};
+
+/// 应收科目（传一级科目即可匹配全部子科目）
+pub const AR_ACCOUNT: &str = "1122";
+
+/// 一行一个客户的汇总
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CustomerSummary {
+    pub code: String,
+    pub name: String,
+    pub parent_code: String,
+    pub disabled: bool,
+    /// 应收余额（已记账，含负数 = 预收）
+    pub balance: Money,
+    /// 未核销余额（balance 的非零部分）
+    pub open_amount: Money,
+    /// 未核销笔数
+    pub open_count: usize,
+    /// 最早一笔未核销的日期（空 = 没有未核销）
+    pub oldest_open_date: String,
+    /// 期初挂账余额（不进 open_entries，来自 arap_opening）
+    pub opening_balance: Money,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CustomerDetail {
+    #[serde(flatten)]
+    pub summary: CustomerSummary,
+    /// 该客户的全部往来行（期初 + 已记账分录）
+    pub lines: Vec<CustomerLine>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CustomerLine {
+    pub entry_id: i64,
+    pub voucher_id: i64,
+    pub period: i32,
+    pub date: String,
+    pub doc_no: String,
+    pub summary: String,
+    pub account_code: String,
+    /// 带符号金额（借正贷负）
+    pub amount: Money,
+    pub settled: Money,
+    pub open: Money,
+    pub settle_no: String,
+    pub posted: bool,
+    /// 这行来自期初挂账（无 voucher_id）
+    pub from_opening: bool,
+}
+
+/// 该客户在某期间的应收未核销分录。
+///
+/// `period` 传 0 表示「到最新」—— 与 settle 侧其他函数的约定一致。
+pub fn open_lines(db: &Db, customer: &str, period: Period) -> DbResult<Vec<OpenEntry>> {
+    let all = settle::open_entries(db, AR_ACCOUNT, period, false)?;
+    let want = crate::balances::aux_key_contains_key(customer);
+    Ok(all
+        .into_iter()
+        .filter(|e| crate::balances::aux_key_contains(&e.aux_key, &want))
+        .collect())
+}
+
+/// 汇总一个客户的余额。只读 [open_lines]，不自己算。
+pub fn summary_of(db: &Db, code: &str, period: Period) -> DbResult<CustomerSummary> {
+    let lines = open_lines(db, code, period)?;
+    Ok(summarize(code, "", &lines, opening_balance(db, code, period)?))
+}
+
+/// 期初挂账（应收方向）余额。
+///
+/// 这部分**不在** open_entries 里 —— open_entries 只读凭证分录。
+/// 而 settle::aging 会把 arap_opening 当影子行加进来，所以账龄里能看到、
+/// open_entries 里看不到。两者口径不同是有意的（影子行不参与 FIFO 核销），
+/// 所以这里必须**单独取并标出来**，不能悄悄加进 balance。
+fn opening_balance(db: &Db, code: &str, period: Period) -> DbResult<Money> {
+    let mut sum = Money::ZERO;
+    for o in settle::arap_opening_list(db, Some("ar"))? {
+        if o.party_code.trim() != code.trim() {
+            continue;
+        }
+        // ArapOpening 没有 period 字段，只有 doc_date —— 从日期算期间。
+        // 与 settle::aging 里 aging() 的做法一致。
+        let p_of_doc = NaiveDate::parse_from_str(&o.doc_date, "%Y-%m-%d")
+            .map(Period::from_date)
+            .unwrap_or(Period::ZERO);
+        if period != Period::ZERO && p_of_doc > period {
+            continue;
+        }
+        sum += o.amount;
+    }
+    Ok(sum)
+}
+
+fn summarize(
+    code: &str,
+    name: &str,
+    lines: &[OpenEntry],
+    opening: Money,
+) -> CustomerSummary {
+    let mut balance = Money::ZERO;
+    let mut open_amount = Money::ZERO;
+    let mut open_count = 0usize;
+    let mut oldest = String::new();
+    for e in lines {
+        balance += e.signed();
+        if e.is_open() {
+            open_amount += e.open();
+            open_count += 1;
+            let d = e.date.format("%Y-%m-%d").to_string();
+            if oldest.is_empty() || d < oldest {
+                oldest = d;
+            }
+        }
+    }
+    CustomerSummary {
+        code: code.to_string(),
+        name: name.to_string(),
+        parent_code: String::new(),
+        disabled: false,
+        balance,
+        open_amount,
+        open_count,
+        oldest_open_date: oldest,
+        opening_balance: opening,
+    }
+}
+
+/// 客户列表：一行一客户，带余额汇总。
+///
+/// `q` 非空时按编码/名称过滤（大小写不敏感）；`only_open` 为真时
+/// 只返回有未核销余额的客户 —— 催款场景要的就是这张名单。
+pub fn list(db: &Db, period: Period, q: &str, only_open: bool) -> DbResult<Vec<CustomerSummary>> {
+    // 一次取全量未核销分录，按 aux_key 分组 —— 免得每个客户查一次
+    let all = settle::open_entries(db, AR_ACCOUNT, period, false)?;
+    let mut grouped: std::collections::BTreeMap<String, Vec<OpenEntry>> =
+        std::collections::BTreeMap::new();
+    for e in all {
+        // 分组键必须是**客户维度**，不是整条 aux_key ——
+        // 一条分录可能同时挂 item/qty/price，整条做键会把同一客户拆成多组。
+        let k = crate::balances::aux_key_contains_key_of(&e.aux_key);
+        if k.is_empty() {
+            continue;
+        }
+        grouped.entry(k).or_default().push(e);
+    }
+
+    let ents = crate::auxs::list(db, &AuxQuery::kind(AuxKind::Customer))?;
+    let kw = q.trim().to_lowercase();
+    let mut out = Vec::with_capacity(ents.len());
+    for ent in ents {
+        if !kw.is_empty()
+            && !ent.code.to_lowercase().contains(&kw)
+            && !ent.name.to_lowercase().contains(&kw)
+        {
+            continue;
+        }
+        let empty = Vec::new();
+        let lines = grouped.get(&ent.code).unwrap_or(&empty);
+        let mut s = summarize(&ent.code, &ent.name, lines, opening_balance(db, &ent.code, period)?);
+        s.parent_code = ent.parent_code.clone().unwrap_or_default();
+        s.disabled = ent.disabled;
+        if only_open && s.open_amount.is_zero() {
+            continue;
+        }
+        out.push(s);
+    }
+    // 有欠款的排前面，同组按余额倒序 —— 催款时先看到最该催的
+    out.sort_by(|a, b| {
+        b.open_amount
+            .cmp(&a.open_amount)
+            .then_with(|| a.code.cmp(&b.code))
+    });
+    Ok(out)
+}
+
+/// 客户详情：汇总 + 全部往来行。
+pub fn detail(db: &Db, code: &str, period: Period) -> DbResult<Option<CustomerDetail>> {
+    let ent = match crate::auxs::get(db, AuxKind::Customer, code)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let mut lines = open_lines(db, code, period)?;
+
+    // 期初挂账也进明细，但要标出来（from_opening=true、无 voucher_id）。
+    //
+    // 条件是「**任何**期间都加」，只按 doc_date 过滤 —— 我第一版写的是
+    // `if period == Period::ZERO`（只有不限期间时才加），逻辑反了：
+    // 期初挂账就发生在建账之前，任何具体期间的账龄/余额都该包含它。
+    // 于是「这个客户有 3000 期初欠款」在正常查询下显示不出来，
+    // 而汇总字段 opening_balance 却有值 —— 界面上会出现
+    // 「顶部写着 3000、明细里一条都没有」。
+    for o in settle::arap_opening_list(db, Some("ar"))? {
+        if o.party_code.trim() != code.trim() {
+            continue;
+        }
+        let dt = NaiveDate::parse_from_str(&o.doc_date, "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+        let p_of_doc = Period::from_date(dt);
+        if period != Period::ZERO && p_of_doc > period {
+            continue;
+        }
+        lines.push(OpenEntry {
+            entry_id: 0,
+            voucher_id: 0,
+            period: p_of_doc,
+            date: dt,
+            word: String::new(),
+            no: 0,
+            line: 0,
+            summary: if o.doc_no.is_empty() {
+                format!("期初 {}", o.memo)
+            } else {
+                format!("期初 {}", o.doc_no)
+            },
+            account_code: AR_ACCOUNT.to_string(),
+            aux_key: crate::balances::aux_key_contains_key(&o.party_code),
+            settle_no: String::new(),
+            debit: o.amount,
+            credit: Money::ZERO,
+            settled: Money::ZERO,
+            posted: true,
+        });
+    }
+
+    let out_lines: Vec<CustomerLine> = lines
+        .iter()
+        .map(|e| CustomerLine {
+            entry_id: e.entry_id,
+            voucher_id: e.voucher_id,
+            period: e.period.ymm(),
+            date: e.date.format("%Y-%m-%d").to_string(),
+            doc_no: if e.entry_id == 0 {
+                e.summary.clone()
+            } else {
+                format!("{}-{}", e.word, e.no)
+            },
+            summary: e.summary.clone(),
+            account_code: e.account_code.clone(),
+            amount: e.signed(),
+            settled: e.settled,
+            open: e.open(),
+            settle_no: e.settle_no.clone(),
+            posted: e.posted,
+            from_opening: e.entry_id == 0,
+        })
+        .collect();
+
+    let mut s = summarize(&ent.code, &ent.name, &lines, opening_balance(db, code, period)?);
+    s.parent_code = ent.parent_code.clone().unwrap_or_default();
+    s.disabled = ent.disabled;
+    Ok(Some(CustomerDetail { summary: s, lines: out_lines }))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::mem;
+    use crate::{auxs, settle::ArapOpening, vouchers};
+    use chrono::NaiveDate;
+    use fincore::{AuxRef, Entry, Voucher};
+
+    fn m(s: &str) -> Money {
+        Money::parse(s).unwrap()
+    }
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    /// 凭证号：同期间 + 同凭证字内必须唯一，而 `Voucher::new(..., 0)`
+    /// **不会**自动编号（重复就报「凭证号已存在」）。所以这里自增。
+    static NEXT_NO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    fn next_no() -> i32 {
+        NEXT_NO.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    fn mk_cust(db: &Db, code: &str, name: &str) {
+        let mut e = fincore::AuxEntity::new(AuxKind::Customer, code, name);
+        e.memo = String::new();
+        auxs::insert(db, &e).unwrap();
+    }
+
+    /// 造一张已记账的应收凭证。debit=true → 客户欠款（借 112201）。
+    fn ar_posted(db: &Db, date: &str, cust: &str, amount: &str, debit: bool) -> i64 {
+        ar_posted_at(db, date, cust, amount, debit, "112201")
+    }
+
+    /// 同上，但可指定挂在哪个（末级）应收科目上。
+    ///
+    /// 为什么要能指定：真实数据分布在 112201 / 112202 两个子科目，
+    /// 而统计侧传的是父科目 1122 —— 能不能合并，是这条测试要验的。
+    fn ar_posted_at(db: &Db, date: &str, cust: &str, amount: &str, debit: bool, acct: &str) -> i64 {
+        let dt = d(date);
+        let mut v = Voucher::new(Period::from_date(dt), dt, "记", next_no());
+        let a = m(amount);
+        v.push_entry(Entry {
+            debit: if debit { a } else { Money::ZERO },
+            credit: if debit { Money::ZERO } else { a },
+            aux: AuxRef { customer: Some(cust.into()), ..Default::default() },
+            ..Entry::new(1, acct, "往来")
+        });
+        v.push_entry(Entry {
+            debit: if debit { Money::ZERO } else { a },
+            credit: if debit { a } else { Money::ZERO },
+            ..Entry::new(2, "1001", "往来")
+        });
+        let vid = vouchers::save(db, &mut v).unwrap();
+        vouchers::post(db, vid, "poster").unwrap();
+        vid
+    }
+
+    /// 只保存不记账（草稿）
+    fn ar_draft(db: &Db, date: &str, cust: &str, amount: &str) -> i64 {
+        let dt = d(date);
+        let mut v = Voucher::new(Period::from_date(dt), dt, "记", next_no());
+        let a = m(amount);
+        v.push_entry(Entry {
+            debit: a,
+            credit: Money::ZERO,
+            aux: AuxRef { customer: Some(cust.into()), ..Default::default() },
+            ..Entry::new(1, "112201", "往来")
+        });
+        v.push_entry(Entry {
+            debit: Money::ZERO,
+            credit: a,
+            ..Entry::new(2, "1001", "往来")
+        });
+        let vid = vouchers::save(db, &mut v).unwrap();
+        // 草稿状态（H-3：只认已记账）
+        db.conn()
+            .execute("UPDATE voucher SET status='draft' WHERE id=?1", [vid])
+            .unwrap();
+        vid
+    }
+
+    /// ① 余额含负数（预收）：客户先付款时应收为负。
+    ///
+    /// 界面上如果显示 0，会让会计以为「他既没欠也没付」——
+    /// 而实际上他有 500 预收款，抵掉以后发货就不用收钱。
+    #[test]
+    fn balance_can_be_negative() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        let per = Period::new(2026, 1).unwrap();
+        ar_posted(&db, "2026-01-10", "C01", "500", false);
+
+        let s = summary_of(&db, "C01", per).unwrap();
+        assert_eq!(
+            s.balance,
+            m("-500"),
+            "预收 500 → 应收为**负数**，不是 0"
+        );
+    }
+
+    /// ② 未记账不计入（H-3）。
+    #[test]
+    fn draft_entries_excluded() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        let per = Period::new(2026, 1).unwrap();
+        ar_draft(&db, "2026-01-10", "C01", "888");
+
+        let s = summary_of(&db, "C01", per).unwrap();
+        assert_eq!(
+            s.balance,
+            Money::ZERO,
+            "草稿不算应收（H-3）—— 记进去就和账龄页对不上了"
+        );
+        assert_eq!(s.open_count, 0, "草稿不该出现在未核销笔数里");
+    }
+
+    /// ③ 期初挂账单独计入并标出来。
+    ///
+    /// 这条最容易做错：期初挂在 arap_opening 表，**不在** open_entries 里。
+    /// 不单独取 → 「欠款」凭空少一笔；
+    /// 悄悄加进 balance → 与账龄页口径混淆（那边它是影子行，不参与 FIFO 核销）。
+    #[test]
+    fn opening_balance_is_separate_and_flagged() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        let per = Period::new(2026, 1).unwrap();
+        settle::arap_opening_insert(
+            &db,
+            &ArapOpening {
+                id: 0,
+                kind: "ar".into(),
+                party_code: "C01".into(),
+                party_name: "客户甲".into(),
+                doc_no: "XS-1".into(),
+                doc_date: "2025-12-01".into(),
+                amount: m("3000"),
+                memo: "上年末欠款".into(),
+                created_by: "u".into(),
+            },
+            "u",
+        )
+        .unwrap();
+
+        let s = summary_of(&db, "C01", per).unwrap();
+        assert_eq!(s.opening_balance, m("3000"), "期初挂账必须计入");
+        assert_eq!(
+            s.balance,
+            Money::ZERO,
+            "balance 只含已记账分录；期初单独一个字段，不混进去"
+        );
+
+        let det = detail(&db, "C01", per).unwrap().expect("客户应存在");
+        let opening: Vec<&CustomerLine> = det.lines.iter().filter(|l| l.from_opening).collect();
+        assert_eq!(opening.len(), 1, "明细里应有 1 行期初：{:?}", det.lines);
+        assert_eq!(opening[0].doc_no, "期初 XS-1");
+        assert_eq!(opening[0].voucher_id, 0, "期初行没有凭证");
+    }
+
+    /// ④ 多客户隔离 + 排序 + 搜索
+    #[test]
+    fn customers_are_isolated_and_sorted() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        mk_cust(&db, "C02", "客户乙");
+        let per = Period::new(2026, 1).unwrap();
+        ar_posted(&db, "2026-01-05", "C01", "1000", true);
+        ar_posted(&db, "2026-01-06", "C02", "250", true);
+
+        assert_eq!(summary_of(&db, "C01", per).unwrap().balance, m("1000"));
+        assert_eq!(summary_of(&db, "C02", per).unwrap().balance, m("250"), "乙不能带上甲的");
+
+        let all = list(&db, per, "", false).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].code, "C01", "欠款多的排前面");
+        assert_eq!(all[1].code, "C02");
+
+        let q = list(&db, per, "乙", false).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].code, "C02");
+    }
+
+    /// 已全部核销的客户不该出现在「只看待催款」名单里。
+    #[test]
+    fn settled_customer_excluded_from_only_open() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        mk_cust(&db, "C02", "客户乙");
+        let per = Period::new(2026, 1).unwrap();
+        ar_posted(&db, "2026-01-05", "C01", "1000", true);
+        ar_posted(&db, "2026-01-06", "C02", "250", true);
+        // 收到 C01 的钱（贷 1122）
+        ar_posted(&db, "2026-01-10", "C01", "1000", false);
+        settle::auto_settle(&db, AR_ACCOUNT, per, Money::ZERO, "u").unwrap();
+
+        let s = summary_of(&db, "C01", per).unwrap();
+        assert_eq!(s.balance, Money::ZERO, "两笔抵平");
+        assert_eq!(s.open_amount, Money::ZERO, "全部核销");
+
+        let only = list(&db, per, "", true).unwrap();
+        assert_eq!(
+            only.len(),
+            1,
+            "只剩乙还在待催款；已结清的甲是噪音（只留它会让人以为催款名单没过滤）"
+        );
+        assert_eq!(only[0].code, "C02");
+    }
+
+    /// 子科目要一并计入 —— 而且这条测试顺带锁住一个容易搞反的事实。
+    ///
+    /// 【记账只能用末级，统计可以含父科目】
+    ///   凭证里**不能**记在 1122 上（非末级，会被 `Validate` 拒：
+    ///   「科目 1122 是非末级科目，不能记账」）。所以真实数据全落在
+    ///   112201 / 112202 上。而统计侧传的是 `AR_ACCOUNT = "1122"`，
+    ///   靠 open_entries 的 `LIKE ?1||'%'` 把子科目一并捞进来。
+    ///
+    ///   这两件事必须分开：AR_ACCOUNT 若改成末级（112201），就会漏掉 112202；
+    ///   若统计也只认末级，就得为每个子科目各查一次再相加 —— 那正是
+    ///   「自己算余额、两套口径」的起点。
+    #[test]
+    fn parent_account_not_postable_but_sub_accounts_aggregated() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        let per = Period::new(2026, 1).unwrap();
+
+        // 对照：父科目确实不能记账（把「统计含父科目」和「记账用父科目」区分开）
+        let dt = d("2026-01-05");
+        let mut v = Voucher::new(Period::from_date(dt), dt, "记", next_no());
+        v.push_entry(Entry {
+            debit: m("100"),
+            credit: Money::ZERO,
+            aux: AuxRef { customer: Some("C01".into()), ..Default::default() },
+            ..Entry::new(1, AR_ACCOUNT, "往来")
+        });
+        v.push_entry(Entry {
+            debit: Money::ZERO,
+            credit: m("100"),
+            ..Entry::new(2, "1001", "往来")
+        });
+        let parent_err = vouchers::save(&db, &mut v).unwrap_err().to_string();
+        assert!(
+            parent_err.contains("非末级"),
+            "1122 是非末级科目，不该能记账 —— 若哪天能记了，说明科目表变了，这条要重读：{parent_err}"
+        );
+
+        // 真实数据：两个不同的子科目
+        ar_posted_at(&db, "2026-01-06", "C01", "700", true, "112201");
+        ar_posted_at(&db, "2026-01-07", "C01", "50", true, "112202");
+
+        assert_eq!(
+            summary_of(&db, "C01", per).unwrap().balance,
+            m("750"),
+            "112201 与 112202 必须**合并**计入；AR_ACCOUNT 若改成只认一个末级，会静默少算"
+        );
+    }
+
+    /// 不存在的客户 → None（而不是造一个空壳）
+    #[test]
+    fn detail_missing_customer_is_none() {
+        let db = mem();
+        assert!(
+            detail(&db, "NOPE", Period::new(2026, 1).unwrap()).unwrap().is_none(),
+            "不存在的客户应返回 None，界面才能提示「未建档」而不是显示一片空白"
+        );
+    }
+}

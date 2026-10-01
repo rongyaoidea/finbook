@@ -509,13 +509,47 @@ impl BalanceSource for BalanceSnapshot {
 }
 
 /// 辅助核算键的包含判断：`\u{1f}` 分隔的 `kind=value` 串
-fn aux_key_contains(key: &str, want: &str) -> bool {
+///
+/// 设为 `pub`：客户视图（customers.rs）要按客户维度过滤与分组，而 aux_key 的
+/// 格式**只有这一处定义** —— 各自拼字符串比较迟早对不上。
+///
+/// 也不要改成整条子串 LIKE：旧实现那样做过，`%customer=C001%` 会把
+/// `customer=C0011` 一并命中（vouchers.rs:368 的注释记着这段教训）。
+pub fn aux_key_contains(key: &str, want: &str) -> bool {
     if want.is_empty() {
         return true;
     }
     let parts: Vec<&str> = want.split('\u{1f}').collect();
     let have: Vec<&str> = key.split('\u{1f}').collect();
     parts.iter().all(|p| have.contains(p))
+}
+
+/// 客户维度的 aux_key 片段（**查询侧**用）：`"customer=C01"`。
+///
+/// 编码为空时返回空串 —— 而 `aux_key_contains` 对空 want 返回 true，
+/// 所以调用方若传空客户，会**匹配到所有带任何辅助核算的分录**。
+/// 那不是「没有筛选」，那是「筛出全部」，两者含义不同，别混用。
+pub fn aux_key_contains_key(customer_code: &str) -> String {
+    let c = customer_code.trim();
+    if c.is_empty() {
+        String::new()
+    } else {
+        format!("customer={c}")
+    }
+}
+
+/// 从整条 aux_key 里取出**客户维度**的值（**分组侧**用）。
+///
+/// 为什么不能直接拿整条 aux_key 做分组键：一条分录可能同时挂
+/// customer / item / qty / price 多个维度，整条做键会把同一个客户
+/// 拆成多组 —— 而客户视图要的是「一个客户一行」。
+pub fn aux_key_contains_key_of(aux_key: &str) -> String {
+    for seg in aux_key.split('\u{1f}') {
+        if let Some(v) = seg.strip_prefix("customer=") {
+            return v.trim().to_string();
+        }
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------

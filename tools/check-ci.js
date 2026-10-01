@@ -655,6 +655,35 @@ try {
   console.log("可移植性检查未能运行：" + String((e && e.message) || e).split("\n")[0].slice(0, 100));
   bad++;
 }
+// ---- 2d. 客户视图的余额只能有一处算法 ----
+//
+// docs/客户管理模块设计.md §3.2①：客户视图的所有余额必须走
+// `settle::open_entries`（H-3：只认已记账）。自己写 SQL 算一遍 = 两套口径，
+// 而「为什么这个客户欠款和往来核销页不一样」是最难查的一类问题。
+// 「约定靠人记住」= 迟早有人在自己模块里加一句 SUM(...)，所以要机器守。
+try {
+  const r = execFileSync(process.execPath, [path.join(__dirname, "check-customers-balance.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(r);
+  if (/FAIL/.test(r)) {
+    console.log("客户余额口径检查：有 FAIL");
+    bad++;
+  }
+  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-customers-balance.js")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  process.stdout.write(st);
+  if (!/全部 3 个变异都被拦下/.test(st) || /FAIL/.test(st)) {
+    console.log("客户余额口径检查的自检没通过 —— 探针没拦下，或文件没还原");
+    bad++;
+  }
+} catch (e) {
+  console.log("客户余额口径检查未能运行：" + String((e && e.message) || e).split("\n")[0].slice(0, 100));
+  bad++;
+}
 // ---- 3. 编码卫生：全仓库不许有 U+FFFD 替换符 / 非法 UTF-8 / BOM ---------
 //
 // 这不是洁癖：本轮在仓库里找到 3 处**既有**的编码损坏，其中一处在

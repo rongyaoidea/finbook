@@ -43,6 +43,7 @@ pub mod taxdecl;
 pub mod receipt;
 pub mod template;
 pub mod scm;
+pub mod customers;
 pub mod scm2;
 pub mod manufacturing;
 pub mod stock;

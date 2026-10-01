@@ -416,6 +416,33 @@ for n in realm.db realm.db-wal realm.db-shm; do ... ; done
 > 这一步能同时抓住「备份了但不是这份数据」和「备份了但少了关键表」。
 
 - **轮转建议**：每日全量 + 保留 30 天（cron 脚本按上例组织；同日重跑前先清理旧目录）。
+
+### 6.2 每日备份 cron（已落地：阿里云）
+
+`tools/finbook-backup.sh` 是上面热备的**可执行版本**，已装在服务器
+`/usr/local/bin/finbook-backup.sh`，crontab `30 4 * * *` 每天 04:30 跑：
+
+| 环节 | 做法 | 对应 §6.1 的坑 |
+|---|---|---|
+| 一致快照 | 宿主机 `sqlite3 … .backup`（`realm.db` + `books/*.fbk`） | ③ WAL 下裸拷丢已提交事务 |
+| 非空 | 源文件与快照都 `test -s`，0 字节直接 FAILED | ① 0 字节照样过校验 |
+| 业务语义回读 | `realm_book` / `realm_user` 行数 > 0，账套表数 > 0，凭证数入日志 | ② 「合法但空」的库 |
+| 附件 | `.attachments/` 两个可能位置存在即打包 | 三处齐全 |
+| 归档自检 | `tar tzf` 可读，且必须含 `realm.db` 与 `books/*.fbk` | 打包漏文件 |
+| 轮转 | 保留 14 天（`FINBOOK_BACKUP_KEEP`） | — |
+| 日志 | `/var/log/finbook-backup.log`，每档一行 `OK size= 账套= realm_book=` | — |
+
+路径全部可用环境变量覆盖（`FINBOOK_DATA_VOL` / `FINBOOK_BACKUP_OUT` /
+`FINBOOK_BACKUP_KEEP` / `FINBOOK_BACKUP_LOG`）。自检脚本正是靠这四个变量
+把**变异夹具**喂进去的，而不是只跑一遍绿灯：
+
+```bash
+bash tools/selftest-finbook-backup.sh            # 服务器上：4 条该失败的探针 + 1 条正例 + 真实卷
+bash tools/selftest-finbook-backup.sh ./tools/finbook-backup.sh   # 指定被检脚本
+```
+
+> 4 条失败探针：数据卷不存在、账套 0 字节、账套 0 张表（「合法但空」）、
+> `realm_book` 0 行（备份到了别的数据）。任一条**没被拦下**即自检失败。
 - **自动化脚本（推荐）**：`deploy/` 下有两个现成脚本，省掉手写 cron：
   | 脚本 | 作用 | 建议频率 |
   |---|---|---|
@@ -492,12 +519,35 @@ cargo run -p findb --release --example reset_pwd -- /opt/finbook/data/books/comp
 已把 `FINBOOK_REQUIRE_BOOKS_DIR=true` 打开，数据目录不存在时服务会**启动失败**
 而不是凭空建一个目录开始记账（详见 §10）。
 
+### 8.2 证书到期看门狗（已落地：阿里云）
+
+`tools/cert-expiry-check.sh` 装在 `/usr/local/bin/`，crontab `15 */6 * * *`：
+
+- 从 `nginx -T` 抓**实际在用**的每一张 `ssl_certificate` —— 不手写清单，
+  新增站点自动纳入；路径不存在也算 ERROR（配置改了但文件没落地）
+- 算 `notAfter - now`，剩余天数 < 阈值（**4 天**）→ 往 `/var/log/cert-watch.log`
+  写一行 `ERROR cert-expires-in-Nd` 并 `exit 1`
+- 每次跑都记 `OK <剩余天数>`，日志本身就是一张证书台账
+
+为什么阈值是 4：IP 站点用 Let's Encrypt **shortlived（6 天）**证书，acme.sh 每天
+21:53 跑 `--cron`，ARI 把下次续期定在到期前约 3.3 天。若那次续期失败，剩余就是
+3.3 天 —— 阈值 4 会在**续期失败的当次**立刻报，而不是等到剩 2 天。
+
+```bash
+tail -5 /var/log/cert-watch.log          # 看台账
+/usr/local/bin/cert-expiry-check.sh 99   # 自证：阈值放大到 99 天，必须 ERROR + exit 1
+/usr/local/bin/cert-expiry-check.sh 3    # 还原，必须 exit 0
+```
+
+> 告警目前**只落日志**（没有短信/邮件通道）。没人看日志 = 没有告警，
+> 这一条要靠值班巡检或后续接通知渠道补上。
+
 ## 9. 安全检查清单
 
 - [ ] 反向代理已启用 HTTPS，8080 未对外暴露；纯 HTTPS 下 `FINWEB_SECURE_COOKIE=true`
 - [ ] systemd 服务开了加固参数（`deploy/finweb.service` 已包含）
 - [ ] `realm.db` 与 `books/` 目录权限 `finbook:finbook` 私有
-- [ ] 每日备份 cron 已生效且有轮转（realm + books + attachments 三处齐全）
+- [x] 每日备份 cron 已生效且有轮转（realm + books + attachments 三处齐全）—— 阿里云已装，见 §6.2
 - [ ] 平台管理员口令已预置或用自动生成口令后立即改密
 - [ ] 普通用户账号由管理员开通，默认强制首登改密
 - [ ] 账套内默认管理员 `admin` 已改默认口令（新账套首登强制改密）

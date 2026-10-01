@@ -377,6 +377,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         // 客户视图（只读；余额口径由 findb::customers 保证走 open_entries）
         .route("/api/customers", get(list_customers))
         .route("/api/customers/:code", get(get_customer))
+        // 账龄 Tab。必须与 `/:code` 分开注册：axum 0.8 里 `:code` 只匹配一段，
+        // `/C01/aging` 会落到另一个 handler，写在一起容易看错。
+        .route("/api/customers/:code/aging", get(get_customer_aging))
         .route("/api/items/master", get(items_master))
         .route("/api/import/run", post(import_run))
         // 账簿 / 报表
@@ -4617,6 +4620,62 @@ async fn get_customer(
         }))),
         None => Err(AppError::not_found(format!("客户 {code} 未建档"))),
     }
+}
+
+/// 客户账龄。桶与算法全部来自 `findb::customers::aging_of` → `settle::aging`，
+/// 本 handler **不参与任何计算**（只挑桶标签与金额）。
+async fn get_customer_aging(
+    State(state): State<Arc<WebState>>,
+    user: CurrentUser,
+    Path(code): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Perm::Report)?;
+    let db = state.db_for(&user.book_key)?;
+    let per = period_from_query(&state, &user, q.get("period"));
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err(AppError::bad_request("缺少客户编码 code"));
+    }
+    // 账龄页与客户页对「客户不存在」的处理必须一致：一个不存在的客户，
+    // 详情页报 404，账龄 Tab 也得报 404 —— 否则界面上会出现
+    // 「有档案、明细有数据、账龄说此人没有未核销余额」这种自相矛盾的三件套。
+    if findb::auxs::get(&db, fincore::AuxKind::Customer, &code)?.is_none() {
+        return Err(AppError::not_found(format!("客户 {code} 未建档")));
+    }
+    // as_of 缺省用**期末**而不是今天：as_of 决定「账龄天数怎么算」，
+    // 用今天算历史期间会得到一份「天数按今天算」的老账龄。
+    // （账龄页 /settle/aging 用的是今天，两处口径不同是有意的：
+    //   那页是「当前视角」，这页是「这个期间视角」。文档 §3.2 有记。）
+    let as_of = match q.get("as_of").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request(format!("as_of 不是合法日期：{s}")))?,
+        None => per.last_day(),
+    };
+    let buckets = if q.get("scheme").map(|s| s == "year").unwrap_or(false) {
+        fincore::engine::aging::buckets_by_year()
+    } else {
+        fincore::engine::aging::buckets_by_days()
+    };
+    let a = findb::customers::aging_of(&db, &code, per, as_of, &buckets)?;
+    // 金额一律走 `fmt_money()`，与 `/api/settle/aging` **同一个格式化**。
+    // 直接把 `Money` 序列化出去会得到 `"3000.00"` / `"0"`（无千分位、零值没有
+    // 两位小数），而账龄页给的是 `"3,000.00"` / `"0.00"` —— 同一份数据两种长相，
+    // 用户把两个页面对着看会以为算错了。
+    Ok(Json(json!({
+        "code": code,
+        "period": per.ymm(),
+        "as_of": as_of.format("%Y-%m-%d").to_string(),
+        "aging": {
+            "buckets": a.buckets,
+            "amounts": a.amounts.iter().map(|m| m.fmt_money()).collect::<Vec<_>>(),
+            "total": a.total.fmt_money(),
+            "credit_total": a.credit_total.fmt_money(),
+            "net": (a.total - a.credit_total).fmt_money(),
+            "max_days": a.max_days,
+            "empty": a.empty,
+        },
+    })))
 }
 
 /// query 里的 period（YYYYMM 或 YYYY-MM），缺省用会话当前期间。
@@ -12396,11 +12455,20 @@ async fn get_settle_aging(
     let db = state.db_for(&user.book_key)?;
     let lines = findb::settle::aging(&db, account.trim(), upto, as_of, &buckets)?;
     let labels: Vec<&str> = buckets.iter().map(|b| b.label).collect();
+    // key 是**裸编码**（`C01`），名称另查 —— 页面上显示 `customer=C01` 是内部存储格式，
+    // 对用户没有意义。以前 key 本身就是整条 aux_key，前端想显示名称也做不到。
+    let party = findb::settle::party_kind(account.trim());
+    let names: std::collections::HashMap<String, String> =
+        findb::auxs::list(&db, &fincore::AuxQuery::kind(party))?
+            .into_iter()
+            .map(|a| (a.code, a.name))
+            .collect();
     let rows: Vec<serde_json::Value> = lines
         .iter()
         .map(|l| {
             json!({
                 "key": l.key,
+                "name": names.get(&l.key).cloned().unwrap_or_default(),
                 "amounts": l.amounts.iter().map(|m| m.fmt_money()).collect::<Vec<_>>(),
                 "total": l.total.fmt_money(),
                 "credit_total": l.credit_total.fmt_money(),

@@ -11,6 +11,8 @@
 //   2. 不许出现 SUM( / GROUP BY 这类聚合（余额是一个个 OpenEntry 加出来的，
 //      不是 SQL 聚合出来的 —— SQL 聚合会绕过 H-3 的 posted 过滤）
 //   3. 反过来：**必须**出现 settle::open_entries（用了别的方式也算破例）
+//   4. 同理：**账龄桶只有一处定义** —— `aging_of` 必须调 `settle::aging`，
+//      不许在 customers.rs 里自己按天数分档
 const fs = require("fs");
 const path = require("path");
 
@@ -95,6 +97,64 @@ if (!usesOpen) {
   bad++;
 } else {
   console.log(`OK   open_lines（第 ${openLinesStart + 1} 行）确实走 settle::open_entries（H-3 口径）`);
+}
+
+// ---- 账龄桶：同样只允许一处定义 --------------------------------------------
+//
+// 为什么余额那套规则要原样复制到账龄上：桶（0-30/31-60/…）也是口径。
+// 客户页自己按 `as_of - date` 分一次档，就会出现「客户页说 60 天以上 3000、
+// 账龄页说 0」—— 两个数都是「按账龄算的」，没人会去怀疑它们口径不同。
+//
+// 判据的粒度同 §3：只看「文件里出现过 settle::aging」是不够的，
+// 必须**按函数**判 `aging_of` 里真的有那个调用。
+const agingStart = lines.findIndex((l) => /^pub fn aging_of\(/.test(l));
+if (agingStart < 0) {
+  console.log("FAIL " + F + " 里找不到 aging_of —— 客户页的账龄 Tab 取数口不见了");
+  process.exit(1);
+}
+// 括号计数必须**先进入函数体再找结尾**。
+//
+// `aging_of` 的签名是跨行的（`pub fn aging_of(` 这一行**没有** `{`），
+// 而 `open_lines` 的签名是单行的（`{` 就在同一行）。第一版这里两种签名用同一段
+// 代码：`if (d === 0 && i > agingStart)` —— 对跨行签名来说，签名第一行 d 仍然是 0，
+// 于是 `agingEnd = agingStart`，取到的「函数体」是**空的**，`settle::aging` 那一行
+// 根本不在范围内，检查报「没调 settle::aging」。
+//
+// 这个形状最坏的地方是：它会**恒定地报 FAIL**，看起来像「代码有问题」，
+// 而真正的问题是检查自己把函数体认丢了 —— 人会去改代码，越改越错。
+d = 0;
+let opened = false;
+let agingEnd = -1;
+for (let i = agingStart; i < lines.length; i++) {
+  for (const ch of lines[i]) {
+    if (ch === "{") { d++; opened = true; }
+    else if (ch === "}") d--;
+  }
+  if (opened && d === 0) { agingEnd = i; break; }
+}
+if (agingEnd < 0) { console.log("FAIL 找不出 aging_of 的结尾（函数体括号没配平？）"); process.exit(1); }
+const agingBody = lines.slice(agingStart, agingEnd + 1);
+if (agingBody.some((l) => !inComment(l) && /settle::aging\s*\(/.test(l))) {
+  console.log(`OK   aging_of（第 ${agingStart + 1} 行）确实走 settle::aging（桶定义只有一处）`);
+} else {
+  console.log(
+    "FAIL " + F + " 的 aging_of 里没有 settle::aging —— " +
+      "账龄桶换了实现。桶（0-30/31-60/…）是口径，不是展示细节：客户页与账龄页" +
+      "各自分一次档，两个数都会「看起来对」，而其中一个是错的"
+  );
+  bad++;
+}
+// 反向：自己造桶标签（30/60/90 这类天数字面量）就是第二个桶定义。
+// 只在 aging_of 的函数体里查 —— 文档注释里提到 0/60/90 不算。
+const bucketLit = agingBody.filter(
+  (l) => !inComment(l) && /"\s*(0|30|60|90|180|365)\s*(天|日|-|\s*-)/.test(l)
+);
+if (bucketLit.length > 0) {
+  console.log(`FAIL ${F}:${agingStart + 1}  aging_of 里出现了桶天数字面量（桶定义只有一处）`);
+  bucketLit.forEach((l) => console.log("       " + l.trim().slice(0, 100)));
+  bad++;
+} else {
+  console.log("OK   aging_of 里没有自己写的桶天数字面量");
 }
 
 process.exit(bad === 0 ? 0 : 1);

@@ -593,6 +593,18 @@ fn open_entries_of(db: &Db, old: &[OpenEntry]) -> DbResult<Vec<OpenEntry>> {
 
 // ---------------- 账龄 ----------------
 
+/// 往来科目 → 辅助核算维度：**科目首位**决定（1 开头 = 应收/客户，2 开头 = 应付/供应商）。
+///
+/// 设为 `pub`：调用方拿到 `AgingLine.key`（**裸编码** `C01`）后，要显示名称或写回
+/// AuxRef，都得先知道它是客户还是供应商。这个判断不许在别处重写一遍 ——
+/// 写死 customer 会让应付账龄整页空白（`2202` 挂的是 `supplier=`）。
+pub fn party_kind(account: &str) -> fincore::AuxKind {
+    match account.as_bytes().first() {
+        Some(b'2') => fincore::AuxKind::Supplier,
+        _ => fincore::AuxKind::Customer,
+    }
+}
+
 /// 账龄分析
 pub fn aging(
     db: &Db,
@@ -602,10 +614,36 @@ pub fn aging(
     buckets: &[AgingBucket],
 ) -> DbResult<Vec<AgingLine>> {
     let entries = open_entries(db, account, upto, false)?;
+    // 往来维度由**科目首位**决定（见 [party_kind]）。
+    //
+    // ⚠️ 不能写死 customer —— 应付挂的是 `supplier=`，写死 customer 会让
+    // 应付账龄一行都不出（整个 2202 报表变空白，而且**不报错**）。
+    let party = party_kind(account);
+    // 期初明细的 ar/ap 与维度是同一条规则，一起算一次。
+    let want = match account.as_bytes().first() {
+        Some(b'1') => Some("ar"),
+        Some(b'2') => Some("ap"),
+        _ => None,
+    };
+    // 没挂往来单位的分录不进往来账龄 —— 往来账龄的每一行都应该是一个
+    // 具体的往来单位；一行 key 为空的记录在界面上无法解释、也无法操作。
+    //
+    // 能发生的情形是**用户自己加的**不带 aux 的应收/应付科目（预置的 112201/220201
+    // 在科目表里就声明了核算客商，凭证校验会先拒掉）。
     let mut items: Vec<AgingItem> = entries
         .iter()
+        .filter(|e| !crate::balances::aux_key_value_of(&e.aux_key, party).is_empty())
         .map(|e| AgingItem {
-            key: e.aux_key.clone(),
+            // key 取**往来维度**（裸编码），不是整条 aux_key。
+            //
+            // 原来这里用 `e.aux_key.clone()` → "customer=C01"，而下面的期初行用
+            // `o.party_code` → "C01"。同一个客户于是被 analyze() 分成两行
+            // （实测：AGING_KEYS=["customer=C01", "C01"]，3000 与 500 分在两行），
+            // 界面上看起来是两个往来单位，按行做的操作会漏掉一半。
+            //
+            // 用 balances.rs 的解析函数而不是自己 split —— aux_key 的格式
+            // 只有那一个权威定义点。
+            key: crate::balances::aux_key_value_of(&e.aux_key, party),
             date: e.date,
             amount: e.signed(),
             settled: e.settled,
@@ -614,13 +652,6 @@ pub fn aging(
         .collect();
     // 往来期初明细（迁移数据，影子行）：按科目方向取对应类型（1开头=应收 / 2开头=应付），
     // 单据日期期间不晚于 upto；**只进账龄展示、不参与 FIFO 核销**（核销 v2，避免伪 entry 外键）。
-    let want = if account.starts_with('1') {
-        Some("ar")
-    } else if account.starts_with('2') {
-        Some("ap")
-    } else {
-        None
-    };
     if let Some(w) = want {
         for o in arap_opening_list(db, Some(w))? {
             let d = NaiveDate::parse_from_str(&o.doc_date, "%Y-%m-%d")
@@ -1013,6 +1044,20 @@ pub fn bad_debt_provision_voucher(
         lines.extend(aging(db, acct, period, date, &buckets)?);
     }
 
+    // ⚠️ key 的契约：`aging()` 返回的 `AgingLine.key` 是**往来维度的裸编码**
+    // （`C01`），不是 aux_key（`customer=C01`）。它有两个用途：给人看（账龄报表），
+    // 和在这里当比对键。所以本函数里 **targets 与 existing 必须归一到同一个空间**。
+    //
+    // 这里踩过一次：`AgingLine.key` 原来返回整条 aux_key，与 existing 的
+    // `e.aux_key` 天然相等；改成裸编码后两者对不上，`existing` 永远读不到
+    // 上一轮计提的数 → 同期间重复执行会**反复全额计提**（幂等性断掉，
+    // 而且第一轮就报「目标不变时不应重复计提」）。所以 existing 侧也要取出
+    // 往来维度。
+    //
+    // 维度取 Customer：1122 应收账款与 1221 其他应收都挂客户（应付是 2202，
+    // 不在本函数范围内）。别用「第一行 kind 是什么」去猜 —— 显式写出来。
+    const PARTY: fincore::AuxKind = fincore::AuxKind::Customer;
+
     // 目标余额按往来对象汇总（同一对象可能同时有应收/其他应收）
     let mut targets: std::collections::BTreeMap<String, Money> = std::collections::BTreeMap::new();
     for l in &lines {
@@ -1039,10 +1084,16 @@ pub fn bad_debt_provision_voucher(
         )?;
         let mut rows = st.query(rusqlite::params![period.ymm()])?;
         while let Some(r) = rows.next()? {
-            let key: String = r.get(0)?;
+            let raw_key: String = r.get(0)?;
+            let code = crate::balances::aux_key_value_of(&raw_key, PARTY);
+            if code.is_empty() {
+                // 没挂往来单位的 1231 余额（历史上手工记的）不能并进任何客户 ——
+                // 归到空串会让某一个客户凭空多出一笔准备，或者反过来。
+                continue;
+            }
             let c = Money::parse_or_zero(&r.get::<_, String>(1)?);
             let d = Money::parse_or_zero(&r.get::<_, String>(2)?);
-            *existing.entry(key).or_insert(Money::ZERO) += c - d;
+            *existing.entry(code).or_insert(Money::ZERO) += c - d;
         }
     }
 
@@ -1074,7 +1125,11 @@ pub fn bad_debt_provision_voucher(
     v.memo = if dec > inc { "冲回坏账准备".to_string() } else { "计提坏账准备".to_string() };
     let mut line_no = 1;
     for (key, d) in &deltas {
-        let aux = fincore::voucher::AuxRef::from_key(key);
+        // AuxRef 从「裸编码 + 维度」**现场构造**，不要 `from_key(key)` ——
+        // `from_key` 吃的是 `kind=value` 串，喂裸编码会得到空 aux，于是这一行
+        // 1231 挂不上往来对象，下一轮 existing 里它的 key 是空串，幂等性又断了。
+        let mut aux = fincore::voucher::AuxRef::default();
+        aux.set(PARTY, Some(key.clone()));
         if d.is_positive() {
             v.push_entry(fincore::voucher::Entry {
                 credit: *d,
@@ -1111,7 +1166,189 @@ pub fn bad_debt_provision_voucher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mem;
     use fincore::voucher::{AuxRef, Entry, Voucher};
+
+    /// 同一客户既有凭证又有期初挂账时，账龄**必须合并成一行**、金额相加。
+    ///
+    /// 回归：凭证行的 key 曾用 `e.aux_key.clone()`（`customer=C01`），期初行用
+    /// `o.party_code`（`C01`）—— 两种格式混用，`analyze()` 把同一个客户分成两行
+    /// （实测 `["customer=C01", "C01"]`，3000 与 500 分在两行）。界面上看起来是两个
+    /// 往来单位，按行做的操作（核销/导出/催款）会漏掉一半。
+    ///
+    /// 而把 `aux_key.clone()` 放回去**不会有任何其他测试变红** —— 所以钉在这里。
+    #[test]
+    fn aging_merges_voucher_and_opening_for_same_party() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+
+        arap_opening_insert(
+            &db,
+            &ArapOpening {
+                id: 0,
+                kind: "ar".into(),
+                party_code: "C01".into(),
+                party_name: "客户甲".into(),
+                doc_no: "XS-1".into(),
+                doc_date: "2025-12-01".into(),
+                amount: Money::parse("500").unwrap(),
+                memo: String::new(),
+                created_by: "u".into(),
+            },
+            "u",
+        )
+        .unwrap();
+
+        let mut v = Voucher::new(p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "记", 1);
+        v.push_entry(Entry {
+            debit: Money::parse("3000").unwrap(),
+            credit: Money::ZERO,
+            aux: AuxRef { customer: Some("C01".into()), ..Default::default() },
+            ..Entry::new(1, "112201", "应收")
+        });
+        v.push_entry(Entry {
+            debit: Money::ZERO,
+            credit: Money::parse("3000").unwrap(),
+            ..Entry::new(2, "1001", "收")
+        });
+        let vid = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, vid, "poster").unwrap();
+
+        let lines = aging(
+            &db,
+            "1122",
+            p,
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+            &fincore::engine::aging::buckets_by_days(),
+        )
+        .unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "同一客户必须只有一行：{:?}",
+            lines.iter().map(|l| (l.key.clone(), l.total.fmt_money())).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lines[0].key, "C01",
+            "key 必须是裸客户编码，不能带 customer= 前缀 —— 那是 aux_key 的内部存储格式"
+        );
+        assert_eq!(
+            lines[0].total,
+            Money::parse("3500").unwrap(),
+            "金额应相加（3000 凭证 + 500 期初），不能分在两行里"
+        );
+    }
+
+    /// 应付账龄（2202）必须仍按 **supplier** 维度出行。
+    ///
+    /// 回归（我自己差点发货的那一个）：key 的取值函数第一版写死了 customer，
+    /// 而应付挂的是 `supplier=` —— 于是整个应付账龄页**一行都不出，且不报错**。
+    /// 写死 customer 的版本里，**应收的 3 条测试全部通过**，只有这条会红。
+    ///
+    /// 「不报错」是它危险的地方：一个只查应收的测试集永远发现不了。
+    #[test]
+    fn aging_uses_supplier_dim_for_payable() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        let mut v = Voucher::new(p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "记", 1);
+        v.push_entry(Entry {
+            debit: Money::parse("2000").unwrap(),
+            credit: Money::ZERO,
+            aux: AuxRef { supplier: Some("S01".into()), ..Default::default() },
+            ..Entry::new(1, "220201", "应付货款")
+        });
+        v.push_entry(Entry {
+            debit: Money::ZERO,
+            credit: Money::parse("2000").unwrap(),
+            ..Entry::new(2, "1001", "付")
+        });
+        let vid = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, vid, "poster").unwrap();
+
+        let lines = aging(
+            &db,
+            "2202",
+            p,
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+            &fincore::engine::aging::buckets_by_days(),
+        )
+        .unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "应付账龄必须出行 —— key 取值写死 customer 会让 2202 整页空白：{:?}",
+            lines.iter().map(|l| (l.key.clone(), l.total.fmt_money())).collect::<Vec<_>>()
+        );
+        assert_eq!(lines[0].key, "S01", "key 是**裸供应商编码**");
+        assert_eq!(lines[0].total, Money::parse("2000").unwrap());
+    }
+
+    /// 没挂客户辅助核算的分录不进往来账龄。
+    ///
+    /// 否则页面上会出现一行 key 为空的记录：无法解释、也无法操作。
+    ///
+    /// 场景必须是**自定义的应收科目**（不带 aux 的）—— 预置的 112201/112202
+    /// 在科目表里就声明了「核算客户」，凭证校验会直接拒（我第一版想用 112201 挂存货，
+    /// 报的是「第 1 行科目 112201 核算客户，必须填写客户」）。所以这条 filter
+    /// 守的是**用户自己加的**应收科目那种情形 —— 那才是它能生效的地方。
+    ///
+    /// 走 `accounts::insert` 而不是手写 INSERT：`account` 表的辅助核算是
+    /// `aux_mask` 位掩码且**没有 `leaf` 列**（我照抄别处的 `aux`/`leaf` 写法，
+    /// 报的是 `table account has no column named leaf`）。手写 SQL 会随 schema 漂移。
+    #[test]
+    fn aging_skips_entries_without_party() {
+        let db = mem();
+        let p = Period::new(2026, 1).unwrap();
+        crate::accounts::insert(
+            &db,
+            &fincore::account::Account {
+                code: "112299".into(),
+                name: "自定义应收(无辅助)".into(),
+                category: fincore::account::AcctCategory::Asset,
+                dir: fincore::account::Direction::Debit,
+                aux: Default::default(),
+                unit: None,
+                currency: None,
+                has_qty: false,
+                is_cash: false,
+                is_bank: false,
+                cash_flow_item: None,
+                bs_item: None,
+                pl_item: None,
+                disabled: false,
+                memo: String::new(),
+            },
+        )
+        .unwrap();
+        let mut v = Voucher::new(p, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(), "记", 1);
+        v.push_entry(Entry {
+            debit: Money::parse("1000").unwrap(),
+            credit: Money::ZERO,
+            ..Entry::new(1, "112299", "应收")
+        });
+        v.push_entry(Entry {
+            debit: Money::ZERO,
+            credit: Money::parse("1000").unwrap(),
+            ..Entry::new(2, "1001", "收")
+        });
+        let vid = crate::vouchers::save(&db, &mut v).unwrap();
+        crate::vouchers::post(&db, vid, "poster").unwrap();
+
+        let lines = aging(
+            &db,
+            "1122",
+            p,
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+            &fincore::engine::aging::buckets_by_days(),
+        )
+        .unwrap();
+        assert!(
+            lines.is_empty(),
+            "没挂往来单位的行不该进往来账龄：{:?}",
+            lines.iter().map(|l| l.key.clone()).collect::<Vec<_>>()
+        );
+    }
+
 
     fn tmpdb(name: &str) -> Db {
         let p = std::env::temp_dir().join(format!("finbook_settle_{name}.fbk"));
@@ -1479,7 +1716,27 @@ mod tests {
             "600101",
         );
         let as_of = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
-        bad_debt_provision_voucher(&db, p1, as_of, "u1").unwrap().expect("首次应计提");
+        let first = bad_debt_provision_voucher(&db, p1, as_of, "u1").unwrap().expect("首次应计提");
+        // 计提出来的 1231 分录**必须挂上往来对象** —— 这是幂等性的机械保证：
+        // 下一轮 existing 从 `e.aux_key` 读回上一轮的数，aux 没挂上就取不到，
+        // 于是每轮都当成「还没提过」而全额重复计提（而且不报错）。
+        //
+        // 「为什么这条重要」不写在断言消息里，因为上面那句注释就是原因；
+        // 这里只钉住事实：aux 存在，且值是**裸编码经 aux_key_frag 还原**的
+        // `customer=C01` 形式，而不是反过来（`from_key` 吃裸编码会得到空 aux）。
+        {
+            let v = crate::vouchers::get(&db, first).unwrap().unwrap();
+            let e1231 = v
+                .entries
+                .iter()
+                .find(|e| e.account_code == "1231")
+                .expect("应有 1231 分录");
+            assert_eq!(
+                e1231.aux.get(fincore::AuxKind::Customer).as_deref(),
+                Some(&"C01".to_string()),
+                "计提的 1231 分录必须挂客户辅助核算，否则下一轮读不回来、幂等性断裂"
+            );
+        }
         // 目标未变：重复执行差额为 0，不再生成
         assert!(
             bad_debt_provision_voucher(&db, p1, as_of, "u1").unwrap().is_none(),

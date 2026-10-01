@@ -6329,9 +6329,24 @@ async function viewCustomers(main) {
 /// 客户详情（弹窗）：顶部汇总 + 往来明细 + 信用占用
 function openCustomerDetail(code, period) {
   const m = modal(`<h3>客户 ${esc(code)}</h3>
+    <div class="subtabs" id="cd-subtabs">
+      <button class="subtab on" data-cd="lines">往来明细</button>
+      <button class="subtab" data-cd="aging">账龄</button>
+    </div>
     <div id="cd-body" class="muted">加载中…</div>
     <div class="foot"><button class="btn ghost" id="cd-close">关闭</button></div>`);
   $("#cd-close", m).onclick = closeModal;
+  // 子视图切换：只换显隐，不重新取数。
+  // 账龄是一次性算好的（它只依赖 period + as_of，不随当前子视图变），
+  // 每次切换都重取会让人多点一下就多等一个来回。
+  const showSub = (which) => {
+    $all("[data-cd]", m).forEach((b) => b.classList.toggle("on", b.dataset.cd === which));
+    ["lines", "aging"].forEach((k) => {
+      const el = $("#cd-" + k, m);
+      if (el) el.style.display = k === which ? "" : "none";
+    });
+  };
+  $all("[data-cd]", m).forEach((b) => (b.onclick = () => showSub(b.dataset.cd)));
   (async () => {
     try {
       const r = await api(`/customers/${encodeURIComponent(code)}?period=${encodeURIComponent(period || "")}`);
@@ -6350,7 +6365,7 @@ function openCustomerDetail(code, period) {
             ${cr ? `<span><span class="muted">信用占用</span> ${fmt(cr.receivable)} / ${Number(cr.limit) > 0 ? fmt(cr.limit) : "<span class=\"muted\">未设额度</span>"}${cr.over ? ' <span class="tag err">超额度</span>' : ""}</span>` : ""}
           </div>
         </div>
-        <div style="max-height:340px;overflow:auto">
+        <div id="cd-lines" style="max-height:340px;overflow:auto">
         ${lines.length ? `<table class="grid"><thead><tr>
           <th>日期</th><th>单据</th><th>摘要</th><th>科目</th>
           <th class="num">金额</th><th class="num">已核销</th><th class="num">未核销</th>
@@ -6364,10 +6379,53 @@ function openCustomerDetail(code, period) {
           <td class="num">${Number(l.open) !== 0 ? `<b>${fmt(l.open)}</b>` : ""}</td>
         </tr>`).join("")}</tbody></table>` : `<div class="muted">没有往来记录</div>`}
         </div>`;
+      renderAging();
     } catch (e) {
       $("#cd-body", m).innerHTML = `<div style="color:var(--err)">${esc(e.message)}</div>`;
     }
   })();
+
+  // 账龄面板。**独立取数、独立失败**：账龄接口挂了不该把明细一起带走
+  //（明细是这一屏的主体，账龄是补充）。第一版把两个请求塞进同一个 try，
+  // 于是账龄一失败整个弹窗变成一行红字，用户连自己欠多少都看不到。
+  function renderAging() {
+    const body = $("#cd-body", m);
+    body.insertAdjacentHTML("beforeend", '<div id="cd-aging" style="display:none"><div class="muted">账龄加载中…</div></div>');
+    // 不传 as_of：用后端默认的「期间期末」。前端若传今天，查历史期间时
+    // 天数会按今天算 —— 「2025 年的账龄」在 2026 年看会全落进最老的一档，
+    // 那不是账龄，那是错。
+    api(`/customers/${encodeURIComponent(code)}/aging?period=${encodeURIComponent(period || "")}`)
+      .then((r) => {
+        const el = $("#cd-aging", m);
+        if (!el) return; // 弹窗已关
+        const a = r.aging || {};
+        const bs = a.buckets || [];
+        const as = a.amounts || [];
+        if (a.empty) {
+          el.innerHTML = `<div class="muted">无未核销余额（账龄基准日 ${esc(r.as_of || "")}）</div>`;
+          return;
+        }
+        el.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:4px">
+            账龄基准日 ${esc(r.as_of || "")}；分档与「往来核销 → 账龄分析」同一套。
+          </div>
+          <table class="grid"><thead><tr><th>区间</th><th class="num">金额</th></tr></thead><tbody>
+          ${bs.map((b, i) => `<tr>
+            <td>${esc(b)}</td>
+            <td class="num">${Number(as[i]) === 0 ? '<span class="muted">—</span>' : `<b>${esc(as[i])}</b>`}</td>
+          </tr>`).join("")}</tbody>
+          <tfoot class="totals"><tr><td>合计</td><td class="num"><b>${esc(a.total)}</b></td></tr></tfoot></table>
+          ${Number(a.credit_total) !== 0
+            ? `<div class="muted" style="font-size:12px;margin-top:4px">另有贷方余额（预收） ${esc(a.credit_total)}，不计入上面各区间。</div>`
+            : ""}
+          ${Number(a.credit_total) === 0 && Number(a.max_days) > 0
+            ? `<div class="muted" style="font-size:12px;margin-top:4px">最长账龄 ${a.max_days} 天</div>`
+            : ""}`;
+      })
+      .catch((e) => {
+        const el = $("#cd-aging", m);
+        if (el) el.innerHTML = `<div style="color:var(--err)">账龄取数失败：${esc(e.message)}</div>`;
+      });
+  }
 }
 
 // ===========================================================================
@@ -7073,7 +7131,7 @@ async function viewSettle(main) {
   if ($("#st-aging", main)) $("#st-aging", main).onclick = async () => {
     try {
       const d = await api(`/settle/aging?account=${encodeURIComponent(acct())}&upto=${encodeURIComponent(upto())}`);
-      $("#st-extra", main).innerHTML = `<div class="panel"><b>账龄分析（${esc(d.as_of)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>往来对象</th>${d.buckets.map((b) => `<th class="num">${esc(b)}</th>`).join("")}<th class="num">借方合计</th><th class="num">贷方合计</th><th class="num">净额</th><th class="num">最老天数</th></tr></thead><tbody>${(d.rows || []).length ? d.rows.map((r) => `<tr><td>${esc(r.key || "—")}</td>${r.amounts.map((x) => `<td class="num">${esc(x)}</td>`).join("")}<td class="num">${esc(r.total)}</td><td class="num">${esc(r.credit_total)}</td><td class="num">${esc(r.net)}</td><td class="num">${r.max_days}</td></tr>`).join("") : `<tr><td colspan="${d.buckets.length + 5}" class="muted">无数据</td></tr>`}</tbody></table></div>`;
+      $("#st-extra", main).innerHTML = `<div class="panel"><b>账龄分析（${esc(d.as_of)}）</b><table class="grid" style="margin-top:6px"><thead><tr><th>往来对象</th>${d.buckets.map((b) => `<th class="num">${esc(b)}</th>`).join("")}<th class="num">借方合计</th><th class="num">贷方合计</th><th class="num">净额</th><th class="num">最老天数</th></tr></thead><tbody>${(d.rows || []).length ? d.rows.map((r) => `<tr><td>${esc(r.name || r.key || "—")}</td>${r.amounts.map((x) => `<td class="num">${esc(x)}</td>`).join("")}<td class="num">${esc(r.total)}</td><td class="num">${esc(r.credit_total)}</td><td class="num">${esc(r.net)}</td><td class="num">${r.max_days}</td></tr>`).join("") : `<tr><td colspan="${d.buckets.length + 5}" class="muted">无数据</td></tr>`}</tbody></table></div>`;
     } catch (e) { toast(e.message, "err"); }
   };
   if ($("#st-records", main)) $("#st-records", main).onclick = async () => {

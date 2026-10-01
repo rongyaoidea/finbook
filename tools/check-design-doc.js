@@ -28,15 +28,16 @@ const doc = fs.readFileSync(docPath, "utf8");
 // 期望内容写死在这里：改了代码这里也要改，这是有意的 ——
 // 它逼着改动者确认「文档说的和代码做的是同一件事」。
 const REFS = [
-  { file: "crates/finweb/src/handlers.rs", line: 7248, re: /^\s+findb::sales::so_payment_add\(/, why: "销售收款同时写 so_payment" },
-  { file: "crates/finweb/src/handlers.rs", line: 7249, re: /^\s+let doc_id = findb::receipt::receipt_create\(/, why: "同一笔钱写两张表" },
+  { file: "crates/finweb/src/handlers.rs", line: 7307, re: /^\s+findb::sales::so_payment_add\(/, why: "销售收款同时写 so_payment" },
+  { file: "crates/finweb/src/handlers.rs", line: 7308, re: /^\s+let doc_id = findb::receipt::receipt_create\(/, why: "同一笔钱写两张表" },
   { file: "crates/findb/src/scm.rs", line: 1161, re: /credit_check\(db, &customer, period\)/, why: "订单流转时的信用拦截" },
   { file: "crates/findb/src/sales.rs", line: 742, re: /^pub fn customer_credit_limit/, why: "额度从 props_json 读" },
   { file: "crates/findb/src/sales.rs", line: 757, re: /^pub fn credit_check/, why: "占用/额度/是否超限" },
   { file: "crates/findb/src/settle.rs", line: 350, re: /^pub fn open_entries\b/, why: "余额唯一口径" },
   { file: "crates/findb/src/settle.rs", line: 366, re: /^pub fn open_entries_with\b/, why: "含子科目的 SQL" },
   { file: "crates/findb/src/settle.rs", line: 380, re: /account_code LIKE/, why: "传一级科目即含子科目" },
-  { file: "crates/findb/src/settle.rs", line: 597, re: /^pub fn aging\b/, why: "账龄桶" },
+  { file: "crates/findb/src/settle.rs", line: 609, re: /^pub fn aging\b/, why: "账龄桶" },
+  { file: "crates/findb/src/settle.rs", line: 601, re: /^pub fn party_kind\b/, why: "往来维度由科目首位定（写死 customer 会让应付账龄空白）" },
   { file: "crates/findb/src/auxs.rs", line: 188, re: /^pub fn check_parent\b/, why: "档案分级环校验" },
 ];
 

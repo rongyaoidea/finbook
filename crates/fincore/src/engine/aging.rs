@@ -71,7 +71,11 @@ pub fn default_bad_debt_rates() -> Vec<Money> {
 /// 一笔未结清的往来单据
 #[derive(Clone, Debug)]
 pub struct AgingItem {
-    /// 往来单位（辅助核算 key）
+    /// 往来单位的**裸编码**（`C01`）。
+    ///
+    /// 原注释写的是「辅助核算 key」，而 `settle::aging` 曾经真的往这里塞整条
+    /// aux_key（`customer=C01`），另一些来源塞裸编码（`C01`）—— 两种格式混用，
+    /// `analyze` 把同一个往来单位拆成两行。所以这里定死：**只能是裸编码**。
     pub key: String,
     /// 单据日期
     pub date: NaiveDate,
@@ -101,6 +105,15 @@ impl AgingItem {
 /// 一个往来单位一行
 #[derive(Clone, Debug)]
 pub struct AgingLine {
+    /// 往来单位的**裸编码**（`C01`），**不是** aux_key（`customer=C01`）。
+    ///
+    /// `analyze` 只按 `AgingItem.key` 原样分组，所以喂进来的 key 是什么格式，
+    /// 出去就是什么格式 —— 混着喂就会把同一个往来单位拆成多行。
+    ///
+    /// 调用方若要把这个 key 与数据库里的 `entry.aux_key` 比对，**必须先归一**：
+    /// 用 `findb::balances::aux_key_value_of(&aux_key, kind)` 从 aux_key 里取出
+    /// 同一维度。要往凭证里写回 AuxRef，则用 `aux_key_frag(code, kind)` 反向构造，
+    /// 不要 `AuxRef::from_key(key)`（它吃 `kind=value` 串，喂裸编码得到空 aux）。
     pub key: String,
     /// 各档金额（与 buckets 一一对应）
     pub amounts: Vec<Money>,

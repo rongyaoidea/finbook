@@ -1574,3 +1574,27 @@ details.wb-ref .card .v { font-size: 14px; }
 @media (max-width: 900px) {
   .topbar .who { display: none; }
 }
+
+/* ---------- 弹窗子视图页签 ---------- */
+/* 弹窗内的子视图切换。刻意与 .tab-bar/.tab-item 分开：后者是顶层页签，
+   带关闭按钮且 data-tab 会被 goView() 消费，语义不同。 */
+.subtabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--panel-border);
+  margin: 0 0 10px;
+}
+.subtab {
+  appearance: none;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--muted);
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.subtab:hover { color: var(--fg); }
+.subtab.on { color: var(--brand); border-bottom-color: var(--brand); font-weight: 600; }
+.subtab:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }

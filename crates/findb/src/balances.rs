@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use chrono::NaiveDate;
 use fincore::report::{AmountKind, BalanceSource};
 use fincore::{
-    AuxRef, BalanceRow, Chart, GeneralLedgerRow, JournalRow, LedgerRow, Money, Period, QtyRow,
-    TrialBalance,
+    AuxKind, AuxRef, BalanceRow, Chart, GeneralLedgerRow, JournalRow, LedgerRow, Money, Period,
+    QtyRow, TrialBalance,
 };
 
 use crate::{accounts, read_money, read_money_opt, Db, DbResult};
@@ -524,28 +524,35 @@ pub fn aux_key_contains(key: &str, want: &str) -> bool {
     parts.iter().all(|p| have.contains(p))
 }
 
-/// 客户维度的 aux_key 片段（**查询侧**用）：`"customer=C01"`。
+/// 某一维度的 aux_key 片段（**查询侧**用）：`AuxKind::Customer` → `"customer=C01"`。
 ///
 /// 编码为空时返回空串 —— 而 `aux_key_contains` 对空 want 返回 true，
-/// 所以调用方若传空客户，会**匹配到所有带任何辅助核算的分录**。
+/// 所以调用方若传空编码，会**匹配到所有带任何辅助核算的分录**。
 /// 那不是「没有筛选」，那是「筛出全部」，两者含义不同，别混用。
-pub fn aux_key_contains_key(customer_code: &str) -> String {
-    let c = customer_code.trim();
+///
+/// 维度是**参数**而不是写死 customer：应付挂的是 `supplier=`（AuxKind::Supplier），
+/// 写死 customer 会让应付账龄一行都不出（我第一版就这么写的）。
+pub fn aux_key_frag(code: &str, kind: AuxKind) -> String {
+    let c = code.trim();
     if c.is_empty() {
         String::new()
     } else {
-        format!("customer={c}")
+        format!("{}={}", kind.code(), c)
     }
 }
 
-/// 从整条 aux_key 里取出**客户维度**的值（**分组侧**用）。
+/// 从整条 aux_key 里取出**指定维度**的值（**分组侧**用）。
 ///
 /// 为什么不能直接拿整条 aux_key 做分组键：一条分录可能同时挂
 /// customer / item / qty / price 多个维度，整条做键会把同一个客户
 /// 拆成多组 —— 而客户视图要的是「一个客户一行」。
-pub fn aux_key_contains_key_of(aux_key: &str) -> String {
+///
+/// 找不到该维度时返回空串 —— 调用方据此判断「这条分录没挂往来单位」，
+/// 别把它当成「编码为空串的客户」。
+pub fn aux_key_value_of(aux_key: &str, kind: AuxKind) -> String {
+    let prefix = format!("{}=", kind.code());
     for seg in aux_key.split('\u{1f}') {
-        if let Some(v) = seg.strip_prefix("customer=") {
+        if let Some(v) = seg.strip_prefix(prefix.as_str()) {
             return v.trim().to_string();
         }
     }

@@ -75,7 +75,7 @@ pub struct CustomerLine {
 /// `period` 传 0 表示「到最新」—— 与 settle 侧其他函数的约定一致。
 pub fn open_lines(db: &Db, customer: &str, period: Period) -> DbResult<Vec<OpenEntry>> {
     let all = settle::open_entries(db, AR_ACCOUNT, period, false)?;
-    let want = crate::balances::aux_key_contains_key(customer);
+    let want = crate::balances::aux_key_frag(customer, AuxKind::Customer);
     Ok(all
         .into_iter()
         .filter(|e| crate::balances::aux_key_contains(&e.aux_key, &want))
@@ -159,7 +159,7 @@ pub fn list(db: &Db, period: Period, q: &str, only_open: bool) -> DbResult<Vec<C
     for e in all {
         // 分组键必须是**客户维度**，不是整条 aux_key ——
         // 一条分录可能同时挂 item/qty/price，整条做键会把同一客户拆成多组。
-        let k = crate::balances::aux_key_contains_key_of(&e.aux_key);
+        let k = crate::balances::aux_key_value_of(&e.aux_key, AuxKind::Customer);
         if k.is_empty() {
             continue;
         }
@@ -243,7 +243,7 @@ pub fn detail(db: &Db, code: &str, period: Period) -> DbResult<Option<CustomerDe
                 format!("期初 {}", o.doc_no)
             },
             account_code: AR_ACCOUNT.to_string(),
-            aux_key: crate::balances::aux_key_contains_key(&o.party_code),
+            aux_key: crate::balances::aux_key_frag(&o.party_code, AuxKind::Customer),
             settle_no: String::new(),
             debit: o.amount,
             credit: Money::ZERO,
@@ -279,6 +279,69 @@ pub fn detail(db: &Db, code: &str, period: Period) -> DbResult<Option<CustomerDe
     s.parent_code = ent.parent_code.clone().unwrap_or_default();
     s.disabled = ent.disabled;
     Ok(Some(CustomerDetail { summary: s, lines: out_lines }))
+}
+
+// ---------------- 账龄（复用 settle::aging，桶与算法都不在这里重算） ----------------
+
+/// 一个客户的账龄分桶。
+///
+/// 为什么单独一个结构而不是直接返回 `AgingLine`：账龄页是「所有客户一行一个」，
+/// 客户页是「这一个客户一整行」。形状不同，但**桶定义与算法必须是同一份**
+/// （`settle::aging`）—— 客户页自己分一次桶，就会出现「客户页说 60 天以上 3000、
+/// 账龄页说 0」，而两个数都是「按账龄算的」，没人会去怀疑口径不同。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CustomerAging {
+    /// 桶标签，顺序与 `amounts` 一一对应（0/30/60/…）
+    pub buckets: Vec<String>,
+    /// 各档金额
+    pub amounts: Vec<Money>,
+    /// 合计（借方性质未核销额）
+    pub total: Money,
+    /// 贷方性质未核销额（预收），单独列示不混进桶
+    pub credit_total: Money,
+    /// 最老一笔单据的账龄天数
+    pub max_days: i64,
+    /// 该客户在账龄里**没有行**（无未核销余额）。
+    ///
+    /// 与「有行但金额都是 0」分开，因为界面上该显示「无未核销余额」
+    /// 而不是一张全 0 的表 —— 后者看起来像「算过了，确实是 0」。
+    pub empty: bool,
+}
+
+/// 某个客户的账龄。**只调 [`settle::aging`]**，不自己算分桶。
+///
+/// `period` 传 [`Period::ZERO`] 表示「到最新」，与 settle 侧约定一致。
+///
+/// 客户在账龄里没有行时返回全 0 + `empty=true`（而不是 None）：界面需要一个
+/// 稳定的形状去渲染「无未核销余额」，而不是按有无数据换两套模板。
+pub fn aging_of(
+    db: &Db,
+    code: &str,
+    period: Period,
+    as_of: NaiveDate,
+    buckets: &[fincore::engine::aging::AgingBucket],
+) -> DbResult<CustomerAging> {
+    let labels: Vec<String> = buckets.iter().map(|b| b.label.to_string()).collect();
+    let code = code.trim();
+    let all = settle::aging(db, AR_ACCOUNT, period, as_of, buckets)?;
+    match all.iter().find(|l| l.key.trim() == code) {
+        Some(l) => Ok(CustomerAging {
+            buckets: labels,
+            amounts: l.amounts.clone(),
+            total: l.total,
+            credit_total: l.credit_total,
+            max_days: l.max_days,
+            empty: false,
+        }),
+        None => Ok(CustomerAging {
+            buckets: labels,
+            amounts: vec![Money::ZERO; buckets.len()],
+            total: Money::ZERO,
+            credit_total: Money::ZERO,
+            max_days: 0,
+            empty: true,
+        }),
+    }
 }
 
 
@@ -594,4 +657,113 @@ mod tests {
             "不存在的客户应返回 None，界面才能提示「未建档」而不是显示一片空白"
         );
     }
+
+    // ---- 账龄 ----
+
+    fn day_buckets() -> Vec<fincore::engine::aging::AgingBucket> {
+        fincore::engine::aging::buckets_by_days()
+    }
+
+    /// 账龄与 `settle::aging` 的**那一行**逐档相同。
+    ///
+    /// 这是「桶定义与算法只有一处」的落点：`aging_of` 只是从全体行里挑出
+    /// 属于这个客户的那一行，一分钱都不自己算。
+    /// 若它自己按天数分档，这里就会红 —— 而两个数都是「按账龄算的」，
+    /// 谁也不会怀疑口径不同。
+    #[test]
+    fn aging_of_equals_its_row_in_settle_aging() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        mk_cust(&db, "C02", "客户乙");
+        ar_posted(&db, "2025-01-10", "C01", "3000", true);
+        ar_posted(&db, "2026-01-05", "C01", "500", true);
+        ar_posted(&db, "2026-01-06", "C02", "700", true);
+
+        let p = Period::new(2026, 1).unwrap();
+        let as_of = d("2026-01-31");
+        let all = settle::aging(&db, AR_ACCOUNT, p, as_of, &day_buckets()).unwrap();
+        let row = all.iter().find(|l| l.key == "C01").expect("C01 应有一行");
+
+        let mine = aging_of(&db, "C01", p, as_of, &day_buckets()).unwrap();
+        assert!(!mine.empty, "有未核销余额，不该是 empty");
+        assert_eq!(mine.amounts, row.amounts, "各档金额必须逐档相同");
+        assert_eq!(mine.total, row.total, "合计必须相同");
+        assert_eq!(mine.credit_total, row.credit_total);
+        assert_eq!(mine.max_days, row.max_days);
+        assert_eq!(
+            mine.buckets,
+            day_buckets().iter().map(|b| b.label.to_string()).collect::<Vec<_>>(),
+            "桶标签必须原样透传（桶定义只有一处）"
+        );
+        // 两笔落在不同的桶里，否则「逐档相同」是个退化断言（全在一档也能通过）
+        assert_eq!(
+            mine.amounts.iter().filter(|m| !m.is_zero()).count(),
+            2,
+            "3000（>365天）与 500（<30天）应落在两个不同的桶：{:?} 桶 {:?}",
+            mine.amounts,
+            mine.buckets
+        );
+    }
+
+    /// 无未核销余额 → `empty=true` + 形状完整（全 0，不是缺字段）
+    ///
+    /// 为什么返回全 0 而不是 None：界面要一个稳定形状渲染「无未核销余额」，
+    /// 而不是按有无数据换两套模板。改成 None 的话前端就会开始写
+    /// `if (!aging) ...` 分支，久了那分支会按别的条件触发。
+    #[test]
+    fn aging_of_no_balance_is_empty_with_full_shape() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        let p = Period::new(2026, 1).unwrap();
+        let a = aging_of(&db, "C01", p, d("2026-01-31"), &day_buckets()).unwrap();
+        assert!(a.empty, "无未核销余额 → empty=true");
+        assert_eq!(a.total, Money::ZERO);
+        assert_eq!(a.credit_total, Money::ZERO);
+        assert_eq!(a.max_days, 0);
+        assert_eq!(
+            a.amounts.len(),
+            day_buckets().len(),
+            "桶与金额仍要一一对应（全 0），否则前端按桶渲染会拿到长度不一的数组"
+        );
+        assert!(a.amounts.iter().all(|m| m.is_zero()));
+    }
+
+    /// 编码前后空格不该把客户查丢
+    ///
+    /// 编码是路径参数 `Path(code)`，界面拼 URL 时不会 trim。这里守的是
+    /// 「findb 层自己兜住」—— 带空格的编码静默返回全 0，界面上会显示
+    /// 「该客户无未核销余额」，而真客户明明欠着钱。
+    #[test]
+    fn aging_of_trims_customer_code() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        ar_posted(&db, "2026-01-05", "C01", "800", true);
+        let p = Period::new(2026, 1).unwrap();
+        let a = aging_of(&db, "  C01  ", p, d("2026-01-31"), &day_buckets()).unwrap();
+        assert!(!a.empty, "带空格的编码也要查到（否则静默显示「无欠款」）");
+        assert_eq!(a.total, m("800"));
+    }
+
+    /// 客户编码前缀不能互相命中（`C01` 与 `C011`）
+    ///
+    /// `aging_of` 用的是 `l.key.trim() == code`（**等值**比较），不是 LIKE。
+    /// 若有人图省事改成 `starts_with` / `contains`，这个客户会凭空背上
+    /// 别人的欠款 —— 而界面上只会显示一个更大的数字，没人会去查它从哪来。
+    ///
+    /// 与 `balances.rs` 里记着的教训同源：`%customer=C001%` 会误命中 `C0011`。
+    #[test]
+    fn aging_of_does_not_match_prefix_of_other_code() {
+        let db = mem();
+        mk_cust(&db, "C01", "客户甲");
+        mk_cust(&db, "C011", "客户乙");
+        ar_posted(&db, "2026-01-05", "C011", "700", true);
+        let p = Period::new(2026, 1).unwrap();
+        let a = aging_of(&db, "C01", p, d("2026-01-31"), &day_buckets()).unwrap();
+        assert!(
+            a.empty && a.total.is_zero(),
+            "C01 不得命中 C011 的 700（等值比较，不是前缀匹配）：{:?}",
+            a
+        );
+    }
+
 }

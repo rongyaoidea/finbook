@@ -34,6 +34,39 @@ function resolveRepoRoot() {
 }
 const FIX_ROOT = resolveRepoRoot();
 
+// 跑一个守门脚本的**自检**，用退出码判它过没过。
+//
+// 判据必须是退出码，不是输出文本。三个理由（每一条都踩过）：
+//   · 自检的**预期输出里就有 `FAIL ...`** —— 那是「变异被正确拦下」的证据。
+//     早先用 `/FAIL/` 判，把自己的成功输出判成了失败。
+//   · 把探针数量写进正则（`/全部 3 个探针/`）会随内容腐烂：我给
+//     selftest-customers-balance 加到第 5 个探针，检查就报「自检没通过」，
+//     而自检本身 5/5 全过。判据写在散文里，内容一改就失效。
+//   · 连全角问号都得原样写：`\？` 是「转义问号」，等于半角 `?`，永不匹配。
+//
+// 输出仍然打出来（人要看），但不参与判断。
+function runGuardSelfTest(label, scriptName) {
+  let out = "";
+  let code = 0;
+  try {
+    out = execFileSync(process.execPath, [path.join(__dirname, scriptName)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    // 非 0 退出是「自检判定失败」；脚本崩/缺失也一样 —— 两种都算失败，
+    // 但输出照样要打出来，否则只剩一句「未能运行」，无从查起。
+    out = String((e && e.stdout) || "") + String((e && e.stderr) || "");
+    code = 1;
+  }
+  process.stdout.write(out);
+  if (code !== 0) {
+    console.log(label + "的自检没通过（退出码 " + code + "）—— 探针没拦下，或文件没还原");
+    return false;
+  }
+  return true;
+}
+
 // 取某个函数的完整函数体（顶格到配对的大括号）。多个检查都用它，所以定义在最前面。
 //
 // 允许行首空白：`test_opts` 缩进在 `mod tests` 里，而 `test_state` 在顶层。
@@ -600,15 +633,7 @@ try {
     console.log("设计文档引用检查：有 FAIL");
     bad++;
   }
-  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-design-doc.js")], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  process.stdout.write(st);
-  if (!/全部 3 个探针都生效/.test(st) || /FAIL/.test(st)) {
-    console.log("设计文档检查的自检没通过 —— 说明这个检查本身可能已经失效");
-    bad++;
-  }
+  if (!runGuardSelfTest("设计文档检查", "selftest-design-doc.js")) bad++;
 } catch (e) {
   // 自检脚本缺失或崩了同样算失败：无法校验 ≠ 校验通过。
   console.log(
@@ -634,23 +659,7 @@ try {
     console.log("可移植性检查：有 FAIL");
     bad++;
   }
-  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-portable.js")], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  process.stdout.write(st);
-  // 判据不能用 `/FAIL/`：自检的**预期输出里就有 `FAIL tools\...`** ——
-  // 那是「变异被正确拦下」的证据。上一版用 `/FAIL/` 判，害得检查把自己的
-  // 成功输出判成失败（我在这上面又栽了一次：看到红就以为自检坏了）。
-  // 正确判据只有两条：① 探针确实拦下了（变异后的退出码非 0）
-  // ② 文件已还原（还原后基线是绿的）。这两条都由 selftest 自己打印。
-  //
-  // 「退出成功？」是**全角问号**，正则里必须原样写，不能写 `\？` ——
-  // `\？` 是「转义问号」，等于半角 `?`，永远匹配不上（我因此多跑了一轮）。
-  if (!/还原后基线：OK/.test(st) || !/变异 1[\s\S]*退出成功？ false/.test(st)) {
-    console.log("可移植性检查的自检没通过 —— 探针没拦下，或文件没还原");
-    bad++;
-  }
+  if (!runGuardSelfTest("可移植性检查", "selftest-portable.js")) bad++;
 } catch (e) {
   console.log("可移植性检查未能运行：" + String((e && e.message) || e).split("\n")[0].slice(0, 100));
   bad++;
@@ -671,15 +680,7 @@ try {
     console.log("客户余额口径检查：有 FAIL");
     bad++;
   }
-  const st = execFileSync(process.execPath, [path.join(__dirname, "selftest-customers-balance.js")], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  process.stdout.write(st);
-  if (!/全部 3 个变异都被拦下/.test(st) || /FAIL/.test(st)) {
-    console.log("客户余额口径检查的自检没通过 —— 探针没拦下，或文件没还原");
-    bad++;
-  }
+  if (!runGuardSelfTest("客户余额口径检查", "selftest-customers-balance.js")) bad++;
 } catch (e) {
   console.log("客户余额口径检查未能运行：" + String((e && e.message) || e).split("\n")[0].slice(0, 100));
   bad++;
@@ -713,12 +714,35 @@ try {
  * 而 REPLACEMENT_CHAR 只会让人以为是乱码。
  */
 const REPLACEMENT_CHAR = String.fromCharCode(0xfffd);
-const tracked = execFileSync("git", ["ls-files"], { encoding: "utf8", maxBuffer: 8 << 20 })
-  .split(/\r?\n/)
-  .filter((f) => /\.(rs|js|ts|json|md|yml|toml|css|html|ps1)$/i.test(f))
-  .filter((f) => fs.existsSync(f));
+// `-c core.quotepath=false` + `-z` 是必需的，不是洁癖：
+//   · git 的 `core.quotepath` 默认 **true**，非 ASCII 路径会被输出成 C 转义
+//     （`docs/\345\256\242...md`），那个字符串在磁盘上不存在；
+//   · 于是旧的 `filter(f => fs.existsSync(f))` 会把它们**静默跳过** ——
+//     实测漏掉 2 个文件：`docs/多租户套帐架构设计.md` 与
+//     `docs/客户管理模块设计.md`，也就是**受机器检查的设计文档本身**。
+//   · 检查报「扫描 203 个，0 个有问题」时，那 2 个文件一次都没被读过。
+//     `docs/客户管理模块设计.md` 里那 3 个 U+FFFD（`额度调整日志` 被写坏成
+//     `额<?><?><?>调整日志`）就是这么活下来的 —— 绿色的检查结果，
+//     底下是一个空洞。
+//
+// 所以：**不许静默跳过**。列不出来/读不到的文件必须报错，见下面的 missing 处理。
+const tracked = execFileSync(
+  "git",
+  ["-c", "core.quotepath=false", "ls-files", "-z"],
+  { encoding: "utf8", maxBuffer: 8 << 20 }
+)
+  .split("\0")
+  .filter(Boolean)
+  .filter((f) => /\.(rs|js|ts|json|md|yml|toml|css|html|ps1)$/i.test(f));
 let encBad = 0;
-for (const f of tracked) {
+// 「列在版本控制里、工作区却读不到」= 无法校验。旧代码把它当不存在而跳过，
+// 那是把「没检查」报成「检查通过」。现在它是一条明确的失败。
+const missing = tracked.filter((f) => !fs.existsSync(f));
+for (const f of missing) {
+  console.log(`FAIL ${f}: 受版本控制但工作区读不到 —— 无法校验编码（不许静默跳过）`);
+  encBad++;
+}
+for (const f of tracked.filter((f) => fs.existsSync(f))) {
   const buf = fs.readFileSync(f);
   if (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
     console.log(`FAIL ${f}: 带 UTF-8 BOM`);
@@ -926,6 +950,39 @@ if (process.argv.includes("--selftest")) {
         const p2 = "crates/finweb/static/util.js";
         const o = fs.readFileSync(p2);
         fs.writeFileSync(p2, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), o]));
+        return () => fs.writeFileSync(p2, o);
+      },
+    },
+    {
+      // 这条探针守的是刚修的那个洞：`git ls-files` 的 `core.quotepath` 默认 true，
+      // 中文文件名被输出成 C 转义 → `existsSync` 失败 → **静默跳过**。
+      // 后果不是「少查两个文件」，是：检查报「扫描 203 个，0 个有问题」，
+      // 而受机器检查的设计文档 `docs/客户管理模块设计.md` 一次都没被读过 ——
+      // 它里面那 3 个 U+FFFD（`额度调整日志` 被写坏）就是这么活下来的。
+      //
+      // 所以探针必须打在**中文命名的文件**上。打在 util.js 上（已有那条探针）
+      // 证明不了任何事：ASCII 文件名从来就没被跳过。
+      name: "中文命名的源文件被写入 U+FFFD（守 core.quotepath 那个洞）",
+      apply: () => {
+        // 路径从 git ls-files 里**按内容特征**找出来，不写死中文名 ——
+        // 写死的话，将来文件改名探针就变成空变异（空变异 = 永真）。
+        const cjk = execFileSync(
+          "git",
+          ["-c", "core.quotepath=false", "ls-files", "-z"],
+          { encoding: "utf8", maxBuffer: 8 << 20 }
+        )
+          .split("\0")
+          .filter(Boolean)
+          .filter((f) => /\.(md|rs|js)$/i.test(f) && /[^\x00-\x7f]/.test(f));
+        if (cjk.length === 0) {
+          throw new Error(
+            "探针失效：仓库里没有中文命名的受版本控制源文件，" +
+              "无法验证 core.quotepath=false 那个修复",
+          );
+        }
+        const p2 = cjk[0];
+        const o = fs.readFileSync(p2, "utf8");
+        fs.writeFileSync(p2, o + "\n" + REPLACEMENT_CHAR + "\n");
         return () => fs.writeFileSync(p2, o);
       },
     },

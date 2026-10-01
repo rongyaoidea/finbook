@@ -34,7 +34,10 @@ const REFS = [
   { file: "crates/findb/src/sales.rs", line: 742, re: /^pub fn customer_credit_limit/, why: "额度从 props_json 读" },
   { file: "crates/findb/src/sales.rs", line: 757, re: /^pub fn credit_check/, why: "占用/额度/是否超限" },
   { file: "crates/findb/src/settle.rs", line: 350, re: /^pub fn open_entries\b/, why: "余额唯一口径" },
+  { file: "crates/findb/src/settle.rs", line: 366, re: /^pub fn open_entries_with\b/, why: "含子科目的 SQL" },
+  { file: "crates/findb/src/settle.rs", line: 380, re: /account_code LIKE/, why: "传一级科目即含子科目" },
   { file: "crates/findb/src/settle.rs", line: 597, re: /^pub fn aging\b/, why: "账龄桶" },
+  { file: "crates/findb/src/auxs.rs", line: 188, re: /^pub fn check_parent\b/, why: "档案分级环校验" },
 ];
 
 for (const r of REFS) {

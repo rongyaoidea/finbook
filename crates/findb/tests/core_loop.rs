@@ -1132,19 +1132,26 @@ fn t20_backup_and_integrity() {
     let (db, _chart, _ids) = posted_book();
     assert_eq!(db.integrity_check().unwrap(), vec!["ok"]);
 
+    // 目录名只带 PID：上一次被中断/泄漏的运行会留下同名目录，Windows 的 PID 会复用，
+    // 复用到就撞上旧的 backup.fbk → VACUUM INTO 报 output file already exists。
+    // 所以进目录第一步先清残留（下面的清理是断言，不是 `let _`，泄漏会当场红）。
     let dir = std::env::temp_dir().join(format!("finbook_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let bak = dir.join("backup.fbk");
     db.backup(&bak).unwrap();
     assert!(bak.exists());
 
-    // 备份文件可独立打开且数据一致
-    let db2 = Db::open(&bak).unwrap();
-    let (d, c) = findb::balances::begin_trial(&db2).unwrap();
-    assert_eq!(d, m("1700000.00"));
-    assert_eq!(c, m("1700000.00"));
-
-    let _ = std::fs::remove_dir_all(&dir);
+    // 备份文件可独立打开且数据一致。连接必须在清理**之前** drop 掉：Windows 上
+    // 打开的文件删不掉，原来写成 `let _ = remove_dir_all(...)` 把错误吞了，
+    // 每跑一次漏一个目录，攒到 PID 复用就炸在上面那一步。
+    {
+        let db2 = Db::open(&bak).unwrap();
+        let (d, c) = findb::balances::begin_trial(&db2).unwrap();
+        assert_eq!(d, m("1700000.00"));
+        assert_eq!(c, m("1700000.00"));
+    }
+    std::fs::remove_dir_all(&dir).expect("临时备份目录必须删干净 —— 连接没 drop 就会删不掉，残留会撞上下次 PID 复用");
 }
 
 #[test]

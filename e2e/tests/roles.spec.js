@@ -32,17 +32,23 @@ test("侧栏「最近/收藏」按当前角色过滤，且不跨账号共享", a
   });
   await loginAs(page, "e2ecash", "Cash@2026x", book1);
 
-  // 出纳的「最近」分区里不该出现他没权限的页面
-  const recentSec = page.locator('.nav-sec[data-sec="recent"]');
-  if (await recentSec.count()) {
-    await expect(recentSec).not.toContainText("期初建账", { timeout: 5_000 });
-    await expect(recentSec).not.toContainText("期末处理", { timeout: 5_000 });
-    await expect(recentSec).not.toContainText("固定资产", { timeout: 5_000 });
-  }
-  // 收藏同理（admin 刚才把「期初建账」加为常用了）
-  const favSec = page.locator('.nav-sec[data-sec="fav"]');
-  if (await favSec.count()) {
-    await expect(favSec).not.toContainText("期初建账", { timeout: 5_000 });
+  // 出纳先访问两页、再收藏其中一页 —— 否则「最近 / 常用」两个分区根本不渲染。
+  // **空分区上的 not.toContainText 恒真**：原写法还挂在只含标题的 .nav-sec 上，
+  // 标题里只有「最近 / 常用」四个字，三条断言永远通过 = 没测。
+  await page.click('.nav-item[data-view="vouchers"]');
+  await page.click('.nav-item[data-view="bank"]');
+  await page.click('.nav-star[data-fav="bank"]');
+  // 结构锚点：secHtml() 的标题和项是**兄弟节点**，必须写 `.nav-sec[...] + .nav-body`
+  const recentBody = page.locator('.nav-sec[data-sec="recent"] + .nav-body');
+  const favBody = page.locator('.nav-sec[data-sec="fav"] + .nav-body');
+  // 正例：两个分区确实渲染了，且里面有他**该**看到的那两页（否则下面的反例是空跑）
+  await expect(recentBody.locator('.nav-jump[data-view="vouchers"]')).toHaveCount(1);
+  await expect(favBody.locator('.nav-item[data-view="bank"]')).toHaveCount(1);
+  // 反例：他没权限的页面在这两个分区里都不许出现
+  for (const sec of [recentBody, favBody]) {
+    for (const v of ["begin", "assets", "period-end"]) {
+      await expect(sec.locator(`[data-view="${v}"]`)).toHaveCount(0);
+    }
   }
   // 主导航本来就没有（对照组：主列表一直是对的，出错的是 localStorage 那条路）
   await expect(page.locator('.nav-item[data-view="begin"]')).toHaveCount(0);

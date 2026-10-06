@@ -63,3 +63,24 @@ test("凭证模板：新建每月模板→本期到期生成凭证", async ({ pa
   await page.click('.nav-item[data-view="vouchers"]');
   await expect(page.locator("#v-table tbody")).toContainText("房租");
 });
+
+test("数据导入：选「银行对账单」跳走后，回来不会再被拽去银行对账", async ({ page }) => {
+  await newBook(page, `E2E导入返回${Date.now()}`);
+  await page.click('.nav-item[data-view="imports"]');
+  await expect(page.locator("#imp-kind")).toBeVisible({ timeout: 15_000 });
+  // 等 viewImports 的监听器绑好（innerHTML 先出，`await api("/accounts")` 之后才 addEventListener）
+  await expect(page.locator("#imp-text")).toHaveAttribute("placeholder", /./, { timeout: 15_000 });
+
+  // 选哨兵项「银行对账单 →（转到银行对账）」→ 跳到银行对账页
+  await page.selectOption("#imp-kind", "__bank");
+  await expect(page).toHaveURL(/#\/bank/, { timeout: 10_000 });
+
+  // 回到数据导入：不能又被视图快照里的 __bank + restoreViewState 300ms 后派发的 change 拽走
+  await page.click('.nav-item[data-view="imports"]');
+  await expect(page.locator("#imp-kind")).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("#imp-kind")).toHaveValue("aux");
+  // 必须跨过 restoreViewState 的 300ms change 派发窗口 —— 没修好的话是在这之后跳走的
+  await page.waitForTimeout(700);
+  await expect(page).toHaveURL(/#\/imports/);
+  await expect(page.locator("#imp-kind")).toHaveValue("aux");
+});

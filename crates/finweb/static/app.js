@@ -1210,6 +1210,11 @@ function saveViewState(id, main) {
     if (el.type === "checkbox" || el.type === "radio" || el.type === "file") return;
     // 只存有意义的值：空值不必占地方
     if (el.value === "") return;
+    // `__` 开头的选项是**入口跳转哨兵**（导入页 __bank「转到银行对账」），不是用户
+    // 选的值。存进快照 → 回到该页 restoreViewState 还原它、并在 300ms 后给它派发
+    // change → syncKind 见到 __bank 又跳一次 → 离开时再存回 __bank：一进「数据导入」
+    // 就被拽去银行对账、永远回不来（2026-10-06 用户反馈）。哨兵一律不进快照。
+    if (el.tagName === "SELECT" && el.value.indexOf("__") === 0) return;
     snap.fields[el.id] = el.value;
   });
   viewState[id] = snap;
@@ -1329,7 +1334,8 @@ function applyHashOnBoot() {
 //   · 搜索框：按功能名/分组名过滤。**空查询时展示全部**——这一点是硬要求，
 //     E2E 全靠 `.nav-item[data-view=...]` 点击进入页面，隐藏了就全超时。
 //   · 收藏（星标）：点导航项右侧的 ☆ 置顶成「常用」。
-//   · 最近：最近 8 个去过的页面，去重后在收藏下面。
+//   · 最近：最近 8 个去过的页面，去重后在收藏下面。**原分组里那一份保留** —— 最近只是
+//     多给一个入口，不把菜单项搬走（2026-10-06 用户反馈：点过之后导航项「消失」了）。
 //
 // ⚠️ 「收藏 / 最近」必须做两道过滤，缺任何一道都是权限泄漏（实测发现）：
 //   1. **按 isNavVisible 过滤**。原来只判 `NAV_INDEX[id]` 存在，于是出纳能在
@@ -1397,10 +1403,14 @@ function renderSidebar() {
   const recents = getRecent().map((id) => NAV_INDEX[id]).filter((n) => n && navMatches(n, q));
   const collapsed = lsGet(LS_SEC, {});
 
-  const itemHtml = (n, extra) => {
+  // 第三个参数 cls 是这一份的 class：原分组/搜索结果用默认的 nav-item，
+  // 「最近」那一份传 nav-jump。**不能都用 nav-item** —— 同一个 data-view 出现两份，
+  // `.nav-item[data-view=x]`（E2E 里到处是这个写法）会一次匹配两个：Playwright 严格
+  // 模式直接报错，`toHaveCount(1)` 也变成 2。
+  const itemHtml = (n, extra, cls) => {
     const on = n.id === state.view;
     return `<div class="nav-fav-row">
-      <button class="nav-item${on ? " active" : ""}" data-view="${n.id}"${on ? ' aria-current="page"' : ""} title="${esc(n.label)}${n.group ? " · " + esc(n.group) : ""}">${esc(n.label)}</button>
+      <button class="${cls || "nav-item"}${on ? " active" : ""}" data-view="${n.id}"${on ? ' aria-current="page"' : ""} title="${esc(n.label)}${n.group ? " · " + esc(n.group) : ""}">${esc(n.label)}</button>
       <button class="nav-star${getFavs().includes(n.id) ? " on" : ""}" data-fav="${n.id}" title="${getFavs().includes(n.id) ? "取消常用" : "加为常用"}（点导航项右侧星星）" aria-label="把${esc(n.label)}加为常用">${getFavs().includes(n.id) ? "★" : "☆"}</button>
     </div>${extra || ""}`;
   };
@@ -1422,7 +1432,7 @@ function renderSidebar() {
     </div>`;
 
   if (favs.length) html += secHtml("fav", "常用", favs.map((n) => itemHtml(n)).join(""), favs.length);
-  if (recents.length) html += secHtml("recent", "最近", recents.map((n) => itemHtml(n)).join(""), recents.length);
+  if (recents.length) html += secHtml("recent", "最近", recents.map((n) => itemHtml(n, "", "nav-jump")).join(""), recents.length);
 
   if (q) {
     // 搜索态：只列命中项，不再按分组铺开（否则「搜明细账」还是一大屏）
@@ -1437,7 +1447,9 @@ function renderSidebar() {
     // 全量：按分组铺开（改造前就是这个行为，E2E 依赖）
     // 每个分组包在自己的 .nav-body 里，折叠靠 `.nav-sec.collapsed + .nav-body`
     // 的相邻选择器生效——所以项必须在 body 内部，不能平铺在 header 后面。
-    const rest = all.filter((n) => !favs.includes(n) && !recents.includes(n));
+    // 只排「收藏」：常用是用户显式的置顶，移出原分组说得通；「最近」是**被动**记的，
+    // 把它从原分组排掉就等于「点一下菜单项，菜单项就没了」（2026-10-06 用户反馈）。
+    const rest = all.filter((n) => !favs.includes(n));
     const groups = [];
     const gmap = {};
     rest.forEach((n) => {
@@ -2123,7 +2135,7 @@ function renderShell() {
   // 事件委托：nav-item 只在 sidebar 容器上绑一次。
   // 注意 star（收藏）按钮在 nav-item 外面一层，必须先排掉，否则点星星会跳页面。
   $(".sidebar").addEventListener("click", (e) => {
-    const btn = e.target.closest(".nav-item");
+    const btn = e.target.closest(".nav-item, .nav-jump");
     if (!btn) return;
     if (e.target.closest("[data-fav]")) return;
     closeMenu();
@@ -4160,10 +4172,12 @@ async function viewImports(main) {
     // 硬塞进同一个 kind 只会让人以为「导进来就等于对上了」。
     if (k === "__bank") {
       toast("银行对账单在「期末 → 银行对账」里导入并自动勾对，正在跳转…");
+      // 复位必须在 click **之前**：bc.click() 同步走 goView → saveViewState，那一刻
+      // 它读的正是 #imp-kind 的值；放在 click 后面就晚了，快照里存下 __bank。
+      kindSel.value = "aux";
       const bc = $all(".nav-item").find((b) => b.dataset.view === "bank");
       if (bc) bc.click();
       else toast("没有「银行对账」入口，可能当前账号缺「凭证录入」权限", "err");
-      kindSel.value = "aux";
       return;
     }
     $("#imp-text").placeholder = `或直接粘贴 CSV 内容…\n列：${TPL_COLS[k] || ""}\n（或点「下载模板」拿标准模板填）`;

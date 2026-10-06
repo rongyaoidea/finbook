@@ -539,4 +539,80 @@ if (appSrc) {
   }
 }
 
+// --- ⑳ 侧栏「最近」是追加，不是搬家 -------------------------------------------
+//
+// 2026-10-06 用户反馈：点过一个导航项，它就从原来的分组里消失、只剩「最近」里一份。
+// 「最近」本该是**多给一个入口**，不是把菜单项搬走 —— 搬走之后分组少一项、组内计数
+// 也跟着少，用起来像菜单项被删了。
+//
+// 判据钉机制（三条缺一条都是真故障）：
+//   1. 铺开分组用的 `rest` 只能排「收藏」：排了 recents 就是搬家；
+//   2. 「最近」那一份必须是 nav-jump —— 同一个 data-view 出现两份 nav-item，
+//      `.nav-item[data-view=x]`（E2E 里到处是这个写法）会一次匹配两个，Playwright
+//      严格模式直接失败、toHaveCount(1) 会变成 2；
+//   3. 侧栏点击委托必须认 nav-jump —— 不认就是「点了没反应」：不报错、不跳转，
+//      是最难查的一类。
+if (appSrc) {
+  const b20 = bad;
+  const rs = stripComments(fnBody("renderSidebar"));
+  if (!rs) {
+    bad++;
+    rule("renderSidebar() 不见了 —— 侧栏分组与「最近」的渲染都在它里面，改名请同步改本检查");
+  } else {
+    if (!/const rest = all\.filter\(\(n\) => !favs\.includes\(n\)\);/.test(rs)) {
+      bad++;
+      rule(
+        "renderSidebar() 铺开分组的 `rest` 不再是「只排收藏」—— 最近访问过的页面被从" +
+          "\n    原分组里搬走了（点一下菜单项，菜单项就没了）。修法：rest 只排 favs。"
+      );
+    }
+    const recLine = rs.split("\n").find((l) => l.indexOf('secHtml("recent"') >= 0) || "";
+    if (recLine.indexOf("nav-jump") < 0) {
+      bad++;
+      rule(
+        '「最近」分区不是用 nav-jump 渲染的 —— 要么改回了 nav-item（同一 data-view 两份，' +
+          '\n    E2E 严格模式会炸），要么这一行被拆了。修法：itemHtml(n, "", "nav-jump")。'
+      );
+    }
+    const deleg = appSrc.split('closest(".nav-item, .nav-jump")').length - 1;
+    if (deleg !== 1) {
+      bad++;
+      rule(
+        "侧栏点击委托没认 nav-jump（匹配 " + deleg + " 次，应为 1）—— 「最近」里那一份" +
+          "\n    点了不跳转也不报错。修法：e.target.closest(\".nav-item, .nav-jump\")。"
+      );
+    }
+  }
+  if (bad === b20) console.log("侧栏「最近」：原分组那一份保留，最近只是多一个入口（nav-jump）");
+}
+
+// --- ㉑ 视图快照不许存「入口跳转哨兵」选项 -------------------------------------
+//
+// 2026-10-06 用户反馈：数据导入页选了「银行对账单 →（转到银行对账）」跳走之后，就再也
+// 回不到数据导入 —— 每次点进去 300ms 后又被拽去银行对账。
+//
+// 链路：选中 __bank → bc.click() 同步走 goView → saveViewState 读 #imp-kind 的值，
+// 把 `__bank` 写进 viewState.imports → 回到该页 restoreViewState 还原它、并在 300ms 后
+// 给它派发 change → syncKind 见到 __bank 又跳一次 → 离开时再存回 __bank：死循环。
+// （select 的哨兵项是**入口跳转**，从来不是用户选的值，本来就不该进快照。）
+//
+// 判据：saveViewState 的**存值语句之前**必须有哨兵拦截。判在代码上，不是「注释里
+// 提过 __bank」—— 注释里提过照样能把人拽走。
+if (appSrc) {
+  const sv = stripComments(fnBody("saveViewState"));
+  if (!sv) {
+    bad++;
+    rule("saveViewState() 不见了 —— 视图快照的哨兵拦截在它里面，改名请同步改本检查");
+  } else if (!/el\.tagName === "SELECT" && el\.value\.indexOf\("__"\) === 0/.test(sv)) {
+    bad++;
+    rule(
+      'saveViewState() 没有拦掉 `__` 开头的哨兵选项 —— __bank 这种「入口跳转」项被存进' +
+        '\n    快照后，回到该页会在 300ms 后派发 change 把用户再拽去银行对账，出不来。' +
+        '\n    修法：存值前 if (el.tagName === "SELECT" && el.value.indexOf("__") === 0) return;'
+    );
+  } else {
+    console.log("视图快照：`__` 开头的入口跳转哨兵不进快照（__bank 不会让数据导入页回不去）");
+  }
+}
+
 process.exit(bad === 0 ? 0 : 1);

@@ -104,6 +104,28 @@ const cases = [
     '    ${can("cashier_sign") && id > 0 && (status === "draft" || status === "audited") ? `<button class="btn ghost" id="v-sign">出纳签字</button>` : ""}',
     "已签字的凭证仍显示「出纳签字」按钮（与「取消签字」并排）",
   ],
+  // ⑳ 侧栏「最近」是追加不是搬家（2026-10-06 反馈：点过之后就从原分组里消失了）
+  [
+    "    const rest = all.filter((n) => !favs.includes(n));",
+    "    const rest = all.filter((n) => !favs.includes(n) && !recents.includes(n));",
+    "⑳ 最近从原分组搬走（rest 排掉 recents）",
+  ],
+  [
+    'recents.map((n) => itemHtml(n, "", "nav-jump"))',
+    'recents.map((n) => itemHtml(n))',
+    "⑳ 最近分区用回 nav-item（同一 data-view 两份，E2E 严格模式炸）",
+  ],
+  [
+    'const btn = e.target.closest(".nav-item, .nav-jump");',
+    'const btn = e.target.closest(".nav-item");',
+    "⑳ 侧栏委托不认 nav-jump（最近那条点了没反应）",
+  ],
+  // ㉑ 视图快照存下入口跳转哨兵 → 回不到数据导入（2026-10-06 反馈）
+  [
+    '    if (el.tagName === "SELECT" && el.value.indexOf("__") === 0) return;\n    snap.fields[el.id] = el.value;',
+    '    snap.fields[el.id] = el.value;',
+    "㉑ saveViewState 存下 __bank 哨兵（进数据导入即被拽去银行对账）",
+  ],
 ];
 /** 对换行不敏感地套用变异（源码是 CRLF，变异串按 LF 写） */
 function applyMut(src, from, to) {
